@@ -1,0 +1,470 @@
+{
+ "schema_version": 1,
+ "kind": "nr-source-lock",
+ "generated_utc": "2026-09-30T10:55:06Z",
+ "roots": {
+  "S": "C:/omo-research/obs-mfg-v020-candidate/source",
+  "D": "C:/omo-research/obs-mfg-v020-candidate/feeder",
+  "Q": "C:/omo-research/obs-mfg-v020-candidate/release-repo"
+ },
+ "files": [
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/DlssNr_Common.h",
+   "sha256": "7488755404a65150bba08e69febe17e2ec2b7f42ae1159d76ee7aaf09f96f45b",
+   "bytes": 15306,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R1",
+   "preflight_sha256": "7488755404a65150bba08e69febe17e2ec2b7f42ae1159d76ee7aaf09f96f45b",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/DlssNr_Dx12.h",
+   "sha256": "26431f5575c63faf6fc71d0c3c2a3c8c801a8cbc29dca2e9389c7f30deffb7d8",
+   "bytes": 8804,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R1",
+   "preflight_sha256": "26431f5575c63faf6fc71d0c3c2a3c8c801a8cbc29dca2e9389c7f30deffb7d8",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/DlssNr_Dx12_Run.cpp",
+   "sha256": "3dd473d54946cdc153a9a668921c06c6d41b5a1cb158170f37eb6218d0a0a1fd",
+   "bytes": 23052,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R1",
+   "preflight_sha256": "3dd473d54946cdc153a9a668921c06c6d41b5a1cb158170f37eb6218d0a0a1fd",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/DlssNr_Dx12_Evaluate.cpp",
+   "sha256": "fed204dce01817c6430b6e1447b2ceac9e344820c99a792a56c874639aa5adce",
+   "bytes": 2643,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R1",
+   "preflight_sha256": "fed204dce01817c6430b6e1447b2ceac9e344820c99a792a56c874639aa5adce",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/dlssnr/DlssNr_Proxy.h",
+   "sha256": "37567b789f2cc87c06569ce25c4027bead3746391d4f76df57ca68289aa3ff49",
+   "bytes": 2286,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R2",
+   "preflight_sha256": "37567b789f2cc87c06569ce25c4027bead3746391d4f76df57ca68289aa3ff49",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/dlssnr/DlssNr_Proxy.cpp",
+   "sha256": "2bee9ca531e2dcda8b40b51cbed96ed7f83e322635daf02aba8b0faf62abd29f",
+   "bytes": 12408,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R2",
+   "preflight_sha256": "2bee9ca531e2dcda8b40b51cbed96ed7f83e322635daf02aba8b0faf62abd29f",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/dlssnr/DlssNr_CompatibilityRuntime.cpp",
+   "sha256": "116ab57daefe624a12ecba8c329582286a7cb240ac24fb883f8881214c43ee76",
+   "bytes": 12947,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R2",
+   "preflight_sha256": "116ab57daefe624a12ecba8c329582286a7cb240ac24fb883f8881214c43ee76",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/dlssnr/DlssNr_RuntimeImports.h",
+   "sha256": "b595a12cfc8b0ff53fbbc8666a66e477d431cd8b2ee642b280ff420fad490889",
+   "bytes": 3453,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R2",
+   "preflight_sha256": "b595a12cfc8b0ff53fbbc8666a66e477d431cd8b2ee642b280ff420fad490889",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/dlssnr/DlssNr_FinishedPictureBridge_Dx11.h",
+   "sha256": "bbfe02cdbad08f288d1dbe6b4901aefaf5bf1f8354ec3fafa9b405734a2b5e94",
+   "bytes": 13611,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R3",
+   "preflight_sha256": "bbfe02cdbad08f288d1dbe6b4901aefaf5bf1f8354ec3fafa9b405734a2b5e94",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/with_dx12/dx11_with_dx12.cpp",
+   "sha256": "744573440adf0026d945af14dff20de122abd0222789d5ad40831dce0adf8da6",
+   "bytes": 35742,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R3",
+   "preflight_sha256": "744573440adf0026d945af14dff20de122abd0222789d5ad40831dce0adf8da6",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl",
+   "sha256": "f97fb3dffc2e305a4edbd83d00942849d222a2f21547d880788a897fdfdd80b5",
+   "bytes": 44964,
+   "license_ids": [
+    "GPL-3.0-only",
+    "MIT-RenoDX"
+   ],
+   "row": "shader",
+   "preflight_sha256": null,
+   "preflight_match": null
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/precompile/dlssnr_finished_color.hlsl",
+   "sha256": "78ccaf5a9e90784f8a36074117a4ae491841ac5fc0b3af0146a7265fb223efc0",
+   "bytes": 10473,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "shader",
+   "preflight_sha256": null,
+   "preflight_match": null
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/precompile/dlssnr_residual.hlsl",
+   "sha256": "91f12d5de68b42e8692536fdf460cf96b4faec76c8f28c6ec82aac74d1578e23",
+   "bytes": 5271,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "shader",
+   "preflight_sha256": null,
+   "preflight_match": null
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/shaders/dlssnr/precompile/dlssnr_resize.hlsli",
+   "sha256": "d47efc0a8eb04611799227f2fbddf6be42b03771546d1259be34f364f5459a83",
+   "bytes": 4747,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "shader",
+   "preflight_sha256": null,
+   "preflight_match": null
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/run_nr_prerelease.ps1",
+   "sha256": "e01f2c667258fdd313ccf3ca3bb2b9450a5777b5a08b51aba23290486f8f4d60",
+   "bytes": 1961,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "e01f2c667258fdd313ccf3ca3bb2b9450a5777b5a08b51aba23290486f8f4d60",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/nr_resize_shader_smoke.cpp",
+   "sha256": "f26b2fa2f323cbe6d5c247d121aa506b4b62b2b2ea2903aafb5d191b46f95563",
+   "bytes": 9374,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "f26b2fa2f323cbe6d5c247d121aa506b4b62b2b2ea2903aafb5d191b46f95563",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/dlssnr_proxy/ProxyTests.cpp",
+   "sha256": "64c6d971024734454a1fb7856bdc0565dd28679e8008608d3d4cb0fe7c5cb541",
+   "bytes": 19636,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "64c6d971024734454a1fb7856bdc0565dd28679e8008608d3d4cb0fe7c5cb541",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/dlssnr_proxy/MockNgx.h",
+   "sha256": "bf221b6f36141aebd2716b7133ca09c09c4b708b4231bfb7afc78c81b7827083",
+   "bytes": 4147,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "bf221b6f36141aebd2716b7133ca09c09c4b708b4231bfb7afc78c81b7827083",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/dlssnr_proxy/run.ps1",
+   "sha256": "a24f959867beef9dc31c2f8406d9c0034db74d136f0abc317d2086c3d490d84f",
+   "bytes": 2071,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "a24f959867beef9dc31c2f8406d9c0034db74d136f0abc317d2086c3d490d84f",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/nr_compatibility/ImportTests.cpp",
+   "sha256": "baa4950c155c3cff5e310c8de025eedf4624e9729ff2faf96ce35b3e5b6eb2a6",
+   "bytes": 3042,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "baa4950c155c3cff5e310c8de025eedf4624e9729ff2faf96ce35b3e5b6eb2a6",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/nr_compatibility/HardwareSmoke.cpp",
+   "sha256": "02297a79f48304252ba0cd68be0c18847219986f241d204707c59fd8917d4f94",
+   "bytes": 16371,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "02297a79f48304252ba0cd68be0c18847219986f241d204707c59fd8917d4f94",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/nr_compatibility/Adapter.h",
+   "sha256": "e6b4d92d3c7b347c6fea6667e0f4e1d53c24e81d38e3657e341f1f38b92a019e",
+   "bytes": 452,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "e6b4d92d3c7b347c6fea6667e0f4e1d53c24e81d38e3657e341f1f38b92a019e",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "tests/nr_compatibility/run.ps1",
+   "sha256": "c5d0bc13e4842181b4fb819c384c30c2e24dafb8d78cf892fc97526ab7044840",
+   "bytes": 2489,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R5",
+   "preflight_sha256": "c5d0bc13e4842181b4fb819c384c30c2e24dafb8d78cf892fc97526ab7044840",
+   "preflight_match": true
+  }
+ ],
+ "comparison_only": [
+  {
+   "root_id": "D",
+   "relative_path": "src/feed_ipc.h",
+   "sha256": "32abfebf6ff482953be4951a19404e2cec1b5059f47ee6a69922136762e1311c",
+   "bytes": 12577,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R4",
+   "preflight_sha256": "32abfebf6ff482953be4951a19404e2cec1b5059f47ee6a69922136762e1311c",
+   "preflight_match": true
+  },
+  {
+   "root_id": "D",
+   "relative_path": "src/dlss5-feed.cpp",
+   "sha256": "2d5fb33e90bb23b36166d98999aa58cfef191060a4448b2be00bf973edcb08d5",
+   "bytes": 472091,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R4",
+   "preflight_sha256": "2d5fb33e90bb23b36166d98999aa58cfef191060a4448b2be00bf973edcb08d5",
+   "preflight_match": true
+  }
+ ],
+ "reference_only": [
+  {
+   "root_id": "Q",
+   "relative_path": "tools/build_zip.py",
+   "sha256": "b82aa4a641c269b19b554b1e2fa3e50f0648412072151bb2fa67d7aa27671266",
+   "bytes": 1752,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R6",
+   "preflight_sha256": "b82aa4a641c269b19b554b1e2fa3e50f0648412072151bb2fa67d7aa27671266",
+   "preflight_match": true
+  },
+  {
+   "root_id": "Q",
+   "relative_path": "tests/test_package_contracts.py",
+   "sha256": "ed301f9b9a6e4a7fb223f4f33f93ad754ad1b799da908e2e230ad788938be69a",
+   "bytes": 3034,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "R6",
+   "preflight_sha256": "ed301f9b9a6e4a7fb223f4f33f93ad754ad1b799da908e2e230ad788938be69a",
+   "preflight_match": true
+  }
+ ],
+ "attribution": [
+  {
+   "root_id": "S",
+   "relative_path": "LICENSE",
+   "sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809",
+   "bytes": 35823,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "license",
+   "preflight_sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "README.md",
+   "sha256": "538d5fe6be96122bf577e3c313afddb8527c0d63d9c3aa1d67b389abe77cd6a8",
+   "bytes": 14260,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "license",
+   "preflight_sha256": "538d5fe6be96122bf577e3c313afddb8527c0d63d9c3aa1d67b389abe77cd6a8",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "docs/CREDITS.md",
+   "sha256": "700318091df65fb10ebde069a8229bfabea5fec0daa1d755ce7e171f7e5bf236",
+   "bytes": 2547,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "license",
+   "preflight_sha256": "700318091df65fb10ebde069a8229bfabea5fec0daa1d755ce7e171f7e5bf236",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "Licenses/MFGUnlock_LICENSE.txt",
+   "sha256": "b3a057a22420584bb0e6867afd7a79a756518eb6f9a3b1fae66f2f762203fb10",
+   "bytes": 3892,
+   "license_ids": [
+    "MIT"
+   ],
+   "row": "license",
+   "preflight_sha256": "b3a057a22420584bb0e6867afd7a79a756518eb6f9a3b1fae66f2f762203fb10",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "Licenses/RenoDX_ATTRIBUTION.txt",
+   "sha256": "1d2f2b2f8cf5c9acfe2eaaa2d2c22face87bd19f7df85453079a28e7123ae727",
+   "bytes": 2976,
+   "license_ids": [
+    "MIT"
+   ],
+   "row": "license",
+   "preflight_sha256": "1d2f2b2f8cf5c9acfe2eaaa2d2c22face87bd19f7df85453079a28e7123ae727",
+   "preflight_match": true
+  },
+  {
+   "root_id": "S",
+   "relative_path": "OptiScaler/dlssnr/README.md",
+   "sha256": "6ee5a206e1c3c38be6aed2e8f81c3f810842f3137acbb5670a5905d7d7c5e5de",
+   "bytes": 3889,
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "row": "license",
+   "preflight_sha256": "6ee5a206e1c3c38be6aed2e8f81c3f810842f3137acbb5670a5905d7d7c5e5de",
+   "preflight_match": true
+  }
+ ],
+ "notices": {
+  "gpl": {
+   "license_ids": [
+    "GPL-3.0-only"
+   ],
+   "license_file": "S/LICENSE",
+   "license_sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809",
+   "notice_file": "provenance/source-notices/GPL-3.0-NOTICE.txt",
+   "license_document_copyright": "Copyright (C) 2007 Free Software Foundation, Inc. This applies to the GNU GPL v3 license document text (S/LICENSE), not to the program or source files.",
+   "program_attribution": "The lock does not assert a copyright holder for the selected files. The project/fork attribution chain is S/docs/CREDITS.md, preserved as provenance/source-notices/CREDITS.md, and is referenced as-is; it is not claimed as proven copyright ownership and no missing holder is invented."
+  },
+  "renodx_mit": {
+   "license_ids": [
+    "MIT-RenoDX"
+   ],
+   "notice_file": "provenance/source-notices/RenoDX-MIT.txt",
+   "source_notice": "S/Licenses/RenoDX_ATTRIBUTION.txt",
+   "source_notice_sha256": "1d2f2b2f8cf5c9acfe2eaaa2d2c22face87bd19f7df85453079a28e7123ae727",
+   "copyright": "Copyright (c) 2025 Carlos Lopez Jr.",
+   "applies_to": [
+    "S/OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
+   ],
+   "derivation": "colour composition in dlssnr.hlsl derived from RenoDX under MIT; preserve this notice"
+  },
+  "credits": {
+   "notice_file": "provenance/source-notices/CREDITS.md",
+   "source_file": "S/docs/CREDITS.md",
+   "source_sha256": "700318091df65fb10ebde069a8229bfabea5fec0daa1d755ce7e171f7e5bf236"
+  },
+  "mfg_excluded": {
+   "status": "excluded",
+   "reason": "MFG unlock is MIT (ImDreamt / Michael Robles dashdogy) and is separate from NR; not in the reuse set",
+   "notice_source": "S/Licenses/MFGUnlock_LICENSE.txt"
+  },
+  "proprietary_runtime": {
+   "status": "not bundled",
+   "reason": "nvngx_dlssnr.dll is owner-supplied and NOT redistributable by this plan; no runtime binary is copied, hashed or referenced as project source in this lock"
+  },
+  "agnya": {
+   "status": "comparison-only; terms UNKNOWN/unresolved",
+   "reason": "no AGNYA content is selected or copied; R4 Feed/Kernel guides are comparison references only"
+  },
+  "copy_normalization": "source-notices/CREDITS.md and source-notices/RenoDX-MIT.txt are LF-normalized copies of S/docs/CREDITS.md and S/Licenses/RenoDX_ATTRIBUTION.txt; content is identical modulo CRLF to LF (the native editor writes LF only). Source sha256 values are recorded in notices.credits and notices.renodx_mit."
+ },
+ "limits": [
+  "Static per-file sha256 and bytes identify the selected read-only source only; they are behavior-of-record, not a build, test or native/GPU proof.",
+  "The four shader source files are an explicit addition beyond the frozen preflight manifest and were freshly hashed; preflight_sha256 is null for them.",
+  "Generated shader artifacts (.cso, generated *_Shader.h, *_Shader_Vk.h, *.spv) are build outputs and are not listed; only .hlsl/.hlsli sources are locked.",
+  "Snapshot directories S/D/Q are untracked in the unrelated C:/omo-research working tree; identity rests on these per-file hashes, NOT on that repository HEAD, which is not NR-fork provenance.",
+  "Current hashes were paired against the frozen preflight manifest (execution-entry/source/inputs-source.json); no changed-input mismatch was found and none is erased.",
+  "R4 feeder files and R6 release-repo files are recorded with hashes but are comparison/reference only, not reuse inputs.",
+  "Runtime/model/settings are not copied or modified; the owner-selected live runtime path/hash is out of this subunit scope.",
+  "No test, build, GPU, OBS or owner-process action was taken; no source was mutated or copied.",
+  "Inspector, SDK lock and the full independent task-1 verifier are separate subunits."
+ ]
+}

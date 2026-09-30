@@ -1,0 +1,36 @@
+GNU GENERAL PUBLIC LICENSE, Version 3, 29 June 2007 (GPL-3.0-only)
+==================================================================
+Preserved license identification for reused source in this worktree.
+
+The canonical full text of the GNU General Public License version 3 is stored read-only in the
+source snapshot this lock references:
+
+  path   : S/LICENSE   (S = C:/omo-research/obs-mfg-v020-candidate/source)
+  sha256 : 230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809
+  bytes  : 35823
+
+Every file listed in provenance/source-lock.json under files[] with license_ids containing
+GPL-3.0-only is GPL-3.0 project source. Reuse must carry this license and the original copyright.
+
+Per-program application notice (GPL-3.0 boilerplate; no copyright holder is asserted by the inspected files):
+
+  This program is free software: you can redistribute it and/or modify it under the terms of the
+  GNU General Public License as published by the Free Software Foundation, version 3.
+
+  This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+  even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+  General Public License for more details.
+
+  You should have received a copy of the GNU General Public License along with this program. If
+  not, see https://www.gnu.org/licenses/.
+
+License-document copyright: Copyright (C) 2007 Free Software Foundation, Inc. This is the copyright
+of the GNU GPL v3 license document (S/LICENSE); it is not program or source attribution.
+
+Program/source attribution: this notice does not assert a copyright holder for the selected files.
+The project/fork attribution chain is S/docs/CREDITS.md, preserved here as CREDITS.md, and is
+referenced as-is as external text treated as data; those credits are not claimed as proven
+copyright owners and no missing holder is invented.
+
+No per-file or-any-later-version grant was found in the selected files, so the lock records the
+identifier GPL-3.0-only.
