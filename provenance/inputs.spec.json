@@ -1,0 +1,28 @@
+{
+ "schema_version":1,"kind":"nr-input-spec",
+ "owned_root":"C:/Users/USER/orca/projects/obs-nr-native-filter-wt/w1",
+ "template_commit":"3e7d7ac3b5342cd7d9b88890b9c70b472d1520fc",
+ "branch":"native-nr-foundation",
+ "obs":{"version":"32.2.2","commit":"ba2f32bdf791005443988a4955e963663e16b1ed"},
+ "nvofa_sdk_version":"5.0",
+ "source_lock":"provenance/source-lock.json","sdk_lock":"provenance/sdk-lock.json",
+ "toolchain":[
+  {"path":"C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe","bytes":469456,"sha256":"c54f3b7c9164ea9a0db8641e81ecdda80c2664ef5a47c4191406f848cc07c662"},
+  {"path":"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe","bytes":11307584,"sha256":"6fe2e6431b45cf32b9b2f3e50a8efae046a2366eb34d0fb36da027cf56102aec"},
+  {"path":"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/ctest.exe","bytes":12292672,"sha256":"e603e19535326eaa213bc9820312d1b7d3a718ae63da3877078d6ecc4d980d91"},
+  {"path":"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe","bytes":2649032,"sha256":"ff29bcb5f547174bae6b73c84278cce9b674e8ebc2f3c3926ab21030b33f34b8"},
+  {"path":"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe","bytes":678008,"sha256":"f4eba2208e132daf500b7d7bbdf051e930c59dbdc1d87c35e146479427ffeb8d"},
+  {"path":"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/link.exe","bytes":3252808,"sha256":"1a9889872481270ca45febcdaf26e75c53cea505c9eb214daea1098d4cf706bd"}
+ ],
+ "runtime":{
+  "path":"C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll",
+  "sha256":"e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a",
+  "version":"310.8.0.0",
+  "required_exports":["NVSDK_NGX_D3D12_Init_Ext","NVSDK_NGX_D3D12_CreateFeature","NVSDK_NGX_D3D12_EvaluateFeature","NVSDK_NGX_D3D12_ReleaseFeature","NVSDK_NGX_D3D12_Shutdown1"],
+  "export_source":"S/OptiScaler/dlssnr/DlssNr_CompatibilityRuntime.cpp",
+  "owner_selected":true,"redistributable":false
+ },
+ "roots":{"S":"C:/omo-research/obs-mfg-v020-candidate/source","D":"C:/omo-research/obs-mfg-v020-candidate/feeder","Q":"C:/omo-research/obs-mfg-v020-candidate/release-repo"},
+ "protected_paths":["C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll","C:/Program Files/obs-studio/bin/64bit/winmm.dll","C:/Program Files/obs-studio/bin/64bit/dxgi.dll","C:/Program Files/obs-studio/bin/64bit/dlss5-feed.addon64","C:/Program Files/obs-studio/bin/64bit/OptiScaler.ini","C:/Program Files/obs-studio/bin/64bit/ReShade.ini"],
+ "limits":["Static exports do not prove Feature 18 evaluation.","SDK 5.0 is package identity, not API major; D3D12 is mandatory.","Per-file hashes govern snapshot provenance, not unrelated HEAD.","Runtime/model/settings are not copied or modified."]
+}

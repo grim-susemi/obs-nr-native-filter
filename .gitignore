@@ -19,6 +19,23 @@
 # Exclude lock files
 *.lock.json
 
+# Task-1 source allowlist; .omo/out/runtime/model stay ignored
+!/tools/
+/tools/*
+!/tools/Inspect-Inputs.ps1
+!/tools/tests/
+!/provenance/
+/provenance/*
+!/provenance/inputs.spec.json
+!/provenance/source-lock.json
+!/provenance/sdk-lock.json
+!/provenance/source-notices/
+!/deps/
+/deps/*
+!/deps/obs-headers/
+!/deps/ngx/
+!/deps/nvofa/
+
 # Exclude macOS legacy resource forks
 .DS_Store
 
