@@ -25,6 +25,8 @@
 /tools/*
 !/tools/Inspect-Inputs.ps1
 !/tools/tests/
+!/tools/Invoke-NrQa.ps1
+!/tools/host/
 !/provenance/
 /provenance/*
 !/provenance/inputs.spec.json

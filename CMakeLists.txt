@@ -1,39 +1,22 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
-
-project(${_name} VERSION ${_version})
-
-option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
-option(ENABLE_QT "Use Qt functionality" OFF)
-
-include(compilerconfig)
-include(defaults)
-include(helpers)
-
-add_library(${CMAKE_PROJECT_NAME} MODULE)
-
-find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
-
-if(ENABLE_FRONTEND_API)
-  find_package(obs-frontend-api REQUIRED)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
+project(obs-nr-filter VERSION 0.1.0 LANGUAGES C CXX)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "Task2 supports Windows x64 only")
 endif()
-
-if(ENABLE_QT)
-  find_package(Qt6 COMPONENTS Widgets Core)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
-  target_compile_options(
-    ${CMAKE_PROJECT_NAME}
-    PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
-  )
-  set_target_properties(
-    ${CMAKE_PROJECT_NAME}
-    PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
-  )
-endif()
-
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
-
-set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+include(cmake/nr/Libobs.cmake)
+add_library(obs-nr-filter MODULE src/plugin-main.c)
+target_link_libraries(obs-nr-filter PRIVATE OBS::libobs)
+set_target_properties(obs-nr-filter PROPERTIES PREFIX "" OUTPUT_NAME "obs-nr-filter")
+add_executable(nr-qa-host tools/host/main.cpp)
+target_compile_features(nr-qa-host PRIVATE cxx_std_20)
+target_link_libraries(nr-qa-host PRIVATE OBS::libobs)
+target_compile_definitions(nr-qa-host PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+enable_testing()
+add_executable(frame_contract_tests tools/tests/frame_contract_tests.cpp)
+target_include_directories(frame_contract_tests PRIVATE src)
+target_compile_features(frame_contract_tests PRIVATE cxx_std_20)
+add_test(NAME frame_contract COMMAND frame_contract_tests)
+add_test(NAME host_runner COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/host_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}")
+install(TARGETS obs-nr-filter LIBRARY DESTINATION obs-plugins/64bit RUNTIME DESTINATION obs-plugins/64bit)
+install(DIRECTORY data/ DESTINATION data/obs-plugins/obs-nr-filter)
