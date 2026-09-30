@@ -12,8 +12,10 @@ Set-StrictMode -Version Latest
 $work = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $task6Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-native-filter-20260930/task-6'))
 $task6VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task6Evidence 'verifier'))
+$task7Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-native-filter-20260930/task-7'))
+$task7VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task7Evidence 'verifier'))
 $evidencePath = [IO.Path]::GetFullPath($Evidence).TrimEnd('\','/')
-$task = if ($Scenario -eq 'sampler' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task6Evidence,$task6VerifierEvidence))) { 'task-6' } else { 'task-2' }
+$task = if ($Scenario -eq 'sampler' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task6Evidence,$task6VerifierEvidence))) { 'task-6' } elseif ($Scenario -eq 'texture-roundtrip' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task7Evidence,$task7VerifierEvidence))) { 'task-7' } else { 'task-2' }
 $owned = [IO.Path]::GetFullPath((Join-Path $work ('out/' + $task + '/host')))
 $root = [IO.Path]::GetFullPath($HostRoot).TrimEnd('\','/')
 $evidenceRoot = [IO.Path]::GetFullPath((Join-Path $work ('.omo/evidence/obs-nr-native-filter-20260930/' + $task)))
@@ -21,8 +23,12 @@ if ($task -eq 'task-6' -and $evidencePath -eq $task6VerifierEvidence) {
     $evidenceRoot = $task6VerifierEvidence
     $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-6-verifier/host'))
 }
+if ($task -eq 'task-7' -and $evidencePath -eq $task7VerifierEvidence) {
+    $evidenceRoot = $task7VerifierEvidence
+    $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-7-verifier/host'))
+}
 if ($evidencePath -ne $evidenceRoot) { throw 'NR_QA_EVIDENCE_REFUSED' }
-if ($Scenario -notin @('host-foundation','host-isolation-refusal','sampler')) { throw 'NR_QA_NOT_IMPLEMENTED' }
+if ($Scenario -notin @('host-foundation','host-isolation-refusal','sampler','texture-roundtrip')) { throw 'NR_QA_NOT_IMPLEMENTED' }
 . (Join-Path $PSScriptRoot 'host/HostSupport.ps1')
 if ($Scenario -eq 'host-isolation-refusal') {
     if (!$ForeignRoot) { $ForeignRoot = $work }
@@ -67,12 +73,15 @@ $inventory = @()
 $readyInventory = @()
 $sourceAfter = @()
 $command = $null
+$arguments = $null
 $exit = $null
 $stdout = $null
 $stderr = $null
 $output = ''
 $exitSignal = $null
 $views = @()
+$patterns = @()
+$physicalUnresolved = $false
 $binding = @()
 New-Item -ItemType Directory -Force $Evidence | Out-Null
 # Teardown registered before the host, links, named events or child exist.
@@ -84,6 +93,10 @@ try {
         if (Test-Path (Join-Path $work $path)) { $binding += FileIdentity (Join-Path $work $path) }
     }
     foreach ($binary in @('obs-nr-filter.dll','nr-qa-host.exe')) { $binding += FileIdentity (Join-Path $build $binary) }
+    if ($Scenario -eq 'texture-roundtrip') {
+        foreach ($path in @('src/interop.h','src/interop.cpp','src/shaders/nr_interop_blit.hlsl','cmake/nr/Interop.cmake','tools/host/nr_interop_scenario.h','tools/host/nr_interop_scenario.cpp','tools/tests/interop_contract_tests.cpp')) { $binding += FileIdentity (Join-Path $work $path) }
+        foreach ($shader in @('nr_interop_vertex.cso','nr_interop_pixel.cso')) { $binding += FileIdentity (Join-Path (Split-Path $build) $shader) }
+    }
     New-Item -ItemType Directory $root | Out-Null
     $created = $true
     Stage-Host
@@ -99,9 +112,11 @@ try {
     $process.StartInfo.RedirectStandardError = $true
     $process.StartInfo.Arguments = '"' + $root + '" ' + (($names | ForEach-Object { '"' + $_ + '"' }) -join ' ')
     if ($Scenario -eq 'sampler') { $process.StartInfo.Arguments += ' sampler' }
+    if ($Scenario -eq 'texture-roundtrip') { $process.StartInfo.Arguments += ' texture-roundtrip' }
     $process.EnableRaisingEvents = $true
     $exitSignal = [NrProcessExit]::new($process)
     $command = $process.StartInfo.FileName + ' ' + $process.StartInfo.Arguments
+    $arguments = $process.StartInfo.Arguments
     if (!$process.Start()) { throw 'NR_QA_START_FAILED' }
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
@@ -151,27 +166,46 @@ try {
             if (@($group | Where-Object { $_.admission -ne $expected -or $_.selected -ne 0 }).Count) { throw 'NR_QA_SAMPLER_BYPASS' }
         }
     }
+    if ($Scenario -eq 'texture-roundtrip') {
+        $prefix = 'NR_INTEROP_PATTERN '
+        foreach ($line in ($output -split [char]10)) {
+            if ($line.StartsWith($prefix)) { $patterns += $line.Substring($prefix.Length) | ConvertFrom-Json }
+        }
+        if ($patterns.Count -ne 4 -or (@($patterns.format | Sort-Object) -join ',') -ne 'BGRA8,RGB10A2,RGBA16F,RGBA8') { throw 'NR_QA_INTEROP_PATTERN_SET' }
+        foreach ($row in $patterns) {
+            if ($row.raw_errors -ne 0 -or $row.output_errors -ne 0 -or !$row.state_restored -or !$row.cleanup -or $row.progress_clock -le $row.capture_clock -or $row.raw_fnv1a64 -ne $row.expected_fnv1a64 -or $row.output_fnv1a64 -ne $row.expected_fnv1a64 -or $row.producer_fence_completed -ne 4 -or $row.worker_fence_completed -ne 3 -or $row.consumer_fence_completed -ne 6) { throw 'NR_QA_INTEROP_PATTERN_OR_FENCE' }
+        }
+        if (!$output.Contains('NR_INTEROP_SCOPE transport=physical same_adapter=true model=not_loaded recording=not_tested HDR=transport_only cleanup=complete') -or $output.Contains('NR_INTEROP_RETAINED')) { throw 'NR_QA_INTEROP_CLEANUP_INCOMPLETE' }
+    }
     $result = 'PASS'
 } catch { $failure = $_.Exception.Message } finally {
     if ($process -and $identity -and !$process.HasExited) {
         if ((Identity $process | ConvertTo-Json -Compress) -ne ($identity | ConvertTo-Json -Compress)) { throw 'NR_QA_CLEANUP_IDENTITY_REFUSED' }
         if ($events.Count -eq 5) { $events[3].Set() | Out-Null }
-        if (!$process.WaitForExit(15000)) { $process.Kill(); if (!$process.WaitForExit(15000)) { throw 'NR_QA_CLEANUP_BLOCKED' } }
+        if (!$process.WaitForExit(15000)) {
+            if ($Scenario -eq 'texture-roundtrip') { $physicalUnresolved=$true; $result='FAIL'; $failure='NR_QA_GPU_OWNERSHIP_RETAINED' }
+            else { $process.Kill(); if (!$process.WaitForExit(15000)) { throw 'NR_QA_CLEANUP_BLOCKED' } }
+        }
     }
-    foreach ($event in $events) { $event.Dispose() }
-    if ($exitSignal) { $exitSignal.Dispose() }
+    if (!$physicalUnresolved) {
+        foreach ($event in $events) { $event.Dispose() }
+        if ($exitSignal) { $exitSignal.Dispose() }
+    }
     foreach ($source in $sources) {
         $after = FileIdentity $source.path
         $sourceAfter += $after
         if ($after.sha256 -ne $source.sha256 -or $after.file_id -ne $source.file_id -or $after.attributes -ne $source.attributes) { $result='FAIL';$failure='NR_QA_SOURCE_CHANGED' }
     }
-    if ($created) { Remove-Item -LiteralPath $root -Recurse -Force }
-    $cleanup = @{host_absent=!(Test-Path $root);child_exited=(!$process -or $process.HasExited);event_handles_closed=$true;linked_bytes_unchanged=($failure -ne 'NR_QA_SOURCE_CHANGED')}
+    if ($created -and !$physicalUnresolved) { Remove-Item -LiteralPath $root -Recurse -Force }
+    $cleanup = @{host_absent=!(Test-Path $root);child_exited=(!$process -or $process.HasExited);event_handles_closed=(!$physicalUnresolved);physical_ownership_retained=$physicalUnresolved;linked_bytes_unchanged=($failure -ne 'NR_QA_SOURCE_CHANGED')}
     if ($process -and $process.HasExited -and $stdout) { $output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult() }
     if ($process -and $process.HasExited) { $exit = $process.ExitCode }
-    $receipt = if ($Scenario -eq 'sampler') { 'sampler.json' } else { 'host-foundation.json' }
-    @{scenario=$Scenario;result=$result;failure=$failure;command=$command;public_command=('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Scenario ' + $Scenario + ' -Evidence "' + $Evidence + '" -HostRoot "' + $HostRoot + '" -Runtime "' + $Runtime + '"');exit=$exit;identity=$identity;events=@('ready','action','exit');output=$output;views=$views;binding=$binding;inventory_ready=$readyInventory;inventory=$inventory;sources_before=@($sources.ToArray());sources_after=$sourceAfter;staging='minimal-private-copy';runtime=@{path=$Runtime;sha256=$spec.runtime.sha256;loaded=$false};scope=@{class='native-pass-through-sampler';NR=$false;FG=$false;recording=$false;HDR=$false;performance=$false;physical_HDMI_PTS=$false;unsupported_renderer='actual signed libobs OpenGL bypass lane'};cleanup=$cleanup} |
-        ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 (Join-Path $Evidence $receipt)
-    if ($process) { $process.Dispose() }
+    $receipt = if ($Scenario -eq 'sampler') { 'sampler.json' } elseif ($Scenario -eq 'texture-roundtrip') { 'interop.json' } else { 'host-foundation.json' }
+    $scope = if ($Scenario -eq 'texture-roundtrip') { @{class='physical-D3D11-D3D12-transport';NR=$false;FG=$false;recording=$false;HDR=$false;HDR_transport=$true;performance=$false;physical_HDMI_PTS=$false} } else { @{class='native-pass-through-sampler';NR=$false;FG=$false;recording=$false;HDR=$false;performance=$false;physical_HDMI_PTS=$false;unsupported_renderer='actual signed libobs OpenGL bypass lane'} }
+    $record = @{scenario=$Scenario;result=$result;failure=$failure;command=$command;args=$arguments;public_command=('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Scenario ' + $Scenario + ' -Evidence "' + $Evidence + '" -HostRoot "' + $HostRoot + '" -Runtime "' + $Runtime + '"');public_args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-Scenario',$Scenario,'-Evidence',$Evidence,'-HostRoot',$HostRoot,'-Runtime',$Runtime);exit=$exit;identity=$identity;events=@('ready','action','exit');output=$output;views=$views;patterns=$patterns;binding=$binding;inventory_ready=$readyInventory;inventory=$inventory;sources_before=@($sources.ToArray());sources_after=$sourceAfter;staging='minimal-private-copy';runtime=@{path=$Runtime;sha256=$spec.runtime.sha256;loaded=$false};scope=$scope;assertions=@{result_pass=($result -eq 'PASS');exact_pattern_rows=$patterns.Count};cleanup=$cleanup}
+    $json = $record | ConvertTo-Json -Depth 12
+    if ($Scenario -eq 'texture-roundtrip') { $json | Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-' + [Guid]::NewGuid().ToString('N') + '-interop.json')) }
+    $json | Set-Content -Encoding UTF8 (Join-Path $Evidence $receipt)
+    if ($process -and !$physicalUnresolved) { $process.Dispose() }
 }
 if ($result -ne 'PASS') { throw $failure }

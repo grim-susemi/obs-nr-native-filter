@@ -56,6 +56,11 @@ function Stage-Host {
     }
     Copy-Item (Join-Path $build 'nr-qa-host.exe') (Join-Path $root 'bin/64bit/nr-qa-host.exe')
     Copy-Item (Join-Path $build 'obs-nr-filter.dll') (Join-Path $root 'obs-plugins/64bit/obs-nr-filter.dll')
+    if ($Scenario -eq 'texture-roundtrip') {
+        foreach ($shader in @('nr_interop_vertex.cso','nr_interop_pixel.cso')) {
+            Copy-Item (Join-Path (Split-Path $build) $shader) (Join-Path $root ('bin/64bit/' + $shader))
+        }
+    }
     Copy-Item (Join-Path $work 'data/locale') (Join-Path $root 'data/obs-plugins/obs-nr-filter/locale') -Recurse
 }
 function Assert-CleanInventory($Inventory, [string]$Graphics = 'libobs-d3d11.dll') {

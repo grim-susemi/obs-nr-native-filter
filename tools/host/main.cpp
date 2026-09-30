@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <windows.h>
 #include <obs.h>
+#include "nr_interop_scenario.h"
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -252,6 +253,8 @@ int wmain(int argc, wchar_t **argv)
 {
     if (argc != 7 && argc != 8) return 64;
     const bool sampler = argc == 8 && std::wstring(argv[7]) == L"sampler";
+    const bool texture = argc == 8 && std::wstring(argv[7]) == L"texture-roundtrip";
+    if (argc == 8 && !sampler && !texture) return 64;
     const std::filesystem::path root(argv[1]);
     HANDLE events[5]{};
     for (int i = 0; i != 5; ++i) {
@@ -285,6 +288,7 @@ int wmain(int argc, wchar_t **argv)
         SetEvent(events[0]);
         if (WaitForSingleObject(events[1], 15000) != WAIT_OBJECT_0) break;
         if (sampler && !run_sampler()) break;
+        if (texture && !nr_run_interop_scenario(root)) break;
         if (sampler) {
             // Separate finite real unsupported-backend lane, not an injected admission hook.
             // obs_reset_video does not recreate the graphics backend; end the first libobs session.
