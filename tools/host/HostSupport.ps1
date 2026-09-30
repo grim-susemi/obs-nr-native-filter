@@ -28,6 +28,7 @@ function Stage-Host {
     }
     $files = @('obs.dll','libobs-d3d11.dll','avcodec-62.dll','avformat-62.dll','avutil-60.dll','swscale-9.dll','swresample-6.dll','zlib.dll','w32-pthreads.dll','libx264-164.dll','librist.dll','srt.dll') | ForEach-Object { 'bin/64bit/' + $_ }
     $files += 'obs-plugins/64bit/obs-x264.dll'
+    if ($Scenario -eq 'sampler') { $files += 'bin/64bit/libobs-opengl.dll' }
     $files += @(Get-ChildItem (Join-Path $installed 'data/libobs') -File | ForEach-Object { 'data/libobs/' + $_.Name })
     $files += @(Get-ChildItem (Join-Path $installed 'data/obs-plugins/obs-x264/locale') -File | ForEach-Object { 'data/obs-plugins/obs-x264/locale/' + $_.Name })
     $pins = @{
@@ -57,14 +58,14 @@ function Stage-Host {
     Copy-Item (Join-Path $build 'obs-nr-filter.dll') (Join-Path $root 'obs-plugins/64bit/obs-nr-filter.dll')
     Copy-Item (Join-Path $work 'data/locale') (Join-Path $root 'data/obs-plugins/obs-nr-filter/locale') -Recurse
 }
-function Assert-CleanInventory($Inventory) {
+function Assert-CleanInventory($Inventory, [string]$Graphics = 'libobs-d3d11.dll') {
     foreach ($module in $Inventory) {
         $name = [IO.Path]::GetFileName($module.path)
         if ($name -match '^(nvngx.*|.*feeder.*|.*dlss5.*|.*reshade.*|.*optiscaler.*)$' -or $name -match '\.(asi|addon64)$') { throw 'NR_QA_INJECTION_LOADED' }
         if ($name -in @('winmm.dll','dxgi.dll') -and !$module.path.StartsWith($env:SystemRoot + '\System32\',[StringComparison]::OrdinalIgnoreCase)) { throw 'NR_QA_PROXY_LOADED' }
         if (!$module.path.StartsWith($root + '\',[StringComparison]::OrdinalIgnoreCase) -and !$module.path.StartsWith($env:SystemRoot + '\',[StringComparison]::OrdinalIgnoreCase)) { throw ('NR_QA_EXTERNAL_MODULE: ' + $module.path) }
     }
-    foreach ($required in @('obs.dll','libobs-d3d11.dll','obs-nr-filter.dll','obs-x264.dll')) {
+    foreach ($required in @('obs.dll',$Graphics,'obs-nr-filter.dll','obs-x264.dll')) {
         if (!($Inventory | Where-Object { [IO.Path]::GetFileName($_.path) -eq $required })) { throw ('NR_QA_MODULE_MISSING: ' + $required) }
     }
 }
