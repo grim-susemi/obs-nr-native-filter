@@ -1,0 +1,11 @@
+# Task6 includes this leaf; Task4 never writes shared presets/build.
+add_library(nr_runtime STATIC ${CMAKE_CURRENT_LIST_DIR}/../../src/nr_runtime.cpp)
+target_include_directories(nr_runtime PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../../src ${CMAKE_CURRENT_LIST_DIR}/../../deps/ngx)
+target_compile_features(nr_runtime PUBLIC cxx_std_20)
+target_compile_definitions(nr_runtime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(nr_runtime PRIVATE /W4 /WX /permissive-)
+target_link_libraries(nr_runtime PUBLIC d3d12 psapi bcrypt)
+add_executable(runtime_contract ${CMAKE_CURRENT_LIST_DIR}/../../tools/tests/runtime_contract_tests.cpp)
+target_compile_options(runtime_contract PRIVATE /W4 /WX /permissive-)
+target_link_libraries(runtime_contract PRIVATE nr_runtime)
+add_test(NAME runtime_contract COMMAND runtime_contract)
