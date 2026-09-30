@@ -1,0 +1,8 @@
+# Narrow repository byte policy (task 1c).
+# Authored provenance and Inspector tools are stored and checked out as LF.
+provenance/** text eol=lf
+tools/** text eol=lf
+/.gitignore text eol=lf
+/.gitattributes text eol=lf
+# Acquired dependency bytes are immutable vendor data: never convert line endings.
+deps/** -text
