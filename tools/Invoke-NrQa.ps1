@@ -14,9 +14,15 @@ $task6Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-n
 $task6VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task6Evidence 'verifier'))
 $task7Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-native-filter-20260930/task-7'))
 $task7VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task7Evidence 'verifier'))
+$task8Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-native-filter-20260930/task-8'))
+$task8VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task8Evidence 'verifier'))
 $evidencePath = [IO.Path]::GetFullPath($Evidence).TrimEnd('\','/')
 $task = if ($Scenario -eq 'sampler' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task6Evidence,$task6VerifierEvidence))) { 'task-6' } elseif ($Scenario -eq 'texture-roundtrip' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task7Evidence,$task7VerifierEvidence))) { 'task-7' } else { 'task-2' }
 $owned = [IO.Path]::GetFullPath((Join-Path $work ('out/' + $task + '/host')))
+if ($Scenario -eq 'flow-translation' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task8Evidence,$task8VerifierEvidence))) {
+    $task = 'task-8'
+    $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-8/host'))
+}
 $root = [IO.Path]::GetFullPath($HostRoot).TrimEnd('\','/')
 $evidenceRoot = [IO.Path]::GetFullPath((Join-Path $work ('.omo/evidence/obs-nr-native-filter-20260930/' + $task)))
 if ($task -eq 'task-6' -and $evidencePath -eq $task6VerifierEvidence) {
@@ -27,8 +33,12 @@ if ($task -eq 'task-7' -and $evidencePath -eq $task7VerifierEvidence) {
     $evidenceRoot = $task7VerifierEvidence
     $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-7-verifier/host'))
 }
+if ($task -eq 'task-8' -and $evidencePath -eq $task8VerifierEvidence) {
+    $evidenceRoot = $task8VerifierEvidence
+    $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-8-verifier/host'))
+}
 if ($evidencePath -ne $evidenceRoot) { throw 'NR_QA_EVIDENCE_REFUSED' }
-if ($Scenario -notin @('host-foundation','host-isolation-refusal','sampler','texture-roundtrip')) { throw 'NR_QA_NOT_IMPLEMENTED' }
+if ($Scenario -notin @('host-foundation','host-isolation-refusal','sampler','texture-roundtrip','flow-translation')) { throw 'NR_QA_NOT_IMPLEMENTED' }
 . (Join-Path $PSScriptRoot 'host/HostSupport.ps1')
 if ($Scenario -eq 'host-isolation-refusal') {
     if (!$ForeignRoot) { $ForeignRoot = $work }
@@ -55,10 +65,10 @@ $spec = Get-Content (Join-Path $work 'provenance/inputs.spec.json') -Raw | Conve
 if (!$spec.runtime.owner_selected) { throw 'NR_QA_RUNTIME_OWNER_REFUSED' }
 if ([IO.Path]::GetFullPath($Runtime) -ne [IO.Path]::GetFullPath($spec.runtime.path)) { throw 'NR_QA_RUNTIME_REFUSED' }
 if ((Get-FileHash -LiteralPath $Runtime -Algorithm SHA256).Hash.ToLowerInvariant() -ne $spec.runtime.sha256) { throw 'NR_QA_RUNTIME_CHANGED' }
-$active = @(Get-Process | Where-Object { $_.ProcessName -match '^(obs64|nr-qa-host|CrimsonDesert|GTA5|GTA5_Enhanced|Cyberpunk2077|eldenring|BlackMythWukong|cs2|dota2|FortniteClient.*)$' })
-if ($active.Count) { throw ('NR_QA_UNRELATED_PROCESS: ' + ($active.Id -join ',')) }
+Assert-NoUnrelatedProcess
 $installed = 'C:/Program Files/obs-studio'
 $build = Join-Path $work 'out/build/windows-x64-debug/Debug'
+if ($task -eq 'task-8') { $build = Join-Path $work 'out/task-8/native/Debug' }
 foreach ($binary in @('obs-nr-filter.dll','nr-qa-host.exe')) {
     if (!(Test-Path (Join-Path $build $binary))) { throw ('NR_QA_BUILD_MISSING: ' + $binary) }
 }
@@ -81,6 +91,10 @@ $output = ''
 $exitSignal = $null
 $views = @()
 $patterns = @()
+$flowRows = @()
+$flowCaps = @()
+$flowPasses = @()
+$flowInputs = @()
 $physicalUnresolved = $false
 $binding = @()
 New-Item -ItemType Directory -Force $Evidence | Out-Null
@@ -99,6 +113,10 @@ try {
     }
     New-Item -ItemType Directory $root | Out-Null
     $created = $true
+    if ($Scenario -eq 'flow-translation') {
+        foreach ($path in @('src/nr_guides.h','src/nr_guides.cpp','src/shaders/nr_guides.hlsl','cmake/nr/Guides.cmake','tools/host/nr_flow_scenario.h','tools/host/nr_flow_scenario.cpp','tools/tests/flow_contract_tests.cpp','src/interop.h','cmake/nr/Interop.cmake','deps/nvofa/nvOpticalFlowCommon.h','deps/nvofa/nvOpticalFlowD3D12.h')) { $binding += FileIdentity (Join-Path $work $path) }
+        $binding += FileIdentity (Join-Path (Split-Path $build) 'nr_guides.cso')
+    }
     Stage-Host
     $nonce = [Guid]::NewGuid().ToString('N')
     $names = @('ready','action','acted','stop','exit') | ForEach-Object { 'Local\nr-qa-' + $nonce + '-' + $_ }
@@ -110,13 +128,16 @@ try {
     $process.StartInfo.CreateNoWindow = $true
     $process.StartInfo.RedirectStandardOutput = $true
     $process.StartInfo.RedirectStandardError = $true
+
     $process.StartInfo.Arguments = '"' + $root + '" ' + (($names | ForEach-Object { '"' + $_ + '"' }) -join ' ')
     if ($Scenario -eq 'sampler') { $process.StartInfo.Arguments += ' sampler' }
     if ($Scenario -eq 'texture-roundtrip') { $process.StartInfo.Arguments += ' texture-roundtrip' }
+    if ($Scenario -eq 'flow-translation') { $process.StartInfo.Arguments += ' flow-translation' }
     $process.EnableRaisingEvents = $true
     $exitSignal = [NrProcessExit]::new($process)
     $command = $process.StartInfo.FileName + ' ' + $process.StartInfo.Arguments
     $arguments = $process.StartInfo.Arguments
+    Assert-NoUnrelatedProcess
     if (!$process.Start()) { throw 'NR_QA_START_FAILED' }
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
@@ -129,7 +150,8 @@ try {
     Assert-CleanInventory $inventory
     $readyInventory = $inventory
     $events[1].Set() | Out-Null
-    $acted = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($events[2],$exitSignal.Exited),15000)
+    $actionBound = if ($Scenario -eq 'flow-translation') { 120000 } else { 15000 }
+    $acted = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($events[2],$exitSignal.Exited),$actionBound)
     if ($acted -eq 1) { throw ('NR_QA_ACTION_FAILED_EXIT: ' + $process.ExitCode) }
     if ($acted -ne 0) { throw 'NR_QA_ACTION_TIMEOUT' }
     # Process.Modules is cached by .NET; the sampler ends D3D11 before its OpenGL refusal lane.
@@ -177,13 +199,28 @@ try {
         }
         if (!$output.Contains('NR_INTEROP_SCOPE transport=physical same_adapter=true model=not_loaded recording=not_tested HDR=transport_only cleanup=complete') -or $output.Contains('NR_INTEROP_RETAINED')) { throw 'NR_QA_INTEROP_CLEANUP_INCOMPLETE' }
     }
+    if ($Scenario -eq 'flow-translation') {
+        foreach ($line in ($output -split [char]10)) {
+            if ($line.StartsWith('NR_FLOW_PATTERN ')) { $flowRows += $line.Substring(16) | ConvertFrom-Json }
+            if ($line.StartsWith('NR_FLOW_CAPABILITY ')) { $flowCaps += $line.Substring(19) | ConvertFrom-Json }
+            if ($line.StartsWith('NR_FLOW_REESTIMATION ')) { $flowPasses += $line.Substring(21) | ConvertFrom-Json }
+            if ($line.StartsWith('NR_FLOW_INPUT_PROOF ')) { $flowInputs += $line.Substring(20) | ConvertFrom-Json }
+        }
+        Assert-FlowRows $flowRows $flowCaps
+        Assert-FlowPasses $flowPasses $flowInputs $flowRows $flowCaps
+        foreach ($cap in $flowCaps) {
+            $expectedModule=Join-Path $env:SystemRoot 'System32/nvofapi64.dll'
+            if ([IO.Path]::GetFullPath($cap.module_path) -ne [IO.Path]::GetFullPath($expectedModule) -or (Get-FileHash -LiteralPath $expectedModule -Algorithm SHA256).Hash.ToLowerInvariant() -ne $cap.module_sha256) { throw 'NR_QA_FLOW_MODULE_IDENTITY' }
+        }
+        if (!$output.Contains('NR_FLOW_SCOPE physical_ofa=true model=not_loaded Feature18=not_admitted HDR=not_claimed recording=not_tested cleanup=complete') -or $output.Contains('NR_FLOW_RETAINED')) { throw 'NR_QA_FLOW_CLEANUP_INCOMPLETE' }
+    }
     $result = 'PASS'
 } catch { $failure = $_.Exception.Message } finally {
     if ($process -and $identity -and !$process.HasExited) {
         if ((Identity $process | ConvertTo-Json -Compress) -ne ($identity | ConvertTo-Json -Compress)) { throw 'NR_QA_CLEANUP_IDENTITY_REFUSED' }
         if ($events.Count -eq 5) { $events[3].Set() | Out-Null }
         if (!$process.WaitForExit(15000)) {
-            if ($Scenario -eq 'texture-roundtrip') { $physicalUnresolved=$true; $result='FAIL'; $failure='NR_QA_GPU_OWNERSHIP_RETAINED' }
+            if ($Scenario -in @('texture-roundtrip','flow-translation')) { $physicalUnresolved=$true; $result='FAIL'; $failure='NR_QA_GPU_OWNERSHIP_RETAINED' }
             else { $process.Kill(); if (!$process.WaitForExit(15000)) { throw 'NR_QA_CLEANUP_BLOCKED' } }
         }
     }
@@ -204,7 +241,17 @@ try {
     $scope = if ($Scenario -eq 'texture-roundtrip') { @{class='physical-D3D11-D3D12-transport';NR=$false;FG=$false;recording=$false;HDR=$false;HDR_transport=$true;performance=$false;physical_HDMI_PTS=$false} } else { @{class='native-pass-through-sampler';NR=$false;FG=$false;recording=$false;HDR=$false;performance=$false;physical_HDMI_PTS=$false;unsupported_renderer='actual signed libobs OpenGL bypass lane'} }
     $record = @{scenario=$Scenario;result=$result;failure=$failure;command=$command;args=$arguments;public_command=('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Scenario ' + $Scenario + ' -Evidence "' + $Evidence + '" -HostRoot "' + $HostRoot + '" -Runtime "' + $Runtime + '"');public_args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-Scenario',$Scenario,'-Evidence',$Evidence,'-HostRoot',$HostRoot,'-Runtime',$Runtime);exit=$exit;identity=$identity;events=@('ready','action','exit');output=$output;views=$views;patterns=$patterns;binding=$binding;inventory_ready=$readyInventory;inventory=$inventory;sources_before=@($sources.ToArray());sources_after=$sourceAfter;staging='minimal-private-copy';runtime=@{path=$Runtime;sha256=$spec.runtime.sha256;loaded=$false};scope=$scope;assertions=@{result_pass=($result -eq 'PASS');exact_pattern_rows=$patterns.Count};cleanup=$cleanup}
     $json = $record | ConvertTo-Json -Depth 12
-    if ($Scenario -eq 'texture-roundtrip') { $json | Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-' + [Guid]::NewGuid().ToString('N') + '-interop.json')) }
+    if ($Scenario -eq 'flow-translation') {
+        $receipt='flow.json'
+        $record.flow_rows=$flowRows; $record.capabilities=$flowCaps
+        $record.native_passes=$flowPasses; $record.input_proofs=$flowInputs
+        $record.scope=@{class='physical-NVOFA-D3D12-guides';NR=$false;Feature18=$false;recording=$false;HDR=$false;quality=$false;performance=$false}
+        $record.assertions.exact_flow_rows=$flowRows.Count
+        $record.assertions.exact_native_pass_rows=$flowPasses.Count
+        $record.assertions.exact_input_proofs=$flowInputs.Count
+        $json=$record | ConvertTo-Json -Depth 12
+    }
+    if ($Scenario -in @('texture-roundtrip','flow-translation')) { $json | Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-' + [Guid]::NewGuid().ToString('N') + '-' + $receipt)) }
     $json | Set-Content -Encoding UTF8 (Join-Path $Evidence $receipt)
     if ($process -and !$physicalUnresolved) { $process.Dispose() }
 }
