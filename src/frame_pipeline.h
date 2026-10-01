@@ -39,6 +39,7 @@ class Processor {
 public:
     virtual ~Processor() = default;
     virtual Processed process(const Work&, std::stop_token) = 0;
+    virtual void worker_stopping() noexcept {}
 };
 struct Admission {
     const JobContract job;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <windows.h>
 #include "nr_color_scenario.h"
+#include "nr_model_scenario.h"
 #include <obs.h>
 #include "nr_interop_scenario.h"
 #include "nr_flow_scenario.h"
@@ -260,7 +261,8 @@ int wmain(int argc, wchar_t **argv)
     const bool texture = argc == 8 && std::wstring(argv[7]) == L"texture-roundtrip";
     const bool flow = argc == 8 && std::wstring(argv[7]) == L"flow-translation";
     const bool color = argc == 8 && std::wstring(argv[7]) == L"color-alpha";
-    if (argc == 8 && !sampler && !texture && !flow && !color) return 64;
+    const bool model = argc == 8 && std::wstring(argv[7]) == L"native-model";
+    if (argc == 8 && !sampler && !texture && !flow && !color && !model) return 64;
     const std::filesystem::path root(argv[1]);
 
     HANDLE events[5]{};
@@ -281,7 +283,8 @@ int wmain(int argc, wchar_t **argv)
         obs_video_info video{};
         auto graphics = (root / "bin/64bit/libobs-d3d11.dll").string();
         video.graphics_module = graphics.c_str();
-        video.fps_num = 60;
+        // Finite identity/ownership fixture, not Task18's performance workload.
+        video.fps_num = model ? 1 : 60;
         video.fps_den = 1;
         video.base_width = video.output_width = 64;
         video.base_height = video.output_height = 64;
@@ -289,7 +292,7 @@ int wmain(int argc, wchar_t **argv)
         video.colorspace = VIDEO_CS_709;
         video.range = VIDEO_RANGE_FULL;
         video.scale_type = OBS_SCALE_DISABLE;
-        if (color) {
+        if (color || model) {
             try { nr_color_refuse_unrelated(); }
             catch (const std::exception& error) { std::cout<<"NR_COLOR_ADMISSION_FAILURE "<<error.what()<<std::endl; break; }
         }
@@ -302,6 +305,7 @@ int wmain(int argc, wchar_t **argv)
         if (texture && !nr_run_interop_scenario(root)) break;
         if (flow && !nr_run_flow_scenario(root)) break;
         if (color && !nr_run_color_scenario(root)) break;
+        if (model && !nr_run_model_scenario(root)) break;
         if (sampler) {
             // Separate finite real unsupported-backend lane, not an injected admission hook.
             // obs_reset_video does not recreate the graphics backend; end the first libobs session.

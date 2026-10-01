@@ -96,6 +96,7 @@ struct FramePipeline::Impl {
             }
             if (stop.stop_requested() && read.load(std::memory_order_relaxed) == written.load(std::memory_order_acquire)) break;
         }
+        processor->worker_stopping();
         exited.store(true, std::memory_order_release);
         exitSignal.set_value();
     }

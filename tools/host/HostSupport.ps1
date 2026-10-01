@@ -8,6 +8,30 @@ public sealed class NrProcessExit : IDisposable {
     public NrProcessExit(Process process) { process.Exited += (sender, args) => Exited.Set(); }
     public void Dispose() { Exited.Dispose(); }
 }
+public sealed class NrHostOutput : IDisposable {
+    private readonly System.Text.StringBuilder output = new System.Text.StringBuilder();
+    private readonly System.Text.StringBuilder error = new System.Text.StringBuilder();
+    private readonly System.IO.StreamWriter log;
+    private readonly object gate = new object();
+    public readonly ManualResetEvent OutputClosed = new ManualResetEvent(false);
+    public readonly ManualResetEvent ErrorClosed = new ManualResetEvent(false);
+    public NrHostOutput(Process process, string path) {
+        log = new System.IO.StreamWriter(path, false, new System.Text.UTF8Encoding(false));
+        log.AutoFlush = true;
+        process.OutputDataReceived += (sender, args) => {
+            if (args.Data == null) { OutputClosed.Set(); return; }
+            lock (gate) { output.AppendLine(args.Data); log.WriteLine("OUT " + args.Data); }
+            Console.WriteLine(args.Data);
+        };
+        process.ErrorDataReceived += (sender, args) => {
+            if (args.Data == null) { ErrorClosed.Set(); return; }
+            lock (gate) { error.AppendLine(args.Data); log.WriteLine("ERR " + args.Data); }
+            Console.WriteLine(args.Data);
+        };
+    }
+    public string Text { get { lock (gate) { return output.ToString() + error.ToString(); } } }
+    public void Dispose() { log.Dispose(); OutputClosed.Dispose(); ErrorClosed.Dispose(); }
+}
 '@
 function Assert-OwnedRoot([string]$Candidate) {
     if ([IO.Path]::GetFullPath($Candidate).TrimEnd('\','/') -ne $owned) { throw 'NR_QA_FOREIGN_ROOT' }
@@ -25,6 +49,70 @@ function FileIdentity([string]$Path) {
 function Assert-NoUnrelatedProcess {
     $active = @(Get-Process | Where-Object { $_.ProcessName -match '^(obs64|nr-qa-host|CrimsonDesert|GTA5|GTA5_Enhanced|Cyberpunk2077|eldenring|BlackMythWukong|cs2|dota2|FortniteClient.*)$' })
     if ($active.Count) { throw ('NR_QA_UNRELATED_PROCESS: ' + ($active.Id -join ',')) }
+}
+function Assert-ModelRows($Rows,$Contexts,$Cleanup,$Modules) {
+    if ($Rows.Count -ne 14 -or $Contexts.Count -ne 5 -or $Cleanup.Count -ne 5 -or !$Modules.Count) { throw 'NR_QA_MODEL_ROW_SET' }
+    for ($lane=0;$lane -lt 5;$lane++) {
+        $context=$Contexts[$lane];$close=$Cleanup[$lane]
+        if ($context.lane -ne $lane -or $context.software -isnot [bool] -or $context.software -or
+            $context.private_direct_queue -isnot [bool] -or !$context.private_direct_queue -or
+            $context.adapter -ne 'RTX 4090' -or [UInt64]$context.device -eq 0 -or [UInt64]$context.queue -eq 0 -or
+            $context.renderer_luid_high -ne $context.worker_luid_high -or $context.renderer_luid_low -ne $context.worker_luid_low) { throw 'NR_QA_MODEL_CONTEXT' }
+        if ($close.lane -ne $lane -or $close.worker_exit -isnot [bool] -or !$close.worker_exit -or
+            $close.closed -isnot [bool] -or !$close.closed -or $close.retained -isnot [bool] -or $close.retained -or
+            $close.applied -ne $(if($lane -eq 0){3}else{0})) { throw 'NR_QA_MODEL_CLEANUP' }
+        if ($lane -eq 0 -and ($close.nr_selections -ne 3 -or $close.raw_selections -ne 0)) { throw 'NR_QA_MODEL_PUBLICATION' }
+        $group=@($Rows | Where-Object {$_.lane -eq $lane})
+        $count=if($lane -eq 0){6}elseif($lane -lt 3){1}else{3}
+        if ($group.Count -ne $count) { throw 'NR_QA_MODEL_CASE_SET' }
+        for ($step=0;$step -lt $count;$step++) {
+            $row=$group[$step]
+            foreach ($field in @('created','evaluated','composed','submitted','gpu_composed','reset','driver_handle','capture_pin_open')) {
+                if ($row.$field -isnot [bool]) { throw 'NR_QA_MODEL_BOOLEAN' }
+            }
+            if (!$row.capture_pin_open -or $row.capture_pin -le 0 -or $row.consumer_done -ge $row.capture_pin) {
+                throw 'NR_QA_MODEL_PIN_ORDER'
+            }
+            if ($row.step -ne $step -or $row.instance_id -ne (111+$lane) -or $row.ingress_sequence -ne ($step+1) -or
+                $row.submission_serial -ne ($step+1) -or $row.settings_revision -ne 1 -or $row.resource_generation -ne 1 -or
+                $row.tick -ne ([Math]::Floor($row.clock/$row.interval)+1) -or $row.deadline -ne ($row.tick+1) -or
+                $row.slot -notin @(0,1,2) -or $row.feature -ne 18 -or $row.width -ne 1920 -or $row.height -ne 1080) { throw 'NR_QA_MODEL_KEY' }
+            if (!$row.raw_hash -or [UInt64]$row.raw_hash -eq 0 -or $row.raw_hash -ne $row.analysis_hash -or
+                [UInt64]$row.raw_resource -eq 0 -or [UInt64]$row.analysis_resource -eq 0 -or
+                $row.raw_resource -eq $row.analysis_resource -or $row.source_format -ne 87 -or
+                $row.producer -le 0 -or $row.producer_done -lt $row.producer -or $row.consumer_done -lt $row.consumer) { throw 'NR_QA_MODEL_INPUT_OR_FENCE' }
+            if ($row.gpu_composed) {
+                if (!$row.evaluated -or !$row.composed -or !$row.submitted -or $row.code -ne 1 -or
+                    $row.invalid_status -ne 0 -or $row.changed_pixels -le 0 -or $row.physical_done -ne 1 -or
+                    $row.epoch -le $row.creation_epoch -or [UInt64]$row.module_base -eq 0 -or $row.driver_handle) { throw 'NR_QA_MODEL_INFERENCE' }
+                foreach ($field in @('input_hash','model_hash','motion_hash','depth_hash','output_hash')) {
+                    if (!$row.$field -or [UInt64]$row.$field -eq 0) { throw 'NR_QA_MODEL_HASH' }
+                }
+                if ($row.input_hash -eq $row.model_hash) { throw 'NR_QA_MODEL_NOOP' }
+                if ($row.color_resources.Count -ne 5 -or @($row.color_resources | Select-Object -Unique).Count -ne 5 -or
+                    @($row.color_resources | Where-Object {[UInt64]$_ -eq 0}).Count -or
+                    $row.descriptor_heaps.Count -ne 3 -or @($row.descriptor_heaps | Select-Object -Unique).Count -ne 3 -or
+                    @($row.descriptor_heaps | Where-Object {[UInt64]$_ -eq 0}).Count -or [UInt64]$row.status_resource -eq 0 -or
+                    [UInt64]$row.output_resource -eq 0 -or [UInt64]$row.motion_resource -eq 0 -or [UInt64]$row.depth_resource -eq 0) { throw 'NR_QA_MODEL_RESOURCE_ALIAS' }
+                if ($row.mv_scale_x -ne 1 -or $row.mv_scale_y -ne 1 -or $row.pre_exposure -ne 1 -or $row.exposure -ne 1) { throw 'NR_QA_MODEL_GUIDE_OR_EXPOSURE' }
+                if ($row.chronology.Count -ne 8) { throw 'NR_QA_MODEL_CHRONOLOGY' }
+                for ($i=1;$i -lt 7;$i++) {
+                    if ($row.chronology[$i] -le 0 -or $row.chronology[$i] -gt $row.chronology[$i+1]) { throw 'NR_QA_MODEL_CHRONOLOGY' }
+                }
+            }
+            if ($lane -eq 0) {
+                if (($step -eq 0 -and (!$row.created -or $row.gpu_composed)) -or
+                    ($step -gt 0 -and !$row.gpu_composed)) { throw 'NR_QA_MODEL_WARM_SET' }
+                if ($step -in @(1,4) -and !$row.reset) { throw 'NR_QA_MODEL_RESET' }
+                if ($step -in @(2,3,5) -and ($row.reset -or $row.selected -ne 3 -or
+                    $row.selected_sequence -ne $step -or $row.target_changed_pixels -le 0 -or [UInt64]$row.target_hash -eq 0)) { throw 'NR_QA_MODEL_PUBLICATION' }
+                if ($step -eq 1 -and $row.selected -ne 1) { throw 'NR_QA_MODEL_RAW_PHASE' }
+            } elseif (($lane -lt 3 -or $step -ge 1) -and ($row.gpu_composed -or $row.submitted -or $row.code -eq 1)) {
+                throw 'NR_QA_MODEL_FAILURE_CONTROL'
+            }
+            if ($lane -ge 3 -and $step -eq 2 -and ($row.selected -ne 2 -or $row.target_hash -ne $group[1].raw_hash)) { throw 'NR_QA_MODEL_RAW_PHASE' }
+        }
+    }
 }
 function Assert-ColorRows($Rows, $Dispatches, $Contexts, $Controls) {
     if ($Rows.Count -ne 15 -or $Dispatches.Count -ne 50 -or $Contexts.Count -ne 1 -or $Controls.Count -ne 8) { throw 'NR_QA_COLOR_ROW_SET' }
@@ -185,6 +273,19 @@ function Stage-Host {
         $staged=FileIdentity $shaderDest
         if ($staged.sha256 -ne $before.sha256 -or $staged.bytes -ne $before.bytes) { throw 'NR_QA_COLOR_SHADER_IDENTITY' }
         $script:binding += $staged
+    }
+    if ($Scenario -eq 'native-model') {
+        New-Item -ItemType Directory -Force (Join-Path $root 'profile/ngx-data') | Out-Null
+        foreach ($shader in @('nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')) {
+            $source=Join-Path (Split-Path $build) $shader
+            $dest=Join-Path $root ('bin/64bit/' + $shader)
+            $before=FileIdentity $source
+            $sources.Add($before)
+            Copy-Item -LiteralPath $source -Destination $dest
+            $staged=FileIdentity $dest
+            if ($staged.sha256 -ne $before.sha256 -or $staged.bytes -ne $before.bytes) { throw 'NR_QA_MODEL_SHADER_IDENTITY' }
+            $script:binding += $staged
+        }
     }
 }
 function Assert-CleanInventory($Inventory, [string]$Graphics = 'libobs-d3d11.dll') {

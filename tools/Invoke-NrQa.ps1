@@ -18,6 +18,8 @@ $task8Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-n
 $task8VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task8Evidence 'verifier'))
 $task9Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-native-filter-20260930/task-9'))
 $task9VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task9Evidence 'verifier'))
+$task11Evidence = [IO.Path]::GetFullPath((Join-Path $work '.omo/evidence/obs-nr-native-filter-20260930/task-11'))
+$task11VerifierEvidence = [IO.Path]::GetFullPath((Join-Path $task11Evidence 'verifier'))
 $evidencePath = [IO.Path]::GetFullPath($Evidence).TrimEnd('\','/')
 $task = if ($Scenario -eq 'sampler' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task6Evidence,$task6VerifierEvidence))) { 'task-6' } elseif ($Scenario -eq 'texture-roundtrip' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task7Evidence,$task7VerifierEvidence))) { 'task-7' } else { 'task-2' }
 $owned = [IO.Path]::GetFullPath((Join-Path $work ('out/' + $task + '/host')))
@@ -28,6 +30,10 @@ if ($Scenario -eq 'flow-translation' -or ($Scenario -eq 'host-foundation' -and $
 if ($Scenario -eq 'color-alpha' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task9Evidence,$task9VerifierEvidence))) {
     $task = 'task-9'
     $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-9/host'))
+}
+if ($Scenario -eq 'native-model' -or ($Scenario -eq 'host-foundation' -and $evidencePath -in @($task11Evidence,$task11VerifierEvidence))) {
+    $task = 'task-11'
+    $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-11/host'))
 }
 $root = [IO.Path]::GetFullPath($HostRoot).TrimEnd('\','/')
 $evidenceRoot = [IO.Path]::GetFullPath((Join-Path $work ('.omo/evidence/obs-nr-native-filter-20260930/' + $task)))
@@ -47,8 +53,12 @@ if ($task -eq 'task-9' -and $evidencePath -eq $task9VerifierEvidence) {
     $evidenceRoot = $task9VerifierEvidence
     $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-9-verifier/host'))
 }
+if ($task -eq 'task-11' -and $evidencePath -eq $task11VerifierEvidence) {
+    $evidenceRoot = $task11VerifierEvidence
+    $owned = [IO.Path]::GetFullPath((Join-Path $work 'out/task-11-verifier/host'))
+}
 if ($evidencePath -ne $evidenceRoot) { throw 'NR_QA_EVIDENCE_REFUSED' }
-if ($Scenario -notin @('host-foundation','host-isolation-refusal','sampler','texture-roundtrip','flow-translation','color-alpha')) { throw 'NR_QA_NOT_IMPLEMENTED' }
+if ($Scenario -notin @('host-foundation','host-isolation-refusal','sampler','texture-roundtrip','flow-translation','color-alpha','native-model')) { throw 'NR_QA_NOT_IMPLEMENTED' }
 . (Join-Path $PSScriptRoot 'host/HostSupport.ps1')
 if ($Scenario -eq 'host-isolation-refusal') {
     if (!$ForeignRoot) { $ForeignRoot = $work }
@@ -83,10 +93,19 @@ if ($task -eq 'task-9') {
     $build = Join-Path $work 'out/task-9/native/Debug'
     if ($evidencePath -eq $task9VerifierEvidence) { $build = Join-Path $work 'out/task-9-verifier/native/Debug' }
 }
+if ($task -eq 'task-11') {
+    $build = Join-Path $work 'out/task-11/native/Debug'
+    if ($evidencePath -eq $task11VerifierEvidence) { $build = Join-Path $work 'out/task-11-verifier/native/Debug' }
+}
 foreach ($binary in @('obs-nr-filter.dll','nr-qa-host.exe')) {
     if (!(Test-Path (Join-Path $build $binary))) { throw ('NR_QA_BUILD_MISSING: ' + $binary) }
 }
 if ($Scenario -eq 'color-alpha' -and !(Test-Path (Join-Path (Split-Path $build) 'nr_color.dxil'))) { throw 'NR_QA_BUILD_MISSING: nr_color.dxil' }
+if ($Scenario -eq 'native-model') {
+    foreach ($shader in @('nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')) {
+        if (!(Test-Path (Join-Path (Split-Path $build) $shader))) { throw ('NR_QA_BUILD_MISSING: ' + $shader) }
+    }
+}
 $sources = [Collections.Generic.List[object]]::new()
 $process = $null
 $identity = $null
@@ -104,6 +123,8 @@ $stdout = $null
 $stderr = $null
 $output = ''
 $exitSignal = $null
+$nativeOutput = $null
+$nativeLog = $null
 $views = @()
 $patterns = @()
 $flowRows = @()
@@ -114,6 +135,10 @@ $colorRows = @()
 $colorDispatches = @()
 $colorContext = @()
 $colorControls = @()
+$modelRows = @()
+$modelContexts = @()
+$modelCleanup = @()
+$modelModules = @()
 $physicalUnresolved = $false
 $binding = @()
 New-Item -ItemType Directory -Force $Evidence | Out-Null
@@ -133,6 +158,15 @@ try {
     if ($Scenario -eq 'color-alpha') {
         foreach ($path in @('src/nr_color.h','src/nr_color.cpp','src/shaders/nr_color.hlsl','cmake/nr/Color.cmake','tools/host/nr_color_scenario.h','tools/host/nr_color_scenario.cpp','tools/tests/color_contract_tests.cpp','tools/tests/color_software_tests.cpp','src/interop.h','src/interop.cpp','cmake/nr/Interop.cmake')) { $binding += FileIdentity (Join-Path $work $path) }
         $binding += FileIdentity (Join-Path (Split-Path $build) 'nr_color.dxil')
+    }
+    if ($Scenario -eq 'native-model') {
+        foreach ($path in @('src/nr_model.h','src/nr_model.cpp','src/nr_runtime.h','src/nr_runtime.cpp',
+            'src/nr_core.h','src/nr_core.cpp','src/nr_guides.h','src/nr_guides.cpp','src/nr_color.h','src/nr_color.cpp',
+            'src/frame_pipeline.h','src/frame_pipeline.cpp','src/interop.h','src/interop.cpp','src/shaders/nr_codec.hlsl',
+            'src/shaders/nr_color.hlsl','src/shaders/nr_guides.hlsl','src/shaders/nr_interop_blit.hlsl',
+            'cmake/nr/Model.cmake','cmake/nr/Scheduler.cmake','tools/host/nr_model_scenario.h','tools/host/nr_model_scenario.cpp',
+            'tools/tests/model_contract_tests.cpp','tools/tests/model_runner_tests.ps1')) { $binding += FileIdentity (Join-Path $work $path) }
+        $sources.Add((FileIdentity 'C:/Windows/System32/DriverStore/FileRepository/nv_dispi.inf_amd64_b20cc8aeaed64fc2/_nvngx.dll'))
     }
     New-Item -ItemType Directory $root | Out-Null
     $created = $true
@@ -157,15 +191,35 @@ try {
     if ($Scenario -eq 'texture-roundtrip') { $process.StartInfo.Arguments += ' texture-roundtrip' }
     if ($Scenario -eq 'flow-translation') { $process.StartInfo.Arguments += ' flow-translation' }
     if ($Scenario -eq 'color-alpha') { $process.StartInfo.Arguments += ' color-alpha' }
+    if ($Scenario -eq 'native-model') { $process.StartInfo.Arguments += ' native-model' }
     $process.EnableRaisingEvents = $true
     $exitSignal = [NrProcessExit]::new($process)
+    if ($Scenario -eq 'native-model') {
+        $nativeLog=Join-Path $Evidence ('attempt-'+$nonce+'-native-host.log')
+        $nativeOutput=[NrHostOutput]::new($process,$nativeLog)
+    }
     $command = $process.StartInfo.FileName + ' ' + $process.StartInfo.Arguments
     $arguments = $process.StartInfo.Arguments
     Assert-NoUnrelatedProcess
+    if ($Scenario -eq 'native-model') {
+        @{state='registered';registered=[DateTime]::UtcNow.ToString('o');command=$process.StartInfo.FileName;
+            args=$arguments;root=$root;raw_log=$nativeLog;binding=$binding;runtime=$spec.runtime;
+            subscription_before_start=$true;identity=$null} | ConvertTo-Json -Depth 12 |
+            Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-'+$nonce+'-native-registered.json'))
+    }
     if (!$process.Start()) { throw 'NR_QA_START_FAILED' }
-    $stdout = $process.StandardOutput.ReadToEndAsync()
-    $stderr = $process.StandardError.ReadToEndAsync()
     $identity = Identity $process
+    if ($Scenario -eq 'native-model') {
+        @{state='started';identity=$identity;command=$process.StartInfo.FileName;args=$arguments;
+            raw_log=$nativeLog;registered_receipt=('attempt-'+$nonce+'-native-registered.json')} |
+            ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-'+$nonce+'-native-start.json'))
+    }
+    if ($nativeOutput) {
+        $process.BeginOutputReadLine();$process.BeginErrorReadLine()
+    } else {
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+    }
     if ($identity.image -ne $process.StartInfo.FileName) { throw 'NR_QA_CHILD_IDENTITY_REFUSED' }
     $ready = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($events[0],$exitSignal.Exited),15000)
     if ($ready -eq 1) { throw ('NR_QA_EARLY_EXIT: ' + $process.ExitCode) }
@@ -174,7 +228,7 @@ try {
     Assert-CleanInventory $inventory
     $readyInventory = $inventory
     $events[1].Set() | Out-Null
-    $actionBound = if ($Scenario -in @('flow-translation','color-alpha')) { 120000 } else { 15000 }
+    $actionBound = if ($Scenario -in @('flow-translation','color-alpha','native-model')) { 120000 } else { 15000 }
     $acted = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($events[2],$exitSignal.Exited),$actionBound)
     if ($acted -eq 1) { throw ('NR_QA_ACTION_FAILED_EXIT: ' + $process.ExitCode) }
     if ($acted -ne 0) { throw 'NR_QA_ACTION_TIMEOUT' }
@@ -187,7 +241,10 @@ try {
     if (!$process.WaitForExit(15000)) { throw 'NR_QA_PROCESS_EXIT_TIMEOUT' }
     $exit = $process.ExitCode
     if ($exit) { throw ('NR_QA_HOST_FAILED: ' + $exit) }
-    $output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+    if ($nativeOutput) {
+        if (!$nativeOutput.OutputClosed.WaitOne(15000) -or !$nativeOutput.ErrorClosed.WaitOne(15000)) { throw 'NR_QA_MODEL_OUTPUT_DRAIN' }
+        $output=$nativeOutput.Text
+    } else { $output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult() }
     foreach ($token in @('NR_QA_READY libobs=32.2.2 module=obs-nr-filter encoder=obs_x264','NR_QA_ACTION content_id=2583','NR_QA_EXIT cleanup=complete result=0')) {
         if (!$output.Contains($token)) { throw ('NR_QA_EVENT_LITERAL_MISSING: ' + $token) }
     }
@@ -248,13 +305,28 @@ try {
         Assert-ColorRows $colorRows $colorDispatches $colorContext $colorControls
         if (!$output.Contains('NR_COLOR_SCOPE physical_color=true model=not_loaded Feature18=not_admitted HDR=boundary_only recording=not_tested cleanup=complete') -or $output.Contains('NR_COLOR_RETAINED')) { throw 'NR_QA_COLOR_CLEANUP_INCOMPLETE' }
     }
+    if ($Scenario -eq 'native-model') {
+        foreach ($line in ($output -split [char]10)) {
+            if ($line.StartsWith('NR_MODEL_CASE ')) { $modelRows += $line.Substring(14) | ConvertFrom-Json }
+            if ($line.StartsWith('NR_MODEL_CONTEXT ')) { $modelContexts += $line.Substring(17) | ConvertFrom-Json }
+            if ($line.StartsWith('NR_MODEL_CLEANUP ')) { $modelCleanup += $line.Substring(17) | ConvertFrom-Json }
+            if ($line.StartsWith('NR_MODEL_MODULE ')) { $modelModules += $line.Substring(16) | ConvertFrom-Json }
+        }
+        Assert-ModelRows $modelRows $modelContexts $modelCleanup $modelModules
+        foreach ($module in $modelModules) {
+            if ([IO.Path]::GetFullPath($module.path) -ne [IO.Path]::GetFullPath($Runtime) -or
+                $module.selected_sha256 -ne $spec.runtime.sha256 -or [UInt64]$module.base -eq 0) { throw 'NR_QA_MODEL_MODULE_IDENTITY' }
+        }
+        if (!$output.Contains('NR_MODEL_SCOPE Feature18=true integrated=true quality=false performance=false recording=false cleanup=complete') -or
+            $output.Contains('NR_MODEL_RETAINED')) { throw 'NR_QA_MODEL_CLEANUP_INCOMPLETE' }
+    }
     $result = 'PASS'
 } catch { $failure = $_.Exception.Message } finally {
     if ($process -and $identity -and !$process.HasExited) {
         if ((Identity $process | ConvertTo-Json -Compress) -ne ($identity | ConvertTo-Json -Compress)) { throw 'NR_QA_CLEANUP_IDENTITY_REFUSED' }
         if ($events.Count -eq 5) { $events[3].Set() | Out-Null }
         if (!$process.WaitForExit(15000)) {
-            if ($Scenario -in @('texture-roundtrip','flow-translation','color-alpha')) { $physicalUnresolved=$true; $result='FAIL'; $failure='NR_QA_GPU_OWNERSHIP_RETAINED' }
+            if ($Scenario -in @('texture-roundtrip','flow-translation','color-alpha','native-model')) { $physicalUnresolved=$true; $result='FAIL'; $failure='NR_QA_GPU_OWNERSHIP_RETAINED' }
             else { $process.Kill(); if (!$process.WaitForExit(15000)) { throw 'NR_QA_CLEANUP_BLOCKED' } }
         }
     }
@@ -270,6 +342,7 @@ try {
     if ($created -and !$physicalUnresolved) { Remove-Item -LiteralPath $root -Recurse -Force }
     $cleanup = @{host_absent=!(Test-Path $root);child_exited=(!$process -or $process.HasExited);event_handles_closed=(!$physicalUnresolved);physical_ownership_retained=$physicalUnresolved;linked_bytes_unchanged=($failure -ne 'NR_QA_SOURCE_CHANGED')}
     if ($process -and $process.HasExited -and $stdout) { $output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult() }
+    if ($nativeOutput) { $output=$nativeOutput.Text }
     if ($process -and $process.HasExited) { $exit = $process.ExitCode }
     $receipt = if ($Scenario -eq 'sampler') { 'sampler.json' } elseif ($Scenario -eq 'texture-roundtrip') { 'interop.json' } else { 'host-foundation.json' }
     $scope = if ($Scenario -eq 'texture-roundtrip') { @{class='physical-D3D11-D3D12-transport';NR=$false;FG=$false;recording=$false;HDR=$false;HDR_transport=$true;performance=$false;physical_HDMI_PTS=$false} } else { @{class='native-pass-through-sampler';NR=$false;FG=$false;recording=$false;HDR=$false;performance=$false;physical_HDMI_PTS=$false;unsupported_renderer='actual signed libobs OpenGL bypass lane'} }
@@ -294,7 +367,20 @@ try {
         $record.assertions.exact_dispatch_rows=$colorDispatches.Count
         $json=$record | ConvertTo-Json -Depth 12
     }
-    if ($Scenario -in @('texture-roundtrip','flow-translation','color-alpha')) { $json | Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-' + [Guid]::NewGuid().ToString('N') + '-' + $receipt)) }
+    if ($Scenario -eq 'native-model') {
+        $receipt='native-model.json'
+        $record.model_rows=$modelRows; $record.model_contexts=$modelContexts
+        $record.model_cleanup=$modelCleanup; $record.model_modules=$modelModules
+        $record.runtime.loaded_during_inference=($modelModules.Count -gt 0)
+        $record.runtime.loaded_after_cleanup=$false
+        $record.native_raw_log=$nativeLog
+        if ($nativeOutput -and !$physicalUnresolved) { $nativeOutput.Dispose() }
+        if ($nativeLog -and (Test-Path $nativeLog)) { $record.native_raw_log_identity=FileIdentity $nativeLog }
+        $record.scope=@{class='physical-joined-Feature18-processor';NR=$true;Feature18=$true;recording=$false;HDR=$false;quality=$false;performance=$false;fixture_fps=1}
+        $record.assertions.exact_model_rows=$modelRows.Count
+        $json=$record | ConvertTo-Json -Depth 12
+    }
+    if ($Scenario -in @('texture-roundtrip','flow-translation','color-alpha','native-model')) { $json | Set-Content -Encoding UTF8 (Join-Path $Evidence ('attempt-' + [Guid]::NewGuid().ToString('N') + '-' + $receipt)) }
     $json | Set-Content -Encoding UTF8 (Join-Path $Evidence $receipt)
     if ($process -and !$physicalUnresolved) { $process.Dispose() }
 }
