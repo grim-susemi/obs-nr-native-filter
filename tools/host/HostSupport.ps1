@@ -26,6 +26,61 @@ function Assert-NoUnrelatedProcess {
     $active = @(Get-Process | Where-Object { $_.ProcessName -match '^(obs64|nr-qa-host|CrimsonDesert|GTA5|GTA5_Enhanced|Cyberpunk2077|eldenring|BlackMythWukong|cs2|dota2|FortniteClient.*)$' })
     if ($active.Count) { throw ('NR_QA_UNRELATED_PROCESS: ' + ($active.Id -join ',')) }
 }
+function Assert-ColorRows($Rows, $Dispatches, $Contexts, $Controls) {
+    if ($Rows.Count -ne 15 -or $Dispatches.Count -ne 50 -or $Contexts.Count -ne 1 -or $Controls.Count -ne 8) { throw 'NR_QA_COLOR_ROW_SET' }
+    $context=$Contexts[0]
+    if ($context.software -isnot [bool] -or $context.private_direct_queue -isnot [bool]) { throw 'NR_QA_COLOR_CONTEXT' }
+    if ($context.software -or !$context.private_direct_queue -or $context.vendor_id -ne 4318 -or $context.adapter -ne 'RTX 4090' -or !$context.device -or !$context.queue -or [UInt64]$context.device -eq 0 -or [UInt64]$context.queue -eq 0 -or $context.renderer_luid_high -ne $context.worker_luid_high -or $context.renderer_luid_low -ne $context.worker_luid_low) { throw 'NR_QA_COLOR_CONTEXT' }
+    for ($i=0; $i -lt 50; $i++) {
+        $d=$Dispatches[$i]
+        foreach ($field in @('restore','status_cleared','subscribed_before_trigger','common_handoff','cleanup')) {
+            if ($d.$field -isnot [bool]) { throw 'NR_QA_COLOR_FENCE' }
+        }
+        if ($d.serial -ne ($i+1) -or $d.width -ne 16 -or $d.height -ne 8 -or !$d.status_cleared -or !$d.subscribed_before_trigger -or $d.fence_signaled -ne 1 -or $d.fence_completed -ne 1 -or !$d.common_handoff -or !$d.cleanup) { throw 'NR_QA_COLOR_FENCE' }
+        $ids=@($d.source_resource,$d.canonical_resource,$d.output_resource,$d.status_resource)
+        if (@($ids | Select-Object -Unique).Count -ne 4 -or @($ids | Where-Object { !$_ -or [UInt64]$_ -eq 0 }).Count -or !$d.heap -or [UInt64]$d.heap -eq 0) { throw 'NR_QA_COLOR_ALIAS' }
+        if (!$d.raw_expected_hash -or !$d.raw_readback_hash -or $d.raw_expected_hash -ne $d.raw_readback_hash -or !$d.output_hash -or [UInt64]$d.raw_expected_hash -eq 0 -or [UInt64]$d.output_hash -eq 0) { throw 'NR_QA_COLOR_SOURCE_IDENTITY' }
+    }
+    for ($i=0; $i -lt 15; $i++) {
+        $row=$Rows[$i]
+        $color=if($i -lt 6){1}elseif($i -lt 9){2}elseif($i -lt 12){3}else{4}
+        $format=if($i -lt 3){2}elseif($i -lt 6){1}elseif($i -lt 12){3}else{4}
+        $white=if($color -eq 1){1}else{3.80625}
+        $scale=if($color -eq 1){1}elseif($color -eq 2){1.5}elseif($color -eq 3){3.80625}else{0.01875}
+        foreach ($field in @('source_load','canonical_load','canonical_store','output_store','basic_double')) {
+            if ($row.$field -isnot [bool]) { throw 'NR_QA_COLOR_METADATA_OR_CAPS' }
+        }
+        if ($row.normalized_codes -is [string] -or [double]::IsNaN($row.normalized_codes) -or [double]::IsInfinity($row.normalized_codes) -or $row.half_ulps -is [string] -or [double]::IsNaN($row.half_ulps) -or [double]::IsInfinity($row.half_ulps)) { throw 'NR_QA_COLOR_ORACLE' }
+        if ($row.case -ne $i -or $row.color -ne $color -or $row.format -ne $format -or $row.alpha -ne (($i%3)+1) -or $row.width -ne 16 -or $row.height -ne 8 -or $row.source_white_nits -ne 203 -or $row.pre_exposure -ne 2 -or $row.exposure -ne 3 -or $row.white_point -ne $white -or $row.linear_scale -ne $scale -or !$row.source_load -or !$row.canonical_load -or !$row.canonical_store -or !$row.output_store -or !$row.basic_double) { throw 'NR_QA_COLOR_METADATA_OR_CAPS' }
+        if ($row.compared_pixels -ne 256 -or $row.identity_pixels -ne 128 -or $row.alpha_errors -ne 0 -or $row.normalized_codes -lt 0 -or $row.normalized_codes -gt 1 -or $row.half_ulps -lt 0 -or $row.half_ulps -gt 2 -or $row.negative_checks -lt 0 -or ($color -in @(2,3) -and $row.negative_checks -eq 0)) { throw 'NR_QA_COLOR_ORACLE' }
+        foreach ($field in @('raw_hash','raw_output_hash','identity_hash','prepared_hash','oracle_prepared_hash','restored_hash','oracle_restored_hash')) {
+            if (!$row.$field -or [UInt64]$row.$field -eq 0) { throw 'NR_QA_COLOR_HASH' }
+        }
+        if ($row.identity_hash -ne $row.raw_output_hash) { throw 'NR_QA_COLOR_IDENTITY' }
+        $dxgi=if($format -eq 1){87}elseif($format -eq 2){28}elseif($format -eq 3){10}else{24}
+        for ($phase=0; $phase -lt 3; $phase++) {
+            $d=$Dispatches[3*$i+$phase]
+            $expectedOutput=if($phase -eq 0){10}elseif($format -eq 1){28}else{$dxgi}
+            $serial=@($row.prepare_serial,$row.identity_serial,$row.restore_serial)[$phase]
+            if ($serial -ne $d.serial -or $d.restore -ne ($phase -ne 0) -or $d.invalid_status -ne 0 -or $d.source_format -ne $dxgi -or $d.output_format -ne $expectedOutput -or $d.raw_readback_hash -ne $row.raw_hash) { throw 'NR_QA_COLOR_PHASE' }
+            $hash=@($row.prepared_hash,$row.identity_hash,$row.restored_hash)[$phase]
+            if ($d.output_hash -ne $hash) { throw 'NR_QA_COLOR_PHASE' }
+        }
+    }
+    $names=@('nonfinite-input','nonfinite-resolve','canonical-overflow','restore-overflow','malformed-premultiplication')
+    $status=@(1,8,4,16,2)
+    for ($i=0; $i -lt 5; $i++) {
+        $c=$Controls[$i];$d=$Dispatches[45+$i]
+        if ($c.rejected -isnot [bool] -or $c.published -isnot [bool]) { throw 'NR_QA_COLOR_INVALID_STATUS' }
+        if ($c.name -ne $names[$i] -or $c.stage -ne 'completed_gpu' -or !$c.rejected -or $c.published -or $c.serial -ne $d.serial -or $c.invalid_status -ne $status[$i] -or $d.invalid_status -ne $status[$i]) { throw 'NR_QA_COLOR_INVALID_STATUS' }
+    }
+    for ($i=5; $i -lt 8; $i++) {
+        $c=$Controls[$i];$name=@('unknown-primaries','unavailable-format-capability','unavailable-output-format')[$i-5]
+        if ($c.rejected -isnot [bool] -or $c.submitted -isnot [bool]) { throw 'NR_QA_COLOR_ADMISSION_CONTROL' }
+        $stage=if($i -eq 7){'record'}else{'plan'}
+        if ($c.name -ne $name -or $c.stage -ne $stage -or !$c.rejected -or $c.submitted) { throw 'NR_QA_COLOR_ADMISSION_CONTROL' }
+    }
+}
 function Assert-FlowRows($Rows, $Caps) {
     if ($Rows.Count -ne 96 -or $Caps.Count -ne 2) { throw 'NR_QA_FLOW_ROWS' }
     foreach ($cap in $Caps) {
@@ -120,6 +175,16 @@ function Stage-Host {
     Copy-Item (Join-Path $work 'data/locale') (Join-Path $root 'data/obs-plugins/obs-nr-filter/locale') -Recurse
     if ($Scenario -eq 'flow-translation') {
         Copy-Item (Join-Path (Split-Path $build) 'nr_guides.cso') (Join-Path $root 'bin/64bit/nr_guides.cso')
+    }
+    if ($Scenario -eq 'color-alpha') {
+        $shaderSource=Join-Path (Split-Path $build) 'nr_color.dxil'
+        $shaderDest=Join-Path $root 'bin/64bit/nr_color.dxil'
+        $before=FileIdentity $shaderSource
+        $sources.Add($before)
+        Copy-Item $shaderSource $shaderDest
+        $staged=FileIdentity $shaderDest
+        if ($staged.sha256 -ne $before.sha256 -or $staged.bytes -ne $before.bytes) { throw 'NR_QA_COLOR_SHADER_IDENTITY' }
+        $script:binding += $staged
     }
 }
 function Assert-CleanInventory($Inventory, [string]$Graphics = 'libobs-d3d11.dll') {

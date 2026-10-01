@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <windows.h>
+#include "nr_color_scenario.h"
 #include <obs.h>
 #include "nr_interop_scenario.h"
 #include "nr_flow_scenario.h"
@@ -258,7 +259,8 @@ int wmain(int argc, wchar_t **argv)
     const bool sampler = argc == 8 && std::wstring(argv[7]) == L"sampler";
     const bool texture = argc == 8 && std::wstring(argv[7]) == L"texture-roundtrip";
     const bool flow = argc == 8 && std::wstring(argv[7]) == L"flow-translation";
-    if (argc == 8 && !sampler && !texture && !flow) return 64;
+    const bool color = argc == 8 && std::wstring(argv[7]) == L"color-alpha";
+    if (argc == 8 && !sampler && !texture && !flow && !color) return 64;
     const std::filesystem::path root(argv[1]);
 
     HANDLE events[5]{};
@@ -287,6 +289,10 @@ int wmain(int argc, wchar_t **argv)
         video.colorspace = VIDEO_CS_709;
         video.range = VIDEO_RANGE_FULL;
         video.scale_type = OBS_SCALE_DISABLE;
+        if (color) {
+            try { nr_color_refuse_unrelated(); }
+            catch (const std::exception& error) { std::cout<<"NR_COLOR_ADMISSION_FAILURE "<<error.what()<<std::endl; break; }
+        }
         if (obs_reset_video(&video) != OBS_VIDEO_SUCCESS) break;
         if (!load_modules(root)) break;
         std::cout << "NR_QA_READY libobs=" << obs_get_version_string() << " module=obs-nr-filter encoder=obs_x264\n" << std::flush;
@@ -295,6 +301,7 @@ int wmain(int argc, wchar_t **argv)
         if (sampler && !run_sampler()) break;
         if (texture && !nr_run_interop_scenario(root)) break;
         if (flow && !nr_run_flow_scenario(root)) break;
+        if (color && !nr_run_color_scenario(root)) break;
         if (sampler) {
             // Separate finite real unsupported-backend lane, not an injected admission hook.
             // obs_reset_video does not recreate the graphics backend; end the first libobs session.

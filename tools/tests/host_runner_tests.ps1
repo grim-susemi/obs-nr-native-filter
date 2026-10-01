@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Work, [switch]$Task8Only)
+param([Parameter(Mandatory)][string]$Work, [switch]$Task8Only, [switch]$Task9Only)
 $ErrorActionPreference = 'Stop'
 $runner = Join-Path $Work 'tools/Invoke-NrQa.ps1'
 $evidence = Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-2'
@@ -27,7 +27,7 @@ function Reject([string]$Scenario, [string]$Root, [string]$Runtime, [string]$Tok
         Write-Output ('PASS refusal ' + $Token)
     } finally { $exitSignal.Dispose(); $child.Dispose() }
 }
-if (!$Task8Only) {
+if (!$Task8Only -and !$Task9Only) {
 if (Test-Path $root) { throw 'QA root must be absent before CPU tests' }
 Reject 'unknown-qa' $root $runtime 'ParameterArgumentValidationError'
 Reject 'sampler' $root $runtime 'NR_QA_EVIDENCE_REFUSED'
@@ -100,7 +100,7 @@ try {
 } finally { Remove-Item -LiteralPath $task7Root }
 $evidence = $savedEvidence
 foreach ($future in @('flow-translation','color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) {
-    $token = if ($future -eq 'flow-translation') { 'NR_QA_EVIDENCE_REFUSED' } else { 'NR_QA_NOT_IMPLEMENTED' }
+    $token = if ($future -in @('flow-translation','color-alpha')) { 'NR_QA_EVIDENCE_REFUSED' } else { 'NR_QA_NOT_IMPLEMENTED' }
     Reject $future $root $runtime $token
 }
 if ((Test-Path $task7Root) -or (Test-Path $task7VerifierRoot)) { throw 'Task7 refusal leaked a host' }
@@ -120,6 +120,7 @@ if (Test-Path $root) { throw 'Refusal created a host' }
 if (Test-Path $samplerRoot) { throw 'Refusal created a sampler host' }
 if (Test-Path $verifierRoot) { throw 'Refusal created a verifier host' }
 }
+if (!$Task9Only) {
 $task8Evidence = Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-8'
 $task8VerifierEvidence = Join-Path $task8Evidence 'verifier'
 $task8Root = Join-Path $Work 'out/task-8/host'
@@ -146,7 +147,10 @@ try {
     Reject 'flow-translation' $task8Root $runtime 'NR_QA_EXISTING_ROOT'
 } finally { Remove-Item -LiteralPath $task8Root }
 $evidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-2'
-foreach ($future in @('color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) { Reject $future $root $runtime 'NR_QA_NOT_IMPLEMENTED' }
+foreach ($future in @('color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) {
+    $token=if($future -eq 'color-alpha'){'NR_QA_EVIDENCE_REFUSED'}else{'NR_QA_NOT_IMPLEMENTED'}
+    Reject $future $root $runtime $token
+}
 if ((Test-Path $task8Root) -or (Test-Path $task8VerifierRoot)) { throw 'Task8 refusal leaked a host' }
 # Machine-field parser controls exercise the SAME public-run validator, not a prose/snapshot test.
 $rows=@()
@@ -211,3 +215,146 @@ $inputs[0].input_hashes[2]='13'; RejectPass 'NR_QA_FLOW_INPUT_IDENTITY'; $inputs
 $passes[0].worker_completed=4; RejectPass 'NR_QA_FLOW_PASS_FENCE'; $passes[0].worker_completed=5
 $passes[0].ofa_completed=[UInt64]::MaxValue; RejectPass 'NR_QA_FLOW_PASS_FENCE'; $passes[0].ofa_completed=12
 $passes[0].worker_fence='102'; RejectPass 'NR_QA_FLOW_PASS_FENCE'; $passes[0].worker_fence='103'
+}
+if (!$Task8Only) {
+    $task9Evidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-9'
+    $task9VerifierEvidence=Join-Path $task9Evidence 'verifier'
+    $task9Root=Join-Path $Work 'out/task-9/host'
+    $task9VerifierRoot=Join-Path $Work 'out/task-9-verifier/host'
+    if ((Test-Path $task9Root) -or (Test-Path $task9VerifierRoot)) { throw 'Task9 roots must be absent before CPU tests' }
+    function ProbeBuildSelection([string]$Evidence, [string]$Root, [string]$Build, [string]$Missing) {
+        # Only unrelated-process presence and artifact availability are isolated.
+        # Actual runner routing, guards and missing-artifact refusal execute;
+        # no binary is renamed/copied and no host/GPU can start.
+        $probe = @'
+$ErrorActionPreference='Stop'
+$global:selectedBuildPaths=[Collections.Generic.List[string]]::new()
+function global:Get-Process { @() }
+function global:Test-Path {
+    param([string]$Path,[string]$LiteralPath,[Microsoft.PowerShell.Commands.TestPathType]$PathType)
+    $candidate=if($LiteralPath){$LiteralPath}else{$Path}
+    $name=[IO.Path]::GetFileName($candidate)
+    if($name -in @('obs-nr-filter.dll','nr-qa-host.exe','nr_color.dxil')) {
+        $global:selectedBuildPaths.Add([IO.Path]::GetFullPath($candidate))
+        return $name -ne '@MISSING@'
+    }
+    Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+}
+try {
+    & '@RUNNER@' -Scenario color-alpha -Evidence '@EVIDENCE@' -HostRoot '@ROOT@' -Runtime '@RUNTIME@'
+    throw 'build probe unexpectedly reached host execution'
+} catch {
+    if($_.Exception.Message -ne 'NR_QA_BUILD_MISSING: @MISSING@'){throw}
+    @{selected=@($global:selectedBuildPaths.ToArray());missing='@MISSING@';refused=$true;host_absent=!(Microsoft.PowerShell.Management\Test-Path '@ROOT@')} | ConvertTo-Json -Compress
+}
+'@
+        foreach ($entry in @(@('@RUNNER@',$runner),@('@EVIDENCE@',$Evidence),@('@ROOT@',$Root),@('@RUNTIME@',$runtime),@('@MISSING@',$Missing))) {
+            $probe=$probe.Replace($entry[0],$entry[1].Replace("'","''"))
+        }
+        $child=[Diagnostics.Process]::new()
+        $child.StartInfo.FileName="$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe"
+        $child.StartInfo.Arguments='-NoProfile -ExecutionPolicy Bypass -Command "'+$probe.Replace('"','\"')+'"'
+        $child.StartInfo.UseShellExecute=$false
+        $child.StartInfo.CreateNoWindow=$true
+        $child.StartInfo.RedirectStandardOutput=$true
+        $child.StartInfo.RedirectStandardError=$true
+        $child.EnableRaisingEvents=$true
+        $exitSignal=[NrProcessExit]::new($child)
+        try {
+            if(!$child.Start()){throw 'build probe child start failed'}
+            $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
+            if(!$exitSignal.Exited.WaitOne(15000)){
+                $child.Kill()
+                if(!$exitSignal.Exited.WaitOne(15000) -or !$child.WaitForExit(15000)){throw 'build probe cleanup blocked'}
+                throw 'build probe timed out'
+            }
+            if(!$child.WaitForExit(15000)){throw 'build probe reaping failed'}
+            $text=$stdout.GetAwaiter().GetResult();$errors=$stderr.GetAwaiter().GetResult()
+            if($child.ExitCode){throw ('build probe failed: '+$text+$errors)}
+            $row=$text | ConvertFrom-Json
+            $expected=Join-Path $(if($Missing -eq 'nr_color.dxil'){Split-Path $Build}else{$Build}) $Missing
+            if(!$row.refused -or !$row.host_absent -or $row.missing -ne $Missing -or !$row.selected.Count -or $row.selected[-1] -ne [IO.Path]::GetFullPath($expected)){throw 'public selected wrong build path'}
+            foreach($selected in $row.selected) {
+                $name=[IO.Path]::GetFileName($selected)
+                $expected=Join-Path $(if($name -eq 'nr_color.dxil'){Split-Path $Build}else{$Build}) $name
+                if($selected -ne [IO.Path]::GetFullPath($expected)){throw 'public artifact fallback selected'}
+            }
+            Write-Output ('PASS public build selection '+($row | ConvertTo-Json -Compress))
+        } finally {$exitSignal.Dispose();$child.Dispose()}
+    }
+    foreach ($pair in @(@($task9Evidence,$task9Root,(Join-Path $Work 'out/task-9/native/Debug')),@($task9VerifierEvidence,$task9VerifierRoot,(Join-Path $Work 'out/task-9-verifier/native/Debug')))) {
+        foreach ($missing in @('obs-nr-filter.dll','nr-qa-host.exe','nr_color.dxil')) { ProbeBuildSelection $pair[0] $pair[1] $pair[2] $missing }
+    }
+    foreach ($scenario in @('color-alpha','host-foundation')) {
+        foreach ($pair in @(@($task9Evidence,$task9Root,$task9VerifierRoot),@($task9VerifierEvidence,$task9VerifierRoot,$task9Root))) {
+            $evidence=$pair[0]
+            Reject $scenario $pair[1] 'C:/not-selected/runtime.dll' 'NR_QA_RUNTIME_REFUSED'
+            Reject $scenario $pair[1] $runtime 'NR_QA_FOREIGN_PROCESS' ('-ForeignPid '+$PID)
+            Reject $scenario $pair[2] $runtime 'NR_QA_FOREIGN_ROOT'
+        }
+    }
+    foreach ($badEvidence in @(($task9Evidence+'-near'),(Join-Path $task9Evidence 'nested'),($task9VerifierEvidence+'-near'),(Join-Path $task9VerifierEvidence 'nested'),(Join-Path $task9VerifierEvidence '../../foreign'))) {
+        $evidence=$badEvidence;Reject 'color-alpha' $task9Root $runtime 'NR_QA_EVIDENCE_REFUSED'
+    }
+    $evidence=$task9VerifierEvidence
+    foreach ($badRoot in @(($task9VerifierRoot+'-near'),(Join-Path $task9VerifierRoot 'nested'),(Join-Path $Work 'out/task-9/verifier/host'),(Join-Path $task9VerifierRoot '../../foreign'),$Work)) {
+        Reject 'color-alpha' $badRoot $runtime 'NR_QA_FOREIGN_ROOT'
+    }
+    $evidence=$task9Evidence
+    try {
+        New-Item -ItemType Directory -Path $task9Root | Out-Null
+        Reject 'color-alpha' $task9Root $runtime 'NR_QA_EXISTING_ROOT'
+    } finally {Remove-Item -LiteralPath $task9Root}
+    $evidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-2'
+    Reject 'color-alpha' $root $runtime 'NR_QA_EVIDENCE_REFUSED'
+    if ((Test-Path $task9Root) -or (Test-Path $task9VerifierRoot)) {throw 'Task9 refusal leaked a host'}
+    $colorRows=@();$colorDispatches=@()
+    $colorContext=@([pscustomobject]@{software=$false;private_direct_queue=$true;vendor_id=4318;adapter='RTX 4090';device='101';queue='102';renderer_luid_high=1;renderer_luid_low=2;worker_luid_high=1;worker_luid_low=2})
+    for($i=0;$i -lt 15;$i++) {
+        $color=if($i -lt 6){1}elseif($i -lt 9){2}elseif($i -lt 12){3}else{4}
+        $format=if($i -lt 3){2}elseif($i -lt 6){1}elseif($i -lt 12){3}else{4}
+        $dxgi=if($format -eq 1){87}elseif($format -eq 2){28}elseif($format -eq 3){10}else{24}
+        $white=if($color -eq 1){1}else{3.80625}
+        $scale=if($color -eq 1){1}elseif($color -eq 2){1.5}elseif($color -eq 3){3.80625}else{0.01875}
+        $colorRows += [pscustomobject]@{case=$i;color=$color;format=$format;alpha=(($i%3)+1);width=16;height=8;source_white_nits=203;pre_exposure=2;exposure=3;white_point=$white;linear_scale=$scale;source_load=$true;canonical_load=$true;canonical_store=$true;output_store=$true;basic_double=$true;compared_pixels=256;identity_pixels=128;alpha_errors=0;normalized_codes=0;half_ulps=0;negative_checks=1;raw_hash='11';raw_output_hash='11';identity_hash='11';prepared_hash='22';oracle_prepared_hash='22';restored_hash='33';oracle_restored_hash='33';prepare_serial=(3*$i+1);identity_serial=(3*$i+2);restore_serial=(3*$i+3)}
+        for($phase=0;$phase -lt 3;$phase++) {
+            $colorDispatches += [pscustomobject]@{serial=(3*$i+$phase+1);width=16;height=8;restore=($phase -ne 0);source_format=$dxgi;output_format=$(if($phase -eq 0){10}elseif($format -eq 1){28}else{$dxgi});status_cleared=$true;subscribed_before_trigger=$true;fence_signaled=1;fence_completed=1;common_handoff=$true;cleanup=$true;source_resource='1';canonical_resource='2';output_resource='3';status_resource='4';heap='5';raw_expected_hash='11';raw_readback_hash='11';output_hash=@('22','11','33')[$phase];invalid_status=0}
+        }
+    }
+    $colorControls=@();$controlNames=@('nonfinite-input','nonfinite-resolve','canonical-overflow','restore-overflow','malformed-premultiplication')
+    $controlStatus=@(1,8,4,16,2)
+    for($i=0;$i -lt 5;$i++) {
+        $d=$colorDispatches[0] | ConvertTo-Json | ConvertFrom-Json
+        $d.serial=46+$i;$d.invalid_status=$controlStatus[$i];$colorDispatches+=$d
+        $colorControls += [pscustomobject]@{name=$controlNames[$i];stage='completed_gpu';serial=(46+$i);invalid_status=$controlStatus[$i];rejected=$true;published=$false}
+    }
+    foreach($name in @('unknown-primaries','unavailable-format-capability','unavailable-output-format')) {
+        $colorControls += [pscustomobject]@{name=$name;stage=$(if($name -eq 'unavailable-output-format'){'record'}else{'plan'});rejected=$true;submitted=$false}
+    }
+    Assert-ColorRows $colorRows $colorDispatches $colorContext $colorControls
+    Write-Output 'PASS color public parser valid machine fields'
+    function RejectColor([string]$Token) {
+        $refused=$false
+        try {Assert-ColorRows $colorRows $colorDispatches $colorContext $colorControls} catch {if($_.Exception.Message -ne $Token){throw};$refused=$true}
+        if(!$refused){throw 'color parser admitted invalid machine fields'}
+        Write-Output ('PASS color parser refusal '+$Token)
+    }
+    $colorContext[0].software=$true;RejectColor 'NR_QA_COLOR_CONTEXT';$colorContext[0].software=$false
+    $colorContext[0].worker_luid_low=3;RejectColor 'NR_QA_COLOR_CONTEXT';$colorContext[0].worker_luid_low=2
+    $colorDispatches[0].fence_completed=0;RejectColor 'NR_QA_COLOR_FENCE';$colorDispatches[0].fence_completed=1
+    $colorDispatches[0].status_cleared='false';RejectColor 'NR_QA_COLOR_FENCE';$colorDispatches[0].status_cleared=$true
+    $colorDispatches[0].canonical_resource='1';RejectColor 'NR_QA_COLOR_ALIAS';$colorDispatches[0].canonical_resource='2'
+    $colorDispatches[0].raw_readback_hash='12';RejectColor 'NR_QA_COLOR_SOURCE_IDENTITY';$colorDispatches[0].raw_readback_hash='11'
+    $colorRows[0].source_load='false';RejectColor 'NR_QA_COLOR_METADATA_OR_CAPS';$colorRows[0].source_load=$true
+    $colorRows[0].source_white_nits=80;RejectColor 'NR_QA_COLOR_METADATA_OR_CAPS';$colorRows[0].source_white_nits=203
+    $colorRows[0].normalized_codes=2;RejectColor 'NR_QA_COLOR_ORACLE';$colorRows[0].normalized_codes=0
+    $colorRows[0].normalized_codes=[double]::NaN;RejectColor 'NR_QA_COLOR_ORACLE';$colorRows[0].normalized_codes=0
+    $colorRows[0].half_ulps=3;RejectColor 'NR_QA_COLOR_ORACLE';$colorRows[0].half_ulps=0
+    $colorRows[0].alpha_errors=1;RejectColor 'NR_QA_COLOR_ORACLE';$colorRows[0].alpha_errors=0
+    $colorRows[0].identity_hash='12';RejectColor 'NR_QA_COLOR_IDENTITY';$colorRows[0].identity_hash='11'
+    $colorRows[0].prepare_serial=2;RejectColor 'NR_QA_COLOR_PHASE';$colorRows[0].prepare_serial=1
+    $colorControls[0].invalid_status=0;RejectColor 'NR_QA_COLOR_INVALID_STATUS';$colorControls[0].invalid_status=1
+    $colorControls[7].submitted=$true;RejectColor 'NR_QA_COLOR_ADMISSION_CONTROL';$colorControls[7].submitted=$false
+    $savedColorRows=$colorRows;$colorRows=@($colorRows[0..13])
+    RejectColor 'NR_QA_COLOR_ROW_SET';$colorRows=$savedColorRows
+}
