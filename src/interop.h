@@ -106,6 +106,8 @@ public:
  Bridge(const Bridge&)=delete;
  Bridge& operator=(const Bridge&)=delete;
  std::optional<Ticket> capture(const JobKey&,ID3D11Texture2D*);
+ // Scheduler reservation authority. Invalid/busy refusal changes no ownership or cursor.
+ std::optional<Ticket> capture_at(size_t,const JobKey&,ID3D11Texture2D*);
  std::optional<WorkerView> begin_worker(const Ticket&);
  bool submit_worker(const Ticket&);
  bool discard_recording(const Ticket&);

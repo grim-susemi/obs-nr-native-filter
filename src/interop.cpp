@@ -145,7 +145,13 @@ std::optional<Ticket> Bridge::capture(const JobKey& key,ID3D11Texture2D* borrowe
  if(!impl_||!impl_->on_graphics()||!key.valid()||key.resourceGeneration!=impl_->generation||
     key.submissionSerial<=impl_->lastSubmission||!impl_->shape(borrowed,source_format(impl_->descriptor.format),true))return std::nullopt;
  size_t index=0;for(;index<3;++index)if(reusable(impl_->snapshot(index)))break;
- if(index==3)return std::nullopt;auto& s=impl_->slots[index];const auto value=impl_->producerCursor.reserve();if(!value)return std::nullopt;
+ return capture_at(index,key,borrowed);
+}
+std::optional<Ticket> Bridge::capture_at(size_t index,const JobKey& key,ID3D11Texture2D* borrowed){
+ if(!impl_||!impl_->on_graphics()||index>=impl_->slots.size()||!key.valid()||key.resourceGeneration!=impl_->generation||
+    key.submissionSerial<=impl_->lastSubmission||!impl_->shape(borrowed,source_format(impl_->descriptor.format),true)||
+    !reusable(impl_->snapshot(index)))return std::nullopt;
+ auto& s=impl_->slots[index];const auto value=impl_->producerCursor.reserve();if(!value)return std::nullopt;
  s.producer=value;s.worker=0;s.consumer=0;s.consumerOpen=false;s.cancelled=false;s.failed=false;
  s.key.store(std::make_shared<const JobKey>(key));s.phase=WorkPhase::Captured;impl_->lastSubmission=key.submissionSerial;
  try{impl_->graphics->CopyResource(s.raw.Get(),borrowed);impl_->convert(s.raw.Get(),s.input11.Get());

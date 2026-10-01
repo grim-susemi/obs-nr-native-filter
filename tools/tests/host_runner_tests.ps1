@@ -100,7 +100,7 @@ try {
 } finally { Remove-Item -LiteralPath $task7Root }
 $evidence = $savedEvidence
 foreach ($future in @('flow-translation','color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) {
-    $token = if ($future -in @('flow-translation','color-alpha','native-model')) { 'NR_QA_EVIDENCE_REFUSED' } else { 'NR_QA_NOT_IMPLEMENTED' }
+    $token = if ($future -in @('flow-translation','color-alpha','native-model','native-bootstrap')) { 'NR_QA_EVIDENCE_REFUSED' } else { 'NR_QA_NOT_IMPLEMENTED' }
     Reject $future $root $runtime $token
 }
 if ((Test-Path $task7Root) -or (Test-Path $task7VerifierRoot)) { throw 'Task7 refusal leaked a host' }
@@ -148,7 +148,7 @@ try {
 } finally { Remove-Item -LiteralPath $task8Root }
 $evidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-2'
 foreach ($future in @('color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) {
-    $token=if($future -in @('color-alpha','native-model')){'NR_QA_EVIDENCE_REFUSED'}else{'NR_QA_NOT_IMPLEMENTED'}
+    $token=if($future -in @('color-alpha','native-model','native-bootstrap')){'NR_QA_EVIDENCE_REFUSED'}else{'NR_QA_NOT_IMPLEMENTED'}
     Reject $future $root $runtime $token
 }
 if ((Test-Path $task8Root) -or (Test-Path $task8VerifierRoot)) { throw 'Task8 refusal leaked a host' }

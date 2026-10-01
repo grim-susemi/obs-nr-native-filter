@@ -50,6 +50,72 @@ function Assert-NoUnrelatedProcess {
     $active = @(Get-Process | Where-Object { $_.ProcessName -match '^(obs64|nr-qa-host|CrimsonDesert|GTA5|GTA5_Enhanced|Cyberpunk2077|eldenring|BlackMythWukong|cs2|dota2|FortniteClient.*)$' })
     if ($active.Count) { throw ('NR_QA_UNRELATED_PROCESS: ' + ($active.Id -join ',')) }
 }
+function Assert-BootstrapRows($Frames,$Lanes,$Decoded,$Cleanup,$Slots,$SlotCleanup) {
+    if($Lanes.Count -ne 4 -or $Cleanup.Count -ne 4 -or $Slots.Count -ne 1 -or $SlotCleanup.Count -ne 1) { throw 'NR_QA_BOOTSTRAP_SET' }
+    $slot=$Slots[0]
+    if($slot.targeted_slot -ne 2 -or $slot.lower_reusable_slot -ne 0 -or $slot.old_api_slot -ne 0 -or
+        $slot.refusal_ownership_unchanged -isnot [bool] -or !$slot.refusal_ownership_unchanged -or
+        $slot.serial_not_consumed -isnot [bool] -or !$slot.serial_not_consumed -or $slot.producer_cursor -ne 6) { throw 'NR_QA_BOOTSTRAP_SLOT' }
+    foreach($close in @($Cleanup)+@($SlotCleanup)) {
+        if($close.closed -isnot [bool] -or !$close.closed -or $close.worker_exit -isnot [bool] -or
+            !$close.worker_exit -or $close.retained -isnot [bool] -or $close.retained) { throw 'NR_QA_BOOTSTRAP_CLEANUP' }
+    }
+    for($lane=0;$lane -lt 4;$lane++) {
+        $hdr=$lane -ge 2;$deterministic=($lane%2)-eq 0
+        $summary=$Lanes[$lane];$close=$Cleanup[$lane]
+        $group=@($Frames | Where-Object {$_.lane -eq $lane})
+        $recorded=@($Decoded | Where-Object {$_.lane -eq $lane})
+        if($summary.lane -ne $lane -or $close.lane -ne $lane -or $summary.hdr -isnot [bool] -or
+            $summary.deterministic -isnot [bool] -or $summary.hdr -ne $hdr -or $summary.deterministic -ne $deterministic -or
+            $summary.packets -lt 8 -or $summary.packets -gt 16 -or $recorded.Count -ne $summary.packets -or
+            $summary.decoded_frames -ne $recorded.Count -or $group.Count -lt 3 -or $group.Count -gt 16) { throw 'NR_QA_BOOTSTRAP_SET' }
+        $applied=0;$previous=$null
+        foreach($row in $group) {
+            foreach($field in @('hdr','deterministic','genuine_nr','same_latch_views')) {
+                if($row.$field -isnot [bool]) { throw 'NR_QA_BOOTSTRAP_BOOLEAN' }
+            }
+            if($row.hdr -ne $hdr -or $row.deterministic -ne $deterministic -or !$row.same_latch_views -or
+                $row.width -ne 1920 -or $row.height -ne 1080 -or $row.instance -le 0 -or $row.content_epoch -le 0 -or
+                $row.interval -ne 1000000000 -or $row.tick -ne ([Math]::Floor($row.clock/$row.interval)+1) -or
+                $row.ingress -le 0 -or $row.alpha_errors -ne 0 -or $row.source_id -ne $row.selected -or
+                $row.filter_id -ne $row.source_id -or $row.program_id -ne $row.source_id -or
+                $row.kind -notin @(1,2,3) -or $row.selected -ne $(if($row.kind -eq 1){$row.ingress}else{$row.ingress-1})) {
+                throw 'NR_QA_BOOTSTRAP_LINEAGE'
+            }
+            if($previous -and ($row.tick -ne $previous.tick+1 -or $row.ingress -ne $previous.ingress+1 -or
+                $row.unrelated_hash -ne $previous.unrelated_hash)) { throw 'NR_QA_BOOTSTRAP_LINEAGE' }
+            foreach($field in @('raw_hash','filter_hash','program_hash','unrelated_hash')) {
+                if(!$row.$field -or [UInt64]$row.$field -eq 0) { throw 'NR_QA_BOOTSTRAP_IMAGE_HASH' }
+            }
+            if($deterministic) {
+                if($row.genuine_nr -or $row.raw_hash -ne $row.filter_hash -or $row.same_key_nr_rms -ne 0) { throw 'NR_QA_BOOTSTRAP_DETERMINISTIC' }
+            }
+            if($row.kind -eq 3) {
+                $applied++
+                if($row.submission_serial -le 0 -or $row.history_epoch -le 0 -or $row.resource_generation -ne 1) { throw 'NR_QA_BOOTSTRAP_KEY' }
+                if(!$deterministic -and (!$row.genuine_nr -or $row.module_base -le 0 -or
+                    $row.same_key_nr_rms -is [string] -or [double]::IsNaN($row.same_key_nr_rms) -or
+                    [double]::IsInfinity($row.same_key_nr_rms) -or $row.same_key_nr_rms -le 0)) { throw 'NR_QA_BOOTSTRAP_NR_NOOP' }
+            }
+            $previous=$row
+        }
+        if($applied -lt 3) { throw 'NR_QA_BOOTSTRAP_PREVIEW_ONLY' }
+        $previousId=0;$positive=0
+        foreach($row in $recorded) {
+            if($row.width -ne 1920 -or $row.height -ne 1080 -or $row.bit_depth -ne $(if($hdr){10}else{8}) -or
+                ($hdr -and $row.transfer -ne 2) -or (!$hdr -and $row.transfer -eq 2) -or
+                $row.full_range -isnot [bool] -or $row.full_range -or
+                $row.primaries_matrix_preserved -isnot [bool] -or !$row.primaries_matrix_preserved -or
+                $row.codes_compared -ne 3110400 -or $row.code_errors -ne 0 -or
+                ($hdr -and $row.decoded_peak_linear_nits -le 200)) { throw 'NR_QA_BOOTSTRAP_CODEC_COLOR' }
+            if($previousId -and $row.source_id -ne $previousId+1) { throw 'NR_QA_BOOTSTRAP_DECODED_LINEAGE' }
+            if(!@($group | Where-Object {$_.program_id -eq $row.source_id -and $_.kind -eq 3}).Count) { throw 'NR_QA_BOOTSTRAP_PREVIEW_ONLY' }
+            if(!$deterministic -and $row.same_id_raw_decoded_nr_rms_codes -gt 0) {$positive++}
+            $previousId=$row.source_id
+        }
+        if(!$deterministic -and $positive -lt 3) { throw 'NR_QA_BOOTSTRAP_DECODED_NR_NOOP' }
+    }
+}
 function Assert-ModelRows($Rows,$Contexts,$Cleanup,$Modules) {
     if ($Rows.Count -ne 14 -or $Contexts.Count -ne 5 -or $Cleanup.Count -ne 5 -or !$Modules.Count) { throw 'NR_QA_MODEL_ROW_SET' }
     for ($lane=0;$lane -lt 5;$lane++) {
@@ -227,6 +293,13 @@ function Stage-Host {
     }
     $files = @('obs.dll','libobs-d3d11.dll','avcodec-62.dll','avformat-62.dll','avutil-60.dll','swscale-9.dll','swresample-6.dll','zlib.dll','w32-pthreads.dll','libx264-164.dll','librist.dll','srt.dll') | ForEach-Object { 'bin/64bit/' + $_ }
     $files += 'obs-plugins/64bit/obs-x264.dll'
+    if($Scenario -eq 'native-bootstrap') {
+        $files+=@('bin/64bit/avdevice-62.dll','bin/64bit/avfilter-11.dll','bin/64bit/obs-nvenc-test.exe','obs-plugins/64bit/obs-nvenc.dll','obs-plugins/64bit/obs-ffmpeg.dll')
+        foreach($module in @('obs-nvenc','obs-ffmpeg')) {
+            $files+=@(Get-ChildItem (Join-Path $installed ('data/obs-plugins/'+$module+'/locale')) -File |
+                ForEach-Object {'data/obs-plugins/'+$module+'/locale/'+$_.Name})
+        }
+    }
     if ($Scenario -eq 'sampler') { $files += 'bin/64bit/libobs-opengl.dll' }
     $files += @(Get-ChildItem (Join-Path $installed 'data/libobs') -File | ForEach-Object { 'data/libobs/' + $_.Name })
     $files += @(Get-ChildItem (Join-Path $installed 'data/obs-plugins/obs-x264/locale') -File | ForEach-Object { 'data/obs-plugins/obs-x264/locale/' + $_.Name })
@@ -234,13 +307,18 @@ function Stage-Host {
         'bin/64bit/obs.dll'='9B9A76F64A1D27262209F1CFBEAF6D57A175CC4E823C71882BB7D5B5AB99BDCF'
         'bin/64bit/libobs-d3d11.dll'='A2A065786F146EEE219031BC9A28845CFF78ABF570296E88DD5AD051ABB8188F'
         'obs-plugins/64bit/obs-x264.dll'='0610DAE11937263E4520FC2562845D50EF4B27A7EF3ABDB6997DFDE0CEA80EFC'
+        'obs-plugins/64bit/obs-nvenc.dll'='6187771511C43960016F79C760249C08E43A9835CAA0F58C9E41B98CC92032CC'
+        'obs-plugins/64bit/obs-ffmpeg.dll'='A47BE5E81294BF594905696DD3D1372F7E79F2BB9DABA9900DD166FDF62BFA12'
+        'bin/64bit/avdevice-62.dll'='824ED5CDCD7512F3EDAB94D28F7FA072353B4E0AFEBB14E4E08A6793686890AC'
+        'bin/64bit/avfilter-11.dll'='E9C3951157A47AC2FC692D8B4B346AD1A460D05ECC379FE35F615079A6EDB35E'
+        'bin/64bit/obs-nvenc-test.exe'='8AEB65065DA88D9C3919189871EE5508D8252AEBE01CEC8BCD82518D292FD3D4'
     }
     foreach ($file in $files) {
         $source = Join-Path $installed $file
         $dest = Join-Path $root $file
         $before = FileIdentity $source
         if ($pins.ContainsKey($file) -and $before.sha256 -ne $pins[$file]) { throw 'NR_QA_INSTALLED_IDENTITY_CHANGED' }
-        if ($file.EndsWith('.dll')) {
+        if ($file.EndsWith('.dll') -or $file -eq 'bin/64bit/obs-nvenc-test.exe') {
             $signature = Get-AuthenticodeSignature -LiteralPath $source
             if ($signature.Status -ne 'Valid' -or !$signature.SignerCertificate.Subject.Contains('OBS Project, LLC')) { throw 'NR_QA_OFFICIAL_SIGNATURE_REFUSED' }
             $before.signature_status = $signature.Status.ToString()
@@ -274,9 +352,11 @@ function Stage-Host {
         if ($staged.sha256 -ne $before.sha256 -or $staged.bytes -ne $before.bytes) { throw 'NR_QA_COLOR_SHADER_IDENTITY' }
         $script:binding += $staged
     }
-    if ($Scenario -eq 'native-model') {
+    if ($Scenario -in @('native-model','native-bootstrap')) {
         New-Item -ItemType Directory -Force (Join-Path $root 'profile/ngx-data') | Out-Null
-        foreach ($shader in @('nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')) {
+        $shaders=@('nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')
+        if($Scenario -eq 'native-bootstrap'){$shaders+='nr_obs_analysis.cso'}
+        foreach ($shader in $shaders) {
             $source=Join-Path (Split-Path $build) $shader
             $dest=Join-Path $root ('bin/64bit/' + $shader)
             $before=FileIdentity $source
