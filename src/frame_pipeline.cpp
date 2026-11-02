@@ -54,6 +54,7 @@ struct FramePipeline::Impl {
     std::promise<void> exitSignal;
     const std::shared_future<void> exitFuture = exitSignal.get_future().share();
     std::atomic<bool> exited{false};
+    std::atomic<bool> servicePending{false};
     std::thread worker;
     Impl(const Epochs& epochs, std::shared_ptr<Processor> p)
         : active(epochs), processor(std::move(p)), ticks(epochs.instanceId), current(std::make_unique<Generation>(epochs.resourceGeneration))
@@ -83,20 +84,27 @@ struct FramePipeline::Impl {
     {
         for (;;) {
             wake.acquire(); // Worker only.
+            servicePending.store(false,std::memory_order_release);
             const auto index = read.load(std::memory_order_relaxed);
             if (index != written.load(std::memory_order_acquire)) {
                 Slot* s = queue[index % queue.size()];
                 read.store(index + 1, std::memory_order_release);
                 s->stage.store(Stage::Running, std::memory_order_relaxed);
                 auto signal = std::move(s->signal);
-                try { s->output.emplace(processor->process(*s->work, stop.get_token())); }
+                try {
+                    const auto& owner=s->work->binding.workerProcessor?s->work->binding.workerProcessor:processor;
+                    s->output.emplace(owner->process(*s->work, stop.get_token()));
+                }
                 catch (...) { s->output.emplace(Processed{s->work->job, false, {}}); }
                 s->stage.store(Stage::Returned, std::memory_order_release);
                 signal.set_value(); // No further slot access: graphics may now collect it.
             }
-            if (stop.stop_requested() && read.load(std::memory_order_relaxed) == written.load(std::memory_order_acquire)) break;
+            processor->worker_service();
+            if (stop.stop_requested() && read.load(std::memory_order_relaxed) == written.load(std::memory_order_acquire)) {
+                processor->worker_stopping();
+                if(processor->worker_stop_complete())break;
+            }
         }
-        processor->worker_stopping();
         exited.store(true, std::memory_order_release);
         exitSignal.set_value();
     }
@@ -148,7 +156,7 @@ struct FramePipeline::Impl {
         }
         active.emplace(next->next);
         cancel_pending();
-        if (next->discardDelayed) { previous.reset(); phase = Phase::Priming; }
+        if (next->discardDelayed) { previous.reset(); published.reset(); phase = Phase::Priming; }
         retirementBlocked = false;
         return true;
     }
@@ -242,11 +250,13 @@ bool FramePipeline::finish(std::shared_ptr<const RawFrame> raw, const WorkBindin
             binding->captured.failed || binding->captured.cancelled || !binding->captured.producer ||
             (!binding->transport && !binding->processorLease)) return false;
         if (binding->captured.producer == UINT64_MAX || binding->captured.producerDone == UINT64_MAX ||
-            binding->captured.workerDone == UINT64_MAX || binding->captured.consumerDone == UINT64_MAX) return false;
+            binding->captured.workerDone == UINT64_MAX || binding->captured.consumerDone == UINT64_MAX ||
+            binding->captured.consumer == UINT64_MAX || binding->captured.consumerLease == UINT64_MAX) return false;
         if (binding->transport && (!binding->capturePin || !binding->capturePin->raw ||
             binding->capturePin->ticket != binding->ticket || !binding->capturePin->texture ||
-            !binding->captured.consumerOpen || !binding->captured.consumer ||
-            binding->capturePin->completionValue != binding->captured.consumer)) return false;
+            !binding->captured.consumerOpen || !binding->captured.consumerLease ||
+            binding->capturePin->leaseValue != binding->captured.consumerLease ||
+            !binding->transport->owns_consumer(*binding->capturePin))) return false;
         auto& s = *p.reserved;
         s.work.emplace(Work{s.admission.job, raw, *binding});
         std::destroy_at(&s.physical); // Ownership contains the frozen nonassignable JobKey.
@@ -279,16 +289,30 @@ bool FramePipeline::observe(const interop::Ticket& ticket, const interop::Owners
     // Reject malformed/reordered physical receipts. No failed sentinel can masquerade
     // as completion; publication cancels but physical ownership stays retained.
     if (receipt.producerDone == UINT64_MAX || receipt.workerDone == UINT64_MAX || receipt.consumerDone == UINT64_MAX ||
-        receipt.producer == UINT64_MAX || receipt.worker == UINT64_MAX || receipt.consumer == UINT64_MAX) {
+        receipt.producer == UINT64_MAX || receipt.worker == UINT64_MAX || receipt.consumer == UINT64_MAX ||
+        receipt.consumerLease == UINT64_MAX) {
         p.terminal(*s, PublicationEvent::Cancel);
         return false;
     }
     if (receipt.phase == interop::WorkPhase::Empty || receipt.producer < before.producer || receipt.worker < before.worker ||
-        receipt.consumer < before.consumer || receipt.producerDone < before.producerDone ||
+        receipt.consumer < before.consumer || receipt.consumerLease < before.consumerLease ||
+        receipt.producerDone < before.producerDone ||
         receipt.workerDone < before.workerDone || receipt.consumerDone < before.consumerDone ||
         (before.phase == interop::WorkPhase::Submitted && receipt.phase != interop::WorkPhase::Submitted) ||
         (before.phase == interop::WorkPhase::Discarded && receipt.phase != interop::WorkPhase::Discarded) ||
         (receipt.phase == interop::WorkPhase::Submitted && !receipt.worker)) return false;
+    if (s->work && s->work->binding.transport) {
+        const auto actual=s->work->binding.transport->ownership(ticket.slot);
+        if(!actual.key || *actual.key!=ticket.key || actual.consumerLease!=receipt.consumerLease ||
+            actual.consumer!=receipt.consumer || actual.consumerOpen!=receipt.consumerOpen ||
+            actual.consumerDone==UINT64_MAX || receipt.consumerDone>actual.consumerDone ||
+            (actual.failed && !receipt.failed) || (actual.cancelled && !receipt.cancelled)) return false;
+        // Same acquisition can close only with its newly reserved final target.
+        // Reopening requires a new serial, even for an otherwise identical ticket.
+        if((before.consumerOpen && !receipt.consumerOpen && receipt.consumerLease==before.consumerLease &&
+                receipt.consumer<=before.consumer) ||
+            (!before.consumerOpen && receipt.consumerOpen && receipt.consumerLease<=before.consumerLease)) return false;
+    }
     const bool failed = before.failed || receipt.failed;
     const bool cancelled = before.cancelled || receipt.cancelled;
     std::destroy_at(&s->physical);
@@ -346,6 +370,12 @@ size_t FramePipeline::retired_generations() const
 }
 Counters FramePipeline::counters() const { return impl_->counts; }
 void FramePipeline::collect() { if (impl_->on_graphics()) impl_->collect(); }
+void FramePipeline::service()
+{
+    if(impl_->on_graphics() && !impl_->exited.load(std::memory_order_acquire) &&
+        !impl_->servicePending.exchange(true,std::memory_order_acq_rel))
+        impl_->wake.release();
+}
 std::shared_future<void> FramePipeline::worker_exit() const { return impl_->exitFuture; }
 void FramePipeline::request_stop()
 {

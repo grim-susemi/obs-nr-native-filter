@@ -193,6 +193,71 @@ static void metadataTests() {
     }
     puts("metadata: missingExport/corruptPE/forwardedExport/noncanonical/movedImports refusal PASS");
 }
+static void ownedModuleRetry() {
+    auto lease=std::make_shared<int>(18);
+    std::weak_ptr<int> retained=lease;
+    bool allowed=false;
+    unsigned attempts=0;
+    const Dispatch dispatch{allocate,destroy,create,evaluate,release};
+    auto owner=Module::controlled(dispatch,{},lease,Route::Driver,[&] { ++attempts;return allowed; });
+    auto independent=Module::controlled(dispatch,{},std::make_shared<int>(19),Route::Driver);
+    auto* identity=owner.get();
+    lease.reset();
+    {
+        Pass live(owner);
+        check(!owner->close() && attempts==0);
+    }
+    check(!owner->close() && owner.get()==identity && !retained.expired());
+    check(!owner->close() && owner.get()==identity && attempts==2);
+    check(independent->close() && !retained.expired());
+    allowed=true;
+    check(owner->close() && owner.get()==identity && attempts==3);
+    check(owner->close() && attempts==3);
+    owner.reset();
+    check(retained.expired());
+    puts("PASS actual owned Module refusal/same-owner/retry/idempotence/independent owner");
+}
+static void vendorTrace() {
+    nr::lifecycle::VendorTrace trace, independent;
+    check(trace.snapshot().owner==0 && trace.snapshot().calls[0].count==0);
+    check(trace.bind(11,22,33,44));
+    check(!trace.bind(11,22,34,44));
+    check(independent.bind(51,52,53,54));
+    const nr::lifecycle::VendorBinding binding{61,62,63};
+    const auto refused=trace.call(nr::lifecycle::VendorStage::CoreInit,binding,[&] {
+        const auto pending=trace.snapshot();
+        check(pending.calls[0].count==1 && pending.calls[0].first.enter && !pending.calls[0].first.returned);
+        return nr::lifecycle::VendorResult{0xBAD00007u,0,0};
+    });
+    check(refused.result==0xBAD00007u);
+    trace.call(nr::lifecycle::VendorStage::CoreInit,binding,[] {return nr::lifecycle::VendorResult{1,0,0};});
+    trace.call(nr::lifecycle::VendorStage::NrShutdown,binding,[] {return nr::lifecycle::VendorResult{1,0,0};});
+    trace.call(nr::lifecycle::VendorStage::CapabilityDestroy,binding,[] {return nr::lifecycle::VendorResult{1,0,0};});
+    trace.call(nr::lifecycle::VendorStage::NrLibraryRelease,binding,[] {return nr::lifecycle::VendorResult{1,0,0};});
+    trace.call(nr::lifecycle::VendorStage::CoreShutdown,binding,[] {return nr::lifecycle::VendorResult{0xBAD00007u,0,0};});
+    trace.call(nr::lifecycle::VendorStage::CoreShutdown,binding,[] {return nr::lifecycle::VendorResult{1,2,0};});
+    const auto d=trace.snapshot();
+    check(d.coherent && d.owner==11 && d.instance==22 && d.generation==33 && d.device==44);
+    check(d.calls[0].first.result==0xBAD00007u && d.calls[0].latest.result==1 && d.calls[0].count==2);
+    check(d.calls[2].first.returned<d.calls[3].first.enter && d.calls[3].first.returned<d.calls[4].first.enter);
+    check(d.calls[4].first.returned<d.calls[5].first.enter);
+    check(d.calls[5].first.result==0xBAD00007u && d.calls[5].first.remaining==0 && d.calls[5].latest.remaining==2);
+    check(d.calls[5].count==2 && d.calls[5].first.module==61 && d.calls[5].first.procedure==62 && d.calls[5].first.thread==63);
+    check(!d.nestedCoreObserved && independent.snapshot().calls[5].count==0 && independent.snapshot().device==54);
+    check(nr::lifecycle::vendor_return_kind(nr::lifecycle::VendorStage::NrLibraryRelease)==nr::lifecycle::VendorReturnKind::Win32Bool);
+    check(nr::lifecycle::vendor_return_kind(nr::lifecycle::VendorStage::CapabilityDestroy)==nr::lifecycle::VendorReturnKind::SdkResult);
+    independent.call(nr::lifecycle::VendorStage::CoreLibraryRelease,binding,[] {return nr::lifecycle::VendorResult{0,0,5};});
+    check(independent.snapshot().calls[6].first.returned && independent.snapshot().calls[6].first.result==0 && independent.snapshot().calls[6].first.error==5);
+    try {independent.call(nr::lifecycle::VendorStage::CoreShutdown,binding,[]()->nr::lifecycle::VendorResult {throw std::runtime_error("controlled boundary exception");});}
+    catch(const std::runtime_error&) {}
+    independent.call(nr::lifecycle::VendorStage::CoreShutdown,binding,[] {return nr::lifecycle::VendorResult{1,0,0};});
+    check(independent.snapshot().calls[5].first.enter && !independent.snapshot().calls[5].first.returned && independent.snapshot().calls[5].latest.returned);
+    nr::lifecycle::ModelClose proof;
+    proof.settlement=proof.feature=proof.ofa=proof.module=proof.core=nr::lifecycle::CloseResult::Complete;
+    proof.coreCalled=true;proof.coreResult=0xBAD00007u;proof.coreRemaining=0;proof.vendor=d;
+    check(nr::lifecycle::close_model(proof)==nr::lifecycle::CloseBlock::CoreShutdown);
+    puts("PASS bounded production VendorTrace first/latest/ordering/owner/default-unknown; no vendor execution");
+}
 int main(int argc,char** argv) {
     try {
         if(argc==2 && std::string(argv[1])=="happy") happy();
@@ -200,7 +265,9 @@ int main(int argc,char** argv) {
         else if(argc==2 && std::string(argv[1])=="metadata") {
             auto r=inspect({settings().runtimePath,"e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a"});
             check(r.accepted && !r.loaded); puts("owner canonical path/hash/PE64/direct exports PASS; not loaded");
-        } else if(argc==1) { happy(); refused(); adversarial(); metadataTests(); }
+        } else if(argc==2 && std::string(argv[1])=="close") ownedModuleRetry();
+        else if(argc==2 && std::string(argv[1])=="trace") vendorTrace();
+        else if(argc==1) { happy(); refused(); adversarial(); metadataTests(); ownedModuleRetry(); vendorTrace(); }
         else return 2;
         check(handles.empty() && allocations==destroys);
         printf("PASS runtime_contract: %u checks\n",checks); return 0;

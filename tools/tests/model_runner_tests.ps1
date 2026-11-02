@@ -39,7 +39,7 @@ foreach($bad in @(($evidence+'-near'),(Join-Path $evidence 'nested'),(Join-Path 
 }
 foreach($pair in @(@($evidence,$producer,(Join-Path $Work 'out/task-11/native/Debug')),
     @((Join-Path $evidence 'verifier'),$verifier,(Join-Path $Work 'out/task-11-verifier/native/Debug')))){
-    foreach($missing in @('obs-nr-filter.dll','nr-qa-host.exe','nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')){
+    foreach($missing in @('obs-nr-filter.dll','nr-qa-host.exe','nr-driver-inspect.exe','nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')){
         # Same narrow actual-runner probe as accepted9a: isolate only process
         # presence/file availability, preserving Get-FileHash's PathType checks.
         $probe=@'
@@ -49,7 +49,7 @@ function global:Test-Path {
     [CmdletBinding()]param([Parameter(Position=0)][string]$Path,[string]$LiteralPath,[string]$PathType)
     $candidate=if($LiteralPath){$LiteralPath}else{$Path}
     $name=[IO.Path]::GetFileName($candidate)
-    if(!$PathType -and $name -in @('obs-nr-filter.dll','nr-qa-host.exe','nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')){
+    if(!$PathType -and $name -in @('obs-nr-filter.dll','nr-qa-host.exe','nr-driver-inspect.exe','nr_codec.dxil','nr_color.dxil','nr_guides.cso','nr_interop_vertex.cso','nr_interop_pixel.cso')){
         $global:queried.Add([IO.Path]::GetFullPath($candidate));return $name -ne '@MISSING@'
     }
     Microsoft.PowerShell.Management\Test-Path @PSBoundParameters

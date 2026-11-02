@@ -17,6 +17,10 @@ int main() {
         auto changed=*canonical;changed.g=3;changed.r=1;
         const auto edited=color_restore(*plan,raw,changed);
         expect(edited&&edited->r==raw.r&&edited->g==3&&edited->a==raw.a,"negative source channel/alpha lost on edit");
+        const auto protectedRaw=color_restore(*plan,raw,changed,false);
+        expect(protectedRaw&&*protectedRaw==raw,"missing actual reference changed same-key HDR raw/negative/alpha");
+        expect(color_constants(*plan,true,false).referenceValid==0&&
+            color_constants(*plan,true,true).referenceValid==1,"restore validity was not binary or default changed");
         const auto exposed=color_plan(d,{2,4},true);
         expect(exposed&&exposed->linearScale==2&&exposed->whitePoint==2,"exposure/preExposure ordering");
         expect(color_prepare(*exposed,raw)->g==4,"explicit scene exposure");
@@ -34,6 +38,8 @@ int main() {
                     const auto back=color_restore(*cp,input,*can);expect(back&&*back==input,"exact identity ramp/alpha");
                     auto edit=*can;edit.g*=0.95f;edit.a=1;
                     const auto out=color_restore(*cp,input,edit);expect(out&&out->a==input.a,"model alpha overwrote source");
+                    const auto protectedInput=color_restore(*cp,input,edit,false);
+                    expect(protectedInput&&*protectedInput==input,"cold/reset g=0 changed admitted source color/alpha");
                 }
                 const auto k=color_constants(*cp,false);
                 expect(k.width==8&&k.height==4&&k.originX==2&&k.originY==1,"active subrectangle scaled/rebased incorrectly");
@@ -54,6 +60,8 @@ int main() {
         const FrameDescriptor unknown{{1,1},{0,0,1,1},PixelFormat::Rgba16Float,ColorSpace::Unknown,AlphaMode::Straight,80};
         expect(!color_plan(unknown,{1,1},true),"unknown primaries admitted");
         expect(!color_prepare(*plan,{nan,1,1,1})&&!color_restore(*plan,raw,{nan,1,1,1}),"nonfinite claimed valid");
+        expect(!color_restore(*plan,raw,{nan,1,1,1},false)&&
+            !color_restore(*plan,{nan,1,1,1},changed,false),"g=0 disguised invalid source/NR answer as protected success");
         expect(!color_prepare(*pp,{1.1f,0,0,1}),"invalid normalized PQ accepted");
         for(const auto f:{PixelFormat::Unknown,PixelFormat::Bgra8,PixelFormat::Rgba8,PixelFormat::Rgba16Float,PixelFormat::Rgb10A2})
             for(const auto cs:{ColorSpace::Unknown,ColorSpace::Rec709Srgb,ColorSpace::ScRgbLinear,ColorSpace::Rec2020Linear,ColorSpace::Rec2020Pq})

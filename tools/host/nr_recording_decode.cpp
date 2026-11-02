@@ -81,8 +81,9 @@ obs_source_frame* decoded(void* opaque,obs_source_frame* frame)
 }
 void ended(void* opaque,calldata_t*) { SetEvent(static_cast<Probe*>(opaque)->complete); }
 }
-std::vector<DecodedFrame> decode_recording(const std::filesystem::path& file,bool hdr,uint32_t expectedFrames)
+std::vector<DecodedFrame> decode_recording(const std::filesystem::path& file,bool hdr,uint32_t expectedFrames,StreamRate rate)
 {
+    const auto decoderOptions=rate.decoder_options();
     // Registration is per libobs session, not global decoder/provider state.
     const char* id="nr_task12_decode_observer";
     if(!obs_source_get_display_name(id)) {
@@ -92,10 +93,10 @@ std::vector<DecodedFrame> decode_recording(const std::filesystem::path& file,boo
         obs_register_source(&info);
     }
     // OBS applies async filters to the closest frame at video_tick, not directly
-    // in the decoder callback. Observe a declared1fps elementary stream at60fps
-    // only after the actual production graph and encoder are fully retired.
+    // in the decoder callback. The declared stream rate remains the real rate;
+    // the separate decoder-only observation clock is never production evidence.
     obs_video_info video{};require(obs_get_video_info(&video),"decoder owned video info");
-    video.fps_num=60;video.fps_den=1;
+    video.fps_num=rate.decoder_observation_fps();video.fps_den=1;
     require(obs_reset_video(&video)==OBS_VIDEO_SUCCESS,"decoder-only observation clock reset");
     obs_set_video_levels(300,1000);
     obs_data_t* observerSettings=obs_data_create();
@@ -125,7 +126,7 @@ std::vector<DecodedFrame> decode_recording(const std::filesystem::path& file,boo
     obs_data_set_bool(settings,"restart_on_activate",false);
     obs_data_set_bool(settings,"clear_on_media_end",false);
     obs_data_set_bool(settings,"close_when_inactive",false);
-    obs_data_set_string(settings,"ffmpeg_options","framerate=1");
+    obs_data_set_string(settings,"ffmpeg_options",decoderOptions.c_str());
     obs_source_update(source,settings);obs_data_release(settings);
     const auto wait=WaitForSingleObject(probe->complete,90000);
     const auto framesWait=WaitForSingleObject(probe->framesComplete,90000);
@@ -135,6 +136,8 @@ std::vector<DecodedFrame> decode_recording(const std::filesystem::path& file,boo
     const auto failure=probe->failure;
     auto frames=std::move(probe->frames); // Removal synchronizes with the exact final callback.
     std::cout<<"NR_BOOTSTRAP_DECODER_STATE {\"expected\":"<<expectedFrames<<",\"observed\":"<<frames.size()
+        <<",\"stream_rate_num\":"<<rate.numerator<<",\"stream_rate_den\":"<<rate.denominator
+        <<",\"observation_rate_num\":"<<video.fps_num<<",\"observation_rate_den\":"<<video.fps_den
         <<",\"media_ended\":"<<(wait==WAIT_OBJECT_0?"true":"false")
         <<",\"frame_event\":"<<(framesWait==WAIT_OBJECT_0?"true":"false")<<"}"<<std::endl;
     require(wait==WAIT_OBJECT_0,"recording decoder exact media-ended timeout");

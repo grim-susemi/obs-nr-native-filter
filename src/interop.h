@@ -45,6 +45,7 @@ struct Ownership {
  WorkPhase phase;
  uint64_t producer,worker,consumer,producerDone,workerDone,consumerDone;
  bool consumerOpen,cancelled,failed;
+ uint64_t consumerLease=0; // Acquisition identity, never a completion requirement.
 };
 inline bool reusable(const Ownership& x){
  if(x.phase==WorkPhase::Empty)return !x.key;
@@ -86,11 +87,33 @@ struct WorkerView {
  ID3D12Resource* output;
  uint64_t completionValue;
 };
+class Bridge;
 struct Consumer {
- Ticket ticket;
- ID3D11Texture2D* texture;
- uint64_t completionValue;
- bool raw;
+ const Ticket ticket;
+ ID3D11Texture2D* const texture;
+ const uint64_t leaseValue;
+ const bool raw;
+ const Bridge* const bridge;
+ const Microsoft::WRL::ComPtr<ID3D11Fence> fence;
+ const DWORD graphicsOwner;
+};
+// Precreated exclusive one-use event. Bridge retains it on binding/Signal failure.
+class ConsumerEvent final {
+ HANDLE handle_;
+ bool bound_=false;
+ explicit ConsumerEvent(HANDLE handle):handle_(handle){}
+ friend class Bridge;
+public:
+ static std::shared_ptr<ConsumerEvent> create();
+ ~ConsumerEvent();
+ ConsumerEvent(const ConsumerEvent&)=delete;
+ ConsumerEvent& operator=(const ConsumerEvent&)=delete;
+ HANDLE handle()const{return handle_;}
+};
+struct ConsumerEnd {
+ const Consumer consumer;
+ const uint64_t completionValue;
+ const std::shared_ptr<ConsumerEvent> event;
 };
 // Own one resource generation, exactly three slots. This is transport, NOT Task10 scheduling.
 // Graphics calls are capture/acquire/copy/end/cancel/close. begin/submit/discard are one worker.
@@ -99,6 +122,7 @@ struct Consumer {
 class Bridge final {
  struct Impl;
  std::unique_ptr<Impl> impl_;
+ bool closed_=false; // Only an accepted close of the original Impl sets this.
 public:
  Bridge(std::shared_ptr<Context>,uint64_t generation,const FrameDescriptor&,
         std::span<const std::byte> vertexShader,std::span<const std::byte> pixelShader);
@@ -114,12 +138,14 @@ public:
  bool record_copy(const Ticket&); // Same-format canonical copy with explicit COMMON barriers.
  std::optional<Consumer> acquire_raw(const Ticket&);
  std::optional<Consumer> acquire_output(const Ticket&);
+ bool owns_consumer(const Consumer&)const; // Exact live acquisition and original provenance.
  bool copy_to(const Consumer&,ID3D11Texture2D*);
- bool end_consumer(const Consumer&);
+ std::shared_ptr<const ConsumerEnd> end_consumer(const Consumer&,std::shared_ptr<ConsumerEvent> = {});
  bool cancel(const Ticket&);
  Ownership ownership(size_t)const;
  bool quiescent()const;
  bool close(); // Never waits. False preserves all physical ownership.
+ bool closed()const{return closed_;}
  ID3D12Fence* producer_fence()const;
  ID3D12Fence* worker_fence()const;
  ID3D11Fence* consumer_fence()const;

@@ -66,9 +66,10 @@ std::optional<ColorPixel> color_prepare(const ColorPlan& p,ColorPixel raw) {
     if(!valid_pixel(result,p.codecColor)||std::abs(result.r)>65504||std::abs(result.g)>65504||std::abs(result.b)>65504) return {};
     return result;
 }
-std::optional<ColorPixel> color_restore(const ColorPlan& p,ColorPixel raw,ColorPixel resolved) {
+std::optional<ColorPixel> color_restore(const ColorPlan& p,ColorPixel raw,ColorPixel resolved,bool referenceValid) {
     const auto prepared=color_prepare(p,raw);
     if(!prepared||!valid_pixel(resolved,p.codecColor)) return {};
+    if(!referenceValid)return raw;
     const auto half=[](float x) {return DirectX::PackedVector::XMConvertHalfToFloat(DirectX::PackedVector::XMConvertFloatToHalf(x));};
     if((p.source.alpha==AlphaMode::Premultiplied&&raw.a==0)||
         (prepared->r==resolved.r&&prepared->g==resolved.g&&prepared->b==resolved.b)||
@@ -87,9 +88,9 @@ std::optional<ColorPixel> color_restore(const ColorPlan& p,ColorPixel raw,ColorP
     if(p.source.format==PixelFormat::Rgba16Float&&(std::abs(raw.r)>65504||std::abs(raw.g)>65504||std::abs(raw.b)>65504)) return {};
     return valid_pixel(raw,p.source.color)?std::optional<ColorPixel>(raw):std::nullopt;
 }
-ColorConstants color_constants(const ColorPlan& p,bool restore) {
+ColorConstants color_constants(const ColorPlan& p,bool restore,bool referenceValid) {
     return {restore?1u:0u,static_cast<uint32_t>(p.source.color),static_cast<uint32_t>(p.source.alpha),
-        p.source.active.width,p.source.active.height,p.source.active.x,p.source.active.y,0,p.linearScale,{}};
+        p.source.active.width,p.source.active.height,p.source.active.x,p.source.active.y,referenceValid?1u:0u,p.linearScale,{}};
 }
 D3D12ColorPass::D3D12ColorPass(ID3D12Device* device,std::span<const std::byte> shader):device_(device) {
     if(!device||shader.empty()) throw std::invalid_argument("color pass requires explicit device and shader");
@@ -112,7 +113,7 @@ D3D12ColorPass::D3D12ColorPass(ID3D12Device* device,std::span<const std::byte> s
     check(device->CreateComputePipelineState(&ps,IID_PPV_ARGS(&pipeline_)));
 }
 bool D3D12ColorPass::record(ID3D12GraphicsCommandList* cmd,ID3D12DescriptorHeap* heap,const ColorPlan& p,
-    ID3D12Resource* raw,ID3D12Resource* canonical,ID3D12Resource* output,ID3D12Resource* invalidStatus,bool restore) {
+    ID3D12Resource* raw,ID3D12Resource* canonical,ID3D12Resource* output,ID3D12Resource* invalidStatus,bool restore,bool referenceValid) {
     if(!cmd||!heap||!raw||!canonical||!output||!invalidStatus||raw==canonical||raw==output||canonical==output) return false;
     const auto hd=heap->GetDesc();
     if(hd.Type!=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV||hd.NumDescriptors<4||!(hd.Flags&D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return false;
@@ -162,7 +163,7 @@ bool D3D12ColorPass::record(ID3D12GraphicsCommandList* cmd,ID3D12DescriptorHeap*
     view={};view.Format=DXGI_FORMAT_R32_TYPELESS;view.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;
     view.Buffer.NumElements=1;view.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
     device_->CreateUnorderedAccessView(invalidStatus,nullptr,&view,cpu);
-    const auto constants=color_constants(p,restore);
+    const auto constants=color_constants(p,restore,referenceValid);
     cmd->SetDescriptorHeaps(1,&heap);cmd->SetComputeRootSignature(root_.Get());cmd->SetPipelineState(pipeline_.Get());
     cmd->SetComputeRoot32BitConstants(0,sizeof(constants)/4,&constants,0);
     cmd->SetComputeRootDescriptorTable(1,heap->GetGPUDescriptorHandleForHeapStart());

@@ -1,0 +1,22 @@
+# Task13 CPU lifecycle leaf. Shared steward imports only after integration release.
+get_filename_component(NR_LIFECYCLE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+add_library(nr_lifecycle STATIC "${NR_LIFECYCLE_ROOT}/src/nr_lifecycle.cpp")
+target_link_libraries(nr_lifecycle PUBLIC nr_scheduler)
+target_include_directories(nr_lifecycle PUBLIC "${NR_LIFECYCLE_ROOT}/src")
+target_compile_features(nr_lifecycle PUBLIC cxx_std_20)
+target_compile_options(nr_lifecycle PRIVATE /W4 /WX /permissive-)
+add_executable(lifecycle_contract_tests "${NR_LIFECYCLE_ROOT}/tools/tests/lifecycle_contract_tests.cpp")
+target_link_libraries(lifecycle_contract_tests PRIVATE nr_lifecycle)
+target_compile_options(lifecycle_contract_tests PRIVATE /W4 /WX /permissive-)
+add_test(NAME lifecycle_contract COMMAND lifecycle_contract_tests)
+set_tests_properties(lifecycle_contract PROPERTIES TIMEOUT 60)
+add_test(NAME lifecycle_closure_diagnostics COMMAND lifecycle_contract_tests --closure)
+add_test(NAME native_output_closure COMMAND native_output_lifetime_tests --closure)
+add_test(NAME lifecycle_stop_retry COMMAND lifecycle_contract_tests --stop-retry)
+add_test(NAME native_output_production_closure COMMAND native_output_lifetime_tests --production-closure)
+set_tests_properties(lifecycle_closure_diagnostics native_output_closure PROPERTIES TIMEOUT 60)
+set_tests_properties(native_output_closure PROPERTIES
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")
+set_tests_properties(lifecycle_stop_retry native_output_production_closure PROPERTIES TIMEOUT 60)
+set_tests_properties(native_output_production_closure PROPERTIES
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")

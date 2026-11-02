@@ -2,7 +2,7 @@
 // Explicit color boundary only. Frozen nr_codec remains the model proxy/resolve.
 cbuffer Params:register(b0) {
     uint mode,color,alpha,width;
-    uint height,originX,originY,padding;
+    uint height,originX,originY,referenceValid;
     float linearScale; float3 reserved;
 };
 Texture2D<float4> original:register(t0);
@@ -94,6 +94,9 @@ void main(uint3 id:SV_DispatchThreadID) {
     if(mode==0) { outputImage[id.xy]=float4(prepared,raw.a);return; }
     float4 resolved=canonical.Load(int3(id.xy,0));
     if(!Valid(resolved,color==1)) { Invalid(id.xy,raw,8);return; }
+    // No real prior guide pair exists on cold/reset. Preserve exact source,
+    // after validating the real unprotected NR answer; D remains independently observed.
+    if(referenceValid==0) { outputImage[id.xy]=raw;return; }
     // Frozen core strength-zero returns its untouched FP16 canonical input.
     // Compare in that declared representation, not against unquantized math.
     float3 storedPrepared=f16tof32(f32tof16(prepared));

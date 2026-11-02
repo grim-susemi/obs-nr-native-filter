@@ -145,7 +145,8 @@ uint64_t image_hash(const std::vector<ColorPixel>& pixels,DXGI_FORMAT format) {
 struct Result {std::vector<ColorPixel> pixels;uint32_t invalid;bool refused=false;};
 Result dispatch(ID3D12Device* device,ID3D12CommandQueue* queue,std::span<const std::byte> shader,
     const ColorPlan& plan,DXGI_FORMAT rawFormat,const std::vector<ColorPixel>& raw,
-    const std::vector<ColorPixel>& canonical,bool restore,std::ostream* evidence=nullptr,uint32_t serial=0,bool refuseFormat=false) {
+    const std::vector<ColorPixel>& canonical,bool restore,std::ostream* evidence=nullptr,uint32_t serial=0,
+    bool refuseFormat=false,bool referenceValid=true) {
     auto run=std::make_unique<Run>();run->device=device;run->queue=queue;
     // Cleanup registered in Run before any list submission. On uncertain physical
     // completion retain the complete owner, including queue/list/upload/PSO/event.
@@ -186,7 +187,7 @@ Result dispatch(ID3D12Device* device,ID3D12CommandQueue* queue,std::span<const s
         void* mapped=nullptr;D3D12_RANGE empty{0,0};check(zero->Map(0,&empty,&mapped));std::memset(mapped,0,4);zero->Unmap(0,nullptr);
         run->list->CopyBufferRegion(status,0,zero,0,4);
         barrier(run->list.Get(),status,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        const bool recorded=run->pass->record(run->list.Get(),run->heap.Get(),plan,input,model,output,status,restore);
+        const bool recorded=run->pass->record(run->list.Get(),run->heap.Get(),plan,input,model,output,status,restore,referenceValid);
         if(refuseFormat) {
             require(!recorded,"unavailable output format admitted");
             run.reset();
@@ -236,6 +237,7 @@ Result dispatch(ID3D12Device* device,ID3D12CommandQueue* queue,std::span<const s
         const auto heapId=reinterpret_cast<uintptr_t>(run->heap.Get());
         run.reset(); // actual cleanup before the row asserts cleanup
         if(evidence) *evidence<<"NR_COLOR_DISPATCH {\"serial\":"<<serial<<",\"restore\":"<<(restore?"true":"false")
+            <<",\"reference_valid\":"<<(referenceValid?"true":"false")
             <<",\"width\":16,\"height\":8,\"source_format\":"<<rawFormat<<",\"output_format\":"<<outputFormat
             <<",\"source_resource\":\""<<inputId<<"\",\"canonical_resource\":\""<<canonicalId<<"\",\"output_resource\":\""<<outputId
             <<"\",\"status_resource\":\""<<statusId<<"\",\"heap\":\""<<heapId<<"\",\"status_cleared\":true,\"invalid_status\":"<<result.invalid
@@ -335,6 +337,9 @@ ColorProof run_color_scenario(ID3D12Device* device,ID3D12CommandQueue* queue,std
             const uint32_t restoreSerial=++serial;
             const auto restored=dispatch(device,queue,shader,*plan,dxgi,raw,canonical,true,evidence,restoreSerial);
             require(restored.invalid==0,"valid restore marked invalid");
+            const uint32_t protectedSerial=++serial;
+            const auto protectedRaw=dispatch(device,queue,shader,*plan,dxgi,raw,canonical,true,evidence,protectedSerial,false,false);
+            require(protectedRaw.invalid==0&&protectedRaw.pixels==raw,"actual cold/reset shader g=0 changed source RGB/alpha");
             std::vector<ColorPixel> oracleRestored(128);uint32_t negativeChecks=0;
             for(size_t i=0;i<128;++i) {
                 oracleRestored[i]=oracle_restore(*plan,raw[i],canonical[i]);
@@ -369,8 +374,8 @@ ColorProof run_color_scenario(ID3D12Device* device,ID3D12CommandQueue* queue,std
     std::vector<ColorPixel> invalid(128,{1,1,1,1}),model(128,{1,1,1,1});
     invalid[0].r=std::numeric_limits<float>::quiet_NaN();
     const auto invalidControl=[&](const char* name,const ColorPlan& p,DXGI_FORMAT format,const std::vector<ColorPixel>& input,
-        const std::vector<ColorPixel>& resolved,bool restore,uint32_t expectedStatus) {
-        const auto id=++serial;const auto result=dispatch(device,queue,shader,p,format,input,resolved,restore,evidence,id);
+        const std::vector<ColorPixel>& resolved,bool restore,uint32_t expectedStatus,bool referenceValid=true) {
+        const auto id=++serial;const auto result=dispatch(device,queue,shader,p,format,input,resolved,restore,evidence,id,false,referenceValid);
         require(result.invalid==expectedStatus,"invalid GPU status does not deny publication with exact reason");
         if(evidence) *evidence<<"NR_COLOR_CONTROL {\"name\":\""<<name<<"\",\"stage\":\"completed_gpu\",\"serial\":"<<id
             <<",\"invalid_status\":"<<result.invalid<<",\"rejected\":true,\"published\":false}"<<std::endl;
@@ -378,6 +383,7 @@ ColorProof run_color_scenario(ID3D12Device* device,ID3D12CommandQueue* queue,std
     invalidControl("nonfinite-input",*plan,DXGI_FORMAT_R16G16B16A16_FLOAT,invalid,model,false,1);
     invalid[0]={1,1,1,1};model[0].g=std::numeric_limits<float>::infinity();
     invalidControl("nonfinite-resolve",*plan,DXGI_FORMAT_R16G16B16A16_FLOAT,invalid,model,true,8);
+    invalidControl("nonfinite-protected-resolve",*plan,DXGI_FORMAT_R16G16B16A16_FLOAT,invalid,model,true,8,false);
     const auto exposed=color_plan(linear,{1,2},true);invalid.assign(128,{65504,65504,65504,1});
     model.assign(128,{1,1,1,1});
     invalidControl("canonical-overflow",*exposed,DXGI_FORMAT_R16G16B16A16_FLOAT,invalid,model,false,4);

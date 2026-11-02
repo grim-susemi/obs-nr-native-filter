@@ -49,7 +49,9 @@ struct GraphicsState {
 enum class Action {None,Init,RawProbe,Verify,Reuse,Cleanup};
 struct Harness {
  // Cleanup/event ownership is established before any device, queue, resource or worker.
- Event acted,submitted,discardTrigger,workerExited,workerComplete,consumerComplete,producerComplete;
+ Event acted,submitted,discardTrigger,workerExited,workerComplete,producerComplete;
+ std::shared_ptr<ConsumerEvent> consumerComplete=ConsumerEvent::create();
+ std::shared_ptr<const ConsumerEnd> consumerEnd;
  std::atomic<Action> action{Action::None};std::atomic<bool> failed{false},workerFailed{false};
  PixelFormat format;unsigned generation;std::vector<std::byte> vs,ps;std::vector<uint8_t> expected;
  gs_texture_t* source=nullptr;Ptr<ID3D11Device> device11;Ptr<ID3D11DeviceContext> graphics;
@@ -104,11 +106,15 @@ struct Harness {
  void verify(){
   std::vector<Consumer> consumers;for(size_t i=0;i<3;++i){const auto c=i==2?bridge->acquire_raw(*tickets[i]):bridge->acquire_output(*tickets[i]);require(c.has_value(),"completed consumer missing");consumers.push_back(*c);}
   require(!bridge->acquire_output(*tickets[2]),"cancelled completion resurrected");
-  require(bridge->consumer_fence()->GetCompletedValue()<consumers.back().completionValue,"unsignalled consumer fence already complete");
+  for(const auto& c:consumers)require(bridge->owns_consumer(c) &&
+   bridge->ownership(c.ticket.slot).consumerLease==c.leaseValue,"exact open consumer acquisition");
   require(!bridge->quiescent()&&!bridge->close(),"incomplete consumer generation released");
   auto* borrowed=static_cast<ID3D11Texture2D*>(gs_texture_get_obj(source));require(!bridge->capture(key(4),borrowed),"incomplete consumer slot reused");
   const GraphicsState before(graphics.Get());
-  for(const auto& c:consumers){require(bridge->copy_to(c,target.Get()),"output conversion failed");require(bridge->end_consumer(c),"consumer signal failed");const auto data=readback();outputErrors+=errors(data);outputHash=hash(data);}
+  for(size_t i=0;i<consumers.size();++i){const auto& c=consumers[i];require(bridge->copy_to(c,target.Get()),"output conversion failed");
+   const auto ending=bridge->end_consumer(c,i+1==consumers.size()?consumerComplete:nullptr);
+   require(static_cast<bool>(ending),"consumer signal failed");if(i+1==consumers.size())consumerEnd=ending;
+   const auto data=readback();outputErrors+=errors(data);outputHash=hash(data);}
   restored=restored&&before.equal(GraphicsState(graphics.Get()));require(outputErrors==0&&restored,"roundtrip numeric/alpha/state mismatch");
  }
  void reuse(){
@@ -156,11 +162,14 @@ bool nr_run_interop_scenario(const std::filesystem::path& root){
    obs_add_main_render_callback(draw,h.get());callback=true;h->execute(Action::Init);
    // Fence subscriptions exist BEFORE worker submissions and before releasing its deterministic GPU gate.
    checked(h->bridge->worker_fence()->SetEventOnCompletion(3,h->workerComplete.handle));
-   checked(h->bridge->consumer_fence()->SetEventOnCompletion(6,h->consumerComplete.handle));
+   require(static_cast<bool>(h->consumerComplete),"fresh exclusive final consumer event");
    checked(h->bridge->producer_fence()->SetEventOnCompletion(4,h->producerComplete.handle));
    h->worker=std::thread(worker,h.get());h->submitted.await();require(!h->workerFailed,"worker failed before raw probe");
    h->execute(Action::RawProbe);checked(h->gate->Signal(1));h->workerComplete.await();
-   h->execute(Action::Verify);h->consumerComplete.await();h->execute(Action::Reuse);h->producerComplete.await();
+   h->execute(Action::Verify);require(h->consumerEnd && h->consumerEnd->event==h->consumerComplete &&
+    WaitForSingleObject(h->consumerComplete->handle(),15000)==WAIT_OBJECT_0 &&
+    completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==Completion::Complete,
+    "exact final consumer ending completion");h->execute(Action::Reuse);h->producerComplete.await();
    h->discardTrigger.signal();h->workerExited.await();h->worker.join();require(!h->workerFailed,"worker discard failed");
    h->execute(Action::Cleanup);obs_remove_main_render_callback(draw,h.get());callback=false;
   }catch(const std::exception& e){

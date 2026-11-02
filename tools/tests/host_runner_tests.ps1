@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Work, [switch]$Task8Only, [switch]$Task9Only)
+param([Parameter(Mandatory)][string]$Work, [switch]$Task8Only, [switch]$Task9Only, [switch]$Task14AttemptOnly)
 $ErrorActionPreference = 'Stop'
 $runner = Join-Path $Work 'tools/Invoke-NrQa.ps1'
 $evidence = Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-2'
@@ -26,6 +26,26 @@ function Reject([string]$Scenario, [string]$Root, [string]$Runtime, [string]$Tok
         if (!$child.ExitCode -or !$text.Contains($Token)) { throw ('Wrong refusal: ' + $text) }
         Write-Output ('PASS refusal ' + $Token)
     } finally { $exitSignal.Dispose(); $child.Dispose() }
+}
+if($Task14AttemptOnly) {
+    $baseEvidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-14'
+    $evidence=Join-Path $baseEvidence 'attempts/native03'
+    $root=Join-Path $Work 'out/task-14-native03/host'
+    if(Test-Path -LiteralPath $root){throw 'Fresh Task14 attempt CPU root required'}
+    Reject 'two-instances' $root 'C:/not-selected/runtime.dll' 'NR_QA_RUNTIME_REFUSED' '-Task14Attempt native03'
+    Reject 'two-instances' (Join-Path $Work 'out/task-14/host') $runtime 'NR_QA_FOREIGN_ROOT' '-Task14Attempt native03'
+    Reject 'two-instances' ($root+'-near') $runtime 'NR_QA_FOREIGN_ROOT' '-Task14Attempt native03'
+    Reject 'two-instances' $root $runtime 'ParameterArgumentValidationError' '-Task14Attempt ../foreign'
+    Reject 'host-foundation' $root $runtime 'NR_QA_INSTANCE_ATTEMPT_SCOPE' '-Task14Attempt native03'
+    foreach($badEvidence in @($baseEvidence,(Join-Path $baseEvidence 'verifier'),($evidence+'-near'),(Join-Path $evidence 'nested'))) {
+        $evidence=$badEvidence
+        Reject 'two-instances' $root $runtime 'NR_QA_EVIDENCE_REFUSED' '-Task14Attempt native03'
+    }
+    $evidence=Join-Path $baseEvidence 'attempts/native03'
+    Reject 'two-instances' $root $runtime 'NR_QA_EVIDENCE_REFUSED'
+    if((Test-Path -LiteralPath $root) -or (Test-Path -LiteralPath $evidence)){throw 'Task14 attempt refusal created a native path'}
+    Write-Output 'TASK14_ATTEMPT_CPU_PASS cases=10 native=false'
+    return
 }
 if (!$Task8Only -and !$Task9Only) {
 if (Test-Path $root) { throw 'QA root must be absent before CPU tests' }
@@ -100,7 +120,7 @@ try {
 } finally { Remove-Item -LiteralPath $task7Root }
 $evidence = $savedEvidence
 foreach ($future in @('flow-translation','color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) {
-    $token = if ($future -in @('flow-translation','color-alpha','native-model','native-bootstrap')) { 'NR_QA_EVIDENCE_REFUSED' } else { 'NR_QA_NOT_IMPLEMENTED' }
+    $token = if ($future -in @('flow-translation','color-alpha','native-model','native-bootstrap')) { 'NR_QA_EVIDENCE_REFUSED' } else { 'NR_FAULT_PARENT_ADMISSION_REQUIRED' }
     Reject $future $root $runtime $token
 }
 if ((Test-Path $task7Root) -or (Test-Path $task7VerifierRoot)) { throw 'Task7 refusal leaked a host' }
@@ -148,7 +168,7 @@ try {
 } finally { Remove-Item -LiteralPath $task8Root }
 $evidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-2'
 foreach ($future in @('color-alpha','native-model','native-bootstrap','handled-faults','shutdown')) {
-    $token=if($future -in @('color-alpha','native-model','native-bootstrap')){'NR_QA_EVIDENCE_REFUSED'}else{'NR_QA_NOT_IMPLEMENTED'}
+    $token=if($future -in @('color-alpha','native-model','native-bootstrap')){'NR_QA_EVIDENCE_REFUSED'}else{'NR_FAULT_PARENT_ADMISSION_REQUIRED'}
     Reject $future $root $runtime $token
 }
 if ((Test-Path $task8Root) -or (Test-Path $task8VerifierRoot)) { throw 'Task8 refusal leaked a host' }

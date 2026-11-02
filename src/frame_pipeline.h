@@ -12,6 +12,7 @@ struct RawFrame {
     const IngressSample input;
     const std::shared_ptr<const void> image;
 };
+class Processor;
 struct WorkBinding {
     const interop::Ticket ticket;
     const interop::Ownership captured;
@@ -20,7 +21,10 @@ struct WorkBinding {
     // Real Bridge capture MUST be pinned against early physical-slot reuse until
     // its deadline selection. Graphics ends this raw Consumer before acquiring the
     // selected output Consumer, then delivers the actual updated ownership receipt.
+    // Pin leaseValue identifies acquisition; captured.consumer is a fence target,
+    // not the pin identity. Only final end reserves the pin's completion target.
     const std::optional<interop::Consumer> capturePin = std::nullopt;
+    const std::shared_ptr<Processor> workerProcessor = {}; // Exact physical generation owner.
 };
 struct Work {
     const JobContract job;
@@ -39,7 +43,9 @@ class Processor {
 public:
     virtual ~Processor() = default;
     virtual Processed process(const Work&, std::stop_token) = 0;
+    virtual void worker_service() noexcept {}
     virtual void worker_stopping() noexcept {}
+    virtual bool worker_stop_complete() const noexcept { return true; }
 };
 struct Admission {
     const JobContract job;
@@ -91,6 +97,7 @@ public:
     size_t retired_generations() const;
     Counters counters() const;
     void collect();
+    void service(); // Notify existing worker; never calls vendor cleanup on graphics.
     std::shared_future<void> worker_exit() const; // Subscribe BEFORE request_stop.
     void request_stop();
     bool try_close(); // Nonblocking refusal while ANY ownership is unresolved.

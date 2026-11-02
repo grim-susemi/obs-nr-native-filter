@@ -80,5 +80,8 @@ public:
     uint32_t grid_size() const;
     uint32_t hint_grid_size() const;
     DXGI_FORMAT cost_format() const;
+    // Worker-only copied descriptors of actual owned allocations, including cold
+    // reset. Descriptors are not flow pixels or an ordinary-guide positive.
+    std::array<D3D12_RESOURCE_DESC,2> observation_descriptors() const;
 };
 }

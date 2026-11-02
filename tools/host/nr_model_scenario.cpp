@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "nr_model_scenario.h"
 #include "nr_model.h"
+#include "nr_model_ownership.h"
+#include "capture_pin_observation.h"
 #include "nr_color_scenario.h"
 #include <obs.h>
 #include <algorithm>
@@ -52,41 +54,60 @@ void transition(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,
     D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after}; list->ResourceBarrier(1,&barrier);
 }
+// Exact owner objects of one readback submission. Once the command list has been executed
+// these must outlive this function if completion was not exactly confirmed.
+struct ReadbackOwner {
+    ComPtr<ID3D12Resource> target;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commands;
+    ComPtr<ID3D12Fence> fence;
+    Event complete;
+};
 // Finite QA only, outside renderer and after exact model physical completion.
 std::vector<uint8_t> readback(interop::Context& context,ID3D12Resource* resource) {
     require(resource!=nullptr,"native GPU readback resource");
     const auto desc=resource->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 total=0;
     context.device()->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&total);
-    ComPtr<ID3D12Resource> target; D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_READBACK;
+    auto owner=std::make_unique<ReadbackOwner>();
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC buffer{}; buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; buffer.Width=total;
     buffer.Height=1; buffer.DepthOrArraySize=buffer.MipLevels=1; buffer.SampleDesc.Count=1;
     buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     checked(context.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,
-        nullptr,IID_PPV_ARGS(&target)),"native QA readback allocation");
-    ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> commands; ComPtr<ID3D12Fence> fence;
-    Event complete;
-    checked(context.device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"native QA allocator");
-    checked(context.device()->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,
-        IID_PPV_ARGS(&commands)),"native QA list");
-    checked(context.device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"native QA fence");
-    transition(commands.Get(),resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION destination{}; destination.pResource=target.Get();
+        nullptr,IID_PPV_ARGS(&owner->target)),"native QA readback allocation");
+    checked(context.device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&owner->allocator)),"native QA allocator");
+    checked(context.device()->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,owner->allocator.Get(),nullptr,
+        IID_PPV_ARGS(&owner->commands)),"native QA list");
+    checked(context.device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&owner->fence)),"native QA fence");
+    transition(owner->commands.Get(),resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION destination{}; destination.pResource=owner->target.Get();
     destination.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; destination.PlacedFootprint=footprint;
     D3D12_TEXTURE_COPY_LOCATION source{}; source.pResource=resource; source.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    commands->CopyTextureRegion(&destination,0,0,0,&source,nullptr);
-    transition(commands.Get(),resource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
-    checked(commands->Close(),"native QA close");
-    checked(fence->SetEventOnCompletion(1,complete.value),"native QA pre-trigger completion subscription");
-    ID3D12CommandList* lists[]{commands.Get()}; context.queue()->ExecuteCommandLists(1,lists);
-    checked(context.queue()->Signal(fence.Get(),1),"native QA signal"); complete.wait();
-    require(fence->GetCompletedValue()==1,"native QA physical completion");
-    const size_t pixelBytes=desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?8:4;
-    const size_t row=static_cast<size_t>(desc.Width)*pixelBytes;
+    owner->commands->CopyTextureRegion(&destination,0,0,0,&source,nullptr);
+    transition(owner->commands.Get(),resource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    checked(owner->commands->Close(),"native QA close");
+    checked(owner->fence->SetEventOnCompletion(1,owner->complete.value),"native QA pre-trigger completion subscription");
+    ID3D12CommandList* lists[]{owner->commands.Get()}; context.queue()->ExecuteCommandLists(1,lists);
+    // From here the GPU owns the submission. Signal failure and an unobserved completion
+    // event are both unresolved: the exact owner objects move to process-lifetime custody
+    // and the caller must not run the settled cleanup.
+    const auto signal=context.queue()->Signal(owner->fence.Get(),1);
+    const auto observed=SUCCEEDED(signal) && WaitForSingleObject(owner->complete.value,30000)==WAIT_OBJECT_0?
+        owner->fence->GetCompletedValue():0;
+    if(qa::settle_readback_owner(true,signal,observed,1,owner)) {
+        std::cout<<"NR_MODEL_READBACK_RETAINED unresolved=true signal="<<static_cast<uint32_t>(signal)
+            <<" observed="<<observed<<" required=1 pid="<<GetCurrentProcessId()<<std::endl;
+        throw std::runtime_error("native QA unresolved readback completion");
+    }
+    // The helper only declines custody on an exactly confirmed completion; keep the explicit
+    // check so a future helper change can never silently proceed without the required value.
+    require(observed==1,"native QA physical completion");
+    const size_t pixelBytes=desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?8:4;    const size_t row=static_cast<size_t>(desc.Width)*pixelBytes;
     std::vector<uint8_t> result(row*desc.Height); void* mapped=nullptr;
-    const D3D12_RANGE range{0,static_cast<SIZE_T>(total)}; checked(target->Map(0,&range,&mapped),"native QA completed map");
+    const D3D12_RANGE range{0,static_cast<SIZE_T>(total)}; checked(owner->target->Map(0,&range,&mapped),"native QA completed map");
     for(UINT y=0;y<desc.Height;++y) memcpy(result.data()+y*row,static_cast<const uint8_t*>(mapped)+y*footprint.Footprint.RowPitch,row);
-    const D3D12_RANGE empty{0,0}; target->Unmap(0,&empty); return result;
+    const D3D12_RANGE empty{0,0}; owner->target->Unmap(0,&empty); return result;
 }
 struct Snapshot {
     ComPtr<ID3D11Texture2D> original11,analysis11;
@@ -97,6 +118,7 @@ struct Sample {
     const JobContract contract;
     const interop::Ticket ticket;
     std::optional<interop::Consumer> pin;
+    const qa::CapturePinObservation pinObservation;
     std::shared_ptr<model::Job> job;
     std::shared_future<void> returned;
     const uint64_t clock,interval;
@@ -104,7 +126,9 @@ struct Sample {
 };
 struct Harness {
     // All cleanup and action events exist before native device/model submissions.
-    Event acted,consumerComplete;
+    Event acted;
+    std::shared_ptr<interop::ConsumerEvent> consumerComplete;
+    std::shared_ptr<const interop::ConsumerEnd> consumerEnd;
     std::atomic<Action> action{Action::None};
     bool failed=false;
     std::string error;
@@ -116,6 +140,7 @@ struct Harness {
     const uint64_t instance;
     gs_texture_t* source=nullptr;
     ComPtr<ID3D11Device> renderer;
+    DXGI_ADAPTER_DESC1 adapterDescription{};
     ComPtr<ID3D11DeviceContext> graphics;
     ComPtr<ID3D11Texture2D> target11;
     ComPtr<ID3D12Resource> target12;
@@ -134,8 +159,7 @@ struct Harness {
     Harness(const std::filesystem::path& root,model::Fault control,unsigned lane):fault(control),instance(111+lane) {
         config.runtime={std::filesystem::canonical(L"C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll"),
             "e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a"};
-        config.driver=std::filesystem::canonical(
-            L"C:/Windows/System32/DriverStore/FileRepository/nv_dispi.inf_amd64_b20cc8aeaed64fc2/_nvngx.dll");
+        config.driver=runtime::resolve_driver().identity.canonicalPath;
         config.data=std::filesystem::canonical(root/"profile/ngx-data");
         config.codec=bytes(root/"bin/64bit/nr_codec.dxil"); config.color=bytes(root/"bin/64bit/nr_color.dxil");
         config.guides=bytes(root/"bin/64bit/nr_guides.cso");
@@ -174,6 +198,7 @@ struct Harness {
         checked(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"native factory");
         checked(factory->EnumAdapterByLuid(context->luid(),IID_PPV_ARGS(&adapter)),"native same LUID");
         checked(adapter->GetDesc1(&desc),"native physical adapter");
+        adapterDescription=desc;
         require(desc.VendorId==0x10de && !(desc.Flags&DXGI_ADAPTER_FLAG_SOFTWARE) &&
             std::wstring(desc.Description).find(L"RTX 4090")!=std::wstring::npos,"native physical RTX4090 required");
         require(interop::same_luid(context->luid(),context->device()->GetAdapterLuid()),"native private worker same LUID");
@@ -205,10 +230,13 @@ struct Harness {
     }
     void end_pin(Sample& sample,bool notify) {
         if(sample.pin) {
-            if(notify) checked(bridge->consumer_fence()->SetEventOnCompletion(sample.pin->completionValue,consumerComplete.value),
-                "native pre-trigger raw pin consumer subscription");
-            require(bridge->end_consumer(*sample.pin),"native captured raw pin end");
-            consumerValue=sample.pin->completionValue; sample.pin.reset();
+            auto event=notify?interop::ConsumerEvent::create():nullptr;
+            require(!notify || event,"native fresh raw pin completion event");
+            const auto ending=bridge->end_consumer(*sample.pin,event);
+            require(static_cast<bool>(ending),"native captured raw pin end");
+            consumerValue=ending->completionValue;
+            if(notify){consumerComplete=event;consumerEnd=ending;}
+            sample.pin.reset();
         }
     }
     void capture() {
@@ -229,7 +257,7 @@ struct Harness {
         const auto ticket=bridge->capture(admission->job.key,borrowed);
         require(ticket && ticket->slot==admission->slot,"native exact Bridge ticket == scheduler slot");
         selected=plan.selection.kind; selectedSequence=plan.selection.frame?plan.selection.frame->ingressSequence:0;
-        ResetEvent(consumerComplete.value); consumerValue=0;
+        consumerComplete.reset();consumerEnd.reset();consumerValue=0;
         const bool delayed=selected==OutputKind::DelayedNr || selected==OutputKind::DelayedRaw;
         for(const auto& old:samples) if(old->pin) end_pin(*old,!delayed);
         if((selected==OutputKind::DelayedNr || selected==OutputKind::DelayedRaw) && !samples.empty()) {
@@ -242,22 +270,26 @@ struct Harness {
                 auto original=std::static_pointer_cast<Snapshot>(old.job->frame->graphicsLease);
                 graphics->CopyResource(target11.Get(),original->original11.Get()); ++rawSelections;
             }
-            checked(bridge->consumer_fence()->SetEventOnCompletion(consumer->completionValue,consumerComplete.value),
-                "native pre-trigger selected consumer subscription");
-            require(bridge->end_consumer(*consumer),"native actual selected consumer end");
+            consumerComplete=interop::ConsumerEvent::create();
+            require(static_cast<bool>(consumerComplete),"native fresh selected consumer event");
+            consumerEnd=bridge->end_consumer(*consumer,consumerComplete);
+            require(static_cast<bool>(consumerEnd),"native actual selected consumer end");
             if(selected==OutputKind::DelayedNr)
                 require(processor->publish(old.job,plan.selection,bridge->ownership(old.ticket.slot)),"native deadline-latched applied publication");
-            consumerValue=consumer->completionValue;
+            consumerValue=consumerEnd->completionValue;
         }
         // Capture has bound the current image, but no worker can discard/reuse it
-        // before finish. Reserve its open pin AFTER the prior output Consumer, so
-        // that a later pin end cannot rewind the shared consumer fence.
+        // before finish. Pin identity is independent of final ending order.
         const auto pin=bridge->acquire_raw(*ticket); require(pin.has_value(),"native capture pin");
         const auto physical=bridge->ownership(ticket->slot); require(physical.consumerOpen,"native captured pin ownership");
+        const auto pinObservation=qa::CapturePinObservation::observe(admission->job.key,*ticket,*pin,
+            *bridge,context->graphics_thread(),physical);
+        require(pinObservation.has_value(),"native graphics-owner exact capture pin observation");
         auto frame=std::make_shared<model::Frame>(immutable->original12.Get(),immutable->analysis12.Get(),immutable,
             NV_OF_FENCE_POINT{bridge->producer_fence(),physical.producer});
         const bool controlled=fault!=model::Fault::None &&
-            ((fault==model::Fault::Capability || fault==model::Fault::Creation) || sequence>1);
+            ((fault==model::Fault::Capability || fault==model::Fault::Creation ||
+              fault==model::Fault::AfterCoreInit) || sequence>1);
         auto job=std::make_shared<model::Job>(frame,admission->job,ColorExposure{1,1},controlled?fault:model::Fault::None);
         auto raw=std::make_shared<const pipeline::RawFrame>(pipeline::RawFrame{input,frame});
         const pipeline::WorkBinding binding{*ticket,physical,bridge,job,pin};
@@ -265,10 +297,10 @@ struct Harness {
         const auto* view=pipeline->view(tick);
         require(view && view->selection.canonicalTick==tick && view->selection.kind==selected,"native immutable same tick view");
         require(pipeline->view(tick)==view,"native all-view same phase latch");
-        samples.push_back(std::make_unique<Sample>(Sample{admission->job,*ticket,pin,job,admission->returned,clock,interval,expectedHash}));
+        samples.push_back(std::make_unique<Sample>(Sample{admission->job,*ticket,pin,*pinObservation,job,admission->returned,clock,interval,expectedHash}));
     }
     void stop() {
-        observe(); ResetEvent(consumerComplete.value); consumerValue=0;
+        observe();consumerComplete.reset();consumerEnd.reset();consumerValue=0;
         for(const auto& sample:samples) if(sample->pin) end_pin(*sample,true);
         stopping=true;
     }
@@ -319,7 +351,10 @@ void proof(Harness& h,unsigned lane,unsigned step) {
     require(WaitForSingleObject(job.observed,30000)==WAIT_OBJECT_0 && job.ready.load(std::memory_order_acquire),
         "native exact subscribed physical/status receipt");
     if(h.consumerValue) {
-        h.consumerComplete.wait(); require(h.bridge->consumer_fence()->GetCompletedValue()>=h.consumerValue,"native actual consumer complete");
+        require(h.consumerEnd && h.consumerEnd->event==h.consumerComplete &&
+            WaitForSingleObject(h.consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
+            interop::completion(h.consumerEnd->completionValue,h.consumerEnd->consumer.fence->GetCompletedValue())==
+                interop::Completion::Complete,"native actual consumer complete");
     }
     // Admission refusals can return before the raw producer finishes. Preserve
     // the actual producer dependency for their finite QA readback too.
@@ -382,9 +417,8 @@ void proof(Harness& h,unsigned lane,unsigned step) {
     }
     const auto completion=job.completion();
     const auto captured=h.bridge->ownership(sample.ticket.slot);
-    require(sample.pin && captured.key && *captured.key==sample.contract.key &&
-        captured.consumerOpen && captured.consumer==sample.pin->completionValue &&
-        captured.consumerDone<captured.consumer,"native open capture pin cannot be overtaken by a later consumer");
+    require(sample.pin && sample.pinObservation.retains(sample.contract.key,sample.ticket,*sample.pin,
+        *h.bridge,h.context->graphics_thread(),captured),"native exact open capture pin retains ownership");
     std::cout<<"NR_MODEL_CASE {\"lane\":"<<lane<<",\"step\":"<<step<<",\"instance_id\":"<<sample.contract.key.frame.instanceId
         <<",\"content_epoch\":"<<sample.contract.key.frame.contentEpoch<<",\"history_epoch\":"<<sample.contract.key.historyEpoch
         <<",\"resource_generation\":"<<sample.contract.key.resourceGeneration<<",\"ingress_sequence\":"<<sample.contract.key.frame.ingressSequence
@@ -412,7 +446,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         <<",\"producer_done\":"<<job.frame->producer.fence->GetCompletedValue()
         <<",\"worker_done\":"<<h.bridge->worker_fence()->GetCompletedValue()<<",\"consumer\":"<<h.consumerValue
         <<",\"consumer_done\":"<<h.bridge->consumer_fence()->GetCompletedValue()
-        <<",\"capture_pin\":"<<captured.consumer<<",\"capture_pin_open\":"<<(captured.consumerOpen?"true":"false")
+        <<",\"capture_pin\":"<<captured.consumerLease<<",\"capture_pin_open\":"<<(captured.consumerOpen?"true":"false")
         <<",\"physical_done\":"<<(completion.fence?completion.fence->GetCompletedValue():0)
         <<",\"module_base\":\""<<job.runtimeModule<<"\",\"driver_create_code\":"<<job.driverCreateCode
         <<",\"driver_handle\":"<<(job.driverHandle?"true":"false")<<",\"chronology\":[";
@@ -432,7 +466,140 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         "native actual Feature18 creation failed; exact row preserved");
 }
 }
-bool nr_run_model_scenario(const std::filesystem::path& root) {
+namespace {
+class CoreBackend final : public nr::qa::CoreControlBackend {
+    Harness h;
+    void* state=nullptr;
+    void(*dispatch)(void*)=nullptr;
+    lifecycle::ModelClose cached;
+    static void render(void* opaque,uint32_t x,uint32_t y) {
+        auto& self=*static_cast<CoreBackend*>(opaque);
+        if(self.h.action.load()!=Action::None)draw(&self.h,x,y);
+        self.dispatch(self.state);
+    }
+public:
+    explicit CoreBackend(const std::filesystem::path& root):h(root,model::Fault::AfterCoreInit,5) {}
+    void register_callback(void* value,void(*fn)(void*)) override {
+        state=value;dispatch=fn;obs_add_main_render_callback(render,this);
+    }
+    void remove_callback() override {
+        obs_enter_graphics();obs_remove_main_render_callback(render,this);obs_leave_graphics();
+    }
+    bool initialize_capture() {
+        h.execute(Action::Init);
+        const auto renderer=interop::renderer_luid(h.renderer.Get());
+        const auto worker=h.context->device()->GetAdapterLuid();
+        const auto& adapter=h.adapterDescription;
+        std::cout<<"NR_CORE_CONTROL_CONTEXT {\"instance\":"<<h.instance
+            <<",\"renderer_luid_high\":"<<renderer.HighPart<<",\"renderer_luid_low\":"<<renderer.LowPart
+            <<",\"context_luid_high\":"<<h.context->luid().HighPart<<",\"context_luid_low\":"<<h.context->luid().LowPart
+            <<",\"worker_luid_high\":"<<worker.HighPart<<",\"worker_luid_low\":"<<worker.LowPart
+            <<",\"device\":"<<reinterpret_cast<uintptr_t>(h.context->device())<<",\"queue\":"<<reinterpret_cast<uintptr_t>(h.context->queue())
+            <<",\"vendor_id\":"<<adapter.VendorId<<",\"device_id\":"<<adapter.DeviceId
+            <<",\"adapter_flags\":"<<adapter.Flags<<",\"software\":"<<((adapter.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)?"true":"false")
+            <<",\"adapter_description_utf16\":[";
+        for(size_t i=0;i<std::size(adapter.Description) && adapter.Description[i];++i){if(i)std::cout<<',';std::cout<<static_cast<uint16_t>(adapter.Description[i]);}
+        std::cout<<"]}"<<std::endl;
+        h.pixels=pattern(h.sequence+1);h.expectedHash=hash(h.pixels);
+        h.execute(Action::Capture);
+        require(h.samples.size()==1,"CORE control one capture");
+        auto& sample=*h.samples.front();auto& job=*sample.job;
+        require(sample.returned.wait_for(std::chrono::seconds(30))==std::future_status::ready,
+            "CORE control exact dispatch return");
+        require(WaitForSingleObject(job.observed,30000)==WAIT_OBJECT_0 && job.ready.load(),
+            "CORE control expected-fault status event");
+        require(job.fault==model::Fault::AfterCoreInit && job.code==0xe019 && job.diagnostic.empty() &&
+            !job.created && !job.evaluated && !job.composed && !job.submitted && !job.eligible &&
+            !job.resources && !job.runtimeModule && !h.processor->applied(),"CORE control no NR work");
+        checked(h.context->queue()->Wait(job.frame->producer.fence,job.frame->producer.value),
+            "CORE control actual producer dependency");
+        const auto raw=readback(*h.context,job.frame->original.Get());
+        const auto analysis=readback(*h.context,job.frame->analysis.Get());
+        require(hash(raw)==sample.expected && hash(analysis)==sample.expected,"CORE control independent input binding");
+        std::cout<<"NR_CORE_CONTROL_CAPTURE {\"captures\":1,\"fault_code\":"<<job.code
+            <<",\"created\":false,\"evaluated\":false,\"composed\":false,\"submitted\":false,\"eligible\":false"
+            <<",\"resources\":false,\"runtime_module\":false,\"applied\":false,\"dispatch_returned\":true,\"observed\":true"
+            <<",\"raw_hash\":\""<<hash(raw)<<"\",\"analysis_hash\":\""<<hash(analysis)<<"\"}"<<std::endl;
+        return true;
+    }
+    lifecycle::ModelClose diagnostics() const override {return h.processor?h.processor->close_diagnostics():cached;}
+    nr::qa::CoreCloseOutcome close_step(nr::qa::CoreCloseStep step) override {
+        using Outcome=nr::qa::CoreCloseOutcome;
+        // An unresolved QA readback may still be reading this lane's source/context: refuse every step.
+        if(!qa::core_close_admissible())return Outcome::Refused;
+        switch(step) {
+        case nr::qa::CoreCloseStep::Stop:
+            if(!h.pipeline)return Outcome::Refused;
+            if(!std::all_of(h.samples.begin(),h.samples.end(),[](const auto& s){return s->job->ready.load();}))return Outcome::Pending;
+            if(!h.stopping)h.stop();
+            if(!h.exited.valid())h.close();
+            return h.exited.valid()?Outcome::Complete:Outcome::Refused;
+        case nr::qa::CoreCloseStep::Worker:
+            h.pipeline->service();cached=h.processor->close_diagnostics();
+            if(h.exited.wait_for(std::chrono::seconds(0))!=std::future_status::ready || !cached.coherent)return Outcome::Pending;
+            return h.processor->closed()?Outcome::Complete:Outcome::Refused;
+        case nr::qa::CoreCloseStep::Generation:
+            return h.pipeline->complete_generation(1)?Outcome::Complete:Outcome::Refused;
+        case nr::qa::CoreCloseStep::Pipeline: {
+            // Samples were released at Stop; refresh the same Bridge's exact tracked tickets.
+            for(size_t slot=0;slot<3;++slot) {
+                const auto physical=h.bridge->ownership(slot);
+                if(!physical.key)continue;
+                const auto before=h.pipeline->state(*physical.key);
+                if(!before)continue;
+                const interop::Ticket ticket{*physical.key,slot};
+                auto diagnostic=[&](const char* phase,const pipeline::SlotState& state,const char* accepted) {
+                    const auto& key=state.ticket.key;
+                    std::cout<<"NR_PIPELINE_RECEIPT {\"refresh\":\""<<phase<<"\",\"observe_accepted\":"<<accepted
+                        <<",\"instance_id\":"<<key.frame.instanceId<<",\"content_epoch\":"<<key.frame.contentEpoch
+                        <<",\"ingress_sequence\":"<<key.frame.ingressSequence<<",\"history_epoch\":"<<key.historyEpoch
+                        <<",\"resource_generation\":"<<key.resourceGeneration<<",\"submission_serial\":"<<key.submissionSerial
+                        <<",\"slot\":"<<slot<<",\"tracked_slot\":"<<state.ticket.slot
+                        <<",\"publication\":"<<static_cast<unsigned>(state.publication)
+                        <<",\"dispatch_returned\":"<<(state.dispatchReturned?"true":"false");
+                    auto ownership=[](const char* name,const interop::Ownership& value) {
+                        std::cout<<",\""<<name<<"\":{\"phase\":"<<static_cast<unsigned>(value.phase)
+                            <<",\"consumer_open\":"<<(value.consumerOpen?"true":"false")
+                            <<",\"failed\":"<<(value.failed?"true":"false")<<",\"cancelled\":"<<(value.cancelled?"true":"false")
+                            <<",\"producer_required\":"<<value.producer<<",\"producer_completed\":"<<value.producerDone
+                            <<",\"worker_required\":"<<value.worker<<",\"worker_completed\":"<<value.workerDone
+                            <<",\"consumer_required\":"<<value.consumer<<",\"consumer_completed\":"<<value.consumerDone<<'}';
+                    };
+                    ownership("cached",state.physical);ownership("bridge",physical);
+                    std::cout<<",\"bridge_graphics_owner\":"<<(h.context->graphics_thread()==GetCurrentThreadId()?"true":"false")
+                        <<",\"pipeline_graphics_owner\":\"UNKNOWN\",\"retired_generations\":"<<h.pipeline->retired_generations()
+                        <<",\"worker_exit_ready\":"<<(h.exited.valid() && h.exited.wait_for(std::chrono::seconds(0))==std::future_status::ready?"true":"false")
+                        <<",\"feature_complete\":\"UNKNOWN\"}"<<std::endl;
+                };
+                diagnostic("BEFORE",*before,"\"UNKNOWN\"");
+                const bool accepted=h.pipeline->observe(ticket,physical);
+                const auto after=h.pipeline->state(ticket.key);
+                require(after.has_value(),"CORE control retained tracked receipt state");
+                diagnostic("AFTER",*after,accepted?"true":"false");
+                require(accepted,"CORE control exact Pipeline physical receipt");
+            }
+            h.pipeline->collect();if(!h.pipeline->try_close())return Outcome::Refused;h.pipeline.reset();return Outcome::Complete;
+        }
+        case nr::qa::CoreCloseStep::Bridge:
+            if(!h.bridge->close())return Outcome::Refused;h.bridge.reset();return Outcome::Complete;
+        case nr::qa::CoreCloseStep::Resources:
+            cached=h.processor->close_diagnostics();h.processor.reset();
+            h.samples.clear();h.admission.reset();h.target12.Reset();h.target11.Reset();
+            if(h.source){gs_texture_destroy(h.source);h.source=nullptr;}
+            h.context.reset();h.graphics.Reset();h.renderer.Reset();return Outcome::Complete;
+        case nr::qa::CoreCloseStep::Count:break;
+        }
+        throw std::logic_error("CORE control close stage");
+    }
+};
+}
+bool nr_start_core_control(const std::filesystem::path& root,std::unique_ptr<nr::qa::CoreControlOwner>& owner) {
+    auto backend=std::make_unique<CoreBackend>(root);auto* borrowed=backend.get();
+    owner=std::make_unique<nr::qa::CoreControlOwner>(std::move(backend));
+    owner->attach();
+    return borrowed->initialize_capture();
+}
+bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained) {
     // This function runs on the coordinator, not the graphics/NR worker.
     nr_color_refuse_unrelated();
     const model::Fault controls[]{model::Fault::None,model::Fault::Capability,model::Fault::Creation,
@@ -462,7 +629,10 @@ bool nr_run_model_scenario(const std::filesystem::path& root) {
             const auto applied=h->processor->applied();
             if(lane==0) require(h->eligibleJobs==5 && applied==3,"native five physical inferences and three actual n-1 publications");
             else require(applied==0,"native failed capability/create/evaluation/submit cannot apply compose");
-            h->execute(Action::Stop); if(h->consumerValue) h->consumerComplete.wait();
+            h->execute(Action::Stop); if(h->consumerValue) require(h->consumerEnd &&
+                WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
+                interop::completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==
+                    interop::Completion::Complete,"native stop exact consumer completion");
             h->execute(Action::Close);
             require(h->exited.wait_for(std::chrono::seconds(30))==std::future_status::ready,"native subscribed worker exit");
             h->execute(Action::Close); obs_remove_main_render_callback(draw,h.get()); callback=false;
@@ -470,13 +640,20 @@ bool nr_run_model_scenario(const std::filesystem::path& root) {
                 <<",\"closed\":true,\"retained\":false,\"nr_selections\":"<<h->nrSelections<<",\"raw_selections\":"<<h->rawSelections<<"}"<<std::endl;
         } catch(const std::exception& error) {
             std::cout<<"NR_MODEL_FAILURE "<<error.what()<<std::endl;
-            const bool settled=h->pipeline && std::all_of(h->samples.begin(),h->samples.end(),[](const auto& sample) {
-                return sample->job->ready.load(std::memory_order_acquire);
-            });
+            // A lane that published no sample proves nothing about the model graph, and a
+            // retained host owner always blocks the settled path: only an exact published
+            // sample set with no unresolved ownership may run the normal cleanup.
+            const bool settled=qa::model_cleanup_settled(!h->samples.empty(),h->pipeline &&
+                std::all_of(h->samples.begin(),h->samples.end(),[](const auto& sample) {
+                    return sample->job->ready.load(std::memory_order_acquire);
+                }));
             if(settled) {
                 try {
                     h->failed=false; h->error.clear();
-                    h->execute(Action::Stop); if(h->consumerValue) h->consumerComplete.wait();
+                    h->execute(Action::Stop); if(h->consumerValue) require(h->consumerEnd &&
+                        WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
+                        interop::completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==
+                            interop::Completion::Complete,"failed native stop exact consumer completion");
                     h->execute(Action::Close);
                     require(h->exited.wait_for(std::chrono::seconds(30))==std::future_status::ready,"failed native exact worker exit");
                     h->execute(Action::Close);
@@ -491,11 +668,16 @@ bool nr_run_model_scenario(const std::filesystem::path& root) {
             // and callback owner; runner retains this host instead of forced unloading.
             if(callback) obs_remove_main_render_callback(draw,h.get());
             std::cout<<"NR_MODEL_RETAINED unresolved=true pid="<<GetCurrentProcessId()<<std::endl;
+            // The exact lane owner moves into process-lifetime custody, including when no
+            // sample published an observed HANDLE. A null retained HANDLE is never
+            // permission to unload libobs, so the coordinator is told unresolved too.
+            auto* owner=h.get();
+            qa::retain_unresolved_model(h);
+            retained=true;
             // Subscribe to the retained job's exact already-created event, never
             // an invented readiness signal. No forced unload on unknown completion.
-            const HANDLE retained=h && !h->samples.empty()?h->samples.back()->job->observed:nullptr;
-            auto* owner=h.release();
-            if(retained && WaitForSingleObject(retained,INFINITE)==WAIT_OBJECT_0) {
+            const HANDLE observed=owner->samples.empty()?nullptr:owner->samples.back()->job->observed;
+            if(observed && WaitForSingleObject(observed,INFINITE)==WAIT_OBJECT_0) {
                 ResetEvent(owner->acted.value);
                 WaitForSingleObject(owner->acted.value,INFINITE); // Explicit retained-owner checkpoint, not GPU readiness.
             }

@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.28)
+project(nr_task13_cpu LANGUAGES CXX)
+enable_testing()
+get_filename_component(NR_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+# Compile the real scheduler without importing its unrelated accepted test suite.
+add_library(nr_scheduler STATIC "${NR_ROOT}/src/frame_pipeline.cpp")
+target_include_directories(nr_scheduler PUBLIC "${NR_ROOT}/src")
+target_compile_features(nr_scheduler PUBLIC cxx_std_20)
+target_compile_definitions(nr_scheduler PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(nr_scheduler PRIVATE /W4 /WX /permissive-)
+include("${NR_ROOT}/cmake/nr/Lifecycle.cmake")

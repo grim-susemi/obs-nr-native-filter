@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "nr_bootstrap_scenario.h"
 #include "nr_bootstrap_images.h"
+#include "nr_ghost_scenario.h"
+#include "ghost_fixture.h"
 #include "nr_recording_encode.h"
+#include "nr_recording_cleanup.h"
 #include "obs_native_output.h"
 #include <obs.h>
 #include <graphics/vec4.h>
@@ -14,6 +17,8 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
+#include <semaphore>
+#include <thread>
 namespace {
 using namespace nr;
 using namespace nr::qa;
@@ -29,20 +34,55 @@ struct Event {
 };
 struct Fixture {
     const bool hdr,unrelated;
+    const uint32_t ghostSeed,ghostColor,ghostStart;
     gs_texture_t* texture=nullptr;
     uint64_t clock=0;
-    uint32_t content=0,renders=0;
-    Fixture(bool h,bool u):hdr(h),unrelated(u) {}
+    uint32_t content=0,renders=0,ingress=0;
+    bool ghostPrepared=false,ghostArmed=false,ghostMissing=false;
+    std::array<std::vector<uint8_t>,3> ghostBytes;
+    std::array<std::atomic<unsigned>,3> ghostReady{};
+    std::counting_semaphore<4> ghostSpace{3};
+    std::atomic<bool> ghostStop{false};
+    Event ghostPrimed,ghostExited;
+    std::thread ghostProducer;
+    Fixture(bool h,bool u,uint32_t seed=0,uint32_t color=0,uint32_t start=0):
+        hdr(h),unrelated(u),ghostSeed(seed),ghostColor(color),ghostStart(start) {}
 };
 const char* source_name(void*) { return "Task12 bounded original source landmarks"; }
 void source_state(void*,calldata_t*);
+void source_arm(void* opaque,calldata_t*) {
+    auto& f=*static_cast<Fixture*>(opaque);f.ghostArmed=true;f.ingress=0;
+}
 void* source_create(obs_data_t* settings,obs_source_t* source) {
-    auto* f=new Fixture(obs_data_get_bool(settings,"hdr"),obs_data_get_bool(settings,"unrelated"));
-    proc_handler_add(obs_source_get_proc_handler(source),"void nr_fixture_state(out int renders, out int content)",source_state,f);
+    auto* f=new Fixture(obs_data_get_bool(settings,"hdr"),obs_data_get_bool(settings,"unrelated"),
+        static_cast<uint32_t>(obs_data_get_int(settings,"ghost_seed")),
+        static_cast<uint32_t>(obs_data_get_int(settings,"ghost_color")),
+        static_cast<uint32_t>(obs_data_get_int(settings,"ghost_start")));
+    proc_handler_add(obs_source_get_proc_handler(source),"void nr_fixture_state(out int renders, out int content, out int ingress)",source_state,f);
+    f->ghostPrepared=f->ghostSeed&&!f->unrelated&&obs_data_get_bool(settings,"ghost_prepare");
+    if(f->ghostPrepared) {
+        for(auto& ready:f->ghostReady)ready.store(UINT32_MAX);
+        f->ghostProducer=std::thread([f] {
+            for(unsigned tick=0;tick<256;++tick) {
+                f->ghostSpace.acquire();if(f->ghostStop.load(std::memory_order_acquire))break;
+                const auto slot=tick%3;
+                f->ghostBytes[slot]=nr_ghost_fixture_bytes(f->ghostSeed,f->ghostColor,tick,f->hdr);
+                f->ghostReady[slot].store(tick,std::memory_order_release);
+                if(tick==2)SetEvent(f->ghostPrimed.value);
+            }
+            SetEvent(f->ghostExited.value);
+        });
+        f->ghostPrimed.wait(); // Creation/control path, before binding the graph.
+        proc_handler_add(obs_source_get_proc_handler(source),"void nr_fixture_arm()",source_arm,f);
+    }
     return f;
 }
 void source_destroy(void* opaque) {
     auto* f=static_cast<Fixture*>(opaque);
+    if(f->ghostProducer.joinable()) {
+        f->ghostStop.store(true,std::memory_order_release);f->ghostSpace.release();
+        f->ghostExited.wait();f->ghostProducer.join();
+    }
     obs_enter_graphics();gs_texture_destroy(f->texture);obs_leave_graphics();delete f;
 }
 uint32_t source_width(void* opaque) { return static_cast<Fixture*>(opaque)->unrelated?128:image::width; }
@@ -53,6 +93,9 @@ gs_color_space source_color(void* opaque,size_t,const gs_color_space*) {
 void source_state(void* opaque,calldata_t* query) {
     auto& f=*static_cast<Fixture*>(opaque);
     calldata_set_int(query,"renders",f.renders);calldata_set_int(query,"content",f.content);
+    calldata_set_int(query,"ingress",f.ingress);
+    calldata_set_bool(query,"prepared",f.ghostPrepared);calldata_set_bool(query,"armed",f.ghostArmed);
+    calldata_set_bool(query,"missing",f.ghostMissing);
 }
 void source_render(void* opaque,gs_effect_t*) {
     auto& f=*static_cast<Fixture*>(opaque);++f.renders;
@@ -61,9 +104,38 @@ void source_render(void* opaque,gs_effect_t*) {
     if(f.clock!=clock) {
         f.clock=clock;
         if(!f.unrelated) {
-            f.content=std::min(f.content+1,16u);
-            const auto bytes=image::fixture_bytes(f.content,f.hdr);
-            gs_texture_set_image(f.texture,bytes.data(),image::width*(f.hdr?8:4),false);
+            if(f.ghostSeed) {
+                const auto tick=f.ghostPrepared&&!f.ghostArmed?0u:std::min(f.ghostStart+f.ingress,255u);
+                const auto corpus=ghost::fixture(f.ghostSeed,static_cast<ghost::FixtureColor>(f.ghostColor));
+                const auto content=corpus.schedule[tick].contentId;
+                if(f.ghostPrepared&&f.ghostArmed&&f.ghostReady[tick%3].load(std::memory_order_acquire)!=tick) {
+                    f.ghostMissing=true;return;
+                }
+                // Identical holds keep the same source bytes; ingress still advances.
+                if(content!=f.content) {
+                    if(f.ghostPrepared) {
+                        const auto slot=tick%3;
+                        if(f.ghostReady[slot].load(std::memory_order_acquire)!=tick) {
+                            f.ghostMissing=true;return; // Explicit refusal, never wait or substitute another ingress.
+                        }
+                        gs_texture_set_image(f.texture,f.ghostBytes[slot].data(),image::width*(f.hdr?8:4),false);
+                    }else {
+                        const auto bytes=nr_ghost_fixture_bytes(f.ghostSeed,f.ghostColor,tick,f.hdr);
+                        gs_texture_set_image(f.texture,bytes.data(),image::width*(f.hdr?8:4),false);
+                    }
+                }
+                f.content=content;
+                if(!f.ghostPrepared||f.ghostArmed) {
+                    if(f.ghostPrepared&&tick<255) {
+                        f.ghostReady[tick%3].store(UINT32_MAX,std::memory_order_release);f.ghostSpace.release();
+                    }
+                    ++f.ingress;
+                }
+            } else {
+                f.content=std::min(f.content+1,16u);
+                const auto bytes=image::fixture_bytes(f.content,f.hdr);
+                gs_texture_set_image(f.texture,bytes.data(),image::width*(f.hdr?8:4),false);
+            }
         } else {
             std::vector<uint8_t> bytes(128*128*(f.hdr?8:4));
             for(size_t i=0;i<128*128;++i)for(size_t c=0;c<4;++c) {
@@ -89,10 +161,10 @@ void register_fixture() {
     info.get_width=source_width;info.get_height=source_height;info.video_render=source_render;info.video_get_color_space=source_color;
     obs_register_source(&info);
 }
-std::vector<uint8_t> read_texture(ID3D11Texture2D* texture,bool hdr) {
+std::vector<uint8_t> read_texture(ID3D11Texture2D* texture,bool hdr,uint32_t width=image::width,uint32_t height=image::height) {
     require(texture!=nullptr,"actual full-size texture");
     D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
-    require(desc.Width==image::width && desc.Height==image::height,"actual full-size capture extent");
+    require(desc.Width==width && desc.Height==height,"actual full-size capture extent");
     require(hdr?(desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format==DXGI_FORMAT_R16G16B16A16_TYPELESS):
         (desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format==DXGI_FORMAT_R8G8B8A8_TYPELESS ||
          desc.Format==DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format==DXGI_FORMAT_B8G8R8A8_TYPELESS),"actual readback numeric format");
@@ -102,9 +174,9 @@ std::vector<uint8_t> read_texture(ID3D11Texture2D* texture,bool hdr) {
     ComPtr<ID3D11Texture2D> stage;checked(device->CreateTexture2D(&desc,nullptr,&stage),"bounded QA stage");
     graphics->CopyResource(stage.Get(),texture);
     D3D11_MAPPED_SUBRESOURCE mapped{};checked(graphics->Map(stage.Get(),0,D3D11_MAP_READ,0,&mapped),"bounded QA map");
-    const uint32_t row=image::width*(hdr?8:4);
-    std::vector<uint8_t> bytes(static_cast<size_t>(row)*image::height);
-    for(uint32_t y=0;y<image::height;++y)memcpy(bytes.data()+static_cast<size_t>(y)*row,
+    const uint32_t row=width*(hdr?8:4);
+    std::vector<uint8_t> bytes(static_cast<size_t>(row)*height);
+    for(uint32_t y=0;y<height;++y)memcpy(bytes.data()+static_cast<size_t>(y)*row,
         static_cast<const uint8_t*>(mapped.pData)+static_cast<size_t>(y)*mapped.RowPitch,row);
     graphics->Unmap(stage.Get(),0);return bytes;
 }
@@ -184,9 +256,14 @@ struct Harness {
             uint64_t value=0;for(size_t i=0;i<3;++i)value=std::max(value,bridge->ownership(i).consumer);
             checked(stoppingFence->SetEventOnCompletion(value,consumerDone.value),"pre-stop actual last consumer subscription");
         } else if(!bridge)SetEvent(consumerDone.value);
-        calldata_init(&query);
-        require(proc_handler_call(obs_source_get_proc_handler(filter),"nr_native_stop",&query),"native cooperative stop");
-        closed=calldata_bool(&query,"closed");calldata_free(&query);
+        // The local Bridge lease ends before the cooperative stop entry point: a lease held
+        // across it keeps the very owner under test alive. The retained fence holds its own
+        // reference, so the pre-stop subscription survives the lease release.
+        enter_stop_released(bridge,[&] {
+            calldata_init(&query);
+            require(proc_handler_call(obs_source_get_proc_handler(filter),"nr_native_stop",&query),"native cooperative stop");
+            closed=calldata_bool(&query,"closed");calldata_free(&query);
+        });
     }
     void release() {
         require(closed,"graph release requires actual native close");
@@ -350,8 +427,17 @@ void stop_graph(Harness& h) {
     h.execute(Action::Close); // Actual completed consumers permit input-lease collection before worker stop.
     if(h.exited.valid())require(h.exited.wait_for(std::chrono::seconds(30))==std::future_status::ready,"subscribed worker normal exit");
     h.execute(Action::Close);require(h.closed,"normal producer/worker/consumer/feature retirement");
+    release_after_final_close(h.exited,h.closed); // The legacy exit future ends with the final Close confirmation.
     h.execute(Action::Release);
 }
+// A lane whose exact encoder stop stayed unresolved keeps its whole graph: the raw
+// registration, the scene/source owners and the Harness itself outlive this call.
+std::vector<std::unique_ptr<Harness>> retainedBootstrapGraphs;
+}
+void nr_register_bootstrap_fixture() { register_fixture(); }
+std::vector<uint8_t> nr_bootstrap_read_texture(ID3D11Texture2D* texture,bool hdr) { return read_texture(texture,hdr); }
+std::vector<uint8_t> nr_bootstrap_read_texture(ID3D11Texture2D* texture,bool hdr,uint32_t width,uint32_t height) {
+    return read_texture(texture,hdr,width,height);
 }
 bool nr_run_bootstrap_scenario(const std::filesystem::path& root,const std::filesystem::path& directory,bool& retained) {
     const auto work=root.parent_path().parent_path().parent_path();
@@ -366,7 +452,7 @@ bool nr_run_bootstrap_scenario(const std::filesystem::path& root,const std::file
         const bool hdr=lane>=2,deterministic=(lane%2)==0;
         const auto laneDirectory=directory/("lane-"+std::to_string(lane));std::filesystem::create_directory(laneDirectory);
         auto h=std::make_unique<Harness>(root,laneDirectory,hdr,deterministic);
-        bool callbacks=false,rawConnected=false;
+        std::unique_ptr<Recording> recording;bool callbacks=false,rawConnected=false;
         try {
             obs_video_info video{};require(obs_get_video_info(&video),"owned video info");
             video.fps_num=1;video.fps_den=1;video.base_width=video.output_width=image::width;
@@ -382,12 +468,12 @@ bool nr_run_bootstrap_scenario(const std::filesystem::path& root,const std::file
             obs_add_main_render_callback(action,h.get());obs_add_main_rendered_callback(rendered,h.get());callbacks=true;
             h->execute(Action::Bind);h->warm.wait();require(!h->failed,h->failure.c_str());
             {
-                Recording recording(laneDirectory/"program.hevc",8,hdr);
+                recording=std::make_unique<Recording>(laneDirectory/"program.hevc",8,hdr);
                 obs_add_raw_video_callback(nullptr,preencode,h.get());rawConnected=true;
-                recording.start();
-                recording.first_packet();
+                recording->start();
+                recording->first_packet();
                 h->recordingArmed.store(true,std::memory_order_release);
-                const auto packets=recording.finish();
+                const auto packets=recording->finish();
                 obs_remove_raw_video_callback(preencode,h.get());rawConnected=false;
                 h->observe.store(false,std::memory_order_release);
                 stop_graph(*h);
@@ -474,12 +560,23 @@ bool nr_run_bootstrap_scenario(const std::filesystem::path& root,const std::file
             emit("NR_BOOTSTRAP_CLEANUP ",close);
         }catch(const std::exception& e) {
             std::cout<<"NR_BOOTSTRAP_FAILURE lane="<<lane<<" "<<e.what()<<std::endl;
-            if(rawConnected)obs_remove_raw_video_callback(preencode,h.get());
-            try { if(callbacks && h->source)stop_graph(*h); }
+            // Encoder stop first: an unresolved exact stop keeps the raw registration,
+            // the graph and the session owners, and is reported through the registry
+            // main.cpp already folds into `retained`.
+            const auto retirement=recording_retirement(retain_recording_failure(recording),
+                rawConnected,callbacks&&h->source!=nullptr);
+            if(retirement.retained) {
+                retained=true;
+                std::cout<<"NR_BOOTSTRAP_RETAINED lane="<<lane<<" exact encoder stop unresolved; raw registration/graph/session owners preserved"<<std::endl;
+                retainedBootstrapGraphs.push_back(std::move(h));
+                return false;
+            }
+            if(retirement.removeRawCallback)obs_remove_raw_video_callback(preencode,h.get());
+            if(retirement.stopGraph)try { stop_graph(*h); }
             catch(const std::exception& cleanup) {
                 std::cout<<"NR_BOOTSTRAP_RETAINED lane="<<lane<<" "<<cleanup.what()<<std::endl;retained=true;
             }
-            if(!retained && callbacks) { obs_remove_main_rendered_callback(rendered,h.get());obs_remove_main_render_callback(action,h.get()); }
+            if(retirement.destroyGraph && !retained) { obs_remove_main_rendered_callback(rendered,h.get());obs_remove_main_render_callback(action,h.get()); }
             if(retained)(void)h.release();
             return false;
         }

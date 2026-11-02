@@ -323,8 +323,11 @@ bool D3D12Guides::Impl::image_valid(const FlowImage& image) const {
     if(FAILED(image.analysis->GetDevice(IID_PPV_ARGS(&resourceDevice))) ||
        FAILED(image.ready.fence->GetDevice(IID_PPV_ARGS(&fenceDevice)))) return false;
     ComPtr<IUnknown> owned,resource,fence;
+    // Hook layers (OptiScaler dxgi proxy) can report another object for fences opened from D3D11 shared handles;
+    // resources stay strict, a fence on the same adapter is accepted.
+    const auto sameAdapter=[&]{const LUID x=device->GetAdapterLuid(),y=fenceDevice->GetAdapterLuid();return x.LowPart==y.LowPart && x.HighPart==y.HighPart;};
     return SUCCEEDED(device.As(&owned)) && SUCCEEDED(resourceDevice.As(&resource)) && SUCCEEDED(fenceDevice.As(&fence)) &&
-           owned.Get()==resource.Get() && owned.Get()==fence.Get();
+           owned.Get()==resource.Get() && (owned.Get()==fence.Get() || sameAdapter());
 }
 bool D3D12Guides::Impl::register_image(NvOFHandle owner,ID3D12Resource* resource,NV_OF_FENCE_POINT ready,size_t index) {
     if(ofValue==UINT64_MAX-1) { uncertain=true; return false; }
@@ -499,4 +502,8 @@ const FlowCapabilities& D3D12Guides::capabilities() const { return impl_->caps; 
 uint32_t D3D12Guides::grid_size() const { return impl_->grid; }
 uint32_t D3D12Guides::hint_grid_size() const { return impl_->hintGrid; }
 DXGI_FORMAT D3D12Guides::cost_format() const { return impl_->costFormat; }
+std::array<D3D12_RESOURCE_DESC,2> D3D12Guides::observation_descriptors() const {
+    if(impl_->uncertain || !impl_->hardware || !impl_->cost) return {};
+    return {impl_->hardware->GetDesc(),impl_->cost->GetDesc()};
+}
 } // nr
