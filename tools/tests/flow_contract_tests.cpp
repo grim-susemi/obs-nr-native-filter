@@ -47,6 +47,9 @@ int main(int argc,char**) {
   require(flow_chronology_problem(prev,nullptr,&prev,active,&active,true)==FlowProblem::KeyMismatch,"repeated reset key");
   const JobKey resetKey{{41,3,12},4,4,13};
   require(flow_chronology_problem(resetKey,nullptr,&current,active,&active,true)==FlowProblem::None,"cut reset advances epoch");
+  const JobKey dropped{{41,2,13},3,4,14},backwards{{41,2,13},2,4,14};
+  require(flow_chronology_problem(dropped,nullptr,&current,active,&active,true)==FlowProblem::None,"model reset inside history epoch after dropped frame");
+  require(flow_chronology_problem(backwards,nullptr,&current,active,&active,true)==FlowProblem::ResetPair,"reset cannot move history epoch backwards");
   require(flow_chronology_problem(current,&prev,nullptr,active,nullptr,false)==FlowProblem::MissingPrevious,"resume cannot infer temporal state");
   const auto init=flow_init_params({1920,1080},1);
   require(init.width==1920 && init.height==1080 && init.outGridSize==NV_OF_OUTPUT_VECTOR_GRID_SIZE_1,"full working-size SDK init");
@@ -70,6 +73,13 @@ int main(int argc,char**) {
   require(bootstrap.enableGlobalFlow==NV_OF_TRUE && bootstrap.enableExternalHints==NV_OF_FALSE,"bootstrap estimates native global, no external predictor");
   require(refine.enableExternalHints==NV_OF_TRUE && refine.enableGlobalFlow==NV_OF_FALSE && refine.hintGridSize==NV_OF_HINT_VECTOR_GRID_SIZE_1,"refinement admits exact hint grid, distinct pass");
   require(bootstrap.perfLevel==refine.perfLevel && bootstrap.outGridSize==refine.outGridSize && refine.width==2560 && refine.height==1440,"uniform full-resolution native estimator");
+  require(flow_init_params({1920,1080},1).perfLevel==NV_OF_PERF_LEVEL_MEDIUM && flow_bootstrap_params({1920,1080},1,NV_OF_PERF_LEVEL_FAST).perfLevel==NV_OF_PERF_LEVEL_FAST &&
+      flow_refinement_params({1920,1080},4,4,NV_OF_PERF_LEVEL_FAST).perfLevel==NV_OF_PERF_LEVEL_FAST,"explicit estimator speed level");
+  require(flow_policy({2528,1369},0).perf==NV_OF_PERF_LEVEL_MEDIUM && flow_policy({2528,1369},0).minGrid==1,"unknown frame rate keeps MEDIUM full grid");
+  require(flow_policy({960,540},16666667).perf==NV_OF_PERF_LEVEL_MEDIUM && flow_policy({960,540},16666667).minGrid==1,"small pixel rate keeps MEDIUM");
+  require(flow_policy({1478,919},16666667).perf==NV_OF_PERF_LEVEL_FAST && flow_policy({1478,919},16666667).minGrid==1,"measured 1478x919@60 FAST full grid");
+  require(flow_policy({2528,1369},33333333).perf==NV_OF_PERF_LEVEL_FAST && flow_policy({2528,1369},33333333).minGrid==1,"measured 2528x1369@30 FAST full grid");
+  require(flow_policy({2560,1440},16666667).perf==NV_OF_PERF_LEVEL_FAST && flow_policy({2560,1440},16666667).minGrid==4,"owner 1440p@60 FAST 4-pixel grid");
   const auto hint=reinterpret_cast<NvOFGPUBufferHandle>(uintptr_t(3));
   const auto refinePacket=flow_execute_input(c,p,true,deps,hint);
   require(refinePacket.externalHints==hint && refinePacket.disableTemporalHints==NV_OF_TRUE && refinePacket.fencePoint==deps.data(),"refinement uses this-pair GPU hint, never prior-call temporal field");

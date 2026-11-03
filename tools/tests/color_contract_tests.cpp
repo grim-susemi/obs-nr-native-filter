@@ -75,6 +75,11 @@ int main() {
         expect(!color_prepare(*overflow,{65504,65504,65504,1}),"canonical half storage overflow falsely valid");
         const auto repeat=color_plan(d,{1,1},true);
         expect(color_prepare(*repeat,raw)==canonical,"cached exposure contaminated subsequent plan");
+        const FrameDescriptor sdr{{1,1},{0,0,1,1},PixelFormat::Rgba8,ColorSpace::Rec709Srgb,AlphaMode::Straight,80};
+        const auto sp=color_plan(sdr,{1,1},true);const ColorPixel sraw{0.5f,0.25f,0.75f,1};
+        const auto over=color_restore(*sp,sraw,{1.25f,0.25f,-0.5f,1});const auto clamped=color_restore(*sp,sraw,{1,0.25f,0,1});
+        expect(over&&clamped&&*over==*clamped&&over->r==1&&over->b==0,"SDR finite overshoot rejected or not clamped like the GPU restore");
+        expect(!color_restore(*sp,sraw,{nan,0.25f,0.5f,1})&&!color_restore(*sp,sraw,{0.5f,0.25f,0.5f,1.5f}),"SDR nonfinite/alpha NR answer admitted");
         std::puts("PASS color_contract CPU: ramps HDR white/exposure PQ primaries negative alpha invalid controls stateless resume"); return 0;
     } catch(const std::exception& e) { std::fprintf(stderr,"FAIL %s\n",e.what()); return 1; }
 }

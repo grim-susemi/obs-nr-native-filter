@@ -16,9 +16,12 @@ enum class FlowProblem { None,InvalidKey,MissingPrevious,ResetPair,KeyMismatch,B
 FlowProblem flow_pair_problem(const JobKey&,const JobKey*,bool reset);
 FlowProblem flow_chronology_problem(const JobKey&,const JobKey* previous,const JobKey* last,
     Rect active,const Rect* lastActive,bool reset);
-NV_OF_INIT_PARAMS flow_init_params(Extent,uint32_t);
-NV_OF_INIT_PARAMS flow_bootstrap_params(Extent,uint32_t);
-NV_OF_INIT_PARAMS flow_refinement_params(Extent,uint32_t,uint32_t hintGrid);
+NV_OF_INIT_PARAMS flow_init_params(Extent,uint32_t,NV_OF_PERF_LEVEL perf=NV_OF_PERF_LEVEL_MEDIUM);
+NV_OF_INIT_PARAMS flow_bootstrap_params(Extent,uint32_t,NV_OF_PERF_LEVEL perf=NV_OF_PERF_LEVEL_MEDIUM);
+NV_OF_INIT_PARAMS flow_refinement_params(Extent,uint32_t,uint32_t hintGrid,NV_OF_PERF_LEVEL perf=NV_OF_PERF_LEVEL_MEDIUM);
+// Automatic estimator cost from working size and OBS frame interval; 0 interval = unknown -> MEDIUM, finest grid.
+struct FlowPolicy { NV_OF_PERF_LEVEL perf=NV_OF_PERF_LEVEL_MEDIUM; uint32_t minGrid=1; };
+FlowPolicy flow_policy(Extent,uint64_t frameIntervalNs);
 std::optional<uint32_t> smallest_hint_grid(std::span<const uint32_t>,uint32_t outputGrid);
 // Built by the production adapter; unit tests inspect the exact SDK submission packet.
 NV_OF_EXECUTE_INPUT_PARAMS_D3D12 flow_execute_input(NvOFGPUBufferHandle current,NvOFGPUBufferHandle previous,
@@ -66,7 +69,7 @@ class D3D12Guides {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 public:
-    D3D12Guides(ID3D12Device*,ID3D12CommandQueue*,Extent,std::span<const std::byte> shader);
+    D3D12Guides(ID3D12Device*,ID3D12CommandQueue*,Extent,std::span<const std::byte> shader,uint64_t frameIntervalNs=0);
     ~D3D12Guides();
     D3D12Guides(const D3D12Guides&)=delete;
     D3D12Guides& operator=(const D3D12Guides&)=delete;
@@ -78,7 +81,9 @@ public:
     const FlowModuleIdentity& module_identity() const;
     const FlowCapabilities& capabilities() const;
     uint32_t grid_size() const;
+    uint32_t state_bits() const; // N23 diagnostics: 1 pending, 2 uncertain, 4 output
     uint32_t hint_grid_size() const;
+    NV_OF_PERF_LEVEL perf_level() const; // estimator speed chosen by flow_policy
     DXGI_FORMAT cost_format() const;
     // Worker-only copied descriptors of actual owned allocations, including cold
     // reset. Descriptors are not flow pixels or an ordinary-guide positive.

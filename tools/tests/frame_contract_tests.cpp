@@ -63,7 +63,7 @@ void known_sequence(bool print)
     const std::array<OutputKind, 7> expectedKinds{OutputKind::PrimingRaw, OutputKind::DelayedNr,
         OutputKind::DelayedRaw, OutputKind::DelayedNr, OutputKind::DelayedNr,
         OutputKind::DelayedRaw, OutputKind::DelayedNr};
-    const std::array<uint64_t, 7> histories{1, 1, 1, 2, 2, 2, 3};
+    const std::array<uint64_t, 7> histories{1, 1, 1, 1, 1, 1, 1}; // late jobs keep the history epoch
     const std::array<std::array<const char*, 3>, 7> orders{{
         {"preview", "program", "projector"}, {"program", "projector", "preview"},
         {"projector", "preview", "program"}, {"preview", "projector", "program"},
@@ -85,7 +85,7 @@ void known_sequence(bool print)
         expect(selected.frame && content(*selected.frame).content == expectedIds[n], "one-tick oracle mismatch");
         const auto index = static_cast<size_t>(expectedIds[n]);
         expect(content(*selected.frame).raw == originalIngress[index].raw, "fallback did not bind untouched fixture raw");
-        expect(selected.resetTemporal == miss, "miss must jointly reset temporal histories");
+        expect(!selected.resetTemporal, "a late job must keep the joint NR/OFA temporal history");
         expect(views.latch(current.canonicalTick, selected), "first selection not latched");
         const auto late = complete(submitted);
         const auto afterDeadline = select_for_tick(active, Phase::Delayed, current, &previous, &submitted, &late);
@@ -365,6 +365,27 @@ void bad_control(std::string_view control)
 }
 } // namespace
 
+void held_nr_frames()
+{
+    const Selection late{101, OutputKind::DelayedRaw, Status::Bypassed, Reason::DeadlineMiss, std::nullopt, std::nullopt, false};
+    expect(hold_previous_nr(late, true, 100, 0) && hold_previous_nr(late, true, 100, kMaxHeldNrFrames - 1),
+           "late job did not re-show the previous NR frame");
+    expect(!hold_previous_nr(late, true, 100, kMaxHeldNrFrames), "NR hold is not bounded");
+    expect(!hold_previous_nr(late, false, 100, 0), "held a frame the output never showed as NR");
+    expect(!hold_previous_nr(late, true, 99, 0), "held an NR frame from a non-adjacent tick");
+    const Selection reset{101, OutputKind::DelayedRaw, Status::Bypassed, Reason::DeadlineMiss, std::nullopt, std::nullopt, true};
+    const Selection failed{101, OutputKind::DelayedRaw, Status::Error, Reason::EvaluationFailure, std::nullopt, std::nullopt, true};
+    const Selection expired{101, OutputKind::DelayedRaw, Status::Bypassed, Reason::Expired, std::nullopt, std::nullopt, true};
+    const Selection applied{101, OutputKind::DelayedNr, Status::Applied, Reason::None, std::nullopt, std::nullopt, false};
+    expect(!hold_previous_nr(reset, true, 100, 0) && !hold_previous_nr(failed, true, 100, 0) &&
+           !hold_previous_nr(expired, true, 100, 0) && !hold_previous_nr(applied, true, 100, 0), "held outside a plain late job");
+    const auto current = sample(2, 101);
+    const auto previous = sample(1, 100);
+    const auto unseen = select_for_tick({41, 1, 1, 1}, Phase::Delayed, current, &previous);
+    expect(unseen.kind == OutputKind::DelayedRaw && unseen.reason == Reason::DeadlineMiss && unseen.resetTemporal,
+           "a frame the model never received kept the temporal history");
+}
+
 int main(int argc, char** argv)
 {
     try {
@@ -375,6 +396,7 @@ int main(int argc, char** argv)
             instance_and_format_boundaries(argc == 2);
             epochs_and_publication();
             bounded_ownership();
+            held_nr_frames();
             std::printf("PASS frame_contract: %u checks\n", checks);
             return 0;
         }

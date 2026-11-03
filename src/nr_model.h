@@ -6,6 +6,7 @@
 #include "nr_core.h"
 #include "nr_guides.h"
 #include "nr_runtime.h"
+#include <string>
 #include <atomic>
 #include "nr_qa_fault.h"
 
@@ -16,6 +17,7 @@ struct Config {
     std::vector<std::byte> codec, color, guides;
     bool qaObservations=false; // Explicit bounded technical host only; no inference input.
     bool qaPreparation=false; // Read-only allocation metadata, no image lease.
+    uint64_t frameIntervalNs=0; // OBS frame interval for the automatic estimator cost policy; 0 = unknown.
 };
 struct GuidePreparation {
     const JobKey key;
@@ -152,6 +154,7 @@ public:
     pipeline::Processed process(const pipeline::Work&,std::stop_token) override;
     void worker_service() noexcept override;
     bool request_original_marker(const std::shared_ptr<Job>&,const JobKey&);
+    std::string diag() const; // N23 worker diagnostics
     void worker_stopping() noexcept override;
     bool worker_stop_complete() const noexcept override;
     bool closed() const;
@@ -160,4 +163,10 @@ public:
     std::shared_ptr<const GuidePreparation> guide_preparation() const;
     bool publish(const std::shared_ptr<Job>&,const Selection&,const interop::Ownership&);
 };
+struct JobTimingWindow {unsigned jobs=0,late=0;double submitMeanMs=0,submitMaxMs=0,encodeMeanMs=0,encodeMaxMs=0,admitMeanMs=0,admitMaxMs=0,queueMeanMs=0,queueMaxMs=0,prodMeanMs=0,prodMaxMs=0,prepMeanMs=0,recMeanMs=0,gpuMeanMs=0,creationMeanMs=0,creationMaxMs=0;unsigned creationJobs=0;};
+int64_t qpc_now(); // diagnostic clock
+double qpc_ms(int64_t delta);
+void note_admit(uint64_t tick,int64_t qpc); // diagnostic: graphics thread stamps each tick's native tick() start
+JobTimingWindow take_job_timing(); // diagnostic: evaluation-job latency since the last call
+std::string take_job_trace(); // diagnostic: last completed jobs (deadline tick, queue/run/total ms, late flag)
 } // namespace nr::model

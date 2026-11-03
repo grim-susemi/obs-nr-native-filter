@@ -89,15 +89,22 @@ char* obs_module_get_config_path(obs_module_t*,const char*) {return nullptr;}
 const char* obs_data_get_string(obs_data_t*,const char*) {return "";}
 bool obs_data_get_bool(obs_data_t*,const char*) {return false;}
 double obs_data_get_double(obs_data_t*,const char*) {return 0;}
+long long obs_data_get_int(obs_data_t*,const char*) {return 0;}
 void obs_data_set_default_bool(obs_data_t*,const char*,bool) {}
 void obs_data_set_default_string(obs_data_t*,const char*,const char*) {}
 void obs_data_set_default_double(obs_data_t*,const char*,double) {}
+void obs_data_set_default_int(obs_data_t*,const char*,long long) {}
 obs_properties_t* obs_properties_create(void) {return nullptr;}
 obs_property_t* obs_properties_add_bool(obs_properties_t*,const char*,const char*) {return nullptr;}
 obs_property_t* obs_properties_add_path(obs_properties_t*,const char*,const char*,enum obs_path_type,const char*,
     const char*) {return nullptr;}
 obs_property_t* obs_properties_add_float_slider(obs_properties_t*,const char*,const char*,double,double,double)
 {return nullptr;}
+obs_property_t* obs_properties_add_int_slider(obs_properties_t*,const char*,const char*,int,int,int)
+{return nullptr;}
+obs_property_t* obs_properties_add_list(obs_properties_t*,const char*,const char*,enum obs_combo_type,
+    enum obs_combo_format) {return nullptr;}
+size_t obs_property_list_add_int(obs_property_t*,const char*,long long) {return 0;}
 obs_property_t* obs_properties_add_text(obs_properties_t*,const char*,const char*,enum obs_text_type) {return nullptr;}
 void obs_property_set_enabled(obs_property_t*,bool) {}
 obs_property_t* obs_properties_get(obs_properties_t*,const char*) {return nullptr;}

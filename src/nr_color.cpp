@@ -68,7 +68,10 @@ std::optional<ColorPixel> color_prepare(const ColorPlan& p,ColorPixel raw) {
 }
 std::optional<ColorPixel> color_restore(const ColorPlan& p,ColorPixel raw,ColorPixel resolved,bool referenceValid) {
     const auto prepared=color_prepare(p,raw);
-    if(!prepared||!valid_pixel(resolved,p.codecColor)) return {};
+    if(!prepared||!valid_pixel(resolved,ColorSpace::ScRgbLinear)) return {};
+    // A finite SDR answer may overshoot [0,1] once history is carried; the GPU restore (nr_color.hlsl) clamps that
+    // pixel instead of rejecting the frame, so the contract twin does the same.
+    if(p.codecColor==ColorSpace::Rec709Srgb) for(float* v:{&resolved.r,&resolved.g,&resolved.b}) *v=std::clamp(*v,0.0f,1.0f);
     if(!referenceValid)return raw;
     const auto half=[](float x) {return DirectX::PackedVector::XMConvertHalfToFloat(DirectX::PackedVector::XMConvertFloatToHalf(x));};
     if((p.source.alpha==AlphaMode::Premultiplied&&raw.a==0)||

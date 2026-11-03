@@ -408,8 +408,8 @@ void missed_evaluations_and_slots()
         const auto before = s.pipeline.epochs();
         s.submit(observation(101),2,8);
         selected(s.pipeline,101,7,OutputKind::DelayedRaw);
-        expect(s.pipeline.epochs() == Epochs{41,1,2,1} && before == Epochs{41,1,1,1},
-            "missed evaluation did not jointly reset history while preserving exact raw n-1");
+        expect(s.pipeline.epochs() == Epochs{41,1,1,1} && before == Epochs{41,1,1,1},
+            "late evaluation reset the history or lost exact raw n-1");
         s.complete(0);
         selected(s.pipeline,101,7,OutputKind::DelayedRaw);
         s.complete(1);

@@ -174,19 +174,20 @@ foreach ($future in @('color-alpha','native-model','native-bootstrap','handled-f
 if ((Test-Path $task8Root) -or (Test-Path $task8VerifierRoot)) { throw 'Task8 refusal leaked a host' }
 # Machine-field parser controls exercise the SAME public-run validator, not a prose/snapshot test.
 $rows=@()
-foreach ($width in @(1920,2560)) {
+foreach ($spec in @(@(1920,81),@(2560,82),@(2560,83))) {
+    $width=$spec[0]; $instance=$spec[1]
     $height=if($width -eq 1920){1080}else{1440}; $sequence=0; $epoch=0
     foreach($sub in @($false,$true)) { foreach($amount in @(1,8,32)) { foreach($sign in @(-1,1)) { foreach($axis in @(0,1)) {
         $epoch++
         foreach($reset in @($true,$false)) {
             $sequence++; $w=if($sub){$width-32}else{$width}; $h=if($sub){$height-48}else{$height}
             $dx=if(!$reset -and $axis -eq 0){$amount*$sign}else{0}; $dy=if(!$reset -and $axis -eq 1){$amount*$sign}else{0}
-            $rows += [pscustomobject]@{width=$width;height=$height;sequence=$sequence;history_epoch=$epoch;content_epoch=$epoch;instance_id=$(if($width -eq 1920){81}else{82});resource_generation=1;submission_serial=$sequence;reset=$reset;active_x=$(if($sub){16}else{0});active_y=$(if($sub){24}else{0});active_width=$w;active_height=$h;errors=0;fixed_vector_bound_pixels=1;max_error_pixels=0;motion_hash='18446744073709551615';dx=$dx;dy=$dy;expected_mv_x=(-$dx);expected_mv_y=(-$dy);scored_pixels=$(if($reset){0}else{($w-128)*($h-128)})}
+            $rows += [pscustomobject]@{width=$width;height=$height;sequence=$sequence;history_epoch=$epoch;content_epoch=$epoch;instance_id=$instance;resource_generation=1;submission_serial=$sequence;reset=$reset;active_x=$(if($sub){16}else{0});active_y=$(if($sub){24}else{0});active_width=$w;active_height=$h;errors=0;fixed_vector_bound_pixels=1;max_error_pixels=0;motion_hash='18446744073709551615';dx=$dx;dy=$dy;expected_mv_x=(-$dx);expected_mv_y=(-$dy);scored_pixels=$(if($reset){0}else{($w-128)*($h-128)})}
         }
     } } } }
 }
-$cap=[pscustomobject]@{supported_grids=@(4,1,2);grid=1;signed_nvidia_system32=$true;api_max=80;cost_is_probability=$false;cost_dxgi_format=62;input_formats=@(87);output_formats=@(38);cost_formats=@(62,42);module_signer='NVIDIA Corporation'}
-$caps=@($cap,$cap)
+$cap=[pscustomobject]@{supported_grids=@(4,1,2);grid=1;frame_interval_ns=0;signed_nvidia_system32=$true;api_max=80;cost_is_probability=$false;cost_dxgi_format=62;input_formats=@(87);output_formats=@(38);cost_formats=@(62,42);module_signer='NVIDIA Corporation'}
+$fast=[pscustomobject]@{supported_grids=@(4,1,2);grid=4;submitted_perf_level=20;frame_interval_ns=16666667;signed_nvidia_system32=$true;api_max=80;cost_is_probability=$false;cost_dxgi_format=62;input_formats=@(87);output_formats=@(38);cost_formats=@(62,42);module_signer='NVIDIA Corporation'}; $caps=@($cap,$cap,$fast)
 Assert-FlowRows $rows $caps
 Write-Output 'PASS flow parser valid machine fields'
 function RejectFlow([string]$Token) {
@@ -205,15 +206,21 @@ $rows[1].expected_mv_x=-$rows[1].expected_mv_x; RejectFlow 'NR_QA_FLOW_DIRECTION
 $rows[0].reset=$false; RejectFlow 'NR_QA_FLOW_CHRONOLOGY'; $rows[0].reset=$true
 $rows[1].history_epoch=0; RejectFlow 'NR_QA_FLOW_CHRONOLOGY'; $rows[1].history_epoch=1
 $rows[48].instance_id=81; RejectFlow 'NR_QA_FLOW_CHRONOLOGY'; $rows[48].instance_id=82
+$rows[96].instance_id=82; RejectFlow 'NR_QA_FLOW_CHRONOLOGY'; $rows[96].instance_id=83
+$fast.grid=1; RejectFlow 'NR_QA_FLOW_CAPABILITY'; $fast.grid=4
+$fast.submitted_perf_level=10; RejectFlow 'NR_QA_FLOW_CAPABILITY'; $fast.submitted_perf_level=20
+$fast.frame_interval_ns=0; RejectFlow 'NR_QA_FLOW_CAPABILITY'; $fast.frame_interval_ns=16666667
 # New native-pass parser controls are machine consumed, not prompt/prose assertions.
 $cap | Add-Member -NotePropertyName hint_support -NotePropertyValue @(1)
 $cap | Add-Member -NotePropertyName hint_grids -NotePropertyValue @(1,2,4,8)
 $cap | Add-Member -NotePropertyName hint_formats -NotePropertyValue @(38)
 $cap | Add-Member -NotePropertyName global_formats -NotePropertyValue @(38)
+foreach($m in @('hint_support','hint_grids','hint_formats','global_formats')){ $fast | Add-Member -NotePropertyName $m -NotePropertyValue $cap.$m }
 $passes=@(); $inputs=@()
 foreach($row in @($rows | Where-Object { !$_.reset })) {
+    $g=if($row.instance_id -eq 83){4}else{1}
     $row | Add-Member -NotePropertyName hardware_hash -NotePropertyValue '123456'
-    $passes += [pscustomobject]@{sequence=$row.sequence;instance_id=$row.instance_id;history_epoch=$row.history_epoch;content_epoch=$row.content_epoch;resource_generation=$row.resource_generation;submission_serial=$row.submission_serial;native_passes=2;predictor_source='native_global';hint_published_as_final_estimate=$false;hint_errors=0;global_width=1;global_height=1;hint_grid=1;output_grid=1;bootstrap_hash='23456';hint_hash='34567';current_resource='1';reference_resource='2';bootstrap_resource='3';global_resource='4';hint_resource='5';local_resource='6';bootstrap_current_resource='7';bootstrap_reference_resource='8';registered_handles=@('1','2','3','4','5','6','7','8','9','10');input_admitted=3;bootstrap_ofa=6;predictor_worker=4;refinement_ofa=12;conversion_worker=5;consumer=3;ofa_completed=12;worker_completed=5;consumer_completed=3;current_producer=2;previous_producer=1;producer_fence='101';ofa_fence='102';worker_fence='103';consumer_fence='101'}
+    $passes += [pscustomobject]@{sequence=$row.sequence;instance_id=$row.instance_id;history_epoch=$row.history_epoch;content_epoch=$row.content_epoch;resource_generation=$row.resource_generation;submission_serial=$row.submission_serial;native_passes=2;predictor_source='native_global';hint_published_as_final_estimate=$false;hint_errors=0;global_width=1;global_height=1;hint_grid=$g;output_grid=$g;bootstrap_hash='23456';hint_hash='34567';current_resource='1';reference_resource='2';bootstrap_resource='3';global_resource='4';hint_resource='5';local_resource='6';bootstrap_current_resource='7';bootstrap_reference_resource='8';registered_handles=@('1','2','3','4','5','6','7','8','9','10');input_admitted=3;bootstrap_ofa=6;predictor_worker=4;refinement_ofa=12;conversion_worker=5;consumer=3;ofa_completed=12;worker_completed=5;consumer_completed=3;current_producer=2;previous_producer=1;producer_fence='101';ofa_fence='102';worker_fence='103';consumer_fence='101'}
     $inputs += [pscustomobject]@{current_sequence=$row.sequence;previous_sequence=($row.sequence-1);instance_id=$row.instance_id;history_epoch=$row.history_epoch;content_epoch=$row.content_epoch;resource_generation=$row.resource_generation;submission_serial=$row.submission_serial;width=$row.width;height=$row.height;format=87;compared_pixels=(4*$row.width*$row.height);gpu_analysis_errors=0;input_hashes=@('11','12','11','12')}
 }
 Assert-FlowPasses $passes $inputs $rows $caps

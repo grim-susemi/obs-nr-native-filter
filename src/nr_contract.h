@@ -214,8 +214,19 @@ inline Selection select_for_tick(const Epochs& active, Phase phase, const Ingres
     else if (expected && ready) problem = completion_problem(*expected, *ready, active, current.canonicalTick);
     if (problem == Reason::None)
         return {current.canonicalTick, OutputKind::DelayedNr, Status::Applied, Reason::None, previous->key, expected->key, false};
+    // A job that is only late keeps running in order on the model queue, so NR and OFA history stay joint;
+    // only a frame the model never got (no expected job) or a refused/failed result resets them.
     return {current.canonicalTick, OutputKind::DelayedRaw, problem == Reason::EvaluationFailure ? Status::Error : Status::Bypassed,
-            problem, previous->key, std::nullopt, true};
+            problem, previous->key, std::nullopt, !(problem == Reason::DeadlineMiss && expected)};
+}
+
+// A late NR result keeps the temporal history, so the frame between two NR frames re-shows the NR frame
+// already in the output instead of flashing the raw frame. Bounded so a stalled runtime still falls back to raw.
+inline constexpr unsigned kMaxHeldNrFrames = 2;
+inline bool hold_previous_nr(const Selection& selected, bool targetHoldsNr, uint64_t targetTick, unsigned held) noexcept
+{
+    return selected.kind == OutputKind::DelayedRaw && selected.reason == Reason::DeadlineMiss && !selected.resetTemporal &&
+           targetHoldsNr && targetTick + 1 == selected.canonicalTick && held < kMaxHeldNrFrames;
 }
 
 enum class TickAction { CaptureOnce, AwaitLatch, ReuseLatch, Reject };

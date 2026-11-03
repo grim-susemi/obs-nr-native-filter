@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Driver ABI and Feature18 use R2 / tests/nr_compatibility/HardwareSmoke.cpp.
 #include "nr_model.h"
+#include <string>
+#include <cstring>
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <mutex>
 #include <stdexcept>
@@ -37,9 +40,73 @@ public:
     }
     uintptr_t owner_module() const noexcept override {return reinterpret_cast<uintptr_t>(&__ImageBase);}
 };
-void checked(HRESULT hr,const char* what) { if(FAILED(hr)) throw std::runtime_error(what); }
+void checked(HRESULT hr,const char* what) { if(FAILED(hr)) throw interop::HResultError(hr,what); }
 void require(bool value,const char* what) { if(!value) throw std::runtime_error(what); }
 int64_t stamp() { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return value.QuadPart; }
+struct TimingAgg {
+    std::atomic<unsigned> jobs{0};
+    std::atomic<int64_t> sumSubmit{0},maxSubmit{0},sumEncode{0},maxEncode{0},sumAdmit{0},maxAdmit{0};
+    std::atomic<unsigned> admitJobs{0},late{0},stageJobs{0},queueJobs{0},creationJobs{0};
+    std::atomic<int64_t> sumCreation{0},maxCreation{0};
+    std::atomic<int64_t> sumProd{0},maxProd{0},sumPrep{0},sumRec{0},sumGpu{0},sumQueue{0},maxQueue{0};
+};
+TimingAgg timingAgg;
+struct JobTraceEntry {std::atomic<uint64_t> deadline{0};std::atomic<int64_t> queue{0},run{0},total{0};std::atomic<int> late{0};};
+JobTraceEntry jobTrace[16];
+std::atomic<unsigned> jobTraceHead{0};
+struct EligEntry {std::atomic<uint64_t> deadline{0};std::atomic<uint32_t> invalid{0},code{0},flags{0};}; // diagnostic: publication eligibility
+EligEntry eligTrace[16];
+std::atomic<unsigned> eligHead{0};
+struct EligAgg {std::atomic<unsigned> n{0},bad{0},badHist{0},badReset{0},orMask{0},noEval{0},noSubmit{0},incomplete{0},qa{0};};
+EligAgg eligAgg;
+std::atomic<uint32_t> appliedPerf{0},appliedGrid{0},appliedHint{0}; // diagnostic: estimator settings actually in use
+struct TickRing {std::atomic<uint64_t> tick[256];std::atomic<int64_t> qpc[256];};
+TickRing tickRing;
+int64_t admit_stamp(uint64_t tick) {
+    if(!tick) return 0;
+    const auto i=tick&255;
+    if(tickRing.tick[i].load(std::memory_order_acquire)!=tick) return 0;
+    return tickRing.qpc[i].load(std::memory_order_relaxed);
+}
+void raise_max(std::atomic<int64_t>& slot,int64_t value) {
+    auto seen=slot.load(std::memory_order_relaxed);
+    while(value>seen && !slot.compare_exchange_weak(seen,value,std::memory_order_relaxed)) {}
+}
+void record_timing(const std::array<int64_t,8>& c,uint64_t deadline,const std::array<int64_t,5>& q) { // diagnostic only: evaluation jobs carry an encode stamp
+    if(c[1]<=0 && c[0]>0 && c[5]>0 && c[6]>=c[0]) {
+        timingAgg.creationJobs.fetch_add(1,std::memory_order_relaxed);const auto cd=c[6]-c[0];
+        timingAgg.sumCreation.fetch_add(cd,std::memory_order_relaxed);raise_max(timingAgg.maxCreation,cd);return;
+    }
+    if(c[1]<=0 || c[5]<=0 || c[6]<c[5] || c[5]<c[1]) return;
+    const auto submit=c[6]-c[5],encode=c[6]-c[1];
+    timingAgg.jobs.fetch_add(1,std::memory_order_relaxed);
+    timingAgg.sumSubmit.fetch_add(submit,std::memory_order_relaxed);timingAgg.sumEncode.fetch_add(encode,std::memory_order_relaxed);
+    raise_max(timingAgg.maxSubmit,submit);raise_max(timingAgg.maxEncode,encode);
+    if(const auto admit=admit_stamp(deadline-1); admit>0 && c[6]>=admit) {
+        const auto total=c[6]-admit;
+        timingAgg.admitJobs.fetch_add(1,std::memory_order_relaxed);timingAgg.sumAdmit.fetch_add(total,std::memory_order_relaxed);
+        raise_max(timingAgg.maxAdmit,total);
+    }
+    if(const auto check=admit_stamp(deadline); check>0 && c[6]>check) timingAgg.late.fetch_add(1,std::memory_order_relaxed);
+    if(c[0]>0 && q[1]>=c[0] && c[1]>=q[1] && c[5]>=c[1]) {
+        timingAgg.stageJobs.fetch_add(1,std::memory_order_relaxed);
+        const auto prod=q[1]-c[0];
+        timingAgg.sumProd.fetch_add(prod,std::memory_order_relaxed);raise_max(timingAgg.maxProd,prod);
+        timingAgg.sumPrep.fetch_add(c[1]-q[1],std::memory_order_relaxed);
+        timingAgg.sumRec.fetch_add(c[5]-c[1],std::memory_order_relaxed);
+        timingAgg.sumGpu.fetch_add(c[6]-c[5],std::memory_order_relaxed);
+        {
+            const auto ad=admit_stamp(deadline-1);const auto chk=admit_stamp(deadline);
+            auto& e=jobTrace[jobTraceHead.fetch_add(1,std::memory_order_relaxed)&15];
+            e.deadline.store(deadline);e.queue.store(ad>0&&c[0]>=ad?c[0]-ad:0);e.run.store(c[6]-c[0]);
+            e.total.store(ad>0&&c[6]>=ad?c[6]-ad:0);e.late.store(chk>0&&c[6]>chk?1:0);
+        }
+        if(const auto admit2=admit_stamp(deadline-1); admit2>0 && c[0]>=admit2) {
+            const auto qd=c[0]-admit2;
+            timingAgg.queueJobs.fetch_add(1,std::memory_order_relaxed);timingAgg.sumQueue.fetch_add(qd,std::memory_order_relaxed);raise_max(timingAgg.maxQueue,qd);
+        }
+    }
+}
 template<class T> T symbol(HMODULE module,const char* name) {
     auto value=GetProcAddress(module,name); require(value!=nullptr,name);
     return reinterpret_cast<T>(value);
@@ -336,7 +403,19 @@ void finish_completed(Job& job) {
     job.eligible=qa_publication_allowed(job.qaFailure.load(std::memory_order_acquire)) &&
         job.evaluated && job.composed && job.submitted && !job.invalid &&
         r.submission->state()==runtime::Completion::Complete;
-    job.chronology[7]=stamp();
+    { // diagnostic: why a completed job is or is not publishable
+        const bool hist=job.flow.has_value() && !job.flow->reset;
+        const bool complete=r.submission->state()==runtime::Completion::Complete;
+        const bool qaOk=qa_publication_allowed(job.qaFailure.load(std::memory_order_acquire));
+        auto& e=eligTrace[eligHead.fetch_add(1,std::memory_order_relaxed)&15];
+        e.deadline.store(job.contract.deadlineTick);e.invalid.store(job.invalid);e.code.store(job.code);
+        e.flags.store((hist?1u:0u)|(job.eligible?2u:0u)|(job.evaluated?4u:0u)|(job.submitted?8u:0u)|(complete?16u:0u)|(qaOk?32u:0u)|(job.flow.has_value()?64u:0u));
+        eligAgg.n.fetch_add(1);
+        if(!job.eligible){eligAgg.bad.fetch_add(1);(hist?eligAgg.badHist:eligAgg.badReset).fetch_add(1);eligAgg.orMask.fetch_or(job.invalid);
+            if(!job.evaluated)eligAgg.noEval.fetch_add(1);if(!job.submitted)eligAgg.noSubmit.fetch_add(1);
+            if(!complete)eligAgg.incomplete.fetch_add(1);if(!qaOk)eligAgg.qa.fetch_add(1);}
+    }
+    job.chronology[7]=stamp();record_timing(job.chronology,job.contract.deadlineTick,job.qaTiming);
     job.ready.store(true,std::memory_order_release);
     observe_completed(job);
     SetEvent(job.observed);
@@ -418,6 +497,19 @@ struct Processor::Impl {
     uint64_t generation=0;
     bool reset=true;
     const char* lastResetSetter="initial-reset";
+    // N23 worker diagnostics (no behavior change).
+    std::atomic<uint64_t> diagOk{0},diagFail{0},diagExc{0};std::atomic<uint32_t> diagSettle{0},diagLastCode{0},diagFirstN{0};
+    std::array<std::atomic<uint64_t>,8> diagFirst{};std::array<char,160> diagWhat{};std::atomic<bool> diagWhatSet{false};
+    void diag_fail(uint32_t code) {
+        diagFail.fetch_add(1);diagLastCode.store(code);const auto n=diagFirstN.load();
+        if(n<diagFirst.size()) {
+            uint64_t v=code&0xffff;v|=uint64_t(diagSettle.load()&3)<<16;if(guides)v|=uint64_t(guides->state_bits()&7)<<18;
+            if(pending){v|=1ull<<21;if(pending->ready.load())v|=1ull<<22;if(pending->callbackArrived.load())v|=1ull<<23;
+                if(pending->resources&&pending->resources->complete)v|=uint64_t(std::min<uint64_t>(pending->resources->complete->GetCompletedValue(),3))<<24;}
+            if(pendingGuide)v|=1ull<<26;diagFirst[n].store(v);diagFirstN.store(n+1);
+        }
+        diagSettle.store(0);
+    }
     Impl(std::shared_ptr<interop::Context> value,Config input,uint64_t id)
         :context(std::move(value)),config(std::move(input)),instance(id) {
         require(context && id && !config.codec.empty() && !config.color.empty() && !config.guides.empty(),
@@ -425,8 +517,8 @@ struct Processor::Impl {
     }
     bool settle() {
         if(!pending) return true;
-        if(!pending->ready.load(std::memory_order_acquire)) return false;
-        if(pendingGuide && !guides->collect(*pendingGuide,{pending->resources->complete.Get(),1})) return false;
+        if(!pending->ready.load(std::memory_order_acquire)) {diagSettle.store(1);return false;}
+        if(pendingGuide && !guides->collect(*pendingGuide,{pending->resources->complete.Get(),1})) {diagSettle.store(2);return false;}
         pendingGuide.reset(); pending->resources->unsubscribe(); pending.reset(); return true;
     }
     void subscribe(const std::shared_ptr<Job>& job) {
@@ -548,6 +640,14 @@ bool Processor::publish(const std::shared_ptr<Job>& job,const Selection& selecte
     if(!job->published.compare_exchange_strong(expected,true)) return false;
     impl_->appliedCount.fetch_add(1,std::memory_order_relaxed); return true;
 }
+std::string Processor::diag() const {
+    const auto& p=*impl_;char b[64];
+    std::string s=" mdl ok="+std::to_string(p.diagOk.load())+" fail="+std::to_string(p.diagFail.load())+" exc="+std::to_string(p.diagExc.load());
+    std::snprintf(b,sizeof b," last=%x",p.diagLastCode.load());s+=b;
+    for(uint32_t i=0;i<p.diagFirstN.load()&&i<p.diagFirst.size();++i){std::snprintf(b,sizeof b," f%u=%llx",i,(unsigned long long)p.diagFirst[i].load());s+=b;}
+    if(p.diagWhatSet.load(std::memory_order_acquire)){s+=" what=";s+=p.diagWhat.data();}
+    return s;
+}
 pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_token stop) {
     auto& p=*impl_;
     if(p.worker==std::thread::id{}) p.worker=std::this_thread::get_id();
@@ -556,9 +656,10 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     require(job && job->contract==work.job && work.raw && work.job.input==work.raw->input && work.binding.transport &&
         work.binding.ticket.key==work.job.key && work.binding.capturePin &&
         work.binding.capturePin->ticket==work.binding.ticket,"exact captured model binding");
-    if(p.config.qaObservations||job->observation)job->qaTiming[0]=stamp();
+    job->chronology[0]=stamp();if(p.config.qaObservations||job->observation)job->qaTiming[0]=stamp();
     auto fail=[&](uint32_t code) {
         job->code=code; p.reset=true; p.lastResetSetter="presubmit-failure";
+        p.diag_fail(code);
         if(job->fault!=Fault::None)job->qaFailure.store(code,std::memory_order_release);
         require(work.binding.transport->discard_recording(work.binding.ticket),"model presubmit discard");
         job->ready.store(true,std::memory_order_release); observe_completed(*job);SetEvent(job->observed);
@@ -579,7 +680,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     });
     if(producerCode)return fail(producerCode);
     const auto& d=work.job.input.descriptor;
-    if(p.config.qaObservations||job->observation)job->qaTiming[1]=stamp();
+    job->qaTiming[1]=stamp();
     const Extent size{d.active.width,d.active.height};
     auto* device=p.context->device();
     const auto plan=color_plan(d,job->exposure,
@@ -677,7 +778,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const bool reset=p.reset || !p.previousKey || p.previousKey->historyEpoch!=work.job.key.historyEpoch ||
         p.previousKey->frame.contentEpoch!=work.job.key.frame.contentEpoch ||
         p.previousKey->frame.ingressSequence+1!=work.job.key.frame.ingressSequence;
-    if(!p.guides) p.guides=std::make_unique<D3D12Guides>(device,p.context->queue(),d.allocation,p.config.guides);
+    if(!p.guides) p.guides=std::make_unique<D3D12Guides>(device,p.context->queue(),d.allocation,p.config.guides,p.config.frameIntervalNs);
     if(p.config.qaPreparation && !p.preparation.load(std::memory_order_relaxed))
         p.preparation.store(std::make_shared<const GuidePreparation>(GuidePreparation{
             work.job.key,p.guides->observation_descriptors(),p.guides->grid_size()}),std::memory_order_release);
@@ -689,6 +790,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const auto* guide=p.guides->result(); require(guide && guide->key==work.job.key,"exact native guides");
     job->flow.emplace(*guide);
     job->guideGrid=p.guides->grid_size();
+        appliedPerf.store(static_cast<uint32_t>(p.guides->perf_level()));appliedGrid.store(p.guides->grid_size());appliedHint.store(p.guides->hint_grid_size());
     if(previous) job->guideReferenceKey.emplace(previous->key);
     p.pendingGuide.emplace(work.job.key);
     checked(p.context->queue()->Wait(guide->complete.fence,guide->complete.value),"native guide queue dependency");
@@ -779,9 +881,11 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     p.reset=!job->submitted; p.lastResetSetter="submission-result";
     p.previousKey.emplace(work.job.key); p.previousFrame=job->frame;
     p.signal(job);
+    p.diagOk.fetch_add(1);
     return {work.job,job->submitted,job};
     } catch(const std::exception& error) {
         job->diagnostic=error.what(); job->code=0xefff; p.reset=true; p.lastResetSetter="process-exception";
+        p.diagExc.fetch_add(1);if(!p.diagWhatSet.load()){{const char* m=error.what();size_t i=0;for(;m[i]&&i+1<p.diagWhat.size();++i)p.diagWhat[i]=m[i];p.diagWhat[i]=0;}p.diagWhatSet.store(true,std::memory_order_release);}p.diag_fail(0xefff);
         // No recording/resources means no feature submission occurred. All other
         // failures retain their exact resource owners; never manufacture completion.
         if(!job->resources && work.binding.transport->discard_recording(work.binding.ticket)) {
@@ -850,5 +954,67 @@ void Processor::worker_stopping() noexcept {
     if(complete) {
         p.module.reset();p.driver.reset();p.session.reset();p.closed.store(true,std::memory_order_release);
     }
+}
+int64_t qpc_now() { return stamp(); }
+double qpc_ms(int64_t delta) {
+    LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
+    return freq.QuadPart>0?1000.0*static_cast<double>(delta)/static_cast<double>(freq.QuadPart):0.0;
+}
+void note_admit(uint64_t tick,int64_t qpc) {
+    const auto i=tick&255;
+    tickRing.tick[i].store(0,std::memory_order_release);
+    tickRing.qpc[i].store(qpc,std::memory_order_relaxed);
+    tickRing.tick[i].store(tick,std::memory_order_release);
+}
+std::string take_job_trace_base() {
+    const auto head=jobTraceHead.load(std::memory_order_relaxed);
+    std::string out;
+    const unsigned n=head<12?head:12;
+    for(unsigned k=n;k>0;--k) {
+        const auto& e=jobTrace[(head-k)&15];
+        char buf[96];
+        std::snprintf(buf,sizeof buf,"%s%llu:q%.0f/r%.0f/t%.0f%s",out.empty()?"":",",static_cast<unsigned long long>(e.deadline.load()%1000),
+            qpc_ms(e.queue.load()),qpc_ms(e.run.load()),qpc_ms(e.total.load()),e.late.load()?"L":"");
+        out+=buf;
+    }
+    return out;
+}
+std::string take_job_trace() {
+    auto out=take_job_trace_base();
+    out+=" | of perf"+std::to_string(appliedPerf.load())+" grid"+std::to_string(appliedGrid.load())+" hint"+std::to_string(appliedHint.load());
+    char buf[200];
+    std::snprintf(buf,sizeof buf," | elig n%u bad%u hist%u reset%u mask%x noEval%u noSub%u incomplete%u qa%u last(",
+        eligAgg.n.exchange(0),eligAgg.bad.exchange(0),eligAgg.badHist.exchange(0),eligAgg.badReset.exchange(0),eligAgg.orMask.exchange(0),
+        eligAgg.noEval.exchange(0),eligAgg.noSubmit.exchange(0),eligAgg.incomplete.exchange(0),eligAgg.qa.exchange(0));
+    out+=buf;
+    const auto head=eligHead.load(std::memory_order_relaxed);const unsigned n=head<8?head:8;
+    for(unsigned k=n;k>0;--k) {
+        const auto& e=eligTrace[(head-k)&15];
+        std::snprintf(buf,sizeof buf,"%s%llu:i%x/c%x/f%x",k==n?"":",",static_cast<unsigned long long>(e.deadline.load()%1000),e.invalid.load(),e.code.load(),e.flags.load());
+        out+=buf;
+    }
+    out+=")";
+    return out;
+}
+JobTimingWindow take_job_timing() {
+    LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
+    const double toMs=freq.QuadPart>0?1000.0/static_cast<double>(freq.QuadPart):0.0;
+    JobTimingWindow w;
+    w.jobs=timingAgg.jobs.exchange(0);
+    const auto aj=timingAgg.admitJobs.exchange(0);const auto sa=timingAgg.sumAdmit.exchange(0);
+    w.late=timingAgg.late.exchange(0);w.admitMaxMs=qpc_ms(timingAgg.maxAdmit.exchange(0));
+    if(aj) w.admitMeanMs=qpc_ms(sa)/aj;
+    const auto sj=timingAgg.stageJobs.exchange(0),qj=timingAgg.queueJobs.exchange(0);
+    const auto sp=timingAgg.sumProd.exchange(0),spp=timingAgg.sumPrep.exchange(0),sr=timingAgg.sumRec.exchange(0),sg=timingAgg.sumGpu.exchange(0),sq=timingAgg.sumQueue.exchange(0);
+    w.queueMaxMs=qpc_ms(timingAgg.maxQueue.exchange(0));w.prodMaxMs=qpc_ms(timingAgg.maxProd.exchange(0));
+    if(sj){w.prodMeanMs=qpc_ms(sp)/sj;w.prepMeanMs=qpc_ms(spp)/sj;w.recMeanMs=qpc_ms(sr)/sj;w.gpuMeanMs=qpc_ms(sg)/sj;}
+    if(qj) w.queueMeanMs=qpc_ms(sq)/qj;
+    const auto cj=timingAgg.creationJobs.exchange(0);const auto scr=timingAgg.sumCreation.exchange(0);
+    w.creationJobs=cj;w.creationMaxMs=qpc_ms(timingAgg.maxCreation.exchange(0));if(cj)w.creationMeanMs=qpc_ms(scr)/cj;
+    const auto ss=timingAgg.sumSubmit.exchange(0),se=timingAgg.sumEncode.exchange(0);
+    w.submitMaxMs=static_cast<double>(timingAgg.maxSubmit.exchange(0))*toMs;
+    w.encodeMaxMs=static_cast<double>(timingAgg.maxEncode.exchange(0))*toMs;
+    if(w.jobs){w.submitMeanMs=static_cast<double>(ss)*toMs/w.jobs;w.encodeMeanMs=static_cast<double>(se)*toMs/w.jobs;}
+    return w;
 }
 } // namespace nr::model

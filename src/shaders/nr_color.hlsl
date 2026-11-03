@@ -93,7 +93,10 @@ void main(uint3 id:SV_DispatchThreadID) {
     if(!Valid(float4(prepared,raw.a),color==1)||any(abs(prepared)>65504)) { Invalid(id.xy,raw,4);return; }
     if(mode==0) { outputImage[id.xy]=float4(prepared,raw.a);return; }
     float4 resolved=canonical.Load(int3(id.xy,0));
-    if(!Valid(resolved,color==1)) { Invalid(id.xy,raw,8);return; }
+    if(!all(isfinite(resolved))||resolved.a<0||resolved.a>1) { Invalid(id.xy,raw,8);return; }
+    // A finite SDR answer can overshoot [0,1] slightly at sharp edges once history is carried. Clamp that pixel
+    // instead of discarding the whole frame: one such pixel cancelled every history job (copy OBS 2026-11-03, bit 8).
+    if(color==1) resolved.rgb=saturate(resolved.rgb);
     // No real prior guide pair exists on cold/reset. Preserve exact source,
     // after validating the real unprotected NR answer; D remains independently observed.
     if(referenceValid==0) { outputImage[id.xy]=raw;return; }

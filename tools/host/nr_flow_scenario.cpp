@@ -79,7 +79,7 @@ struct State {
     HANDLE event=nullptr;
     uint64_t serial=0;
     bool inFlight=false;
-    State(ID3D12Device* d,ID3D12CommandQueue* q,Extent s,std::span<const std::byte> shader):device(d),queue(q),size(s) {
+    State(ID3D12Device* d,ID3D12CommandQueue* q,Extent s,std::span<const std::byte> shader,uint64_t interval=0):device(d),queue(q),size(s) {
         // Cleanup is owned by State BEFORE the first asynchronous submit.
         checked(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"QA allocator");
         checked(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&commands)),"QA list");
@@ -95,7 +95,7 @@ struct State {
         device->GetCopyableFootprints(&desc,0,1,0,&mvFootprint,nullptr,nullptr,&bytes); readMotion=buffer(device,bytes,D3D12_HEAP_TYPE_READBACK);
         desc.Format=DXGI_FORMAT_R32_FLOAT;
         device->GetCopyableFootprints(&desc,0,1,0,&depthFootprint,nullptr,nullptr,&bytes); readDepth=buffer(device,bytes,D3D12_HEAP_TYPE_READBACK);
-        guides=std::make_unique<D3D12Guides>(device,queue,size,shader);
+        guides=std::make_unique<D3D12Guides>(device,queue,size,shader,interval);
         desc.Width=(size.width+guides->grid_size()-1)/guides->grid_size();
         desc.Height=(size.height+guides->grid_size()-1)/guides->grid_size(); desc.Format=DXGI_FORMAT_R16G16_SINT;
         device->GetCopyableFootprints(&desc,0,1,0,&hardwareFootprint,nullptr,nullptr,&bytes); readHardware=buffer(device,bytes,D3D12_HEAP_TYPE_READBACK);
@@ -349,8 +349,12 @@ int run_flow_translation(ID3D12Device* device,ID3D12CommandQueue* queue,std::spa
     if(!device || !queue || shader.empty()) { evidence<<"{\"state\":\"INVALID_OWNED_CONTEXT\"}"<<std::endl; return 1; }
     std::unique_ptr<State> state;
     try {
-        for(auto size:{Extent{1920,1080},Extent{2560,1440}}) {
-            state=std::make_unique<State>(device,queue,size,shader);
+        for(const auto& pass:{std::pair{Extent{1920,1080},uint64_t{0}},std::pair{Extent{2560,1440},uint64_t{0}},
+            std::pair{Extent{2560,1440},uint64_t{16666667}}}) { // third pass: owner 1440p@60 interval -> FAST, 4-pixel grid
+            const Extent size=pass.first; const uint64_t interval=pass.second;
+            state=std::make_unique<State>(device,queue,size,shader,interval);
+            if(interval) require(state->guides->perf_level()==NV_OF_PERF_LEVEL_FAST && state->guides->grid_size()>=4,
+                "owner 1440p@60 interval must select FAST with a 4-pixel or coarser grid");
 
             const auto& module=state->guides->module_identity();
             const auto& caps=state->guides->capabilities();
@@ -358,7 +362,7 @@ int run_flow_translation(ID3D12Device* device,ID3D12CommandQueue* queue,std::spa
                 <<",\"module_signer\":"<<std::quoted(utf8(module.signer))
                 <<",\"module_sha256\":\""<<module.sha256<<"\",\"signed_nvidia_system32\":true,\"api_max\":"<<module.maxApi
                 <<",\"grid\":"<<state->guides->grid_size()<<",\"cost_dxgi_format\":"<<static_cast<unsigned>(state->guides->cost_format())
-                <<",\"submitted_perf_level\":"<<static_cast<unsigned>(flow_init_params(size,state->guides->grid_size()).perfLevel)
+                <<",\"submitted_perf_level\":"<<static_cast<unsigned>(state->guides->perf_level())<<",\"frame_interval_ns\":"<<interval
                 <<",\"cost_is_probability\":false,\"supported_grids\":[";
             for(size_t i=0;i<caps.grids.size();++i) evidence<<(i?",":"")<<caps.grids[i];
             evidence<<"],\"input_formats\":[";
@@ -377,7 +381,7 @@ int run_flow_translation(ID3D12Device* device,ID3D12CommandQueue* queue,std::spa
             for(size_t i=0;i<caps.globalFormats.size();++i) evidence<<(i?",":"")<<static_cast<unsigned>(caps.globalFormats[i]);
             evidence<<"]}"<<std::endl;
             uint64_t sequence=0,epoch=0;
-            const uint64_t instance=size.width==1920?81u:82u;
+            const uint64_t instance=size.width==1920?81u:(interval?83u:82u);
             for(const auto active:{Rect{0,0,size.width,size.height},Rect{16,24,size.width-32,size.height-48}})
                 for(auto amount:{1,8,32}) for(auto sign:{-1,1}) for(auto axis:{0,1}) {
                     const int dx=axis==0?amount*sign:0,dy=axis==1?amount*sign:0;

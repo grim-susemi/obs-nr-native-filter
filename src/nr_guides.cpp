@@ -42,15 +42,28 @@ FlowProblem flow_chronology_problem(const JobKey& current,const JobKey* previous
     if(current.frame.instanceId!=last->frame.instanceId || current.resourceGeneration!=last->resourceGeneration ||
        current.submissionSerial<=last->submissionSerial || current.frame.ingressSequence<=last->frame.ingressSequence)
         return FlowProblem::KeyMismatch;
-    if(reset) return current.historyEpoch>last->historyEpoch?FlowProblem::None:FlowProblem::ResetPair;
+    // A model-initiated reset (dropped/refused job, presubmit failure) stays inside the current history
+    // epoch since DeadlineMiss keeps history; the NR pass applies DLSSNR.Reset from the same flag.
+    // Only a history epoch moving backwards is refused (strict > wedged every later job as ResetPair).
+    if(reset) return current.historyEpoch>=last->historyEpoch?FlowProblem::None:FlowProblem::ResetPair;
     return previous && *previous==*last && lastActive && active==*lastActive?FlowProblem::None:FlowProblem::KeyMismatch;
 }
-NV_OF_INIT_PARAMS flow_init_params(Extent size,uint32_t grid) {
+NV_OF_INIT_PARAMS flow_init_params(Extent size,uint32_t grid,NV_OF_PERF_LEVEL perf) {
     NV_OF_INIT_PARAMS p{}; p.width=size.width; p.height=size.height;
     p.outGridSize=static_cast<NV_OF_OUTPUT_VECTOR_GRID_SIZE>(grid);
-    p.mode=NV_OF_MODE_OPTICALFLOW; p.perfLevel=NV_OF_PERF_LEVEL_MEDIUM;
+    p.mode=NV_OF_MODE_OPTICALFLOW; p.perfLevel=perf;
     p.enableOutputCost=NV_OF_TRUE; p.predDirection=NV_OF_PRED_DIRECTION_FORWARD;
     p.inputBufferFormat=NV_OF_BUFFER_FORMAT_ABGR8; return p;
+}
+FlowPolicy flow_policy(Extent size,uint64_t frameIntervalNs) {
+    // Copy-OBS measurements on RTX 4090 (2026-11-03): history jobs at MEDIUM/full grid missed one frame at
+    // 1478x919@60 (21 ms); FAST/full grid held 1478x919@60 (12 ms) and 2528x1369@30 (24 ms);
+    // 2528x1369@60 needed FAST with a 4-pixel vector grid (14-15 ms). Rate = working pixels per second.
+    if(!frameIntervalNs || !size.width || !size.height) return {};
+    const double rate=double(size.width)*double(size.height)*1e9/double(frameIntervalNs);
+    if(rate<=50e6) return {};
+    if(rate<=110e6) return {NV_OF_PERF_LEVEL_FAST,1};
+    return {NV_OF_PERF_LEVEL_FAST,4};
 }
 std::optional<uint32_t> smallest_hint_grid(std::span<const uint32_t> caps,uint32_t outputGrid) {
     std::optional<uint32_t> result;
@@ -60,11 +73,11 @@ std::optional<uint32_t> smallest_hint_grid(std::span<const uint32_t> caps,uint32
     }
     return result;
 }
-NV_OF_INIT_PARAMS flow_bootstrap_params(Extent size,uint32_t grid) {
-    auto p=flow_init_params(size,grid); p.enableGlobalFlow=NV_OF_TRUE; return p;
+NV_OF_INIT_PARAMS flow_bootstrap_params(Extent size,uint32_t grid,NV_OF_PERF_LEVEL perf) {
+    auto p=flow_init_params(size,grid,perf); p.enableGlobalFlow=NV_OF_TRUE; return p;
 }
-NV_OF_INIT_PARAMS flow_refinement_params(Extent size,uint32_t grid,uint32_t hintGrid) {
-    auto p=flow_init_params(size,grid); p.enableExternalHints=NV_OF_TRUE;
+NV_OF_INIT_PARAMS flow_refinement_params(Extent size,uint32_t grid,uint32_t hintGrid,NV_OF_PERF_LEVEL perf) {
+    auto p=flow_init_params(size,grid,perf); p.enableExternalHints=NV_OF_TRUE;
     p.hintGridSize=static_cast<NV_OF_HINT_VECTOR_GRID_SIZE>(hintGrid); return p;
 }
 NV_OF_EXECUTE_INPUT_PARAMS_D3D12 flow_execute_input(NvOFGPUBufferHandle c,NvOFGPUBufferHandle p,bool reset,
@@ -181,13 +194,14 @@ struct D3D12Guides::Impl {
     NvOFHandle session=nullptr,refinement=nullptr;
     const Extent size;
     uint32_t grid=0,hintGrid=0;
+    FlowPolicy policy;
     DXGI_FORMAT costFormat=DXGI_FORMAT_UNKNOWN;
     uint64_t ofValue=0,workerValue=0;
     bool pending=false,uncertain=false,disableHints=true,closed=false;
     std::optional<JobKey> last;
     std::optional<Rect> lastActive;
     std::optional<FlowResult> output;
-    explicit Impl(ID3D12Device* d,ID3D12CommandQueue* q,Extent s):device(d),queue(q),size(s) {}
+    explicit Impl(ID3D12Device* d,ID3D12CommandQueue* q,Extent s,uint64_t interval):device(d),queue(q),size(s),policy(flow_policy(s,interval)) {}
     std::vector<DXGI_FORMAT> formats(NV_OF_BUFFER_USAGE usage) {
         uint32_t count=0;
         of_checked(driver.api.nvOFGetSurfaceFormatCountD3D12(session,usage,NV_OF_MODE_OPTICALFLOW,&count),"OFA format count");
@@ -223,6 +237,7 @@ struct D3D12Guides::Impl {
         grids.resize(count); const auto smallest=smallest_flow_grid(grids);
         caps.grids=grids;
         if(!smallest) throw std::runtime_error("OFA unsupported output grid"); grid=*smallest;
+        if(policy.minGrid>grid){uint32_t best=0;for(auto g:grids)if(g>=policy.minGrid&&(best==0||g<best))best=g;if(best)grid=best;}
         const auto inputFormats=formats(NV_OF_BUFFER_USAGE_INPUT),outputFormats=formats(NV_OF_BUFFER_USAGE_OUTPUT);
         caps.inputFormats=inputFormats; caps.outputFormats=outputFormats;
         if(std::find(inputFormats.begin(),inputFormats.end(),DXGI_FORMAT_B8G8R8A8_UNORM)==inputFormats.end() ||
@@ -246,9 +261,9 @@ struct D3D12Guides::Impl {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT hintSupport{DXGI_FORMAT_R16G16_SINT};
         checked(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&hintSupport,sizeof(hintSupport)),"predictor typed UAV query");
         if(!(hintSupport.Support2&D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) throw std::runtime_error("predictor typed UAV store unsupported");
-        const auto init=flow_bootstrap_params(size,grid); of_checked(driver.api.nvOFInit(session,&init),"OFA bootstrap initialize");
+        const auto init=flow_bootstrap_params(size,grid,policy.perf); of_checked(driver.api.nvOFInit(session,&init),"OFA bootstrap initialize");
         of_checked(driver.api.nvCreateOpticalFlowD3D12(device.Get(),&refinement),"OFA refinement create");
-        const auto refineInit=flow_refinement_params(size,grid,hintGrid);
+        const auto refineInit=flow_refinement_params(size,grid,hintGrid,policy.perf);
         of_checked(driver.api.nvOFInit(refinement,&refineInit),"OFA refinement initialize");
         const Extent cells{(size.width+grid-1)/grid,(size.height+grid-1)/grid};
         hardware=texture(device.Get(),cells,DXGI_FORMAT_R16G16_SINT,false);
@@ -475,8 +490,8 @@ FlowProblem D3D12Guides::Impl::submit(const FlowInput& in) {
         OutputDebugStringA(error.what()); uncertain=true; return FlowProblem::ApiFailure;
     }
 }
-D3D12Guides::D3D12Guides(ID3D12Device* device,ID3D12CommandQueue* queue,Extent size,std::span<const std::byte> shader)
-    :impl_(std::make_unique<Impl>(device,queue,size)) {
+D3D12Guides::D3D12Guides(ID3D12Device* device,ID3D12CommandQueue* queue,Extent size,std::span<const std::byte> shader,uint64_t frameIntervalNs)
+    :impl_(std::make_unique<Impl>(device,queue,size,frameIntervalNs)) {
     try { impl_->initialize(shader); }
     catch(...) { if(!impl_->close()) { OutputDebugStringA("OFA initialization ownership retained"); (void)impl_.release(); } throw; }
 }
@@ -500,7 +515,9 @@ bool D3D12Guides::close() { return impl_->close(); }
 const FlowModuleIdentity& D3D12Guides::module_identity() const { return impl_->driver.identity; }
 const FlowCapabilities& D3D12Guides::capabilities() const { return impl_->caps; }
 uint32_t D3D12Guides::grid_size() const { return impl_->grid; }
+uint32_t D3D12Guides::state_bits() const { return (impl_->pending?1u:0u)|(impl_->uncertain?2u:0u)|(impl_->output?4u:0u); }
 uint32_t D3D12Guides::hint_grid_size() const { return impl_->hintGrid; }
+NV_OF_PERF_LEVEL D3D12Guides::perf_level() const { return impl_->policy.perf; }
 DXGI_FORMAT D3D12Guides::cost_format() const { return impl_->costFormat; }
 std::array<D3D12_RESOURCE_DESC,2> D3D12Guides::observation_descriptors() const {
     if(impl_->uncertain || !impl_->hardware || !impl_->cost) return {};

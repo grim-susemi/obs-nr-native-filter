@@ -3,10 +3,20 @@
 #include <atomic>
 #include <array>
 #include <stdexcept>
+#include <cstdio>
+#include <string>
+#include <vector>
 namespace nr::interop {
 namespace {
 template<class T>using Ptr=Microsoft::WRL::ComPtr<T>;
-void check(HRESULT hr){if(FAILED(hr))throw std::runtime_error("interop HRESULT failure: "+std::to_string(static_cast<uint32_t>(hr)));}
+void check(HRESULT hr){if(FAILED(hr))throw HResultError(hr,"interop HRESULT failure: "+std::to_string(static_cast<uint32_t>(hr)));}
+bool dred_requested(){wchar_t v[4]{};return GetEnvironmentVariableW(L"OBS_NR_DRED",v,4)==1&&v[0]==L'1';}
+std::string narrow(const wchar_t* w){
+ if(!w||!*w)return "?";
+ const int n=WideCharToMultiByte(CP_UTF8,0,w,-1,nullptr,0,nullptr,nullptr);
+ if(n<=1)return "?";
+ std::string s(static_cast<size_t>(n-1),'\0');WideCharToMultiByte(CP_UTF8,0,w,-1,s.data(),n,nullptr,nullptr);return s;
+}
 struct Handle {
  HANDLE value=nullptr;
  ~Handle(){if(value&&value!=INVALID_HANDLE_VALUE)CloseHandle(value);}
@@ -34,12 +44,50 @@ HRESULT open_shared_resource(ID3D12Device* device,HANDLE handle,ID3D12Resource**
 Context::Context(ID3D11Device* renderer):graphicsThread_(GetCurrentThreadId()),luid_(renderer_luid(renderer)){
  check(renderer->QueryInterface(IID_PPV_ARGS(&renderer_)));Ptr<IDXGIFactory4> factory;Ptr<IDXGIAdapter1> adapter;
  check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));check(factory->EnumAdapterByLuid(luid_,IID_PPV_ARGS(&adapter)));
+ if(dred_requested()) { // diagnostic soak only: must precede device creation
+  Ptr<ID3D12DeviceRemovedExtendedDataSettings> dred;
+  if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+   dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+   dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+  }
+ }
  check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device_)));
  D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
  check(device_->CreateCommandQueue(&q,IID_PPV_ARGS(&queue_)));
  if(!compatible_context(renderer,device_.Get(),queue_.Get()))throw std::runtime_error("interop adapter/canonical queue identity mismatch");
 }
 std::shared_ptr<Context> Context::create(ID3D11Device* d){return std::shared_ptr<Context>(new Context(d));}
+HRESULT device_lost_cause(ID3D12Device* device,const std::exception& failure) noexcept {
+ if(device) { const HRESULT removed=device->GetDeviceRemovedReason(); if(removed!=S_OK)return removed; }
+ const auto* typed=dynamic_cast<const HResultError*>(&failure);
+ return typed&&device_lost(typed->code())?typed->code():S_OK;
+}
+std::vector<std::string> dred_report(ID3D12Device* device,ID3D12CommandQueue* ours) {
+ std::vector<std::string> lines;
+ if(!device||!dred_requested())return lines;
+ Ptr<ID3D12DeviceRemovedExtendedData> dred;
+ if(FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) { lines.emplace_back("DRED unavailable on this device"); return lines; }
+ D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs{};
+ if(SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs))) {
+  size_t nodes=0;
+  for(const auto* node=crumbs.pHeadAutoBreadcrumbNode;node && nodes<32;node=node->pNext,++nodes) {
+   const UINT done=node->pLastBreadcrumbValue?*node->pLastBreadcrumbValue:0;
+   if(done>=node->BreadcrumbCount || !node->pCommandHistory)continue; // finished list
+   std::string line="DRED unfinished list "+narrow(node->pCommandListDebugNameW)+" on queue "+narrow(node->pCommandQueueDebugNameW)+
+    (node->pCommandQueue==ours?" (plugin queue)":" (other queue)")+": "+std::to_string(done)+"/"+std::to_string(node->BreadcrumbCount)+" ops done, ops";
+   for(UINT i=done>2?done-2:0;i<node->BreadcrumbCount && i<done+3;++i)
+    line+=(i==done?" [":" ")+std::to_string(static_cast<int>(node->pCommandHistory[i]))+(i==done?"]":"");
+   lines.push_back(std::move(line));
+  }
+  if(lines.empty())lines.emplace_back("DRED: every recorded command list finished");
+ } else lines.emplace_back("DRED breadcrumbs unavailable");
+ D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+ if(SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA) {
+  char va[32];std::snprintf(va,sizeof va,"0x%016llX",static_cast<unsigned long long>(fault.PageFaultVA));
+  lines.push_back(std::string("DRED page fault at ")+va);
+ }
+ return lines;
+}
 struct Bridge::Impl {
  struct Slot {
   std::atomic<std::shared_ptr<const JobKey>> key;

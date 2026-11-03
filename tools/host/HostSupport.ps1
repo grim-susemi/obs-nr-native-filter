@@ -644,26 +644,33 @@ function Assert-ColorRows($Rows, $Dispatches, $Contexts, $Controls) {
         if ($c.name -ne $name -or $c.stage -ne $stage -or !$c.rejected -or $c.submitted) { throw 'NR_QA_COLOR_ADMISSION_CONTROL' }
     }
 }
+# Emission order of nr_flow_scenario.cpp: 1080p, 1440p, then 1440p at the owner 60 fps interval (FAST policy).
+function Get-FlowPassSpecs { @(@{instance=81;width=1920;height=1080;interval=0},@{instance=82;width=2560;height=1440;interval=0},@{instance=83;width=2560;height=1440;interval=16666667}) }
 function Assert-FlowRows($Rows, $Caps) {
-    if ($Rows.Count -ne 96 -or $Caps.Count -ne 2) { throw 'NR_QA_FLOW_ROWS' }
-    foreach ($cap in $Caps) {
+    $specs=Get-FlowPassSpecs
+    if ($Rows.Count -ne 48*$specs.Count -or $Caps.Count -ne $specs.Count) { throw 'NR_QA_FLOW_ROWS' }
+    for ($c=0; $c -lt $specs.Count; $c++) {
+        $cap=$Caps[$c]; $spec=$specs[$c]
         $grids = @($cap.supported_grids)
-        if (!$grids.Count -or @($grids | Where-Object { $_ -notin @(1,2,4) }).Count -or $cap.grid -ne ($grids | Measure-Object -Minimum).Minimum -or !$cap.signed_nvidia_system32 -or $cap.api_max -lt 80 -or $cap.cost_is_probability -or $cap.cost_dxgi_format -notin @(62,42) -or 87 -notin $cap.input_formats -or 38 -notin $cap.output_formats -or $cap.cost_dxgi_format -notin $cap.cost_formats -or $cap.module_signer -ne 'NVIDIA Corporation') { throw 'NR_QA_FLOW_CAPABILITY' }
+        # Ordinary passes take the finest grid; the owner 1440p@60 interval pass must submit FAST (20) on a 4-pixel or coarser grid.
+        $gridOk = if ($spec.interval) { $cap.grid -ge 4 -and $cap.grid -in $grids -and $cap.submitted_perf_level -eq 20 } else { $cap.grid -eq ($grids | Measure-Object -Minimum).Minimum }
+        if (!$grids.Count -or @($grids | Where-Object { $_ -notin @(1,2,4) }).Count -or !$gridOk -or $cap.frame_interval_ns -ne $spec.interval -or !$cap.signed_nvidia_system32 -or $cap.api_max -lt 80 -or $cap.cost_is_probability -or $cap.cost_dxgi_format -notin @(62,42) -or 87 -notin $cap.input_formats -or 38 -notin $cap.output_formats -or $cap.cost_dxgi_format -notin $cap.cost_formats -or $cap.module_signer -ne 'NVIDIA Corporation') { throw 'NR_QA_FLOW_CAPABILITY' }
     }
-    foreach ($width in @(1920,2560)) {
-        $height = if ($width -eq 1920) { 1080 } else { 1440 }
-        $group = @($Rows | Where-Object { $_.width -eq $width })
+    for ($k=0; $k -lt $specs.Count; $k++) {
+        $spec=$specs[$k]; $width=$spec.width
+        $height = $spec.height
+        $group = @($Rows[(48*$k)..(48*$k+47)])
         if ($group.Count -ne 48) { throw 'NR_QA_FLOW_EXTENT_SET' }
         for ($i=0; $i -lt $group.Count; $i+=2) {
             $cold=$group[$i]; $flow=$group[$i+1]
             if (!$cold.reset -or $flow.reset -or $cold.sequence -ne ($i+1) -or $flow.sequence -ne ($i+2) -or $cold.history_epoch -ne ($i/2+1) -or $flow.history_epoch -ne $cold.history_epoch) { throw 'NR_QA_FLOW_CHRONOLOGY' }
             $sub = $i -ge 24
             foreach ($row in @($cold,$flow)) {
-                $instance=if($width -eq 1920){81}else{82}
+                $instance=$spec.instance
                 if ($row.instance_id -ne $instance -or $row.content_epoch -ne $row.history_epoch -or $row.resource_generation -ne 1 -or $row.submission_serial -ne $row.sequence) { throw 'NR_QA_FLOW_CHRONOLOGY' }
                 $x=if($sub){16}else{0}; $y=if($sub){24}else{0}
                 $w=if($sub){$width-32}else{$width}; $h=if($sub){$height-48}else{$height}
-                if ($row.height -ne $height -or $row.active_x -ne $x -or $row.active_y -ne $y -or $row.active_width -ne $w -or $row.active_height -ne $h -or $row.errors -ne 0 -or $row.fixed_vector_bound_pixels -ne 1 -or $row.max_error_pixels -lt 0 -or $row.max_error_pixels -gt 1 -or !$row.motion_hash) { throw 'NR_QA_FLOW_PIXELS' }
+                if ($row.width -ne $width -or $row.height -ne $height -or $row.active_x -ne $x -or $row.active_y -ne $y -or $row.active_width -ne $w -or $row.active_height -ne $h -or $row.errors -ne 0 -or $row.fixed_vector_bound_pixels -ne 1 -or $row.max_error_pixels -lt 0 -or $row.max_error_pixels -gt 1 -or !$row.motion_hash) { throw 'NR_QA_FLOW_PIXELS' }
             }
             $local = [int](($i % 24)/2)
             $amount = @(1,8,32)[[int][Math]::Floor($local/4)]
@@ -675,15 +682,16 @@ function Assert-FlowRows($Rows, $Caps) {
     }
 }
 function Assert-FlowPasses($Passes, $Inputs, $Rows, $Caps) {
+    $specs=Get-FlowPassSpecs
     $ordinary=@($Rows | Where-Object { !$_.reset })
-    if ($Passes.Count -ne 48 -or $Inputs.Count -ne 48 -or $ordinary.Count -ne 48) { throw 'NR_QA_FLOW_PASS_SET' }
-    for($i=0;$i -lt 48;$i++) {
+    if ($Passes.Count -ne 24*$specs.Count -or $Inputs.Count -ne 24*$specs.Count -or $ordinary.Count -ne 24*$specs.Count) { throw 'NR_QA_FLOW_PASS_SET' }
+    for($i=0;$i -lt $Passes.Count;$i++) {
         $p=$Passes[$i]; $input=$Inputs[$i]; $row=$ordinary[$i]
         foreach($field in @('instance_id','history_epoch','content_epoch','resource_generation','submission_serial')) {
             if($p.$field -ne $row.$field -or $input.$field -ne $row.$field) { throw 'NR_QA_FLOW_PASS_KEY' }
         }
         if($p.sequence -ne $row.sequence -or $input.current_sequence -ne $row.sequence -or $input.previous_sequence -ne ($row.sequence-1)) { throw 'NR_QA_FLOW_PASS_KEY' }
-        $cap=$Caps[$(if($row.width -eq 1920){0}else{1})]
+        $cap=$Caps[[int][Math]::Floor($i/24)]
         $hintGrids=@($cap.hint_grids)
         $admitted=@($hintGrids | Where-Object { $_ -ge $cap.grid })
         if(($cap.hint_support -join ',') -ne '1' -or !$admitted.Count -or @($hintGrids | Where-Object { $_ -notin @(1,2,4,8) }).Count -or 38 -notin $cap.hint_formats -or 38 -notin $cap.global_formats -or $p.hint_grid -ne ($admitted | Measure-Object -Minimum).Minimum -or $p.output_grid -ne $cap.grid) { throw 'NR_QA_FLOW_HINT_CAPABILITY' }

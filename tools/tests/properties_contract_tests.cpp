@@ -56,6 +56,65 @@ void decoded_toggle_lifecycle(const std::shared_ptr<const nr::Settings>& initial
     const auto exit=pipeline.worker_exit();pipeline.request_stop();
     expect(exit.wait_for(std::chrono::seconds(5))==std::future_status::ready && pipeline.try_close(),"CPU lifecycle closes");
 }
+void tuning_controls(const std::shared_ptr<const nr::Settings>& initial)
+{
+    auto* data=obs_data_create();defaults(data);
+    expect(obs_data_get_int(data,"nr_preset")==0 && obs_data_get_int(data,"nr_style")==0 &&
+        obs_data_get_double(data,"nr_intensity")==1 && obs_data_get_double(data,"nr_local_structure")==1 &&
+        obs_data_get_double(data,"nr_local_tone")==0 && obs_data_get_double(data,"nr_skin_structure")==-1 &&
+        obs_data_get_bool(data,"nr_auto_mask"),"tuning defaults match core defaults except OBS local tone 0 (#768)");
+    const auto base=decode(data,default_runtime,initial->runtimePath);
+    expect(base.reason.empty() && base.tuning==nr::ModelTuning{0,0,1,1,0,-1,true},"default tuning decoded");
+    auto* props=controls({"priming","awaitingSample"});
+    struct Slider {const char* key;double low,high,step;};
+    for(const Slider& s:{Slider{"nr_intensity",0,2,.05},Slider{"nr_local_structure",0,2,.05},
+            Slider{"nr_local_tone",0,2,.05},Slider{"nr_skin_structure",-1,2,.05}}) {
+        auto* p=obs_properties_get(props,s.key);
+        expect(p && obs_property_get_type(p)==OBS_PROPERTY_FLOAT && obs_property_float_type(p)==OBS_NUMBER_SLIDER &&
+            obs_property_float_min(p)==s.low && obs_property_float_max(p)==s.high && obs_property_float_step(p)==s.step,s.key);
+    }
+    auto* preset=obs_properties_get(props,"nr_preset");
+    expect(preset && obs_property_get_type(preset)==OBS_PROPERTY_INT && obs_property_int_type(preset)==OBS_NUMBER_SLIDER &&
+        obs_property_int_min(preset)==0 && obs_property_int_max(preset)==3 && obs_property_int_step(preset)==1,"preset slider bounds");
+    auto* style=obs_properties_get(props,"nr_style");
+    expect(style && obs_property_get_type(style)==OBS_PROPERTY_LIST && obs_property_list_format(style)==OBS_COMBO_FORMAT_INT &&
+        obs_property_list_item_count(style)==3 && obs_property_list_item_int(style,0)==0 &&
+        obs_property_list_item_int(style,1)==1 && obs_property_list_item_int(style,2)==2,"style list");
+    expect(obs_property_get_type(obs_properties_get(props,"nr_auto_mask"))==OBS_PROPERTY_BOOL,"auto mask checkbox");
+    obs_properties_destroy(props);
+    obs_data_set_int(data,"nr_preset",3);obs_data_set_int(data,"nr_style",2);
+    obs_data_set_double(data,"nr_intensity",1.5);obs_data_set_double(data,"nr_local_structure",.5);
+    obs_data_set_double(data,"nr_local_tone",2);obs_data_set_double(data,"nr_skin_structure",0);
+    obs_data_set_bool(data,"nr_auto_mask",false);
+    const auto edited=decode(data,default_runtime,initial->runtimePath);
+    expect(edited.reason.empty() && edited.tuning==nr::ModelTuning{3,2,1.5f,.5f,2.f,0.f,false},"edited tuning decoded");
+    const auto next=updated(initial,edited);
+    expect(next->revision.value==initial->revision.value+1 && next->tuning==edited.tuning &&
+        next->enabled==initial->enabled && next->runtimePath==initial->runtimePath &&
+        next->strength==initial->strength,"tuning change advances revision once");
+    expect(updated(next,edited)==next,"unchanged tuning identity");
+    struct Edge {const char* key;double value;bool valid;};
+    for(const Edge& e:{Edge{"nr_intensity",0,true},Edge{"nr_intensity",2,true},Edge{"nr_skin_structure",-1,true},
+            Edge{"nr_skin_structure",2,true},Edge{"nr_intensity",-.01,false},Edge{"nr_intensity",2.01,false},
+            Edge{"nr_local_structure",2.01,false},Edge{"nr_local_tone",-.01,false},Edge{"nr_skin_structure",-1.01,false},
+            Edge{"nr_skin_structure",2.01,false},Edge{"nr_intensity",std::numeric_limits<double>::quiet_NaN(),false},
+            Edge{"nr_local_tone",std::numeric_limits<double>::infinity(),false}}) {
+        auto* probe=obs_data_create();defaults(probe);obs_data_set_double(probe,e.key,e.value);
+        const auto reason=decode(probe,default_runtime,initial->runtimePath).reason;
+        expect(e.valid?reason.empty():reason=="invalidTuning",e.key);
+        obs_data_release(probe);
+    }
+    struct IntEdge {const char* key;long long value;bool valid;};
+    for(const IntEdge& e:{IntEdge{"nr_preset",0,true},IntEdge{"nr_preset",3,true},IntEdge{"nr_style",0,true},
+            IntEdge{"nr_style",2,true},IntEdge{"nr_preset",-1,false},IntEdge{"nr_preset",4,false},
+            IntEdge{"nr_style",-1,false},IntEdge{"nr_style",3,false}}) {
+        auto* probe=obs_data_create();defaults(probe);obs_data_set_int(probe,e.key,e.value);
+        const auto reason=decode(probe,default_runtime,initial->runtimePath).reason;
+        expect(e.valid?reason.empty():reason=="invalidTuning",e.key);
+        obs_data_release(probe);
+    }
+    obs_data_release(data);
+}
 int main()
 {
     try {
@@ -82,6 +141,17 @@ int main()
             obs_property_float_min(slider)==0 && obs_property_float_max(slider)==1 && obs_property_float_step(slider)==.01,"slider bounds");
         for(const auto* key:{"nr_status","nr_reason"})expect(!obs_property_enabled(obs_properties_get(props,key)) &&
             obs_property_text_type(obs_properties_get(props,key))==OBS_TEXT_INFO,"read-only status");
+        {
+            Labels shown;shown.statusText="S-localized";shown.reasonText="R-localized";
+            auto* shownProps=controls({"bypassed","deadlineMiss"},shown);
+            expect(std::string(obs_property_description(obs_properties_get(shownProps,"nr_status")))=="S-localized" &&
+                   std::string(obs_property_description(obs_properties_get(shownProps,"nr_reason")))=="R-localized","status rows show localized text");
+            obs_properties_destroy(shownProps);
+            auto* rawProps=controls({"bypassed","deadlineMiss"});
+            expect(std::string(obs_property_description(obs_properties_get(rawProps,"nr_status")))=="bypassed" &&
+                   std::string(obs_property_description(obs_properties_get(rawProps,"nr_reason")))=="deadlineMiss","status rows fall back to raw codes");
+            obs_properties_destroy(rawProps);
+        }
         obs_properties_destroy(props);
         const auto first=admit(data,count_inspection);
         expect(first.enabled && first.strength.value==1 && first.runtimePath==default_runtime,"defaults");
@@ -89,11 +159,13 @@ int main()
                !effective_enabled(false,true) && !effective_enabled(false,false),"enable truth table");
         auto a=updated({},first);
         decoded_toggle_lifecycle(a);
-        expect(a->revision.value==1 && a->tuning==nr::core_default_tuning(),"initial revision/tuning");
+        expect(a->revision.value==1 && a->tuning==nr::ModelTuning{0,0,1,1,0,-1,true},"initial revision/tuning (OBS local tone 0, #768)");
         expect(updated(a,first)==a,"unchanged settings identity");
         auto custom=std::make_shared<const nr::Settings>(nr::Settings{{8},true,a->runtimePath,{.4f},{2,3,.2f,.3f,.4f,-1,false}});
-        const auto preserved=updated(custom,{false,a->runtimePath,{.6f},{}});
-        expect(preserved->tuning==custom->tuning && preserved->revision.value==9,"owned tuning preserved");
+        const nr::ModelTuning chosen{1,2,.5f,1.5f,.25f,.75f,false};
+        const auto followed=updated(custom,{false,a->runtimePath,{.6f},{},chosen});
+        expect(followed->tuning==chosen && followed->revision.value==9,"tuning follows decoded values");
+        tuning_controls(a);
         obs_data_set_bool(data,"nr_enabled",false);
         obs_data_set_double(data,"nr_strength",0);
         obs_data_set_string(data,"foreign_owner","keep");

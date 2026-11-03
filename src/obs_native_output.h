@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
+#include <string>
 #include "nr_model.h"
 #include "nr_lifecycle.h"
 #include <graphics/graphics.h>
@@ -59,6 +60,8 @@ public:
     std::shared_ptr<model::Job> current_job() const;
     std::optional<TickWitness> tick_witness() const;
     pipeline::Counters counters() const;
+    uint64_t held_frames() const; // deadline-miss frames that re-showed the previous NR frame
+    std::string diag() const; // N22 cumulative admission/capture diagnostics
     std::shared_ptr<model::Job> selected_job() const;
     std::shared_ptr<const Capture> selected_raw() const;
     std::shared_ptr<const Capture> current_raw() const;

@@ -156,6 +156,9 @@ struct NativeOutput::Impl {
     std::list<Record> records;
     std::shared_ptr<Capture> previousRaw;
     std::optional<FrameKey> previousKey;
+    ID3D11Texture2D* nrTarget=nullptr; // output texture whose content is an NR frame (deadline-miss hold)
+    uint64_t nrTargetTick=0;unsigned nrHeld=0;uint64_t heldFrames=0;
+    uint64_t diagAdmit=0,diagRefused=0,diagNoAdmit=0;unsigned diagLogged=0;uint64_t diagReason[32]{}; // N22 wedge diagnostics
     std::optional<IngressSample> lastInput;
     std::shared_ptr<model::Job> selectedJob;
     std::optional<TickWitness> tickWitness;
@@ -399,8 +402,9 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     const auto plan=p.pipeline->begin(input,input.canonicalTick+1);
     require(plan.action==TickAction::CaptureOnce,"native immutable capture once per canonical tick");
     p.tickWitness.emplace(TickWitness{input.canonicalTick,plan.admissionReason,{},p.pipeline->counters()});
+    if(plan.admission)++p.diagAdmit;else{++p.diagNoAdmit;const auto rr=static_cast<size_t>(plan.admissionReason);if(rr<32)++p.diagReason[rr];}
     if(plan.selection.kind==OutputKind::CurrentSource && plan.admissionReason!=Reason::SlotsFull) {
-        p.clear_views();p.end_pins();
+        p.clear_views();p.end_pins();p.nrTarget=nullptr;
         require(p.pipeline->finish({}),"native capture-free scheduler placeholder");
         p.collect();p.tickWitness->counters=p.pipeline->counters();
         return p.pipeline->view(input.canonicalTick)->selection;
@@ -416,7 +420,14 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     p.selectedJob.reset();
     const auto ticket=plan.admission?
         bridge->capture_at(plan.admission->slot,plan.admission->job.key,borrowed):std::nullopt;
+    if(plan.admission&&!ticket){++p.diagRefused;if(p.diagLogged<6){++p.diagLogged;const auto o=bridge->ownership(plan.admission->slot);
+        blog(LOG_INFO,"[obs-nr-filter] diag capture refused instance %llu tick %llu slot %zu serial %llu sel %d/%d | slot serial %llu phase %d prod %llu/%llu work %llu/%llu cons %llu/%llu open %d cancel %d fail %d",
+            (unsigned long long)p.instance,(unsigned long long)input.canonicalTick,plan.admission->slot,(unsigned long long)plan.admission->job.key.submissionSerial,
+            (int)selected.kind,(int)selected.reason,(unsigned long long)(o.key?o.key->submissionSerial:0),(int)o.phase,
+            (unsigned long long)o.producer,(unsigned long long)o.producerDone,(unsigned long long)o.worker,(unsigned long long)o.workerDone,
+            (unsigned long long)o.consumer,(unsigned long long)o.consumerDone,(int)o.consumerOpen,(int)o.cancelled,(int)o.failed);}}
     p.end_pins();
+    const bool holdNr=!p.deterministicQa && hold_previous_nr(selected,p.nrTarget==target,p.nrTargetTick,p.nrHeld);
     // The readiness cutoff is latched by begin, not by completion during capture.
     if(selected.kind==OutputKind::DelayedNr) {
         const auto old=std::find_if(p.records.begin(),p.records.end(),[&](const Record& r) {
@@ -431,8 +442,10 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
         p.selectedJob=old->job;
     } else if(selected.kind==OutputKind::DelayedRaw) {
         require(p.previousRaw && p.previousKey==selected.frame,"native independent delayed raw owner");
-        g.graphics->CopyResource(target,p.previousRaw->original11.Get());
+        if(!holdNr) g.graphics->CopyResource(target,p.previousRaw->original11.Get()); // else target keeps the previous NR frame
     } else g.graphics->CopyResource(target,immutable->original11.Get());
+    p.nrHeld=holdNr?p.nrHeld+1:0;p.heldFrames+=holdNr?1:0;
+    p.nrTarget=selected.kind==OutputKind::DelayedNr||holdNr?target:nullptr;p.nrTargetTick=input.canonicalTick;
     auto raw=std::make_shared<const pipeline::RawFrame>(pipeline::RawFrame{input,immutable});
     if(ticket) {
         const auto pin=bridge->acquire_raw(*ticket);require(pin.has_value(),"native new capture pin reservation");
@@ -605,6 +618,14 @@ std::shared_ptr<model::Job> NativeOutput::current_job() const
     return impl_->records.empty()?nullptr:impl_->records.back().job;
 }
 std::shared_ptr<model::Job> NativeOutput::selected_job() const { return impl_->selectedJob; }
+uint64_t NativeOutput::held_frames() const { return impl_->heldFrames; }
+std::string NativeOutput::diag() const {
+    const auto& p=*impl_;const auto c=p.pipeline?p.pipeline->counters():pipeline::Counters{};
+    std::string s=" diag adm="+std::to_string(p.diagAdmit)+" refused="+std::to_string(p.diagRefused)+" noadm="+std::to_string(p.diagNoAdmit)+" disp="+std::to_string(c.dispatches)+" sel="+std::to_string(c.selections);
+    for(size_t i=0;i<32;++i)if(p.diagReason[i])s+=" r"+std::to_string(i)+"="+std::to_string(p.diagReason[i]);
+    if(p.active && p.active->model)s+=p.active->model->diag();
+    return s;
+}
 std::shared_ptr<const Capture> NativeOutput::selected_raw() const { return impl_->selectedRaw; }
 std::shared_ptr<const Capture> NativeOutput::current_raw() const { return impl_->previousRaw; }
 std::shared_ptr<interop::Context> NativeOutput::context() const { return impl_->active?impl_->active->context:nullptr; }

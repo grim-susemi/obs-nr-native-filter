@@ -7,6 +7,9 @@
 #include <wrl/client.h>
 #include <memory>
 #include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
 namespace nr::interop {
 enum class Completion { Pending, Complete, Failed };
 inline Completion completion(uint64_t required,uint64_t actual) {
@@ -63,6 +66,21 @@ bool same_identity(IUnknown*,IUnknown*);
 LUID renderer_luid(ID3D11Device*);
 bool compatible_context(ID3D11Device*,ID3D12Device*,ID3D12CommandQueue*);
 HRESULT open_shared_resource(ID3D12Device*,HANDLE,ID3D12Resource**);
+// A thrown D3D12/DXGI failure that keeps its HRESULT, so callers can tell a driver reset from other errors.
+class HResultError final : public std::runtime_error {
+ HRESULT code_;
+public:
+ HResultError(HRESULT code,const std::string& what):std::runtime_error(what),code_(code) {}
+ HRESULT code()const noexcept{return code_;}
+};
+// Driver reset (TDR) codes: the device is gone for the rest of this process.
+constexpr bool device_lost(HRESULT hr) noexcept {
+ return hr==DXGI_ERROR_DEVICE_REMOVED||hr==DXGI_ERROR_DEVICE_HUNG||hr==DXGI_ERROR_DEVICE_RESET||hr==DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+// The driver-reset HRESULT behind a failure, or S_OK: the device removed reason first, else a thrown device-lost code.
+HRESULT device_lost_cause(ID3D12Device* device,const std::exception& failure) noexcept;
+// DRED breadcrumb and page-fault lines for a removed device. Empty unless OBS_NR_DRED=1 was set before the device was created.
+std::vector<std::string> dred_report(ID3D12Device* device,ID3D12CommandQueue* ours);
 // One private same-adapter device/queue. Callers retain this object for all external GPU ownership.
 // Guides/core receive only explicit device/queue; no renderer immediate-context API is exposed.
 class Context final {
