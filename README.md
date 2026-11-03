@@ -42,14 +42,23 @@ Tested on an RTX 4090 with driver 617.14 on Windows 11. Other RTX cards should w
 
 ### The NR model file
 
-The filter accepts exactly one build of `nvngx_dlssnr.dll`: the 310.8.0.0 compatibility build that circulates in the RenoDX community (ShortFuse's DLSS thread on the RenoDX Discord). It contains GPU code for RTX 20, 30, 40 and 50 cards.
+The filter accepts exactly one build of `nvngx_dlssnr.dll`: the 310.8.0.0 compatibility build shared in the RenoDX community (ShortFuse's DLSS thread). It contains GPU code for RTX 20, 30, 40 and 50 cards.
+
+This is the **only** file you need besides the release zip. Everything else the plugin uses comes with OBS, Windows and the NVIDIA driver.
+
+**How to get it**
+
+1. Join the RenoDX Discord: https://discord.gg/F6AUTeWJHM
+2. Open this channel (the link works after you have joined): https://discord.com/channels/1408098019194310818/1543975158937821315
+3. Download the `nvngx_dlssnr.dll` **310.8.0.0 compatibility build** (165,840,496 bytes). Unzip it if it comes as a zip.
+4. Check the hash below. The installer checks it too and tells you if you picked the wrong file.
 
 | | |
 |---|---|
 | SHA-256 | `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a` |
 | Size | 165,840,496 bytes |
 
-NVIDIA's own signed builds (310.8.0.0 `e16bcf15...` and 310.9.16.0) only contain RTX 50 code and are refused by this version. The installer checks the hash for you. To check a file yourself:
+Newer or official files, such as `nvngx_dlssnr_2026_10_16.zip` (310.9.16.0) or NVIDIA's signed 310.8.0.0 (`e16bcf15...`), only contain RTX 50 code and are refused by this version. To check a file yourself:
 
 ```powershell
 (Get-FileHash 'C:\path\to\nvngx_dlssnr.dll' -Algorithm SHA256).Hash   # must start with E67DEE209320
@@ -157,7 +166,14 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링)을 바로 거는 OBS 필터입니
 
 - Windows 10/11 64비트, OBS Studio 32.x (32.2.2에서 시험)
 - NVIDIA RTX 20~50 시리즈 (RTX 4090에서 시험)
-- `nvngx_dlssnr.dll` 310.8.0.0 호환판, SHA-256 `e67dee20…c989a`. **이 저장소와 릴리즈에는 들어 있지 않습니다.** RenoDX 커뮤니티(ShortFuse DLSS 스레드)에서 구하세요. NVIDIA 정품 310.8 / 310.9.16은 RTX 50 전용이라 받지 않습니다.
+- `nvngx_dlssnr.dll` 310.8.0.0 호환판 (165,840,496바이트, SHA-256 `e67dee20…c989a`). **이 저장소와 릴리즈에는 들어 있지 않습니다.** 릴리즈 zip 말고 따로 필요한 건 이 파일 하나뿐이고, 나머지는 OBS·Windows·NVIDIA 드라이버에 들어 있습니다.
+
+**NR 모델 파일 받는 법**
+
+1. RenoDX 디스코드에 들어갑니다: https://discord.gg/F6AUTeWJHM
+2. 이 채널을 엽니다 (서버에 들어간 뒤에 열립니다): https://discord.com/channels/1408098019194310818/1543975158937821315
+3. `nvngx_dlssnr.dll` **310.8.0.0 호환판**(165,840,496바이트)을 받습니다. zip이면 풉니다.
+4. 설치기가 해시를 확인해 맞는 파일인지 알려 줍니다. `nvngx_dlssnr_2026_10_16.zip`(310.9.16) 같은 새 판이나 NVIDIA 정품 310.8은 RTX 50 전용이라 받지 않습니다.
 
 **설치**
 

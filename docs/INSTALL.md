@@ -9,13 +9,19 @@ How to install OBS Native NR 0.1.0 into OBS Studio on Windows. It takes about fi
 - **OBS Studio 32.x, 64-bit** (tested with 32.2.2). In OBS: Help > About.
 - **Direct3D 11 renderer**, which is the OBS default. In OBS: Settings > Advanced > Video > Renderer.
 - **NVIDIA RTX 20, 30, 40 or 50 series** with a current driver (tested: RTX 4090, driver 617.14).
-- **The NR model file** `nvngx_dlssnr.dll`, version 310.8.0.0, 165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`. It is not included. It circulates in the RenoDX community (ShortFuse's DLSS thread on the RenoDX Discord). To check a file you have, run this in PowerShell; the result must start with `E67DEE209320`:
+- **The NR model file** `nvngx_dlssnr.dll`, version 310.8.0.0, 165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`. It is not included, and it is the only file you need besides the release zip; everything else comes with OBS, Windows and the NVIDIA driver. To get it:
+
+  1. Join the RenoDX Discord: https://discord.gg/F6AUTeWJHM
+  2. Open this channel (works after you have joined): https://discord.com/channels/1408098019194310818/1543975158937821315
+  3. Download the `nvngx_dlssnr.dll` **310.8.0.0 compatibility build** (165,840,496 bytes). Unzip it if it comes as a zip.
+
+  To check the file, run this in PowerShell; the result must start with `E67DEE209320`:
 
   ```powershell
   (Get-FileHash 'C:\path\to\nvngx_dlssnr.dll' -Algorithm SHA256).Hash
   ```
 
-  NVIDIA's signed builds (310.8.0.0 `E16BCF15...`, 310.9.16.0) only support RTX 50 and are refused by this version.
+  Newer or official files, such as `nvngx_dlssnr_2026_10_16.zip` (310.9.16.0) or NVIDIA's signed 310.8.0.0 (`E16BCF15...`), only support RTX 50 and are refused by this version.
 
 ## Install with the installer
 
@@ -87,13 +93,19 @@ OBS Native NR 0.1.0을 Windows의 OBS Studio에 설치하는 방법입니다. 5�
 - **OBS Studio 32.x 64비트** (32.2.2에서 시험). OBS 메뉴 도움말 > 정보에서 확인.
 - **Direct3D 11 렌더러** (OBS 기본값). 설정 > 고급 > 비디오 > 렌더러.
 - **NVIDIA RTX 20~50 시리즈**와 최신 드라이버 (시험: RTX 4090, 드라이버 617.14).
-- **NR 모델 파일** `nvngx_dlssnr.dll` 310.8.0.0, 165,840,496바이트, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`. 릴리즈에 들어 있지 않으니 RenoDX 커뮤니티(ShortFuse DLSS 스레드)에서 구하세요. 가진 파일이 맞는지는 PowerShell에서 아래 명령으로 확인하고, 결과가 `E67DEE209320`으로 시작해야 합니다.
+- **NR 모델 파일** `nvngx_dlssnr.dll` 310.8.0.0, 165,840,496바이트, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`. 릴리즈에 들어 있지 않고, 릴리즈 zip 말고 따로 필요한 건 이 파일 하나뿐입니다(나머지는 OBS·Windows·NVIDIA 드라이버에 들어 있음). 받는 법:
+
+  1. RenoDX 디스코드에 들어갑니다: https://discord.gg/F6AUTeWJHM
+  2. 이 채널을 엽니다 (서버에 들어간 뒤에 열립니다): https://discord.com/channels/1408098019194310818/1543975158937821315
+  3. `nvngx_dlssnr.dll` **310.8.0.0 호환판**(165,840,496바이트)을 받습니다. zip이면 풉니다.
+
+  가진 파일이 맞는지는 PowerShell에서 아래 명령으로 확인하고, 결과가 `E67DEE209320`으로 시작해야 합니다.
 
   ```powershell
   (Get-FileHash 'C:\경로\nvngx_dlssnr.dll' -Algorithm SHA256).Hash
   ```
 
-  NVIDIA 정품 서명판(310.8.0.0 `E16BCF15...`, 310.9.16.0)은 RTX 50 전용이라 이 버전에서는 받지 않습니다.
+  `nvngx_dlssnr_2026_10_16.zip`(310.9.16.0) 같은 새 판이나 NVIDIA 정품 서명판(310.8.0.0 `E16BCF15...`)은 RTX 50 전용이라 이 버전에서는 받지 않습니다.
 
 ### 설치기로 설치
 
