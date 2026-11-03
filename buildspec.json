@@ -1,6 +1,6 @@
 {
   "name": "obs-nr-filter",
-  "displayName": "Native NR Foundation (TEST-NOT-RELEASE)",
+  "displayName": "Native NR",
   "version": "0.1.0",
   "dependencies": {
     "obs-studio": {

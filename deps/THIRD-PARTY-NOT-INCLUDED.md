@@ -1,7 +1,7 @@
 # Third-party NVIDIA files not included
 
 This repository does not contain NVIDIA SDK files. They were removed from the whole history before the first push.
-The filter needs them to build. Download them from NVIDIA and place them at the paths below; the hashes identify the exact files the N2 candidate was built with.
+The filter needs them to build. Download them from NVIDIA and place them at the paths below; the hashes identify the exact files release 0.1.0 was built with.
 
 | Path | SHA-256 | Bytes |
 |---|---|---|

@@ -1,22 +1,5 @@
-# NGX SDK (not included)
+# NVIDIA NGX SDK files (not included)
 
-This add-on links NVIDIA's NGX SDK, which is **not redistributed** in this repository.
+The build needs the NGX SDK headers and `libs/nvsdk_ngx_d.lib` in this folder. They are NVIDIA files and are not redistributed here.
 
-To build, drop the NGX SDK here so the paths match `build.bat`:
-
-```
-external/ngx/nvsdk_ngx.h
-external/ngx/nvsdk_ngx_defs.h
-external/ngx/nvsdk_ngx_defs_dlssd.h
-external/ngx/nvsdk_ngx_helpers.h
-external/ngx/nvsdk_ngx_helpers_dlssd.h
-external/ngx/nvsdk_ngx_params.h
-external/ngx/nvsdk_ngx_params_dlssd.h
-external/ngx/libs/nvsdk_ngx_d.lib      (Release, /MD)
-```
-
-Get it from the NVIDIA DLSS Super Resolution SDK: https://github.com/NVIDIA/DLSS
-(headers under `include/`, the import library under `lib/Windows_x86_64/x64/` -- that one
-targets VS2015+/UCRT; the `vs2010`/`vs2012`/`vs2013` siblings fail to link with LNK2038).
-The runtime DLL (`nvngx_dlss.dll`) and the DLSS 5 neural-rendering model (`nvngx_dlssnr.dll`)
-are supplied at runtime by the game / the DLSS 5 add-on, not by this build.
+The exact file list, sizes and SHA-256 hashes are in [../THIRD-PARTY-NOT-INCLUDED.md](../THIRD-PARTY-NOT-INCLUDED.md). The release was built with NGX API 1.5.0; see [provenance/sdk-lock.json](../../provenance/sdk-lock.json).

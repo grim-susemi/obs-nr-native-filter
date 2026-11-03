@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="OBS Native NR - DLSS Neural Rendering filter for OBS Studio">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#10221a"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.8" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#76b900" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#76b900" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#76b900"/>
+      <stop offset="1" stop-color="#3ddc97"/>
+    </linearGradient>
+    <linearGradient id="after" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b5876"/>
+      <stop offset="0.55" stop-color="#4e8d6a"/>
+      <stop offset="1" stop-color="#d9c27a"/>
+    </linearGradient>
+    <pattern id="before" width="30" height="30" patternUnits="userSpaceOnUse">
+      <rect width="30" height="30" fill="#33475a"/>
+      <rect width="15" height="15" fill="#3d5468"/>
+      <rect x="15" y="15" width="15" height="15" fill="#2c3d4e"/>
+    </pattern>
+    <clipPath id="frame">
+      <rect width="300" height="180" rx="14"/>
+    </clipPath>
+  </defs>
+  <rect width="1280" height="320" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="320" rx="24" fill="url(#glow)"/>
+  <g transform="translate(880 70)">
+    <g clip-path="url(#frame)">
+      <rect width="150" height="180" fill="url(#before)"/>
+      <rect x="150" width="150" height="180" fill="url(#after)"/>
+    </g>
+    <rect width="300" height="180" rx="14" fill="none" stroke="#3a4560" stroke-width="2"/>
+    <line x1="150" y1="-12" x2="150" y2="192" stroke="#ffffff" stroke-width="3"/>
+    <circle cx="150" cy="90" r="15" fill="#ffffff"/>
+    <path d="M144 84 l-6 6 l6 6 M156 84 l6 6 l-6 6" fill="none" stroke="#0b1020" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="16" y="164" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#c9d3e3" letter-spacing="1.5">RAW</text>
+    <text x="284" y="164" text-anchor="end" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#ffffff" letter-spacing="1.5">NR</text>
+  </g>
+  <text x="80" y="150" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif" font-size="74" font-weight="800" fill="#ffffff">OBS Native <tspan fill="url(#accent)">NR</tspan></text>
+  <text x="83" y="202" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif" font-size="27" fill="#a9b4c8">DLSS Neural Rendering filter for OBS Studio</text>
+  <text x="84" y="248" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#6f7a90" letter-spacing="2.5">RTX 20 – 50  ·  WINDOWS  ·  OBS 32</text>
+</svg>

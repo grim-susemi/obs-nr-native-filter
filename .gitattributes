@@ -6,3 +6,6 @@ tools/** text eol=lf
 /.gitattributes text eol=lf
 # Acquired dependency bytes are immutable vendor data: never convert line endings.
 deps/** -text
+# Windows release scripts keep CRLF (cmd and Windows PowerShell 5.1).
+packaging/windows/*.bat text eol=crlf
+packaging/windows/*.ps1 text eol=crlf
