@@ -6,6 +6,7 @@
 #include "nr_core.h"
 #include "nr_guides.h"
 #include "nr_runtime.h"
+#include "nr_model_passes.h"
 #include <string>
 #include <atomic>
 #include "nr_qa_fault.h"
@@ -110,6 +111,7 @@ struct Job {
     std::atomic<uint32_t> qaFailure{0}; // Exact-job diagnostic, never completion.
     bool created=false, evaluated=false, composed=false, submitted=false, eligible=false,referenceValid=false;
     uint32_t code=0, invalid=0;
+    uint32_t creationPass=0,completedPasses=0,failedPass=0,passError=0;
     uint64_t epoch=0;
     uint64_t creationEpoch=0;
     uint32_t driverCreateCode=0;
@@ -125,6 +127,7 @@ struct Job {
     ID3D12Resource* output=nullptr; // Borrowed from this job's retained Bridge.
     NV_OF_FENCE_POINT completion() const;
     std::array<ID3D12Resource*,5> color_resources() const;
+    ID3D12Resource* answer_resource() const;
     // Copies made before guide reuse; never retain SDK-registered reference inputs.
     std::array<ID3D12Resource*,4> guide_observation_resources() const;
     std::array<uintptr_t,3> descriptor_heaps() const;
@@ -160,6 +163,7 @@ public:
     bool closed() const;
     lifecycle::ModelClose close_diagnostics() const;
     uint64_t applied() const;
+    PassStatus pass_status() const;
     std::shared_ptr<const GuidePreparation> guide_preparation() const;
     bool publish(const std::shared_ptr<Job>&,const Selection&,const interop::Ownership&);
 };

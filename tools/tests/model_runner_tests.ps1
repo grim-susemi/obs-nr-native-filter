@@ -168,3 +168,5 @@ try{Assert-CostRows $costCreate @() '1280x720' @(@{frame=1;result=3134193675})}c
 if(!$rejected){throw 'Large cost evaluation failure was accepted'}
 Write-Output 'PASS small failure outcome and large failure refusal'
 Reject $evidence $producer $runtime 'NR_QA_INVALID_SIZE' '-Size 0x0'
+Reject $evidence $producer $runtime 'NR_QA_PASS_CASE_SCOPE' '-PassCase two -OutputDigest Z:/nope/x.json'
+. (Join-Path $Work 'tools/tests/model_pass_rows_tests.ps1')

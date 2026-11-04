@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
+. (Join-Path $PSScriptRoot 'ModelPassSupport.ps1')
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;

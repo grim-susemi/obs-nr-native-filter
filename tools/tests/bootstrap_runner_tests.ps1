@@ -216,7 +216,7 @@ if($Task14Only -or $Task14BaselineOnly) {
                 if($verifier){$Evidence=Join-Path $Evidence 'verifier'}
                 $HostRoot=Join-Path $Work $(if($verifier){'out/task-14-verifier/host'}else{'out/task-14/host'})
                 $LifecycleNative=$false;$LifecycleDiagnosticR4=$false;$CoreInitControl=$false
-                $OutputDigest=''
+                $OutputDigest='';$PassCase=''
                 $Task14CandidateManifest='';$Task14CandidateSha256='';$Task14CandidateBuild=''
                 $Task15CandidateManifest='';$Task15CandidateSha256='';$Task15CandidateBuild='';$Task15Attempt=''
                 $Task16CandidateManifest='';$Task16CandidateSha256='';$Task17CandidateManifest='';$Task17CandidateSha256=''

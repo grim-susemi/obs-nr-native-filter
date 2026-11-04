@@ -9,6 +9,7 @@ param(
     [switch]$CoreInitControl,
     [string]$OutputDigest='',
     [string]$Size='',
+    [ValidateSet('','two','create2')][string]$PassCase='',
     [string]$RetainedEvent='',
     [string]$Task14CandidateManifest,
     [string]$Task14CandidateSha256,
@@ -31,6 +32,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if($PassCase -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $OutputDigest -or $Size)){
+    throw 'NR_QA_PASS_CASE_SCOPE'
+}
 if($Size -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $OutputDigest)){throw 'NR_QA_SIZE_SCOPE'}
 if($RetainedEvent -and (!$Size -or $Scenario -ne 'native-model')){throw 'NR_QA_RETAINED_EVENT_SCOPE'}
 if($RetainedEvent -and $RetainedEvent -cnotmatch '^Local\\nr-cost-retained-[0-9a-f]{32}$'){throw 'NR_QA_RETAINED_EVENT_NAME'}
@@ -1053,6 +1057,7 @@ try {
     if ($Scenario -in @('native-model','native-bootstrap','ghost-calibration','ghost-baseline','lifecycle')) {
         if($Size) {foreach($path in @('tools/host/nr_cost_driver.h','tools/host/nr_cost_driver.cpp','tools/host/nr_cost_completion.h','tools/host/nr_cost_scenario.h','tools/host/nr_cost_scenario.cpp')) {$binding += FileIdentity (Join-Path $work $path)}}
         foreach ($path in @('src/nr_model.h','src/nr_model.cpp','src/nr_runtime.h','src/nr_runtime.cpp',
+            'src/nr_model_passes.h','src/nr_model_layout.h','tools/host/ModelPassSupport.ps1',
             'src/nr_core.h','src/nr_core.cpp','src/nr_guides.h','src/nr_guides.cpp','src/nr_color.h','src/nr_color.cpp',
             'src/frame_pipeline.h','src/frame_pipeline.cpp','src/interop.h','src/interop.cpp','src/shaders/nr_codec.hlsl',
             'src/shaders/nr_color.hlsl','src/shaders/nr_guides.hlsl','src/shaders/nr_interop_blit.hlsl',
@@ -1133,6 +1138,7 @@ try {
         $process.StartInfo.Arguments += $(if($CoreInitControl){' core-init-control'}else{' native-model'})
         if($OutputDigest){$process.StartInfo.Arguments += ' --output-digest "'+[IO.Path]::GetFullPath($OutputDigest)+'"'}
         if($Size){$process.StartInfo.Arguments += ' --size '+$Size}
+        if($PassCase){$process.StartInfo.Arguments += ' --pass-case '+$PassCase}
     }
     if ($Scenario -eq 'lifecycle') { $process.StartInfo.Arguments += $(if($LifecycleNative){' lifecycle-native'}else{' lifecycle'}) }
     if ($Scenario -eq 'native-bootstrap') { $process.StartInfo.Arguments += ' native-bootstrap "'+$artifactRoot+'"' }
@@ -1291,7 +1297,11 @@ try {
             if ($line.StartsWith('NR_MODEL_CLEANUP ')) { $modelCleanup += $line.Substring(17) | ConvertFrom-Json }
             if ($line.StartsWith('NR_MODEL_MODULE ')) { $modelModules += $line.Substring(16) | ConvertFrom-Json }
         }
-        Assert-ModelRows $modelRows $modelContexts $modelCleanup $modelModules
+        if($PassCase) {
+            $passStatus=@($output -split [char]10|Where-Object {$_.StartsWith('NR_MODEL_PASS_STATUS ')}|
+                ForEach-Object {$_.Substring(21)|ConvertFrom-Json})
+            Assert-ModelPassRows $modelRows $modelContexts $modelCleanup $modelModules $passStatus $PassCase
+        } else {Assert-ModelRows $modelRows $modelContexts $modelCleanup $modelModules}
         foreach ($module in $modelModules) {
             if ([IO.Path]::GetFullPath($module.path) -ne [IO.Path]::GetFullPath($Runtime) -or
                 $module.selected_sha256 -ne $spec.runtime.sha256 -or [UInt64]$module.base -eq 0) { throw 'NR_QA_MODEL_MODULE_IDENTITY' }
@@ -1386,6 +1396,7 @@ try {
     $receipt = if ($Scenario -eq 'sampler') { 'sampler.json' } elseif ($Scenario -eq 'texture-roundtrip') { 'interop.json' } else { 'host-foundation.json' }
     $scope = if ($Scenario -eq 'texture-roundtrip') { @{class='physical-D3D11-D3D12-transport';NR=$false;FG=$false;recording=$false;HDR=$false;HDR_transport=$true;performance=$false;physical_HDMI_PTS=$false} } else { @{class='native-pass-through-sampler';NR=$false;FG=$false;recording=$false;HDR=$false;performance=$false;physical_HDMI_PTS=$false;unsupported_renderer='actual signed libobs OpenGL bypass lane'} }
     $record = @{scenario=$Scenario;result=$result;failure=$failure;command=$command;args=$arguments;public_command=('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Scenario ' + $Scenario + ' -Evidence "' + $Evidence + '" -HostRoot "' + $HostRoot + '" -Runtime "' + $Runtime + '"');public_args=@('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-Scenario',$Scenario,'-Evidence',$Evidence,'-HostRoot',$HostRoot,'-Runtime',$Runtime);exit=$exit;identity=$identity;events=@('ready','action','exit');output=$output;views=$views;patterns=$patterns;binding=$binding;inventory_ready=$readyInventory;inventory=$inventory;sources_before=@($sources.ToArray());sources_after=$sourceAfter;staging='minimal-private-copy';runtime=@{path=$Runtime;sha256=$spec.runtime.sha256;loaded=$false};scope=$scope;assertions=@{result_pass=($result -eq 'PASS');exact_pattern_rows=$patterns.Count};cleanup=$cleanup}
+    if($PassCase){$record.public_command+=' -PassCase '+$PassCase;$record.public_args+=@('-PassCase',$PassCase)}
     if($Scenario -eq 'lifecycle' -and $LifecycleNative) {
         $record.public_command+=' -LifecycleNative'
         $record.public_args+='-LifecycleNative'
@@ -1431,6 +1442,7 @@ try {
             $record.cost_size=$Size
         }
         $record.model_rows=$modelRows; $record.model_contexts=$modelContexts
+        if($PassCase){$record.model_pass_case=$PassCase;$record.model_pass_status=$passStatus}
         $record.model_cleanup=$modelCleanup; $record.model_modules=$modelModules
         $record.runtime.loaded_during_inference=(($modelModules.Count -gt 0) -or ($costModules.Count -gt 0))
         $record.runtime.loaded_after_cleanup=$false

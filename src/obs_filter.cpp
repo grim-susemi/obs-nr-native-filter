@@ -65,6 +65,8 @@ struct Filter {
     uint64_t recentStart=0;unsigned recentFrames=0,recentReady=0;std::atomic<uint64_t> recentShown{0};
     nr::properties::DeadlineWindow deadlineWindow; // Graphics-owned, independent of the capped diagnostic log.
     std::atomic<uint64_t> recentLate{0}; // Eligible total/late pair, published together for the properties thread.
+    std::atomic<uint64_t> passStatus{nr::model::pack_pass_status({})};
+    uint64_t loggedPassGeneration=0,loggedPassRevision=0;
     std::atomic<Admission> admission{Admission::NoTarget};
     explicit Filter(obs_source_t *s) : source(s), instance(nextInstance.fetch_add(1)), ticks(instance)
     {
@@ -489,6 +491,18 @@ obs_properties_t *properties(void *opaque)
         labels.deadlineText=deadlineText.c_str();
     }
     labels.statusText=statusText.c_str();labels.reasonText=reasonText.c_str();
+    labels.passStatus=opaque?nr::model::unpack_pass_status(static_cast<Filter*>(opaque)->passStatus.load(std::memory_order_acquire)):
+        nr::model::PassStatus{1,1,0,0};
+    std::string passesText=plain("NR.PassesEffective");
+    for(const auto& replacement:std::array<std::pair<const char*,uint32_t>,2>{{
+            {"%1",labels.passStatus.requested},{"%2",labels.passStatus.effective}}})
+        if(const auto marker=passesText.find(replacement.first);marker!=std::string::npos)
+            passesText.replace(marker,2,std::to_string(replacement.second));
+    labels.passesText=passesText.c_str();
+    if(labels.passStatus.failedPass && (value->state=="ready" || value->state=="priming" ||
+        (value->state=="bypassed" && (value->reason=="deadlineMiss" || value->reason=="slotsFull")))) {
+        reasonText=localized("NR.Reason.","passFailed");labels.reasonText=reasonText.c_str();
+    }
     return nr::properties::controls(*value,labels);
 }
 void publish_status(Filter& f)
@@ -496,6 +510,8 @@ void publish_status(Filter& f)
     nr::properties::StatusSnapshot value{"priming","awaitingSample"};
     const auto control=f.configuration.load(std::memory_order_acquire);
     const auto configured=control?control->settings:nullptr;
+    const auto passes=f.native?f.native->pass_status():nr::model::PassStatus{configured?configured->passes:1,0,0,0};
+    f.passStatus.store(nr::model::pack_pass_status(passes),std::memory_order_release);
     if(control && !control->reason.empty())value={"bypassed",control->reason};
     else if(f.nativeFailed)value={"error",f.initializationReason.empty()?"nativeProcessingFailed":f.initializationReason};
     else if(configured && !nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)))
@@ -509,6 +525,17 @@ void publish_status(Filter& f)
     else if(const auto* selected=selection(f,nr::sampler::canonical_tick(f.clock,f.interval)))
         value=f.deterministicQa && selected->status==nr::Status::Applied?
             nr::properties::StatusSnapshot{"bypassed","qaTransportOnly"}:nr::properties::status(selected->status,selected->reason);
+    if(passes.failedPass && (value.state=="ready" || value.state=="priming"))value.reason="passFailed";
+    if(f.native && configured && (passes.effective || value.reason=="workScaleTooSmall")) {
+        const auto generation=f.native->epochs().resourceGeneration;
+        if(f.loggedPassGeneration!=generation || f.loggedPassRevision!=configured->revision.value) {
+            const auto work=nr::work_extent({0,0,f.width,f.height},configured->workScale);
+            blog(LOG_INFO,"[obs-nr-filter] passes %u/%u scale %u%% work %ux%u (instance %llu)",
+                passes.requested,passes.effective,configured->workScale,work.width,work.height,
+                static_cast<unsigned long long>(f.instance));
+            f.loggedPassGeneration=generation;f.loggedPassRevision=configured->revision.value;
+        }
+    }
     if(f.statusLogLines<40 && (value.state!=f.loggedState || value.reason!=f.loggedReason)) {
         f.loggedState=value.state;f.loggedReason=value.reason;++f.statusLogLines;
         blog(LOG_INFO,"[obs-nr-filter] status #%u: %s / %s (instance %llu, %ux%u, frame interval %llu ns, ingress %llu)%s",

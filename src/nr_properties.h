@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "nr_runtime.h"
+#include "nr_model_passes.h"
 #include <obs.h>
 namespace nr::properties {
 inline constexpr char default_runtime[]="C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll";
@@ -48,6 +49,8 @@ struct Labels {
     const char* statusText=nullptr; // already localized status/reason line; null = raw code
     const char* reasonText=nullptr;
     const char* deadlineText=nullptr;
+    const char* passesText=nullptr;
+    model::PassStatus passStatus{1,1,0,0};
 };
 obs_properties_t* controls(const StatusSnapshot&,const Labels& labels=Labels{});
 }

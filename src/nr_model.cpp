@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Driver ABI and Feature18 use R2 / tests/nr_compatibility/HardwareSmoke.cpp.
 #include "nr_model.h"
+#include "nr_model_layout.h"
 #include <string>
 #include <cstring>
 #include <algorithm>
@@ -122,14 +123,14 @@ void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,
     b.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};
     list->ResourceBarrier(1,&b);
 }
-ComPtr<ID3D12Resource> texture(ID3D12Device* device,Extent size,DXGI_FORMAT format) {
+ComPtr<ID3D12Resource> texture(ID3D12Device* device,Extent size,D3D12_RESOURCE_STATES initial) {
     D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width=size.width; desc.Height=size.height; desc.DepthOrArraySize=desc.MipLevels=1;
-    desc.Format=format; desc.SampleDesc.Count=1; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Format=DXGI_FORMAT_R16G16B16A16_FLOAT; desc.SampleDesc.Count=1; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ComPtr<ID3D12Resource> result;
     checked(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&result)),"model color allocation");
+        initial,nullptr,IID_PPV_ARGS(&result)),"model color allocation");
     return result;
 }
 ComPtr<ID3D12Resource> buffer(ID3D12Device* device,D3D12_HEAP_TYPE type) {
@@ -342,16 +343,16 @@ Job::~Job() { if(observed) CloseHandle(observed); if(gpu) CloseHandle(gpu); }
 // resource ends in COMMON; take() also requires that job's completion fence. Every pass writes each texel and
 // descriptor before reading it, so a reused slab never shows stale contents.
 struct ColorSlab {
-    std::array<ComPtr<ID3D12Resource>,5> colors;
+    std::array<ComPtr<ID3D12Resource>,8> colors;
     ComPtr<ID3D12Resource> status,statusRead,zero;
     ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap;
     ComPtr<ID3D12Fence> complete;
 };
 struct ColorSlabPool {
-    const Extent size;
+    const ColorLayout layout;
     std::mutex lock;
     std::vector<ColorSlab> free;
-    explicit ColorSlabPool(Extent value):size(value) {}
+    explicit ColorSlabPool(ColorLayout value):layout(value) {}
     std::optional<ColorSlab> take() {
         std::lock_guard<std::mutex> guard(lock);
         for(auto it=free.begin();it!=free.end();++it) {
@@ -370,7 +371,7 @@ struct Job::Resources {
     const std::shared_ptr<interop::Bridge> bridge;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> creation;
-    std::array<ComPtr<ID3D12Resource>,5> colors;
+    std::array<ComPtr<ID3D12Resource>,8> colors;
     std::array<ComPtr<ID3D12Resource>,4> guideObservations;
     ComPtr<ID3D12Resource> status, statusRead, zero;
     ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap;
@@ -398,6 +399,9 @@ std::array<ID3D12Resource*,5> Job::color_resources() const {
     std::array<ID3D12Resource*,5> result{};
     if(resources) for(size_t i=0;i<result.size();++i) result[i]=resources->colors[i].Get();
     return result;
+}
+ID3D12Resource* Job::answer_resource() const {
+    return resources && completedPasses?resources->colors[completedPasses%2?3:6].Get():nullptr;
 }
 std::array<ID3D12Resource*,4> Job::guide_observation_resources() const {
     std::array<ID3D12Resource*,4> result{};
@@ -475,18 +479,22 @@ runtime::Recording recording(const std::shared_ptr<Job>& job,ID3D12GraphicsComma
     return {commands,job->epoch,job,[submission]{return submission->state();}};
 }
 struct Evaluator final : ModelEvaluator {
-    runtime::Pass& pass;
+    const std::array<runtime::Pass*,3> passes;
     const std::weak_ptr<Job> current;
-    Evaluator(runtime::Pass& value,const std::shared_ptr<Job>& job):pass(value),current(job) {}
+    Evaluator(std::array<runtime::Pass*,3> value,const std::shared_ptr<Job>& job):passes(value),current(job) {}
     EvaluationResult evaluate(const ModelInput& in) override {
         auto job=current.lock(); require(job!=nullptr,"live model evaluation lease");
-        if(job->fault==Fault::Evaluation) return {EvaluationState::Error,0xe018};
+        if(job->fault==Fault::Evaluation || (job->fault==Fault::LaterEvaluation && in.pass==1))
+            return {EvaluationState::Error,0xe018};
+        auto* commands=static_cast<ID3D12GraphicsCommandList*>(in.input.commands);
+        auto* color=static_cast<ID3D12Resource*>(in.color.native);
+        if(in.pass)barrier(commands,color,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         const runtime::Inputs inputs{static_cast<ID3D12Resource*>(in.color.native),
             static_cast<ID3D12Resource*>(in.depth.native),static_cast<ID3D12Resource*>(in.motion.native),
             static_cast<ID3D12Resource*>(in.output.native),in.depth.active,in.motion.active,false,
             in.input.history.reset,in.input.mvScaleX,in.input.mvScaleY,true};
-        const auto result=pass.run(in.input.job,inputs,recording(job,
-            static_cast<ID3D12GraphicsCommandList*>(in.input.commands)));
+        const auto result=passes[in.pass]->run(in.input.job,inputs,recording(job,commands));
+        if(in.pass)barrier(commands,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         job->chronology[2]=stamp();
         return {result==NVSDK_NGX_Result_Success?EvaluationState::Evaluated:EvaluationState::Error,
             static_cast<uint32_t>(result)};
@@ -503,6 +511,7 @@ struct TracedCodec final : Codec {
         return codec.downsample(input,from,to);
     }
     bool clamp(const CoreInput& input,const CoreTexture& from,const CoreTexture& to,uint32_t slot) override {
+        if(job.fault==Fault::Clamp && slot==0)return false; // Refuse before recording any descriptors/barriers.
         return codec.clamp(input,from,to,slot);
     }
     bool resolve(const CoreInput& input,const CodecConstants& constants,const CoreTexture& source,const CoreTexture& answer) override {
@@ -525,7 +534,9 @@ struct Processor::Impl {
     std::shared_ptr<SdkSession> session; // Exactly one explicit owner lease.
     std::shared_ptr<Driver> driver;
     std::shared_ptr<runtime::Module> module;
-    std::unique_ptr<runtime::Pass> pass;
+    std::array<std::unique_ptr<runtime::Pass>,3> passes;
+    PassChain chain;
+    std::atomic<uint64_t> passStatus{pack_pass_status({})};
     std::unique_ptr<D3D12Guides> guides;
     std::optional<Settings> settings;
     std::optional<Extent> extent;
@@ -568,6 +579,15 @@ struct Processor::Impl {
         if(!pending) return true;
         if(!pending->ready.load(std::memory_order_acquire)) {diagSettle.store(1);return false;}
         if(pendingGuide && !guides->collect(*pendingGuide,{pending->resources->complete.Get(),1})) {diagSettle.store(2);return false;}
+        const auto completion=pending->resources->submission->state();
+        const bool historyRecorded=pending->creationPass || pending->completedPasses || pending->failedPass;
+        if(!chain.settle({pending->completedPasses,pending->failedPass,
+            pending->passError?pending->passError:pending->code,
+            !historyRecorded || completion==runtime::Completion::Complete || completion==runtime::Completion::Discarded,
+            pending->eligible}))
+            return false;
+        if(pending->failedPass) {reset=true;lastResetSetter="pass-failed";}
+        passStatus.store(pack_pass_status(chain.status()),std::memory_order_release);
         pendingGuide.reset(); pending->resources->unsubscribe(); pending.reset(); return true;
     }
     void subscribe(const std::shared_ptr<Job>& job) {
@@ -676,6 +696,7 @@ std::shared_ptr<QaSignal> make_qa_signal(){
 }
 uint64_t qa_signal_live_count(){return signalLive.load(std::memory_order_acquire);}
 uint64_t Processor::applied() const { return impl_->appliedCount.load(std::memory_order_acquire); }
+PassStatus Processor::pass_status() const {return unpack_pass_status(impl_->passStatus.load(std::memory_order_acquire));}
 std::shared_ptr<const GuidePreparation> Processor::guide_preparation() const {
     return impl_->preparation.load(std::memory_order_acquire);
 }
@@ -716,6 +737,13 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     };
     try {
     if(stop.stop_requested() || !p.settle()) return fail(0xe002);
+    const auto& d=work.job.input.descriptor;
+    const Extent size{d.active.width,d.active.height};
+    const auto working=work_extent(d.active,work.job.input.settings.workScale);
+    if(!work_admitted(working)) {
+        p.passStatus.store(pack_pass_status({work.job.input.settings.passes,0,0,work_scale_refused}),std::memory_order_release);
+        return fail(work_scale_refused); // No producer wait, NR session, prepare or submission.
+    }
     job->epoch=++p.epoch; job->creationEpoch=p.creationEpoch;
     if(job->fault==Fault::Capability) return fail(0xe003); // Owned admission control, no feature/compose.
     const auto producer=job->frame->producer;
@@ -728,9 +756,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         return wait==WAIT_OBJECT_0 && producer.fence->GetCompletedValue()!=UINT64_MAX;
     });
     if(producerCode)return fail(producerCode);
-    const auto& d=work.job.input.descriptor;
     job->qaTiming[1]=stamp();
-    const Extent size{d.active.width,d.active.height};
     auto* device=p.context->device();
     const auto plan=color_plan(d,job->exposure,
         typed(device,interop::source_format(d.format),false) &&
@@ -739,14 +765,22 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(!plan) return fail(0xe006);
     const bool adapterChanged=p.settings!=work.job.input.settings || p.extent!=size ||
         p.generation!=work.job.key.resourceGeneration;
-    if(p.pass && (adapterChanged || !p.pass->ready(job->epoch))) {
-        if(!p.pass->release()) return fail(0xe007);
-        p.pass.reset(); p.previousFrame.reset(); p.previousKey.reset();
+    if(adapterChanged || !p.settings) {
+        if(!release_passes(p.passes))return fail(0xe007);
+        p.previousFrame.reset(); p.previousKey.reset();
         if(adapterChanged && p.guides) {
             require(p.guides->close(),"old generation guides close"); p.guides.reset();
         }
+        p.settings.emplace(work.job.input.settings);p.extent.emplace(size);p.generation=work.job.key.resourceGeneration;
+        p.chain.reset(work.job.input.settings.passes);
+        p.passStatus.store(pack_pass_status(p.chain.status()),std::memory_order_release);
         p.reset=true; p.lastResetSetter="pass-retired";
+    } else if(p.passes[0] && !p.passes[0]->ready(job->epoch)) {
+        if(!p.passes[0]->release())return fail(0xe007);
+        p.passes[0].reset();p.previousFrame.reset();p.previousKey.reset();
+        p.reset=true;p.lastResetSetter="first-pass-retired";
     }
+    if(p.chain.status().failedPass && !release_passes(p.passes,p.chain.limit()))return fail(0xe007);
     if(!p.session) {
         if(p.config.qaObservations||job->observation)job->qaTiming[2]=stamp();
         const auto binding=runtime::resolve_driver();
@@ -775,24 +809,27 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(p.session->state.load(std::memory_order_acquire)!=SessionState::Ready)return fail(0xe020);
     job->resources=std::make_shared<Job::Resources>(work.binding.transport);
     auto& r=*job->resources;
-    if(!p.pass) {
-        p.pass=std::make_unique<runtime::Pass>(p.module);
-        p.settings.emplace(work.job.input.settings); p.extent.emplace(size);
-        p.generation=work.job.key.resourceGeneration;
+    const auto gate=p.chain.gate(p.passes,job->epoch);
+    if(gate.create) {
+        const auto index=*gate.create;
+        job->creationPass=index+1;
+        p.passes[index]=std::make_unique<runtime::Pass>(p.module);
         checked(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&r.allocator)),
             "owned creation allocator");
         checked(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,r.allocator.Get(),nullptr,
             IID_PPV_ARGS(&r.creation)),"owned creation list");
         p.subscribe(job);
-        if(job->fault==Fault::Creation) {
+        if(job->fault==Fault::Creation || (job->fault==Fault::LaterCreation && index==1)) {
             r.submission->discard(); checked(r.creation->Close(),"failed creation close");
             work.binding.transport->discard_recording(work.binding.ticket);
-            job->code=0xe008; p.signal(job); return {work.job,false,{}};
+            job->code=0xe008;job->failedPass=index+1;p.signal(job); return {work.job,false,{}};
         }
         if(p.config.qaObservations||job->observation)job->qaTiming[3]=stamp();
         p.creationReceipt={};
         const CreateScope createScope(p.driver.get(),p.creationReceipt);
-        const auto code=p.pass->prepare(work.job.input.settings,work.job.input.settings.tuning,size,work.job.key.historyEpoch,recording(job,r.creation.Get()));
+        const auto& t=work.job.input.settings.tuning;
+        const ModelTuning tuning{t.preset,t.style,t.intensity,t.localStructure,index?0:t.localTone,t.skinStructure,t.autoMask};
+        const auto code=p.passes[index]->prepare(work.job.input.settings,tuning,working,work.job.key.historyEpoch,recording(job,r.creation.Get()));
         if(p.config.qaObservations||job->observation)job->qaTiming[4]=stamp();
         job->driverCreateCode=p.creationReceipt.code;job->driverHandle=p.creationReceipt.handle;
         HMODULE image=nullptr;
@@ -805,6 +842,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         job->chronology[0]=stamp();
         p.creationEpoch=job->creationEpoch=job->epoch;
         job->code=static_cast<uint32_t>(code); job->created=code==NVSDK_NGX_Result_Success;
+        if(!job->created)job->failedPass=index+1;
         checked(r.creation->Close(),"owned creation close");
         ID3D12CommandList* lists[]{r.creation.Get()}; p.context->queue()->ExecuteCommandLists(1,lists);
         job->chronology[4]=stamp();
@@ -814,7 +852,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         p.signal(job);
         return {work.job,false,{}};
     }
-    if(!p.pass->ready(job->epoch)) return fail(0xe009);
+    if(!gate.primed())return fail(0xe009); // Never expose a smaller NR count while extra creation is still possible.
     job->driverCreateCode=p.creationReceipt.code;job->driverHandle=p.creationReceipt.handle;
     HMODULE image=nullptr;
     require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,p.config.runtime.canonicalPath.c_str(),&image),
@@ -849,8 +887,8 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     require(view.has_value(),"actual Bridge worker admission");
     job->output=view->output;
     const int64_t tAlloc0=stamp();
-    if(!p.pool || p.pool->size.width!=size.width || p.pool->size.height!=size.height)
-        p.pool=std::make_shared<ColorSlabPool>(size);
+    const ColorLayout layout{size,working,work.job.input.settings.passes>1};
+    if(!p.pool || p.pool->layout!=layout)p.pool=std::make_shared<ColorSlabPool>(layout);
     r.pool=p.pool;
     auto slab=p.pool->take();
     if(slab) {
@@ -858,16 +896,24 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         r.zero=std::move(slab->zero); r.codecHeap=std::move(slab->codecHeap);
         r.prepareHeap=std::move(slab->prepareHeap); r.restoreHeap=std::move(slab->restoreHeap);
     } else {
-        for(auto& color:r.colors) color=texture(device,size,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        const auto extents=layout.extents();
+        const auto initial=layout.initial_states();
+        for(size_t i=0;i<r.colors.size();++i) if(extents[i].width)
+            r.colors[i]=texture(device,extents[i],initial[i]);
         r.status=buffer(device,D3D12_HEAP_TYPE_DEFAULT); r.statusRead=buffer(device,D3D12_HEAP_TYPE_READBACK);
         r.zero=buffer(device,D3D12_HEAP_TYPE_UPLOAD);
         r.codecHeap=heap(device,25); r.prepareHeap=heap(device,4); r.restoreHeap=heap(device,4);
     }
     const int64_t tAlloc1=stamp();
     auto* list=view->commands;
-    if(slab) { // Fresh colors start UAV and fresh status COPY_DEST; a reused slab ended its last job in COMMON.
-        for(auto& color:r.colors) barrier(list,color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if(slab) { // A returned slab ended its last submitted job in COMMON, including status.
+        for(auto& color:r.colors) if(color)
+            barrier(list,color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    } else {
+        const auto initial=layout.initial_states();
+        for(size_t i=0;i<r.colors.size();++i) if(r.colors[i] && initial[i]==D3D12_RESOURCE_STATE_COMMON)
+            barrier(list,r.colors[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     void* mapped=nullptr; const D3D12_RANGE empty{0,0};
     checked(r.zero->Map(0,&empty,&mapped),"owned status zero upload");
@@ -883,9 +929,9 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         r.colors[2].Get(),r.colors[0].Get(),r.status.Get(),false),"actual canonical color prepare");
     barrier(list,r.colors[2].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(list,r.colors[0].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    auto ct=[&](ID3D12Resource* value){return CoreTexture{value,size,{0,0,size.width,size.height}};};
-    const CoreResources resources{ct(r.colors[0].Get()),ct(r.colors[1].Get()),ct(r.colors[2].Get()),
-        ct(r.colors[3].Get()),ct(r.colors[4].Get()),
+    const auto ct=[&](size_t i) {const auto extent=layout.extents()[i];
+        return CoreTexture{r.colors[i].Get(),extent,{0,0,extent.width,extent.height}};};
+    const CoreResources resources{ct(0),ct(1),ct(2),ct(3),ct(4),
         {guide->depth,d.allocation,d.active},{guide->motion,d.allocation,d.active},r.codecHeap.Get()};
     // Foreign evaluator consumes explicit readable guides, leaving model output UAV.
     barrier(list,guide->depth,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -893,10 +939,11 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const Epochs epochs{work.job.key.frame.instanceId,work.job.key.frame.contentEpoch,
         work.job.key.historyEpoch,work.job.key.resourceGeneration};
     const CoreInput input{work.job,epochs,resources,{work.job.key.historyEpoch,!reset,reset},list,
-        plan->whitePoint,1,1,plan->codecColor,plan->codecAlpha,1};
+        plan->whitePoint,float(working.width)/float(size.width),float(working.height)/float(size.height),
+        plan->codecColor,plan->codecAlpha,gate.ready,ct(5),ct(6),ct(7)};
     const int64_t tCore0=stamp();
     r.core=std::make_unique<Core>(p.instance,std::make_unique<TracedCodec>(device,p.config.codec,*job),
-        std::make_unique<Evaluator>(*p.pass,job));
+        std::make_unique<Evaluator>(std::array{p.passes[0].get(),p.passes[1].get(),p.passes[2].get()},job));
     const int64_t tCore1=stamp();
     p.subscribe(job);
     const auto result=r.core->record(input);
@@ -908,6 +955,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         prepJobs.fetch_add(1,std::memory_order_relaxed);
     }
     job->evaluated=result.evaluated; job->composed=result.composed; job->code=result.error;
+    job->completedPasses=result.passes;job->failedPass=result.failedPass;job->passError=result.passError;
     if(result.state!=CoreState::Recorded || job->fault==Fault::Submission) {
         require(r.submission->discard(),"unsubmitted evaluation discard");
         require(work.binding.transport->discard_recording(work.binding.ticket),"failed core Bridge discard");
@@ -928,11 +976,12 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     barrier(list,guide->depth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     barrier(list,guide->motion,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     barrier(list,view->output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
-    for(size_t i=0;i<r.colors.size();++i) barrier(list,r.colors[i].Get(),
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    const auto states=final_color_states(result.passes);
+    for(size_t i=0;i<r.colors.size();++i) if(r.colors[i])
+        barrier(list,r.colors[i].Get(),states[i],D3D12_RESOURCE_STATE_COMMON);
     if(auto* o=job->observation) {
         const std::array<ID3D12Resource*,Observation::Count> sources{
-            r.colors[0].Get(),r.colors[1].Get(),r.colors[2].Get(),r.colors[3].Get(),r.colors[4].Get(),
+            r.colors[0].Get(),r.colors[1].Get(),r.colors[2].Get(),job->answer_resource(),r.colors[4].Get(),
             job->frame->analysis.Get(),previous?previous->analysis:job->frame->analysis.Get(),
             guide->motion,guide->hardwareVectors,guide->cost,view->output};
         o->refused=!copy_observation(list,*o,work.job.key,sources);
@@ -1000,8 +1049,8 @@ void Processor::worker_stopping() noexcept {
                 proof.callbackRetained=proof.guidePending=false;
                 return true;
             case 1:
-                if(p.pass && !p.pass->release())return false;
-                p.pass.reset();p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
+                if(!release_passes(p.passes))return false;
+                p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
                 return true;
             case 2:
                 if(p.guides && !p.guides->close())return false;

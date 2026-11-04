@@ -1949,10 +1949,13 @@ int wmain(int argc, wchar_t **argv)
         std::wstring_view(argv[8])==L"--output-digest";
     const bool modelCost=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
         std::wstring_view(argv[8])==L"--size";
+    const bool modelPassCase=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
+        std::wstring_view(argv[8])==L"--pass-case" &&
+        (std::wstring_view(argv[9])==L"two" || std::wstring_view(argv[9])==L"create2");
     if(modelCost && std::wstring_view(argv[9])==L"0x0") {
         std::cout<<"NR_COST_INVALID_SIZE 0x0"<<std::endl; return 64;
     }
-    if (argc != 7 && argc != 8 && argc != 9 && !modelDigest && !modelCost) return 64;
+    if (argc != 7 && argc != 8 && argc != 9 && !modelDigest && !modelCost && !modelPassCase) return 64;
     const bool recording=argc==9 && std::wstring(argv[7])==L"recording-output";
     const bool bootstrap=argc==9 && std::wstring(argv[7])==L"native-bootstrap";
     const bool ghostBaseline=argc==9 && std::wstring(argv[7])==L"ghost-baseline";
@@ -1965,7 +1968,7 @@ int wmain(int argc, wchar_t **argv)
     const bool flow = argc == 8 && std::wstring(argv[7]) == L"flow-translation";
     const bool color = argc == 8 && std::wstring(argv[7]) == L"color-alpha";
     const bool coreControl=argc==8 && std::wstring(argv[7])==L"core-init-control";
-    const bool model = (argc == 8 || modelDigest || modelCost) && (std::wstring(argv[7]) == L"native-model" || coreControl);
+    const bool model = (argc == 8 || modelDigest || modelCost || modelPassCase) && (std::wstring(argv[7]) == L"native-model" || coreControl);
     const bool lifecycleNative=argc==8 && std::wstring(argv[7])==L"lifecycle-native";
     const bool lifecycle = argc == 8 && (std::wstring(argv[7]) == L"lifecycle" || lifecycleNative);
     const bool instances=argc==8 && std::wstring(argv[7])==L"two-instances";
@@ -2048,7 +2051,9 @@ int wmain(int argc, wchar_t **argv)
         } else if (modelCost) {
             if(!nr_run_cost_scenario(root,argv[9],retained)) break;
         } else if (model && !nr_run_model_scenario(root,retained,
-            modelDigest?std::filesystem::path(argv[9]):std::filesystem::path{})) break;
+            NrModelScenario{modelDigest?std::filesystem::path(argv[9]):std::filesystem::path{},
+                modelPassCase?(std::wstring_view(argv[9])==L"two"?NrModelPassCase::Two:NrModelPassCase::CreationFailure):
+                    NrModelPassCase::Legacy})) break;
         if(lifecycle && !run_lifecycle(root,retained,lifecycleNative))break;
         if(instances && !run_instances(root,retained))break;
         if(instances && !run_capacity(root,retained))break;

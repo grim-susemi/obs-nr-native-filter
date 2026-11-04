@@ -156,6 +156,7 @@ struct Harness {
     OutputKind selected=OutputKind::CurrentSource;
     uint64_t nrSelections=0,rawSelections=0;
     uint64_t eligibleJobs=0;
+    uint32_t requestedPasses=1,creationJobs=0;
     bool stopping=false;
     Harness(const std::filesystem::path& root,model::Fault control,unsigned lane):fault(control),instance(111+lane) {
         config.runtime={std::filesystem::canonical(L"C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll"),
@@ -246,7 +247,7 @@ struct Harness {
         require(clock && interval,"native actual OBS clock");
         const auto tick=clock/interval+1;
         const auto epochs=pipeline->epochs(); ++sequence;
-        const Settings settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning()};
+        const Settings settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),requestedPasses,100};
         const IngressSample input{{instance,epochs.contentEpoch,sequence},tick,tick-1,0x111a+instance,reinterpret_cast<uintptr_t>(renderer.Get()),
             epochs.resourceGeneration,SourceValidity::Valid,
             {{width,height},{0,0,width,height},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80},settings};
@@ -351,6 +352,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
     }
     require(WaitForSingleObject(job.observed,30000)==WAIT_OBJECT_0 && job.ready.load(std::memory_order_acquire),
         "native exact subscribed physical/status receipt");
+    if(job.creationPass)++h.creationJobs;
     if(h.consumerValue) {
         require(h.consumerEnd && h.consumerEnd->event==h.consumerComplete &&
             WaitForSingleObject(h.consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
@@ -368,7 +370,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
     if(job.eligible) {
         ++h.eligibleJobs;
         const auto colors=job.color_resources();
-        const auto input=readback(*h.context,colors[1]),model=readback(*h.context,colors[3]);
+        const auto input=readback(*h.context,colors[1]),model=readback(*h.context,job.answer_resource());
         const auto motion=readback(*h.context,job.flow->motion),depth=readback(*h.context,job.flow->depth);
         const auto output=readback(*h.context,job.output);
         inputHash=hash(input); modelHash=hash(model); motionHash=hash(motion); depthHash=hash(depth); outputHash=hash(output);
@@ -394,7 +396,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         if(job.referenceValid) require(h.samples.size()>1 &&
             *job.guideReferenceKey==h.samples[h.samples.size()-2]->contract.key,
             "native actual exact n-1 guide reference");
-        if(lane==0) {
+        if(lane==0 && h.requestedPasses==1) {
             const bool reset=step==1 || step==4;
             require(job.flow->reset==reset && job.referenceValid==!reset,
                 "native fixed reset/reference mapping");
@@ -428,6 +430,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         }
     }
     const auto completion=job.completion();
+    const auto passes=h.processor->pass_status();
     const auto captured=h.bridge->ownership(sample.ticket.slot);
     require(sample.pin && sample.pinObservation.retains(sample.contract.key,sample.ticket,*sample.pin,
         *h.bridge,h.context->graphics_thread(),captured),"native exact open capture pin retains ownership");
@@ -435,6 +438,9 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         <<",\"content_epoch\":"<<sample.contract.key.frame.contentEpoch<<",\"history_epoch\":"<<sample.contract.key.historyEpoch
         <<",\"resource_generation\":"<<sample.contract.key.resourceGeneration<<",\"ingress_sequence\":"<<sample.contract.key.frame.ingressSequence
         <<",\"submission_serial\":"<<sample.contract.key.submissionSerial<<",\"settings_revision\":"<<sample.contract.input.settings.revision.value
+        <<",\"requested_passes\":"<<sample.contract.input.settings.passes<<",\"completed_passes\":"<<job.completedPasses
+        <<",\"effective_passes\":"<<passes.effective<<",\"failed_pass\":"<<passes.failedPass<<",\"pass_code\":"<<passes.code
+        <<",\"creation_pass\":"<<job.creationPass<<",\"creation_jobs\":"<<h.creationJobs
         <<",\"source_identity\":"<<sample.contract.input.sourceIdentity<<",\"device_identity\":"<<sample.contract.input.deviceIdentity
         <<",\"clock\":"<<sample.clock<<",\"interval\":"<<sample.interval<<",\"tick\":"<<sample.contract.input.canonicalTick
         <<",\"deadline\":"<<sample.contract.deadlineTick<<",\"slot\":"<<sample.ticket.slot<<",\"epoch\":"<<job.epoch
@@ -451,6 +457,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         <<",\"raw_resource\":\""<<reinterpret_cast<uintptr_t>(job.frame->original.Get())
         <<"\",\"analysis_resource\":\""<<reinterpret_cast<uintptr_t>(job.frame->analysis.Get())
         <<"\",\"output_resource\":\""<<reinterpret_cast<uintptr_t>(job.output)
+        <<"\",\"answer_resource\":\""<<reinterpret_cast<uintptr_t>(job.answer_resource())
         <<"\",\"status_resource\":\""<<reinterpret_cast<uintptr_t>(job.invalid_status_resource())<<"\""
         <<",\"reset\":"<<(job.flow && job.flow->reset?"true":"false")
         <<",\"reference_valid\":"<<(job.referenceValid?"true":"false")<<",\"selected\":"<<static_cast<unsigned>(h.selected)
@@ -612,13 +619,21 @@ bool nr_start_core_control(const std::filesystem::path& root,std::unique_ptr<nr:
     owner->attach();
     return borrowed->initialize_capture();
 }
-bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,const std::filesystem::path& outputDigest) {
+bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,const NrModelScenario& options) {
     // This function runs on the coordinator, not the graphics/NR worker.
     nr_color_refuse_unrelated();
     const model::Fault controls[]{model::Fault::None,model::Fault::Capability,model::Fault::Creation,
         model::Fault::Evaluation,model::Fault::Submission};
-    for(unsigned lane=0;lane<5;++lane) {
-        auto h=std::make_unique<Harness>(root,controls[lane],lane);
+    bool multipass=false,injected=false;
+    model::Fault probe=model::Fault::None;
+    switch(options.passCase) {
+    case NrModelPassCase::Legacy:break;
+    case NrModelPassCase::Two:multipass=true;break;
+    case NrModelPassCase::CreationFailure:multipass=true;injected=true;probe=model::Fault::LaterCreation;break;
+    }
+    for(unsigned lane=0;lane<(multipass?1u:5u);++lane) {
+        auto h=std::make_unique<Harness>(root,multipass?probe:controls[lane],lane);
+        h->requestedPasses=multipass?2u:1u;
         bool callback=false;
         try {
             nr_color_refuse_unrelated();
@@ -629,23 +644,34 @@ bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,cons
                 <<",\"worker_luid_low\":"<<h->context->device()->GetAdapterLuid().LowPart
                 <<",\"device\":\""<<reinterpret_cast<uintptr_t>(h->context->device())<<"\",\"queue\":\""
                 <<reinterpret_cast<uintptr_t>(h->context->queue())<<"\"}"<<std::endl;
-            const unsigned count=lane==0?6:lane<3?1:3;
+            const unsigned count=multipass?6:lane==0?6:lane<3?1:3;
             for(unsigned step=0;step<count;++step) {
                 // Creation is a warm-up, not an inference-history sample. Retire
                 // that temporal epoch before cold/reset inference, including any
                 // real canonical ticks consumed by driver/model initialization.
-                if(((lane==0 || lane>=3) && step==1) || (lane==0 && step==4)) h->execute(Action::Cut);
+                if(multipass?(step==1 || step==2):(((lane==0 || lane>=3) && step==1) || (lane==0 && step==4)))
+                    h->execute(Action::Cut);
                 h->pixels=pattern(h->sequence+1); h->expectedHash=hash(h->pixels);
                 h->execute(Action::Capture); proof(*h,lane,step);
                 if(h->samples.size()>2) h->samples.erase(h->samples.begin());
             }
             const auto applied=h->processor->applied();
-            if(lane==0) require(h->eligibleJobs==5 && applied==3,"native five physical inferences and three actual n-1 publications");
+            if(multipass) {
+                const auto status=h->processor->pass_status();
+                require(h->creationJobs==2 && h->eligibleJobs==4 && applied==3 &&
+                    status.requested==2 && status.effective==(injected?1u:2u) &&
+                    status.failedPass==(injected?2u:0u) && status.code==(injected?0xe008u:0u),
+                    "native multipass readiness/failure reduction/no-retry proof");
+                std::cout<<"NR_MODEL_PASS_STATUS {\"requested\":"<<status.requested<<",\"effective\":"<<status.effective
+                    <<",\"failed_pass\":"<<status.failedPass<<",\"code\":"<<status.code<<",\"creation_jobs\":"<<h->creationJobs
+                    <<",\"reason\":\""<<(injected?"passFailed":"none")<<"\"}"<<std::endl;
+            }
+            else if(lane==0) require(h->eligibleJobs==5 && applied==3,"native five physical inferences and three actual n-1 publications");
             else require(applied==0,"native failed capability/create/evaluation/submit cannot apply compose");
-            if(lane==0 && !outputDigest.empty()) {
+            if(lane==0 && !options.outputDigest.empty()) {
                 const auto& final=*h->samples.back()->job;
                 require(final.eligible && final.composed,"native final composed golden output");
-                nr::qa::write_model_digest(outputDigest,readback(*h->context,final.output),final.output->GetDesc());
+                nr::qa::write_model_digest(options.outputDigest,readback(*h->context,final.output),final.output->GetDesc());
             }
             h->execute(Action::Stop); if(h->consumerValue) require(h->consumerEnd &&
                 WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&

@@ -5,5 +5,10 @@
 // 'retained' is the caller's existing unresolved-ownership flag: the model lane sets it when
 // it cannot prove cleanup, so the coordinator takes the retained/supervision path instead of
 // reaching obs_shutdown with retained=false.
-bool nr_run_model_scenario(const std::filesystem::path&,bool& retained,const std::filesystem::path& outputDigest={});
+enum class NrModelPassCase { Legacy, Two, CreationFailure };
+struct NrModelScenario {
+    std::filesystem::path outputDigest;
+    NrModelPassCase passCase=NrModelPassCase::Legacy;
+};
+bool nr_run_model_scenario(const std::filesystem::path&,bool& retained,const NrModelScenario& options={});
 bool nr_start_core_control(const std::filesystem::path&,std::unique_ptr<nr::qa::CoreControlOwner>&);

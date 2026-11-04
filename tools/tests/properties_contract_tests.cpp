@@ -7,6 +7,7 @@
 #include <string_view>
 using namespace nr::properties;
 void expect(bool value,const char* reason) { if(!value)throw std::runtime_error(reason); }
+#include "passes_properties_tests.inc"
 unsigned inspections=0;
 nr::runtime::Inspection count_inspection(const nr::runtime::RuntimeIdentity& identity)
 {
@@ -273,6 +274,7 @@ int main(int argc,char** argv)
         expect(followed->tuning==chosen && followed->revision.value==9,"tuning follows decoded values");
         tuning_controls(a);
         multipass_controls(a);
+        passes_status_controls();
         obs_data_set_bool(data,"nr_enabled",false);
         obs_data_set_double(data,"nr_strength",0);
         obs_data_set_string(data,"foreign_owner","keep");

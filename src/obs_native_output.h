@@ -11,6 +11,10 @@ inline Selection adapter_selection(const pipeline::TickPlan& plan)
         return {plan.selection.canonicalTick,OutputKind::CurrentSource,Status::Bypassed,Reason::SlotsFull,{},{},false};
     return plan.selection;
 }
+inline model::PassStatus adapter_pass_status(model::PassStatus observed,uint32_t requested,bool currentGeneration)
+{
+    return currentGeneration && observed.requested==requested?observed:model::PassStatus{requested,0,0,0};
+}
 struct TickWitness {
     uint64_t tick;
     Reason admissionReason;
@@ -61,6 +65,7 @@ public:
     std::optional<TickWitness> tick_witness() const;
     pipeline::Counters counters() const;
     uint64_t held_frames() const; // deadline-miss frames that re-showed the previous NR frame
+    model::PassStatus pass_status() const; // Graphics-owned snapshot; properties use Filter's atomic copy.
     std::string diag() const; // N22 cumulative admission/capture diagnostics
     std::shared_ptr<model::Job> selected_job() const;
     std::shared_ptr<const Capture> selected_raw() const;

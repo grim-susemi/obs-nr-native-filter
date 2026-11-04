@@ -6,7 +6,7 @@
 #include <atomic>
 namespace nr::model {
 enum class Fault { None, Capability, Creation, Evaluation, Submission, AfterCoreInit,
-    ProducerTimeout, ProducerRemoved, CompletionSignal };
+    ProducerTimeout, ProducerRemoved, CompletionSignal, LaterCreation, LaterEvaluation, Clamp };
 // Adapter observations only. Neither helper writes a fence or ownership receipt.
 // The same bounded producer-return seam is used by production and CPU tests.
 template<class Wait>

@@ -138,6 +138,8 @@ StatusSnapshot status(Status state,Reason reason)
     case Reason::EvaluationFailure:result.reason="evaluationFailure";break;
     case Reason::SlotsFull:result.reason="slotsFull";break;
     case Reason::RetirementBudget:result.reason="retirementBudget";break;
+    case Reason::PassFailed:result.reason="passFailed";break;
+    case Reason::WorkScaleTooSmall:result.reason="workScaleTooSmall";break;
     }
     return result;
 }
@@ -166,6 +168,10 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     if(labels.deadlineText) {
         auto* deadline=obs_properties_add_text(props,"nr_deadline",labels.deadlineText,OBS_TEXT_INFO);
         obs_property_set_enabled(deadline,false);
+    }
+    if(labels.passStatus.requested>1 || labels.passStatus.effective<labels.passStatus.requested) {
+        auto* passes=obs_properties_add_text(props,"nr_passes_status",labels.passesText?labels.passesText:labels.passes,OBS_TEXT_INFO);
+        obs_property_set_enabled(passes,false);
     }
     return props;
 }

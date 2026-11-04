@@ -158,6 +158,8 @@ struct NativeOutput::Impl {
     std::optional<FrameKey> previousKey;
     ID3D11Texture2D* nrTarget=nullptr; // output texture whose content is an NR frame (deadline-miss hold)
     uint64_t nrTargetTick=0;unsigned nrHeld=0;uint64_t heldFrames=0;
+    uint32_t requestedPasses=1;
+    bool workBlocked=false;
     uint64_t diagAdmit=0,diagRefused=0,diagNoAdmit=0;unsigned diagLogged=0;uint64_t diagReason[32]{}; // N22 wedge diagnostics
     std::optional<IngressSample> lastInput;
     std::shared_ptr<model::Job> selectedJob;
@@ -358,8 +360,14 @@ lifecycle::Decision NativeOutput::prepare(const lifecycle::Observation& observat
     require(p.graphicsOwner==GetCurrentThreadId(),"native prepare requires its graphics owner");
     if(p.tickWitness && p.tickWitness->tick!=observation.canonicalTick)p.tickWitness.reset();
     p.collect();
-    const auto decision=p.lifecycle->prepare(observation,cut,
-        observation.settings.runtimePath==p.config.runtime.canonicalPath.generic_string()?Reason::None:Reason::InvalidSettings);
+    const bool validSettings=observation.settings.valid();
+    if(validSettings)p.requestedPasses=observation.settings.passes;
+    p.workBlocked=!p.deterministicQa && observation.settings.enabled && validSettings &&
+        observation.descriptor.valid() &&
+        !model::work_admitted(work_extent(observation.descriptor.active,observation.settings.workScale));
+    const auto problem=observation.settings.runtimePath!=p.config.runtime.canonicalPath.generic_string()?
+        Reason::InvalidSettings:p.workBlocked?Reason::WorkScaleTooSmall:Reason::None;
+    const auto decision=p.lifecycle->prepare(observation,cut,problem);
     if(decision.resetTemporal && decision.cause &&
         *decision.cause!=ResetCause::DeadlineMiss && *decision.cause!=ResetCause::EvaluationSkipped &&
         *decision.cause!=ResetCause::EvaluationFailure) {
@@ -619,6 +627,13 @@ std::shared_ptr<model::Job> NativeOutput::current_job() const
 }
 std::shared_ptr<model::Job> NativeOutput::selected_job() const { return impl_->selectedJob; }
 uint64_t NativeOutput::held_frames() const { return impl_->heldFrames; }
+model::PassStatus NativeOutput::pass_status() const {
+    const auto& p=*impl_;
+    if(p.workBlocked)return {p.requestedPasses,0,0,model::work_scale_refused};
+    const bool current=p.pipeline && p.active && p.active->model &&
+        p.active->id==p.pipeline->epochs().resourceGeneration;
+    return adapter_pass_status(current?p.active->model->pass_status():model::PassStatus{},p.requestedPasses,current);
+}
 std::string NativeOutput::diag() const {
     const auto& p=*impl_;const auto c=p.pipeline?p.pipeline->counters():pipeline::Counters{};
     std::string s=" diag adm="+std::to_string(p.diagAdmit)+" refused="+std::to_string(p.diagRefused)+" noadm="+std::to_string(p.diagNoAdmit)+" disp="+std::to_string(c.dispatches)+" sel="+std::to_string(c.selections);

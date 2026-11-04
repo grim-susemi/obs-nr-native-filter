@@ -155,7 +155,7 @@ enum class OutputKind { CurrentSource, PrimingRaw, DelayedRaw, DelayedNr };
 enum class Status { Disabled, Priming, Applied, Bypassed, Error };
 enum class Reason { None, MissingIdentity, InvalidSource, UnknownValidity, InvalidDescriptor,
     InvalidSettings, OldEpoch, KeyMismatch, MissingPrevious, DeadlineMiss, Expired, Cancelled,
-    EvaluationFailure, SlotsFull, RetirementBudget };
+    EvaluationFailure, SlotsFull, RetirementBudget, PassFailed, WorkScaleTooSmall };
 struct Selection {
     const uint64_t canonicalTick;
     const OutputKind kind;
