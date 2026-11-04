@@ -215,12 +215,14 @@ if($Task14Only -or $Task14BaselineOnly) {
                 $Scenario=$route;$Evidence=Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-14'
                 if($verifier){$Evidence=Join-Path $Evidence 'verifier'}
                 $HostRoot=Join-Path $Work $(if($verifier){'out/task-14-verifier/host'}else{'out/task-14/host'})
+                $Runtime='C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll'
                 $LifecycleNative=$false;$LifecycleDiagnosticR4=$false;$CoreInitControl=$false
-                $OutputDigest='';$PassCase=''
+                $OutputDigest='';$Size='';$PassCase='';$RetainedEvent=''
                 $Task14CandidateManifest='';$Task14CandidateSha256='';$Task14CandidateBuild=''
                 $Task15CandidateManifest='';$Task15CandidateSha256='';$Task15CandidateBuild='';$Task15Attempt=''
                 $Task16CandidateManifest='';$Task16CandidateSha256='';$Task17CandidateManifest='';$Task17CandidateSha256=''
                 $Task27CandidateManifest='';$Task27CandidateSha256=''
+                $GhostAcceptedCalibrationSha256='';$GhostAcceptedControlsSha256='';$ForeignRoot='';$ForeignPid=0
                 $Task14Attempt=''
                 $mappingTokens=$null;$mappingErrors=$null
                 $mappingAst=[Management.Automation.Language.Parser]::ParseInput(

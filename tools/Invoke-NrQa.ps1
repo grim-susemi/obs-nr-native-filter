@@ -9,7 +9,7 @@ param(
     [switch]$CoreInitControl,
     [string]$OutputDigest='',
     [string]$Size='',
-    [ValidateSet('','two','create2')][string]$PassCase='',
+    [ValidateSet('','two','create2','eval2','scale50','odd50','quality1','quality2','quality3','align100','align50','hdr50','pair','churn')][string]$PassCase='',
     [string]$RetainedEvent='',
     [string]$Task14CandidateManifest,
     [string]$Task14CandidateSha256,
@@ -32,7 +32,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if($PassCase -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $OutputDigest -or $Size)){
+if($PassCase -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $Size -or
+    ($OutputDigest -and $PassCase -notin @('scale50','odd50','quality1','quality2','quality3','align100','align50','hdr50','pair','churn')))){
     throw 'NR_QA_PASS_CASE_SCOPE'
 }
 if($Size -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $OutputDigest)){throw 'NR_QA_SIZE_SCOPE'}
@@ -1136,9 +1137,9 @@ try {
     if ($Scenario -eq 'color-alpha') { $process.StartInfo.Arguments += ' color-alpha' }
     if ($Scenario -eq 'native-model') {
         $process.StartInfo.Arguments += $(if($CoreInitControl){' core-init-control'}else{' native-model'})
+        if($PassCase){$process.StartInfo.Arguments += ' --pass-case '+$PassCase}
         if($OutputDigest){$process.StartInfo.Arguments += ' --output-digest "'+[IO.Path]::GetFullPath($OutputDigest)+'"'}
         if($Size){$process.StartInfo.Arguments += ' --size '+$Size}
-        if($PassCase){$process.StartInfo.Arguments += ' --pass-case '+$PassCase}
     }
     if ($Scenario -eq 'lifecycle') { $process.StartInfo.Arguments += $(if($LifecycleNative){' lifecycle-native'}else{' lifecycle'}) }
     if ($Scenario -eq 'native-bootstrap') { $process.StartInfo.Arguments += ' native-bootstrap "'+$artifactRoot+'"' }
@@ -1298,9 +1299,43 @@ try {
             if ($line.StartsWith('NR_MODEL_MODULE ')) { $modelModules += $line.Substring(16) | ConvertFrom-Json }
         }
         if($PassCase) {
-            $passStatus=@($output -split [char]10|Where-Object {$_.StartsWith('NR_MODEL_PASS_STATUS ')}|
-                ForEach-Object {$_.Substring(21)|ConvertFrom-Json})
-            Assert-ModelPassRows $modelRows $modelContexts $modelCleanup $modelModules $passStatus $PassCase
+            if($PassCase -like 'quality*'){
+                $passStatus=@($output -split [char]10|Where-Object {$_.StartsWith('NR_MODEL_QUALITY_STATUS ')}|
+                    ForEach-Object {$_.Substring(24)|ConvertFrom-Json})
+                Assert-ModelQualityRows $modelRows $modelContexts $modelCleanup $modelModules $passStatus $PassCase
+            } elseif($PassCase -eq 'churn') {
+                $churnContext=@($output -split [char]10|Where-Object {$_.StartsWith('NR_CHURN_CONTEXT ')}|
+                    ForEach-Object {$_.Substring(17)|ConvertFrom-Json})
+                $churnChanges=@($output -split [char]10|Where-Object {$_.StartsWith('NR_CHURN_CHANGE ')}|
+                    ForEach-Object {$_.Substring(16)|ConvertFrom-Json})
+                $churnSummary=@($output -split [char]10|Where-Object {$_.StartsWith('NR_CHURN_SUMMARY ')}|
+                    ForEach-Object {$_.Substring(17)|ConvertFrom-Json})
+                $churnCleanup=@($output -split [char]10|Where-Object {$_.StartsWith('NR_CHURN_CLEANUP ')}|
+                    ForEach-Object {$_.Substring(17)|ConvertFrom-Json})
+                $passStatus=@()
+                Assert-ModelChurnRows $modelRows $modelModules $churnContext $churnChanges $churnSummary $churnCleanup
+            } elseif($PassCase -eq 'pair') {
+                $pairContext=@($output -split [char]10|Where-Object {$_.StartsWith('NR_PAIR_CONTEXT ')}|
+                    ForEach-Object {$_.Substring(16)|ConvertFrom-Json})
+                $pairStatus=@($output -split [char]10|Where-Object {$_.StartsWith('NR_PAIR_STATUS ')}|
+                    ForEach-Object {$_.Substring(15)|ConvertFrom-Json})
+                $pairClose=@($output -split [char]10|Where-Object {$_.StartsWith('NR_PAIR_CLOSE ')}|
+                    ForEach-Object {$_.Substring(14)|ConvertFrom-Json})
+                $passStatus=@()
+                Assert-ModelPairRows $modelRows $modelModules $pairContext $pairStatus $pairClose
+            } elseif($PassCase -eq 'hdr50') {
+                $passStatus=@($output -split [char]10|Where-Object {$_.StartsWith('NR_MODEL_PASS_STATUS ')}|
+                    ForEach-Object {$_.Substring(21)|ConvertFrom-Json})
+                $hdrRows=@($output -split [char]10|Where-Object {$_.StartsWith('NR_MODEL_HDR ')}|
+                    ForEach-Object {$_.Substring(13)|ConvertFrom-Json})
+                $hdrGuideRows=@($output -split [char]10|Where-Object {$_.StartsWith('NR_HDR_GUIDE_INPUT ')}|
+                    ForEach-Object {$_.Substring(19)|ConvertFrom-Json})
+                Assert-ModelHdrRows $modelRows $modelContexts $modelCleanup $modelModules $passStatus $hdrRows $hdrGuideRows
+            } else {
+                $passStatus=@($output -split [char]10|Where-Object {$_.StartsWith('NR_MODEL_PASS_STATUS ')}|
+                    ForEach-Object {$_.Substring(21)|ConvertFrom-Json})
+                Assert-ModelPassRows $modelRows $modelContexts $modelCleanup $modelModules $passStatus $PassCase
+            }
         } else {Assert-ModelRows $modelRows $modelContexts $modelCleanup $modelModules}
         foreach ($module in $modelModules) {
             if ([IO.Path]::GetFullPath($module.path) -ne [IO.Path]::GetFullPath($Runtime) -or
@@ -1443,13 +1478,17 @@ try {
         }
         $record.model_rows=$modelRows; $record.model_contexts=$modelContexts
         if($PassCase){$record.model_pass_case=$PassCase;$record.model_pass_status=$passStatus}
+        if($PassCase -eq 'hdr50'){$record.model_hdr_rows=$hdrRows;$record.model_hdr_guide_rows=$hdrGuideRows}
+        if($PassCase -eq 'pair'){$record.model_pair_context=$pairContext;$record.model_pair_status=$pairStatus;$record.model_pair_close=$pairClose}
+        if($PassCase -eq 'churn'){$record.model_churn_context=$churnContext;$record.model_churn_changes=$churnChanges;
+            $record.model_churn_summary=$churnSummary;$record.model_churn_cleanup=$churnCleanup}
         $record.model_cleanup=$modelCleanup; $record.model_modules=$modelModules
         $record.runtime.loaded_during_inference=(($modelModules.Count -gt 0) -or ($costModules.Count -gt 0))
         $record.runtime.loaded_after_cleanup=$false
         $record.native_raw_log=$nativeLog
         if ($nativeOutput -and !$physicalUnresolved) { $nativeOutput.Dispose() }
         if ($nativeLog -and (Test-Path $nativeLog)) { $record.native_raw_log_identity=FileIdentity $nativeLog }
-        $record.scope=if($Size){@{class='physical-Feature18-cost-probe';NR=($costFrames.Count -gt 0);Feature18=($costFrames.Count -gt 0);recording=$false;HDR=$false;quality=$false;performance=$true}}else{@{class='physical-joined-Feature18-processor';NR=$true;Feature18=$true;recording=$false;HDR=$false;quality=$false;performance=$false;fixture_fps=1}}
+        $record.scope=if($Size){@{class='physical-Feature18-cost-probe';NR=($costFrames.Count -gt 0);Feature18=($costFrames.Count -gt 0);recording=$false;HDR=$false;quality=$false;performance=$true}}else{@{class='physical-joined-Feature18-processor';NR=$true;Feature18=$true;recording=$false;HDR=($PassCase -eq 'hdr50');quality=$false;performance=$false;fixture_fps=$(if($PassCase -eq 'churn'){60}else{1})}}
         $record.assertions.exact_model_rows=$modelRows.Count
         $json=$record | ConvertTo-Json -Depth 12
     }

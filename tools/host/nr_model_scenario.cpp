@@ -17,7 +17,7 @@
 namespace {
 using namespace nr;
 using Microsoft::WRL::ComPtr;
-constexpr uint32_t width=1920,height=1080;
+constexpr uint32_t defaultWidth=1920,defaultHeight=1080;
 void require(bool value,const char* message) { if(!value) throw std::runtime_error(message); }
 void checked(HRESULT value,const char* message) { require(SUCCEEDED(value),message); }
 struct Event {
@@ -36,7 +36,7 @@ std::vector<std::byte> bytes(const std::filesystem::path& path) {
 uint64_t hash(std::span<const uint8_t> data) {
     uint64_t result=14695981039346656037ull; for(auto byte:data) result=(result^byte)*1099511628211ull; return result;
 }
-std::vector<uint8_t> pattern(uint64_t sequence) {
+std::vector<uint8_t> pattern(uint64_t sequence,uint32_t width=defaultWidth,uint32_t height=defaultHeight) {
     std::vector<uint8_t> result(static_cast<size_t>(width)*height*4);
     for(uint32_t y=0;y<height;++y) for(uint32_t x=0;x<width;++x) {
         const uint32_t shifted=x+static_cast<uint32_t>(sequence);
@@ -49,6 +49,36 @@ std::vector<uint8_t> pattern(uint64_t sequence) {
         result[at+3]=255;
     }
     return result;
+}
+std::vector<uint8_t> rectangle(unsigned shift) {
+    std::vector<uint8_t> result(static_cast<size_t>(defaultWidth)*defaultHeight*4);
+    for(uint32_t y=0;y<defaultHeight;++y) for(uint32_t x=0;x<defaultWidth;++x) {
+        const bool inside=x>=720+shift && x<920+shift && y>=400 && y<600;
+        uint32_t noise=(x-shift)*0x9e3779b9u^y*0x85ebca6bu;noise^=noise>>16;
+        const uint8_t value=inside?static_cast<uint8_t>(176+(noise&63)):16;
+        const auto at=(static_cast<size_t>(y)*defaultWidth+x)*4;
+        result[at]=result[at+1]=result[at+2]=value;result[at+3]=255;
+    }
+    return result;
+}
+std::vector<uint8_t> hdr_pattern(const std::vector<uint8_t>& sdr) {
+    std::vector<uint8_t> result(sdr.size()*2);
+    for(size_t i=0;i<sdr.size();i+=4) {
+        const uint16_t values[]{
+            DirectX::PackedVector::XMConvertFloatToHalf(4.0f*sdr[i+2]/255.0f),
+            DirectX::PackedVector::XMConvertFloatToHalf(4.0f*sdr[i+1]/255.0f),
+            DirectX::PackedVector::XMConvertFloatToHalf(4.0f*sdr[i]/255.0f),
+            DirectX::PackedVector::XMConvertFloatToHalf(1.0f)};
+        std::memcpy(result.data()+i*2,values,sizeof(values));
+    }
+    return result;
+}
+void write_image(const std::filesystem::path& prefix,const char* suffix,const std::vector<uint8_t>& data) {
+    auto path=prefix;path+=suffix;
+    std::ofstream file(path,std::ios::binary|std::ios::trunc);
+    require(static_cast<bool>(file),"native QA image open");
+    file.write(reinterpret_cast<const char*>(data.data()),static_cast<std::streamsize>(data.size()));
+    file.close();require(static_cast<bool>(file),"native QA image write");
 }
 void transition(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,
     D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
@@ -114,7 +144,7 @@ struct Snapshot {
     ComPtr<ID3D11Texture2D> original11,analysis11;
     ComPtr<ID3D12Resource> original12,analysis12;
 };
-enum class Action { None,Init,Capture,Cut,Stop,Close };
+enum class Action { None,Init,Capture,Cut,PrepareChange,ChangeCapture,Stop,Close };
 struct Sample {
     const JobContract contract;
     const interop::Ticket ticket;
@@ -123,7 +153,7 @@ struct Sample {
     std::shared_ptr<model::Job> job;
     std::shared_future<void> returned;
     const uint64_t clock,interval;
-    const uint64_t expected;
+    const uint64_t expected,expectedAnalysis;
 };
 struct Harness {
     // All cleanup and action events exist before native device/model submissions.
@@ -135,28 +165,36 @@ struct Harness {
     std::string error;
     model::Config config;
     std::vector<std::byte> vertex,pixel;
-    std::vector<uint8_t> pixels;
-    uint64_t expectedHash=0;
+    std::vector<uint8_t> pixels,analysisPixels;
+    uint64_t expectedHash=0,expectedAnalysisHash=0;
     model::Fault fault;
     const uint64_t instance;
     gs_texture_t* source=nullptr;
+    gs_texture_t* analysisSource=nullptr;
     ComPtr<ID3D11Device> renderer;
+    ComPtr<ID3D11Device> sharedRenderer;
     DXGI_ADAPTER_DESC1 adapterDescription{};
     ComPtr<ID3D11DeviceContext> graphics;
     ComPtr<ID3D11Texture2D> target11;
     ComPtr<ID3D12Resource> target12;
     std::shared_ptr<interop::Context> context;
+    std::shared_ptr<interop::Context> sharedContext;
     std::shared_ptr<interop::Bridge> bridge;
     std::shared_ptr<model::Processor> processor;
     std::unique_ptr<pipeline::FramePipeline> pipeline;
     std::vector<std::unique_ptr<Sample>> samples;
     std::optional<pipeline::Admission> admission;
     std::shared_future<void> exited;
-    uint64_t sequence=0,consumerValue=0,selectedSequence=0;
+    uint64_t sequence=0,consumerValue=0,selectedSequence=0,lastCaptureTick=0;
     OutputKind selected=OutputKind::CurrentSource;
     uint64_t nrSelections=0,rawSelections=0;
     uint64_t eligibleJobs=0;
+    uint64_t settingsRevision=1,pendingGeneration=0;
     uint32_t requestedPasses=1,creationJobs=0;
+    uint32_t width=defaultWidth,height=defaultHeight,workScale=100;
+    std::filesystem::path imagePrefix;
+    unsigned imageStep=5;
+    bool alignment=false,hdr=false,churn=false,retireSafe=false;
     bool stopping=false;
     Harness(const std::filesystem::path& root,model::Fault control,unsigned lane):fault(control),instance(111+lane) {
         config.runtime={std::filesystem::canonical(L"C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll"),
@@ -171,13 +209,18 @@ struct Harness {
         ResetEvent(acted.value); action.store(next,std::memory_order_release); acted.wait();
         require(!failed,error.c_str());
     }
-    std::shared_ptr<Snapshot> snapshot(ID3D11Texture2D* borrowed) {
+    FrameDescriptor descriptor() const {
+        return {{width,height},{0,0,width,height},hdr?PixelFormat::Rgba16Float:PixelFormat::Bgra8,
+            hdr?ColorSpace::ScRgbLinear:ColorSpace::Rec709Srgb,AlphaMode::Opaque,80};
+    }
+    std::shared_ptr<Snapshot> snapshot(ID3D11Texture2D* borrowed,ID3D11Texture2D* analysisBorrowed) {
         auto result=std::make_shared<Snapshot>();
         D3D11_TEXTURE2D_DESC desc{}; desc.Width=width; desc.Height=height; desc.MipLevels=desc.ArraySize=1;
-        desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count=1;
+        desc.SampleDesc.Count=1;
         desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
         desc.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-        auto copy=[&](ComPtr<ID3D11Texture2D>& texture,ComPtr<ID3D12Resource>& opened) {
+        auto copy=[&](ID3D11Texture2D* input,ComPtr<ID3D11Texture2D>& texture,ComPtr<ID3D12Resource>& opened) {
+            desc.Format=hdr && input==borrowed?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_B8G8R8A8_UNORM;
             checked(renderer->CreateTexture2D(&desc,nullptr,&texture),"native immutable OBS snapshot");
             ComPtr<IDXGIResource1> shared; checked(texture.As(&shared),"native snapshot NT handle interface");
             HANDLE handle=nullptr;
@@ -185,17 +228,25 @@ struct Harness {
                 "native snapshot shared handle");
             const auto hr=interop::open_shared_resource(context->device(),handle,&opened);
             CloseHandle(handle); checked(hr,"native snapshot private open");
-            graphics->CopyResource(texture.Get(),borrowed);
+            graphics->CopyResource(texture.Get(),input);
         };
-        copy(result->original11,result->original12); copy(result->analysis11,result->analysis12);
+        copy(borrowed,result->original11,result->original12);
+        copy(analysisBorrowed,result->analysis11,result->analysis12);
         return result;
     }
     void init() {
         require(gs_get_device_type()==GS_DEVICE_DIRECT3D_11,"native actual OBS D3D11 renderer");
-        source=gs_texture_create(width,height,GS_BGRA,1,nullptr,GS_DYNAMIC); require(source!=nullptr,"native OBS fixture texture");
+        source=gs_texture_create(width,height,hdr?GS_RGBA16F:GS_BGRA,1,nullptr,GS_DYNAMIC); require(source!=nullptr,"native OBS fixture texture");
+        if(hdr) {analysisSource=gs_texture_create(width,height,GS_BGRA,1,nullptr,GS_DYNAMIC);require(analysisSource!=nullptr,"native HDR analysis texture");}
         auto* borrowed=static_cast<ID3D11Texture2D*>(gs_texture_get_obj(source)); require(borrowed!=nullptr,"native OBS texture object");
         borrowed->GetDevice(&renderer); renderer->GetImmediateContext(&graphics);
-        context=interop::Context::create(renderer.Get());
+        if(sharedContext) {
+            ComPtr<IUnknown> actual,expected;
+            checked(renderer.As(&actual),"native shared renderer identity");
+            checked(sharedRenderer.As(&expected),"native expected renderer identity");
+            require(actual.Get()==expected.Get(),"native shared renderer mismatch");
+            context=sharedContext;
+        } else context=interop::Context::create(renderer.Get());
         ComPtr<IDXGIFactory4> factory; ComPtr<IDXGIAdapter1> adapter; DXGI_ADAPTER_DESC1 desc{};
         checked(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"native factory");
         checked(factory->EnumAdapterByLuid(context->luid(),IID_PPV_ARGS(&adapter)),"native same LUID");
@@ -204,13 +255,13 @@ struct Harness {
         require(desc.VendorId==0x10de && !(desc.Flags&DXGI_ADAPTER_FLAG_SOFTWARE) &&
             std::wstring(desc.Description).find(L"RTX 4090")!=std::wstring::npos,"native physical RTX4090 required");
         require(interop::same_luid(context->luid(),context->device()->GetAdapterLuid()),"native private worker same LUID");
-        const FrameDescriptor descriptor{{width,height},{0,0,width,height},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80};
-        bridge=std::make_shared<interop::Bridge>(context,1,descriptor,vertex,pixel);
+        bridge=std::make_shared<interop::Bridge>(context,1,descriptor(),vertex,pixel);
         processor=std::make_shared<model::Processor>(context,config,instance);
         pipeline=std::make_unique<pipeline::FramePipeline>(Epochs{instance,1,1,1},processor);
         require(pipeline->hold_generation(1,processor),"native physical feature generation hold");
         D3D11_TEXTURE2D_DESC target{}; target.Width=width; target.Height=height;
-        target.MipLevels=target.ArraySize=target.SampleDesc.Count=1; target.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
+        target.MipLevels=target.ArraySize=target.SampleDesc.Count=1;
+        target.Format=hdr?DXGI_FORMAT_R16G16B16A16_FLOAT:DXGI_FORMAT_B8G8R8A8_UNORM;
         target.Usage=D3D11_USAGE_DEFAULT; target.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
         target.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
         checked(renderer->CreateTexture2D(&target,nullptr,&target11),"native output consumer target");
@@ -246,16 +297,21 @@ struct Harness {
         const auto clock=obs_get_video_frame_time(),interval=obs_get_frame_interval_ns();
         require(clock && interval,"native actual OBS clock");
         const auto tick=clock/interval+1;
+        lastCaptureTick=tick;
         const auto epochs=pipeline->epochs(); ++sequence;
-        const Settings settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),requestedPasses,100};
+        const Settings settings{{settingsRevision},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),requestedPasses,workScale};
         const IngressSample input{{instance,epochs.contentEpoch,sequence},tick,tick-1,0x111a+instance,reinterpret_cast<uintptr_t>(renderer.Get()),
             epochs.resourceGeneration,SourceValidity::Valid,
-            {{width,height},{0,0,width,height},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80},settings};
-        const auto plan=pipeline->begin(input,tick+1); require(plan.admission.has_value(),"native scheduler admission");
+            descriptor(),settings};
+        const auto plan=pipeline->begin(input,tick+1);
+        require(plan.admission.has_value(),"native scheduler admission");
         admission.emplace(*plan.admission);
-        gs_texture_set_image(source,pixels.data(),width*4,false);
+        gs_texture_set_image(source,pixels.data(),width*(hdr?8:4),false);
+        if(hdr)gs_texture_set_image(analysisSource,analysisPixels.data(),width*4,false);
         auto* borrowed=static_cast<ID3D11Texture2D*>(gs_texture_get_obj(source));
-        auto immutable=snapshot(borrowed);
+        auto* analysisBorrowed=hdr?static_cast<ID3D11Texture2D*>(gs_texture_get_obj(analysisSource)):borrowed;
+        require(analysisBorrowed!=nullptr,"native analysis OBS texture");
+        auto immutable=snapshot(borrowed,analysisBorrowed);
         const auto ticket=bridge->capture(admission->job.key,borrowed);
         require(ticket && ticket->slot==admission->slot,"native exact Bridge ticket == scheduler slot");
         selected=plan.selection.kind; selectedSequence=plan.selection.frame?plan.selection.frame->ingressSequence:0;
@@ -290,8 +346,9 @@ struct Harness {
         auto frame=std::make_shared<model::Frame>(immutable->original12.Get(),immutable->analysis12.Get(),immutable,
             NV_OF_FENCE_POINT{bridge->producer_fence(),physical.producer});
         const bool controlled=fault!=model::Fault::None &&
+            (fault==model::Fault::LaterEvaluation ? sequence==3 :
             ((fault==model::Fault::Capability || fault==model::Fault::Creation ||
-              fault==model::Fault::AfterCoreInit) || sequence>1);
+              fault==model::Fault::AfterCoreInit) || sequence>1));
         auto job=std::make_shared<model::Job>(frame,admission->job,ColorExposure{1,1},controlled?fault:model::Fault::None);
         auto raw=std::make_shared<const pipeline::RawFrame>(pipeline::RawFrame{input,frame});
         const pipeline::WorkBinding binding{*ticket,physical,bridge,job,pin};
@@ -299,12 +356,40 @@ struct Harness {
         const auto* view=pipeline->view(tick);
         require(view && view->selection.canonicalTick==tick && view->selection.kind==selected,"native immutable same tick view");
         require(pipeline->view(tick)==view,"native all-view same phase latch");
-        samples.push_back(std::make_unique<Sample>(Sample{admission->job,*ticket,pin,*pinObservation,job,admission->returned,clock,interval,expectedHash}));
+        samples.push_back(std::make_unique<Sample>(Sample{admission->job,*ticket,pin,*pinObservation,job,admission->returned,
+            clock,interval,expectedHash,hdr?expectedAnalysisHash:expectedHash}));
     }
     void stop() {
         observe();consumerComplete.reset();consumerEnd.reset();consumerValue=0;
         for(const auto& sample:samples) if(sample->pin) end_pin(*sample,true);
         stopping=true;
+    }
+    void finish_retired() {
+        if(!pendingGeneration)return;
+        require(retireSafe,"churn old generation requires exact new creation completion");
+        require(pipeline->complete_generation(pendingGeneration),"churn exact old generation completion");
+        pipeline->collect();
+        require(pipeline->retired_generations()==0,"churn old generation remains retained");
+        pendingGeneration=0;retireSafe=false;
+    }
+    void prepare_change() {
+        observe();consumerComplete.reset();consumerEnd.reset();consumerValue=0;
+        for(const auto& sample:samples)if(sample->pin)end_pin(*sample,true);
+    }
+    void change_capture() {
+        observe();
+        const auto old=pipeline->epochs().resourceGeneration;
+        require(pipeline->reset(ResetCause::SettingsChanged),"churn settings generation reset");
+        for(const auto& sample:samples)if(pipeline->state(sample->contract.key))
+            require(pipeline->cancel(sample->contract.key),"churn cancel old slot");
+        pipeline->collect();samples.clear();admission.reset();
+        require(bridge->close(),"churn old bridge physical close");
+        bridge.reset();
+        const auto next=pipeline->epochs().resourceGeneration;
+        require(next==old+1 && pipeline->hold_generation(next,processor),"churn exact new generation hold");
+        bridge=std::make_shared<interop::Bridge>(context,next,descriptor(),vertex,pixel);
+        ++settingsRevision;pendingGeneration=old;
+        capture();
     }
     void close() {
         require(stopping,"native stop receipt");
@@ -316,7 +401,7 @@ struct Harness {
             const auto tick=obs_get_video_frame_time()/obs_get_frame_interval_ns()+1;
             const IngressSample disabled{{instance,epochs.contentEpoch,++sequence},tick,tick-1,0x111a+instance,reinterpret_cast<uintptr_t>(renderer.Get()),
                 epochs.resourceGeneration,SourceValidity::Valid,
-                {{width,height},{0,0,width,height},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80},
+                descriptor(),
                 {{1},false,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning()}};
             (void)pipeline->begin(disabled,tick+1); require(pipeline->finish({}),"native disabled cleanup latch");
             pipeline->collect(); samples.clear(); admission.reset();
@@ -324,20 +409,32 @@ struct Harness {
             pipeline->request_stop(); return;
         }
         require(processor->closed(),"native worker cleanup retained");
-        require(pipeline->complete_generation(1),"native exact feature retirement");
+        require(pipeline->complete_generation(pipeline->epochs().resourceGeneration),"native exact feature retirement");
         pipeline->collect(); require(pipeline->try_close(),"native exact scheduler close");
         pipeline.reset(); require(bridge->close(),"native exact Bridge physical close"); bridge.reset();
         processor.reset(); target12.Reset(); target11.Reset();
-        gs_texture_destroy(source); source=nullptr; context.reset(); graphics.Reset(); renderer.Reset();
+        gs_texture_destroy(source); source=nullptr;
+        if(analysisSource){gs_texture_destroy(analysisSource);analysisSource=nullptr;}
+        context.reset();sharedContext.reset();sharedRenderer.Reset();graphics.Reset();renderer.Reset();
     }
 };
 void draw(void* opaque,uint32_t,uint32_t) {
     auto& h=*static_cast<Harness*>(opaque);
     const auto action=h.action.exchange(Action::None,std::memory_order_acquire); if(action==Action::None) return;
+    if(h.churn && (action==Action::Capture || action==Action::ChangeCapture ||
+        (action==Action::Close && !h.exited.valid()))) {
+        const auto clock=obs_get_video_frame_time(),interval=obs_get_frame_interval_ns();
+        if(clock && interval && clock/interval+1<=h.lastCaptureTick) {
+            h.action.store(action,std::memory_order_release);return;
+        }
+    }
     try {
+        if(h.pendingGeneration && action!=Action::ChangeCapture)h.finish_retired();
         if(action==Action::Init) h.init();
         else if(action==Action::Capture) h.capture();
         else if(action==Action::Cut) require(h.pipeline->reset(ResetCause::Cut),"native NR/OFA explicit cut reset");
+        else if(action==Action::PrepareChange)h.prepare_change();
+        else if(action==Action::ChangeCapture)h.change_capture();
         else if(action==Action::Stop) h.stop();
         else if(action==Action::Close) h.close();
     } catch(const std::exception& error) { h.failed=true; h.error=error.what(); }
@@ -364,15 +461,82 @@ void proof(Harness& h,unsigned lane,unsigned step) {
     checked(h.context->queue()->Wait(job.frame->producer.fence,job.frame->producer.value),"native QA raw producer dependency");
     const auto raw=readback(*h.context,job.frame->original.Get());
     const auto analysis=readback(*h.context,job.frame->analysis.Get());
-    require(hash(raw)==sample.expected && hash(analysis)==sample.expected,"native untouched original/analysis GPU input binding");
+    require(hash(raw)==sample.expected && hash(analysis)==sample.expectedAnalysis,"native untouched original/analysis GPU input binding");
+    if(h.hdr) {
+        const auto desc=job.frame->analysis->GetDesc();
+        ComPtr<ID3D12Device> resourceDevice,fenceDevice;
+        checked(job.frame->analysis->GetDevice(IID_PPV_ARGS(&resourceDevice)),"HDR analysis device");
+        checked(job.frame->producer.fence->GetDevice(IID_PPV_ARGS(&fenceDevice)),"HDR producer device");
+        ComPtr<IUnknown> expected,resourceOwner,fenceOwner;
+        checked(h.context->device()->QueryInterface(IID_PPV_ARGS(&expected)),"HDR expected device identity");
+        checked(resourceDevice.As(&resourceOwner),"HDR resource device identity");
+        checked(fenceDevice.As(&fenceOwner),"HDR fence device identity");
+        std::cout<<"NR_HDR_GUIDE_INPUT {\"step\":"<<step<<",\"format\":"<<static_cast<unsigned>(desc.Format)
+            <<",\"dimension\":"<<static_cast<unsigned>(desc.Dimension)<<",\"width\":"<<desc.Width
+            <<",\"height\":"<<desc.Height<<",\"depth\":"<<desc.DepthOrArraySize<<",\"mips\":"<<desc.MipLevels
+            <<",\"samples\":"<<desc.SampleDesc.Count<<",\"resource_device_match\":"<<(expected.Get()==resourceOwner.Get()?"true":"false")
+            <<",\"fence_device_match\":"<<(expected.Get()==fenceOwner.Get()?"true":"false")
+            <<",\"fence_required\":"<<job.frame->producer.value<<",\"fence_done\":"
+            <<job.frame->producer.fence->GetCompletedValue()<<"}"<<std::endl;
+    }
     uint64_t inputHash=0,modelHash=0,motionHash=0,depthHash=0,outputHash=0; uint64_t changed=0;
     double motionX=0,motionY=0;
+    float encodedMin=0,encodedMax=0,sourceMax=0;
+    uint64_t encodedBad=0,outputBad=0;
     if(job.eligible) {
         ++h.eligibleJobs;
         const auto colors=job.color_resources();
         const auto input=readback(*h.context,colors[1]),model=readback(*h.context,job.answer_resource());
+        const auto extent=work_extent({0,0,h.width,h.height},h.workScale);
+        const auto answer=job.answer_resource()->GetDesc();
+        require(answer.Width==extent.width && answer.Height==extent.height,"native answer actual work extent");
+        if(!h.imagePrefix.empty() && step==h.imageStep) {
+            write_image(h.imagePrefix,h.hdr?".input.rgba16f":".input.bgra",raw);
+            if(h.hdr)write_image(h.imagePrefix,".analysis.bgra",analysis);
+            write_image(h.imagePrefix,".answer.raw",model);
+            std::cout<<"NR_MODEL_IMAGE {\"step\":"<<step<<",\"input_format\":\""<<(h.hdr?"RGBA16F":"BGRA8")<<"\",\"answer_format\":"
+                <<static_cast<unsigned>(answer.Format)<<",\"answer_width\":"<<answer.Width
+                <<",\"answer_height\":"<<answer.Height<<",\"answer_bytes\":"<<model.size()<<"}"<<std::endl;
+        }
         const auto motion=readback(*h.context,job.flow->motion),depth=readback(*h.context,job.flow->depth);
         const auto output=readback(*h.context,job.output);
+        if(h.alignment && !h.imagePrefix.empty() && (step==2 || step==3)) {
+            write_image(h.imagePrefix,step==2?".static.input.bgra":".moving.input.bgra",raw);
+            write_image(h.imagePrefix,step==2?".static.output.rgba":".moving.output.rgba",output);
+            write_image(h.imagePrefix,step==2?".static.motion.rg16f":".moving.motion.rg16f",motion);
+        }
+        if(h.hdr) {
+            require(colors[1]->GetDesc().Format==DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                job.output->GetDesc().Format==DXGI_FORMAT_R16G16B16A16_FLOAT,"native HDR image formats");
+            encodedMin=1;encodedMax=0;
+            for(size_t i=0;i<input.size();i+=8) {
+                uint16_t packed[4]{};std::memcpy(packed,input.data()+i,8);
+                for(unsigned c=0;c<3;++c) {
+                    const float value=DirectX::PackedVector::XMConvertHalfToFloat(packed[c]);
+                    if(!std::isfinite(value) || value<0 || value>1)++encodedBad;
+                    else {encodedMin=std::min(encodedMin,value);encodedMax=std::max(encodedMax,value);}
+                }
+            }
+            for(size_t i=0;i<raw.size();i+=8) {
+                uint16_t sourceValues[4]{},outputValues[4]{};
+                std::memcpy(sourceValues,raw.data()+i,8);std::memcpy(outputValues,output.data()+i,8);
+                for(unsigned c=0;c<4;++c) {
+                    const float sourceValue=DirectX::PackedVector::XMConvertHalfToFloat(sourceValues[c]);
+                    const float outputValue=DirectX::PackedVector::XMConvertHalfToFloat(outputValues[c]);
+                    require(std::isfinite(sourceValue),"native HDR source finite");
+                    if(!std::isfinite(outputValue))++outputBad;
+                    if(c<3)sourceMax=std::max(sourceMax,sourceValue);
+                }
+            }
+            if(!h.imagePrefix.empty() && step==h.imageStep) {
+                write_image(h.imagePrefix,".encoded.rgba16f",input);
+                write_image(h.imagePrefix,".output.rgba16f",output);
+            }
+            std::cout<<"NR_MODEL_HDR {\"step\":"<<step<<",\"encoded_min\":"<<encodedMin
+                <<",\"encoded_max\":"<<encodedMax<<",\"encoded_bad\":"<<encodedBad
+                <<",\"source_max\":"<<sourceMax<<",\"output_nonfinite\":"<<outputBad<<"}"<<std::endl;
+            require(sourceMax>1 && !encodedBad && !outputBad,"native HDR range and finiteness");
+        }
         inputHash=hash(input); modelHash=hash(model); motionHash=hash(motion); depthHash=hash(depth); outputHash=hash(output);
         require(inputHash && modelHash && motionHash && depthHash && outputHash,"native actual GPU hashes");
         require(inputHash!=modelHash,"native Feature18 model output changed");
@@ -384,24 +548,30 @@ void proof(Harness& h,unsigned lane,unsigned step) {
             motionX+=x; motionY+=y;
             float neutral=0; memcpy(&neutral,depth.data()+i,4); require(neutral==1,"native neutral depth is not geometry");
         }
-        motionX/=static_cast<double>(width)*height; motionY/=static_cast<double>(width)*height;
-        if(!job.flow->reset) require(motionX>0 && std::abs(motionX-1)<=1 && std::abs(motionY)<=1,
+        motionX/=static_cast<double>(h.width)*h.height; motionY/=static_cast<double>(h.width)*h.height;
+        if(!h.alignment && !job.flow->reset) require(motionX>0 && std::abs(motionX-1)<=1 && std::abs(motionY)<=1,
             "native current-to-previous guide sign/pixel units within accepted one-pixel bound");
-        for(size_t i=0;i<raw.size();i+=4) {
-            if(raw[i]!=output[i+2] || raw[i+1]!=output[i+1] || raw[i+2]!=output[i]) ++changed;
-            require(raw[i+3]==output[i+3],"native actual output alpha");
+        for(size_t i=0;i<raw.size();i+=h.hdr?8:4) {
+            if(h.hdr) {
+                if(std::memcmp(raw.data()+i,output.data()+i,6)!=0)++changed;
+                require(std::memcmp(raw.data()+i+6,output.data()+i+6,2)==0,"native HDR output alpha");
+            } else {
+                if(raw[i]!=output[i+2] || raw[i+1]!=output[i+1] || raw[i+2]!=output[i]) ++changed;
+                require(raw[i+3]==output[i+3],"native actual output alpha");
+            }
         }
         require(job.referenceValid==(!job.flow->reset && job.guideReferenceKey.has_value()),
             "native actual reference relationship");
         if(job.referenceValid) require(h.samples.size()>1 &&
             *job.guideReferenceKey==h.samples[h.samples.size()-2]->contract.key,
             "native actual exact n-1 guide reference");
-        if(lane==0 && h.requestedPasses==1) {
+        if(lane==0 && h.requestedPasses==1 && !h.churn) {
             const bool reset=step==1 || step==4;
             require(job.flow->reset==reset && job.referenceValid==!reset,
                 "native fixed reset/reference mapping");
         }
-        require(job.referenceValid?changed>0:changed==0,"native actual source-relative reference pixels");
+        if(!h.alignment || !job.referenceValid)
+            require(job.referenceValid?changed>0:changed==0,"native actual source-relative reference pixels");
         require(job.epoch>job.creationEpoch,"native explicit next submission epoch");
         for(size_t i=1;i<job.chronology.size()-1;++i) require(job.chronology[i] && job.chronology[i]<=job.chronology[i+1],
             "native chronological encode/evaluate/compose/submit/physical/status");
@@ -420,13 +590,19 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         else {
             const auto oldOutput=readback(*h.context,selected.job->output);
             const auto oldRaw=readback(*h.context,selected.job->frame->original.Get());
-            for(size_t i=0;i<target.size();i+=4) {
-                require(target[i]==oldOutput[i+2] && target[i+1]==oldOutput[i+1] &&
-                    target[i+2]==oldOutput[i] && target[i+3]==oldOutput[i+3],"native actual output Consumer pixel ownership");
-                if(target[i]!=oldRaw[i] || target[i+1]!=oldRaw[i+1] || target[i+2]!=oldRaw[i+2]) ++targetChanged;
+            for(size_t i=0;i<target.size();i+=h.hdr?8:4) {
+                if(h.hdr) {
+                    require(std::memcmp(target.data()+i,oldOutput.data()+i,8)==0,"native HDR Consumer pixel ownership");
+                    if(std::memcmp(target.data()+i,oldRaw.data()+i,6)!=0)++targetChanged;
+                } else {
+                    require(target[i]==oldOutput[i+2] && target[i+1]==oldOutput[i+1] &&
+                        target[i+2]==oldOutput[i] && target[i+3]==oldOutput[i+3],"native actual output Consumer pixel ownership");
+                    if(target[i]!=oldRaw[i] || target[i+1]!=oldRaw[i+1] || target[i+2]!=oldRaw[i+2]) ++targetChanged;
+                }
             }
-            require(selected.job->referenceValid?targetChanged>0:targetChanged==0,
-                "native actual delayed NR Consumer reference pixels");
+            if(!h.alignment || !selected.job->referenceValid)
+                require(selected.job->referenceValid?targetChanged>0:targetChanged==0,
+                    "native actual delayed NR Consumer reference pixels");
         }
     }
     const auto completion=job.completion();
@@ -439,6 +615,7 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         <<",\"resource_generation\":"<<sample.contract.key.resourceGeneration<<",\"ingress_sequence\":"<<sample.contract.key.frame.ingressSequence
         <<",\"submission_serial\":"<<sample.contract.key.submissionSerial<<",\"settings_revision\":"<<sample.contract.input.settings.revision.value
         <<",\"requested_passes\":"<<sample.contract.input.settings.passes<<",\"completed_passes\":"<<job.completedPasses
+        <<",\"job_failed_pass\":"<<job.failedPass
         <<",\"effective_passes\":"<<passes.effective<<",\"failed_pass\":"<<passes.failedPass<<",\"pass_code\":"<<passes.code
         <<",\"creation_pass\":"<<job.creationPass<<",\"creation_jobs\":"<<h.creationJobs
         <<",\"source_identity\":"<<sample.contract.input.sourceIdentity<<",\"device_identity\":"<<sample.contract.input.deviceIdentity
@@ -450,9 +627,14 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         <<",\"code\":"<<job.code<<",\"invalid_status\":"<<job.invalid<<",\"changed_pixels\":"<<changed
         <<",\"raw_hash\":\""<<hash(raw)<<"\",\"analysis_hash\":\""<<hash(analysis)<<"\",\"input_hash\":\""<<inputHash
         <<"\",\"model_hash\":\""<<modelHash<<"\",\"motion_hash\":\""<<motionHash<<"\",\"depth_hash\":\""<<depthHash
-        <<"\",\"output_hash\":\""<<outputHash<<"\",\"feature\":18,\"width\":"<<width<<",\"height\":"<<height
+        <<"\",\"output_hash\":\""<<outputHash<<"\",\"feature\":18,\"width\":"<<h.width<<",\"height\":"<<h.height
+        <<",\"work_scale\":"<<h.workScale
+        <<",\"answer_width\":"<<(job.answer_resource()?job.answer_resource()->GetDesc().Width:0)
+        <<",\"answer_height\":"<<(job.answer_resource()?job.answer_resource()->GetDesc().Height:0)
         <<",\"control\":"<<static_cast<unsigned>(job.fault)<<",\"motion_mean_x\":"<<motionX<<",\"motion_mean_y\":"<<motionY
-        <<",\"mv_scale_x\":1,\"mv_scale_y\":1,\"pre_exposure\":"<<job.exposure.preExposure<<",\"exposure\":"<<job.exposure.exposure
+        <<",\"mv_scale_x\":"<<static_cast<double>(work_extent({0,0,h.width,h.height},h.workScale).width)/h.width
+        <<",\"mv_scale_y\":"<<static_cast<double>(work_extent({0,0,h.width,h.height},h.workScale).height)/h.height
+        <<",\"pre_exposure\":"<<job.exposure.preExposure<<",\"exposure\":"<<job.exposure.exposure
         <<",\"source_format\":"<<static_cast<unsigned>(job.frame->original->GetDesc().Format)
         <<",\"raw_resource\":\""<<reinterpret_cast<uintptr_t>(job.frame->original.Get())
         <<"\",\"analysis_resource\":\""<<reinterpret_cast<uintptr_t>(job.frame->analysis.Get())
@@ -619,21 +801,236 @@ bool nr_start_core_control(const std::filesystem::path& root,std::unique_ptr<nr:
     owner->attach();
     return borrowed->initialize_capture();
 }
+namespace {
+bool run_pair_scenario(const std::filesystem::path& root,bool& retained,const NrModelScenario& options) {
+    auto a=std::make_unique<Harness>(root,model::Fault::None,0);
+    auto b=std::make_unique<Harness>(root,model::Fault::None,1);
+    a->requestedPasses=3;b->requestedPasses=1;
+    if(!options.outputDigest.empty())b->imagePrefix=options.outputDigest;
+    bool callbackA=false,callbackB=false,closedA=false,closedB=false;
+    auto close_one=[&](Harness& h,bool& callback,bool& closed) {
+        h.execute(Action::Stop);
+        if(h.consumerValue) require(h.consumerEnd &&
+            WaitForSingleObject(h.consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
+            interop::completion(h.consumerEnd->completionValue,h.consumerEnd->consumer.fence->GetCompletedValue())==
+                interop::Completion::Complete,"pair exact consumer completion");
+        h.execute(Action::Close);
+        require(h.exited.wait_for(std::chrono::seconds(30))==std::future_status::ready,"pair exact worker exit");
+        const auto receipt=h.processor->close_diagnostics();
+        require(lifecycle::close_model(receipt)==lifecycle::CloseBlock::None,"pair exact model close");
+        h.execute(Action::Close);
+        obs_remove_main_render_callback(draw,&h);callback=false;closed=true;
+        return receipt;
+    };
+    auto capture_one=[&](Harness& h,unsigned lane,unsigned step) {
+        if(step)h.execute(Action::Cut);
+        h.pixels=pattern(h.sequence+1,h.width,h.height);h.expectedHash=hash(h.pixels);
+        h.execute(Action::Capture);proof(h,lane,step);
+        if(h.samples.size()>2)h.samples.erase(h.samples.begin());
+    };
+    try {
+        obs_add_main_render_callback(draw,a.get());callbackA=true;a->execute(Action::Init);
+        b->sharedContext=a->context;b->sharedRenderer=a->renderer;
+        obs_add_main_render_callback(draw,b.get());callbackB=true;b->execute(Action::Init);
+        require(a->context==b->context && a->processor!=b->processor &&
+            a->config.runtime.canonicalPath==b->config.runtime.canonicalPath &&
+            a->config.runtime.sha256==b->config.runtime.sha256 && a->config.driver==b->config.driver &&
+            a->config.data==b->config.data,"pair exact shared session key inputs");
+        std::cout<<"NR_PAIR_CONTEXT {\"processor_a\":\""<<reinterpret_cast<uintptr_t>(a->processor.get())
+            <<"\",\"processor_b\":\""<<reinterpret_cast<uintptr_t>(b->processor.get())
+            <<"\",\"device_a\":\""<<reinterpret_cast<uintptr_t>(a->context->device())
+            <<"\",\"device_b\":\""<<reinterpret_cast<uintptr_t>(b->context->device())<<"\"}"<<std::endl;
+        for(unsigned step=0;step<5;++step) {
+            capture_one(*a,0,step);capture_one(*b,1,step);
+        }
+        const auto statusA=a->processor->pass_status(),statusB=b->processor->pass_status();
+        require(a->creationJobs==3 && b->creationJobs==1 && a->eligibleJobs==2 && b->eligibleJobs==4 &&
+            statusA.requested==3 && statusA.effective==3 && !statusA.failedPass && !statusA.code &&
+            statusB.requested==1 && statusB.effective==1 && !statusB.failedPass && !statusB.code,
+            "pair independent live pass statuses");
+        std::cout<<"NR_PAIR_STATUS {\"stage\":\"live\",\"a_requested\":"<<statusA.requested
+            <<",\"a_effective\":"<<statusA.effective<<",\"b_requested\":"<<statusB.requested
+            <<",\"b_effective\":"<<statusB.effective<<",\"a_creations\":"<<a->creationJobs
+            <<",\"b_creations\":"<<b->creationJobs<<"}"<<std::endl;
+        const auto closeA=close_one(*a,callbackA,closedA);
+        require(closeA.sdk==lifecycle::SdkDisposition::DetachedShared && closeA.ownersAtDetachment==2 &&
+            closeA.sessionId,"pair A shared session detachment");
+        std::cout<<"NR_PAIR_CLOSE {\"lane\":\"A\",\"session\":"<<closeA.sessionId
+            <<",\"owners_at_detachment\":"<<closeA.ownersAtDetachment<<",\"sdk\":"
+            <<static_cast<unsigned>(closeA.sdk)<<",\"feature_closed\":true}"<<std::endl;
+        capture_one(*b,1,5);
+        const auto after=b->processor->pass_status();
+        require(b->creationJobs==1 && b->eligibleJobs==5 && after.requested==1 && after.effective==1 &&
+            !after.failedPass && !after.code && b->samples.back()->job->eligible,"pair B continues after A close");
+        std::cout<<"NR_PAIR_STATUS {\"stage\":\"after_a\",\"b_requested\":"<<after.requested
+            <<",\"b_effective\":"<<after.effective<<",\"b_creations\":"<<b->creationJobs
+            <<",\"b_completed\":"<<b->eligibleJobs<<"}"<<std::endl;
+        if(!options.outputDigest.empty()) {
+            const auto& final=*b->samples.back()->job;
+            nr::qa::write_model_digest(options.outputDigest,readback(*b->context,final.output),final.output->GetDesc());
+        }
+        const auto closeB=close_one(*b,callbackB,closedB);
+        require(closeB.sessionId==closeA.sessionId && lifecycle::sdk_retirement_complete(closeB),
+            "pair final owner exact session retirement");
+        std::cout<<"NR_PAIR_CLOSE {\"lane\":\"B\",\"session\":"<<closeB.sessionId
+            <<",\"owners_at_detachment\":"<<closeB.ownersAtDetachment<<",\"sdk\":"
+            <<static_cast<unsigned>(closeB.sdk)<<",\"feature_closed\":true}"<<std::endl;
+        std::cout<<"NR_MODEL_SCOPE Feature18=true integrated=true quality=false performance=false recording=false cleanup=complete"<<std::endl;
+        return true;
+    } catch(const std::exception& error) {
+        std::cout<<"NR_PAIR_FAILURE "<<error.what()<<std::endl;
+        auto finish_or_retain=[&](std::unique_ptr<Harness>& h,bool& callback,bool& closed) {
+            if(closed || !callback)return;
+            const bool settled=qa::model_cleanup_settled(!h->samples.empty(),
+                std::all_of(h->samples.begin(),h->samples.end(),[](const auto& sample) {
+                    return sample->job->ready.load(std::memory_order_acquire);
+                }));
+            if(settled) {
+                try {
+                    h->failed=false;h->error.clear();
+                    (void)close_one(*h,callback,closed);
+                    std::cout<<"NR_PAIR_FAILED_CLEANUP exact=true retained=false"<<std::endl;
+                    return;
+                } catch(const std::exception& cleanup) {
+                    std::cout<<"NR_PAIR_CLEANUP_FAILURE "<<cleanup.what()<<std::endl;
+                }
+            }
+            obs_remove_main_render_callback(draw,h.get());callback=false;
+            qa::retain_unresolved_model(h);retained=true;
+            std::cout<<"NR_MODEL_RETAINED pair=true pid="<<GetCurrentProcessId()<<std::endl;
+        };
+        finish_or_retain(a,callbackA,closedA);finish_or_retain(b,callbackB,closedB);
+        return false;
+    }
+}
+bool run_churn_scenario(const std::filesystem::path& root,bool& retained,const NrModelScenario& options) {
+    auto h=std::make_unique<Harness>(root,model::Fault::None,0);
+    h->width=1280;h->height=720;h->requestedPasses=3;h->churn=true;h->imageStep=26;
+    if(!options.outputDigest.empty())h->imagePrefix=options.outputDigest;
+    bool callback=false,closed=false;
+    auto capture_one=[&](unsigned step,Action action) {
+        h->pixels=pattern(h->sequence+1,h->width,h->height);h->expectedHash=hash(h->pixels);
+        h->execute(action);proof(*h,0,step);
+        if(h->samples.size()>2)h->samples.erase(h->samples.begin());
+    };
+    auto close_one=[&] {
+        h->execute(Action::Stop);
+        if(h->consumerValue)require(h->consumerEnd &&
+            WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
+            interop::completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==
+                interop::Completion::Complete,"churn exact consumer completion");
+        h->execute(Action::Close);
+        require(h->exited.wait_for(std::chrono::seconds(30))==std::future_status::ready,"churn exact worker exit");
+        const auto receipt=h->processor->close_diagnostics();
+        require(lifecycle::sdk_retirement_complete(receipt),"churn exact SDK retirement");
+        h->execute(Action::Close);
+        obs_remove_main_render_callback(draw,h.get());callback=false;closed=true;
+    };
+    try {
+        obs_add_main_render_callback(draw,h.get());callback=true;h->execute(Action::Init);
+        std::cout<<"NR_CHURN_CONTEXT {\"device\":\""<<reinterpret_cast<uintptr_t>(h->context->device())
+            <<"\",\"instance\":"<<h->instance<<",\"width\":"<<h->width<<",\"height\":"<<h->height
+            <<",\"frame_interval_ns\":"<<obs_get_frame_interval_ns()<<"}"<<std::endl;
+        for(unsigned step=0;step<5;++step) {
+            if(step>0)h->execute(Action::Cut);
+            capture_one(step,Action::Capture);
+        }
+        require(h->creationJobs==3 && h->eligibleJobs==2,"churn initial live three-pass generation");
+        const auto started=GetTickCount64();
+        for(unsigned change=0;change<20;++change) {
+            h->execute(Action::PrepareChange);
+            if(h->consumerValue)require(h->consumerEnd &&
+                WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
+                interop::completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==
+                    interop::Completion::Complete,"churn exact pre-change consumer completion");
+            h->requestedPasses=change%2?1u:3u;h->workScale=change%2?100u:50u;
+            capture_one(change+5,Action::ChangeCapture);
+            const auto& sample=*h->samples.back();const auto& job=*sample.job;
+            const auto completion=job.completion();
+            require(job.creationPass==1 && job.created && job.submitted && completion.fence &&
+                interop::completion(completion.value,completion.fence->GetCompletedValue())==interop::Completion::Complete,
+                "churn physically completed replacement creation");
+            h->retireSafe=true;
+            std::cout<<"NR_CHURN_CHANGE {\"change\":"<<change+1<<",\"revision\":"
+                <<sample.contract.input.settings.revision.value<<",\"generation\":"<<sample.contract.key.resourceGeneration
+                <<",\"passes\":"<<sample.contract.input.settings.passes<<",\"scale\":"<<sample.contract.input.settings.workScale
+                <<",\"creation_jobs\":"<<h->creationJobs<<",\"created\":true,\"physical_complete\":true}"<<std::endl;
+        }
+        const auto elapsed=GetTickCount64()-started;
+        h->execute(Action::Cut);
+        capture_one(25,Action::Capture);h->execute(Action::Cut);capture_one(26,Action::Capture);
+        const auto status=h->processor->pass_status();
+        require(h->creationJobs==23 && h->eligibleJobs==4 && status.requested==1 && status.effective==1 &&
+            !status.failedPass && !status.code && h->samples.back()->contract.key.resourceGeneration==21,
+            "churn final live one-pass status");
+        std::cout<<"NR_CHURN_SUMMARY {\"changes\":20,\"elapsed_ms\":"<<elapsed
+            <<",\"creations\":"<<h->creationJobs<<",\"requested\":"<<status.requested
+            <<",\"effective\":"<<status.effective<<",\"generation\":21}"<<std::endl;
+        if(!options.outputDigest.empty()) {
+            const auto& final=*h->samples.back()->job;
+            nr::qa::write_model_digest(options.outputDigest,readback(*h->context,final.output),final.output->GetDesc());
+        }
+        close_one();
+        std::cout<<"NR_CHURN_CLEANUP {\"closed\":true,\"worker_exit\":true,\"retained\":false}"<<std::endl;
+        std::cout<<"NR_MODEL_SCOPE Feature18=true integrated=true quality=false performance=false recording=false cleanup=complete"<<std::endl;
+        return true;
+    } catch(const std::exception& error) {
+        std::cout<<"NR_CHURN_FAILURE "<<error.what()<<std::endl;
+        const bool settled=qa::model_cleanup_settled(!h->samples.empty(),
+            std::all_of(h->samples.begin(),h->samples.end(),[](const auto& sample) {
+                return sample->job->ready.load(std::memory_order_acquire);
+            }));
+        if(callback && !closed && settled) {
+            try {
+                h->failed=false;h->error.clear();close_one();
+                std::cout<<"NR_CHURN_FAILED_CLEANUP exact=true retained=false"<<std::endl;
+                return false;
+            } catch(const std::exception& cleanup) {
+                std::cout<<"NR_CHURN_CLEANUP_FAILURE "<<cleanup.what()<<std::endl;
+            }
+        }
+        if(callback)obs_remove_main_render_callback(draw,h.get());
+        qa::retain_unresolved_model(h);retained=true;
+        std::cout<<"NR_MODEL_RETAINED churn=true pid="<<GetCurrentProcessId()<<std::endl;
+        return false;
+    }
+}
+}
 bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,const NrModelScenario& options) {
     // This function runs on the coordinator, not the graphics/NR worker.
     nr_color_refuse_unrelated();
+    if(options.passCase==NrModelPassCase::Pair)return run_pair_scenario(root,retained,options);
+    if(options.passCase==NrModelPassCase::Churn)return run_churn_scenario(root,retained,options);
     const model::Fault controls[]{model::Fault::None,model::Fault::Capability,model::Fault::Creation,
         model::Fault::Evaluation,model::Fault::Submission};
-    bool multipass=false,injected=false;
+    bool multipass=false,injected=false,scaled=false,alignment=false,hdr=false;
+    unsigned quality=0;
     model::Fault probe=model::Fault::None;
     switch(options.passCase) {
     case NrModelPassCase::Legacy:break;
     case NrModelPassCase::Two:multipass=true;break;
     case NrModelPassCase::CreationFailure:multipass=true;injected=true;probe=model::Fault::LaterCreation;break;
+    case NrModelPassCase::EvaluationFailure:multipass=true;injected=true;probe=model::Fault::LaterEvaluation;break;
+    case NrModelPassCase::Scale50:scaled=true;break;
+    case NrModelPassCase::Odd50:scaled=true;break;
+    case NrModelPassCase::Quality1:quality=1;break;
+    case NrModelPassCase::Quality2:quality=2;break;
+    case NrModelPassCase::Quality3:quality=3;break;
+    case NrModelPassCase::Align100:alignment=true;break;
+    case NrModelPassCase::Align50:alignment=true;scaled=true;break;
+    case NrModelPassCase::Hdr50:hdr=true;scaled=true;multipass=true;break;
+    case NrModelPassCase::Pair:throw std::logic_error("pair routed before single-lane scenarios");
+    case NrModelPassCase::Churn:throw std::logic_error("churn routed before single-lane scenarios");
     }
-    for(unsigned lane=0;lane<(multipass?1u:5u);++lane) {
+    for(unsigned lane=0;lane<(multipass || scaled || quality || alignment?1u:5u);++lane) {
         auto h=std::make_unique<Harness>(root,multipass?probe:controls[lane],lane);
-        h->requestedPasses=multipass?2u:1u;
+        h->requestedPasses=quality?quality:multipass?2u:1u;
+        if(scaled)h->workScale=50;
+        h->hdr=hdr;
+        if(options.passCase==NrModelPassCase::Odd50){h->width=1281;h->height=721;}
+        h->alignment=alignment;
+        if((scaled || quality || alignment) && !options.outputDigest.empty())h->imagePrefix=options.outputDigest;
+        if(quality)h->imageStep=quality+5;
         bool callback=false;
         try {
             nr_color_refuse_unrelated();
@@ -644,23 +1041,36 @@ bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,cons
                 <<",\"worker_luid_low\":"<<h->context->device()->GetAdapterLuid().LowPart
                 <<",\"device\":\""<<reinterpret_cast<uintptr_t>(h->context->device())<<"\",\"queue\":\""
                 <<reinterpret_cast<uintptr_t>(h->context->queue())<<"\"}"<<std::endl;
-            const unsigned count=multipass?6:lane==0?6:lane<3?1:3;
+            const unsigned count=quality?quality+6:multipass?(probe==model::Fault::LaterEvaluation?7:6):lane==0?6:lane<3?1:3;
             for(unsigned step=0;step<count;++step) {
                 // Creation is a warm-up, not an inference-history sample. Retire
                 // that temporal epoch before cold/reset inference, including any
                 // real canonical ticks consumed by driver/model initialization.
-                if(multipass?(step==1 || step==2):(((lane==0 || lane>=3) && step==1) || (lane==0 && step==4)))
+                if(quality?((step>0 && step<=quality) || step==quality+3):
+                    multipass?(step==1 || step==2):(((lane==0 || lane>=3) && step==1) || (lane==0 && step==4)))
                     h->execute(Action::Cut);
-                h->pixels=pattern(h->sequence+1); h->expectedHash=hash(h->pixels);
+                const uint64_t inputSequence=quality && step>=quality?step-quality+1:h->sequence+1;
+                h->analysisPixels=pattern(inputSequence,h->width,h->height);
+                h->pixels=hdr?hdr_pattern(h->analysisPixels):alignment?rectangle(step>=3?8u:0u):h->analysisPixels;
+                h->expectedHash=hash(h->pixels);
+                h->expectedAnalysisHash=hash(h->analysisPixels);
                 h->execute(Action::Capture); proof(*h,lane,step);
                 if(h->samples.size()>2) h->samples.erase(h->samples.begin());
             }
             const auto applied=h->processor->applied();
-            if(multipass) {
+            if(quality) {
+                const auto status=h->processor->pass_status();
+                require(h->creationJobs==quality && h->eligibleJobs==6 && applied==4 &&
+                    status.requested==quality && status.effective==quality && !status.failedPass && !status.code,
+                    "native quality priming and physical inference");
+                std::cout<<"NR_MODEL_QUALITY_STATUS {\"requested\":"<<status.requested
+                    <<",\"effective\":"<<status.effective<<",\"creation_jobs\":"<<h->creationJobs<<"}"<<std::endl;
+            } else if(multipass) {
                 const auto status=h->processor->pass_status();
                 require(h->creationJobs==2 && h->eligibleJobs==4 && applied==3 &&
                     status.requested==2 && status.effective==(injected?1u:2u) &&
-                    status.failedPass==(injected?2u:0u) && status.code==(injected?0xe008u:0u),
+                    status.failedPass==(injected?2u:0u) &&
+                    status.code==(probe==model::Fault::LaterEvaluation?0xe018u:injected?0xe008u:0u),
                     "native multipass readiness/failure reduction/no-retry proof");
                 std::cout<<"NR_MODEL_PASS_STATUS {\"requested\":"<<status.requested<<",\"effective\":"<<status.effective
                     <<",\"failed_pass\":"<<status.failedPass<<",\"code\":"<<status.code<<",\"creation_jobs\":"<<h->creationJobs

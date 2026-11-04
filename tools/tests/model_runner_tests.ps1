@@ -169,4 +169,6 @@ if(!$rejected){throw 'Large cost evaluation failure was accepted'}
 Write-Output 'PASS small failure outcome and large failure refusal'
 Reject $evidence $producer $runtime 'NR_QA_INVALID_SIZE' '-Size 0x0'
 Reject $evidence $producer $runtime 'NR_QA_PASS_CASE_SCOPE' '-PassCase two -OutputDigest Z:/nope/x.json'
+Reject $evidence $producer $runtime 'NR_QA_PASS_CASE_SCOPE' '-PassCase churn -Size 0x0'
 . (Join-Path $Work 'tools/tests/model_pass_rows_tests.ps1')
+. (Join-Path $Work 'tools/tests/model_digest_tests.ps1')

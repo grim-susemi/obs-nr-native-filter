@@ -1949,9 +1949,21 @@ int wmain(int argc, wchar_t **argv)
         std::wstring_view(argv[8])==L"--output-digest";
     const bool modelCost=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
         std::wstring_view(argv[8])==L"--size";
-    const bool modelPassCase=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
+    const bool modelCaseDigest=argc==12 && std::wstring_view(argv[10])==L"--output-digest";
+    const bool modelPassCase=(argc==10 || modelCaseDigest) && std::wstring_view(argv[7])==L"native-model" &&
         std::wstring_view(argv[8])==L"--pass-case" &&
-        (std::wstring_view(argv[9])==L"two" || std::wstring_view(argv[9])==L"create2");
+        (std::wstring_view(argv[9])==L"two" || std::wstring_view(argv[9])==L"create2" ||
+         std::wstring_view(argv[9])==L"eval2" || std::wstring_view(argv[9])==L"scale50" ||
+         std::wstring_view(argv[9])==L"odd50" || std::wstring_view(argv[9])==L"quality1" ||
+         std::wstring_view(argv[9])==L"quality2" || std::wstring_view(argv[9])==L"quality3" ||
+         std::wstring_view(argv[9])==L"align100" || std::wstring_view(argv[9])==L"align50" ||
+         std::wstring_view(argv[9])==L"hdr50" || std::wstring_view(argv[9])==L"pair" ||
+         std::wstring_view(argv[9])==L"churn") &&
+        (!modelCaseDigest || std::wstring_view(argv[9])==L"scale50" || std::wstring_view(argv[9])==L"odd50" ||
+         std::wstring_view(argv[9])==L"quality1" || std::wstring_view(argv[9])==L"quality2" ||
+         std::wstring_view(argv[9])==L"quality3" || std::wstring_view(argv[9])==L"align100" ||
+         std::wstring_view(argv[9])==L"align50" || std::wstring_view(argv[9])==L"hdr50" ||
+         std::wstring_view(argv[9])==L"pair" || std::wstring_view(argv[9])==L"churn");
     if(modelCost && std::wstring_view(argv[9])==L"0x0") {
         std::cout<<"NR_COST_INVALID_SIZE 0x0"<<std::endl; return 64;
     }
@@ -2007,7 +2019,8 @@ int wmain(int argc, wchar_t **argv)
         auto graphics = (root / "bin/64bit/libobs-d3d11.dll").string();
         video.graphics_module = graphics.c_str();
         // Finite identity/ownership fixture, not Task18's performance workload.
-        video.fps_num = model || bootstrap || recording || ghost || lifecycle || instances || property || faults || shutdown ? 1 : 60;
+        const bool churnClock=modelPassCase && std::wstring_view(argv[9])==L"churn";
+        video.fps_num = churnClock?60:(model || bootstrap || recording || ghost || lifecycle || instances || property || faults || shutdown ? 1 : 60);
         video.fps_den = 1;
         video.base_width = video.output_width = 64;
         video.base_height = video.output_height = 64;
@@ -2051,8 +2064,20 @@ int wmain(int argc, wchar_t **argv)
         } else if (modelCost) {
             if(!nr_run_cost_scenario(root,argv[9],retained)) break;
         } else if (model && !nr_run_model_scenario(root,retained,
-            NrModelScenario{modelDigest?std::filesystem::path(argv[9]):std::filesystem::path{},
-                modelPassCase?(std::wstring_view(argv[9])==L"two"?NrModelPassCase::Two:NrModelPassCase::CreationFailure):
+            NrModelScenario{modelDigest?std::filesystem::path(argv[9]):
+                modelCaseDigest?std::filesystem::path(argv[11]):std::filesystem::path{},
+                modelPassCase?(std::wstring_view(argv[9])==L"two"?NrModelPassCase::Two:
+                    std::wstring_view(argv[9])==L"create2"?NrModelPassCase::CreationFailure:
+                    std::wstring_view(argv[9])==L"eval2"?NrModelPassCase::EvaluationFailure:
+                    std::wstring_view(argv[9])==L"scale50"?NrModelPassCase::Scale50:
+                    std::wstring_view(argv[9])==L"odd50"?NrModelPassCase::Odd50:
+                    std::wstring_view(argv[9])==L"quality1"?NrModelPassCase::Quality1:
+                    std::wstring_view(argv[9])==L"quality2"?NrModelPassCase::Quality2:
+                    std::wstring_view(argv[9])==L"quality3"?NrModelPassCase::Quality3:
+                    std::wstring_view(argv[9])==L"align100"?NrModelPassCase::Align100:
+                    std::wstring_view(argv[9])==L"align50"?NrModelPassCase::Align50:
+                    std::wstring_view(argv[9])==L"hdr50"?NrModelPassCase::Hdr50:
+                    std::wstring_view(argv[9])==L"pair"?NrModelPassCase::Pair:NrModelPassCase::Churn):
                     NrModelPassCase::Legacy})) break;
         if(lifecycle && !run_lifecycle(root,retained,lifecycleNative))break;
         if(instances && !run_instances(root,retained))break;
