@@ -37,6 +37,7 @@ public sealed class NrHostOutput : IDisposable {
     private readonly System.Text.StringBuilder error = new System.Text.StringBuilder();
     private readonly System.IO.StreamWriter log;
     private readonly System.IO.TextWriter console;
+    private readonly EventWaitHandle retainedNotification;
     private string sinkFailure;
     private int logFailures,consoleFailures;
     public int LogFailures { get { lock(gate) { return logFailures; } } }
@@ -49,14 +50,21 @@ public sealed class NrHostOutput : IDisposable {
     public readonly ManualResetEvent Reply = new ManualResetEvent(false);
     private long replySequence;
     public long ReplySequence { get { lock(gate) { return replySequence; } } }
-    public NrHostOutput(Process process, string path, System.IO.TextWriter consoleSink=null) {
+    public NrHostOutput(Process process, string path, System.IO.TextWriter consoleSink=null, EventWaitHandle retainedSignal=null) {
         console=consoleSink ?? Console.Out;
+        retainedNotification=retainedSignal;
         log = new System.IO.StreamWriter(path, false, new System.Text.UTF8Encoding(false));
         log.AutoFlush = true;
         process.OutputDataReceived += (sender, args) => {
             if (args.Data == null) { OutputClosed.Set(); return; }
             lock (gate) {
                 output.AppendLine(args.Data);
+                if(retainedNotification!=null &&
+                    (args.Data=="NR_QA_RETAINED" || args.Data.StartsWith("NR_QA_RETAINED ",StringComparison.Ordinal))) {
+                    try {
+                        if(!retainedNotification.Set()) throw new InvalidOperationException("retained event signal failed");
+                    } catch(Exception failure) { RememberFailure(failure); }
+                }
                 try { log.WriteLine("OUT " + args.Data); } catch(Exception failure) { logFailures++;RememberFailure(failure); }
                 const string prefix="NR_QA_RETAINED_REPLY {\"request\":";
                 if(args.Data.StartsWith(prefix, StringComparison.Ordinal)) {
@@ -87,6 +95,10 @@ public sealed class NrHostOutput : IDisposable {
     public void Dispose() { log.Dispose(); OutputClosed.Dispose(); ErrorClosed.Dispose(); Reply.Dispose(); }
 }
 '@
+function Open-NrCostRetainedEvent([string]$Name) {
+    if($Name -cnotmatch '^Local\\nr-cost-retained-[0-9a-f]{32}$'){throw 'NR_QA_RETAINED_EVENT_NAME'}
+    [Threading.EventWaitHandle]::OpenExisting($Name)
+}
 function Assert-OwnedRoot([string]$Candidate) {
     if ([IO.Path]::GetFullPath($Candidate).TrimEnd('\','/') -ne $owned) { throw 'NR_QA_FOREIGN_ROOT' }
     if (Test-Path $Candidate) { throw 'NR_QA_EXISTING_ROOT' }
@@ -523,6 +535,29 @@ function Assert-LifecycleRows($Rows,$Cleanup,[switch]$Native,$Witness=@()) {
             $close.actual_reset_samples -ne @($Witness|Where-Object {$_.flow_reset}).Count){
             throw 'NR_QA_LIFECYCLE_WITNESS_SET'
         }
+    }
+}
+function Assert-CostRows($Create,$Frames,[string]$Size,$Failures=@()) {
+    $dims=$Size.Split('x')
+    if($Create.Count -ne 1 -or $Create[0].width -ne [int]$dims[0] -or $Create[0].height -ne [int]$dims[1]) {
+        throw 'NR_QA_COST_CREATE'
+    }
+    if($Create[0].result -ne 1) {
+        if($Size -notin @('959x539','480x270','64x64') -or $Frames.Count -ne 0 -or $Failures.Count) {throw 'NR_QA_COST_CREATE_FAILED'}
+        return
+    }
+    if($Failures.Count) {
+        if($Size -notin @('959x539','480x270','64x64') -or $Failures.Count -ne 1 -or
+            $Failures[0].frame -ne ($Frames.Count+1) -or $Failures[0].result -eq 1 -or $Frames.Count -ge 6) {throw 'NR_QA_COST_EVALUATE_FAILURE'}
+    } elseif($Frames.Count -ne 6){throw 'NR_QA_COST_FRAME_COUNT'}
+    for($i=0;$i -lt $Frames.Count;$i++) {
+        $r=$Frames[$i]
+        if($r.frame -ne ($i+1) -or $r.reset -isnot [bool] -or $r.reset -ne ($i -eq 0) -or
+            $r.result -ne 1 -or [UInt64]$r.frequency -eq 0 -or [UInt64]$r.end -le [UInt64]$r.begin -or
+            [double]::IsNaN([double]$r.gpu_ms) -or [double]::IsInfinity([double]$r.gpu_ms) -or
+            [double]$r.gpu_ms -le 0) {throw 'NR_QA_COST_FRAME'}
+        $expected=1000.0*([double]$r.end-[double]$r.begin)/[double]$r.frequency
+        if([Math]::Abs($expected-[double]$r.gpu_ms) -gt [Math]::Max(0.00001,$expected*0.00001)) {throw 'NR_QA_COST_TIMESTAMP'}
     }
 }
 function Assert-ModelRows($Rows,$Contexts,$Cleanup,$Modules) {

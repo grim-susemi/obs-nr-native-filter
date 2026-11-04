@@ -143,3 +143,28 @@ foreach($case in @(@(3,4,$true),@(4,4,$true),@(5,4,$false))){
     if(!$refused){throw 'Open capture pin order was accepted'}
 }
 Write-Output 'PASS native machine capture-pin ordering refusals; parser only, no GPU claim'
+# Given: a cost receipt with a reset frame and five subsequent completed frames.
+$costCreate=@(@{width=1280;height=720;result=1})
+$costFrames=@(1..6 | ForEach-Object {@{frame=$_;reset=($_ -eq 1);result=1;begin=1000;end=1100;frequency=1000000;gpu_ms=0.1}})
+# When: the cost-specific validator consumes it. Then: the independent size is accepted.
+Assert-CostRows $costCreate $costFrames '1280x720'
+Write-Output 'PASS cost frame fixture'
+foreach($mutation in @(
+    @{field='reset';value=$false},
+    @{field='gpu_ms';value=0.2},
+    @{field='frequency';value=0},
+    @{field='result';value=0}
+)){
+    $rows=ConvertFrom-Json (ConvertTo-Json -InputObject $costFrames)
+    $rows[0].($mutation.field)=$mutation.value
+    $rejected=$false
+    try{Assert-CostRows $costCreate $rows '1280x720'}catch{$rejected=$true}
+    if(!$rejected){throw ('Cost mutation accepted: '+$mutation.field)}
+}
+Write-Output 'PASS cost frame mutation refusals'
+Assert-CostRows @(@{width=64;height=64;result=1}) @() '64x64' @(@{frame=1;result=3134193675})
+$rejected=$false
+try{Assert-CostRows $costCreate @() '1280x720' @(@{frame=1;result=3134193675})}catch{$rejected=$true}
+if(!$rejected){throw 'Large cost evaluation failure was accepted'}
+Write-Output 'PASS small failure outcome and large failure refusal'
+Reject $evidence $producer $runtime 'NR_QA_INVALID_SIZE' '-Size 0x0'

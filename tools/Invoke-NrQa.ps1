@@ -8,6 +8,8 @@ param(
     [switch]$LifecycleDiagnosticR4,
     [switch]$CoreInitControl,
     [string]$OutputDigest='',
+    [string]$Size='',
+    [string]$RetainedEvent='',
     [string]$Task14CandidateManifest,
     [string]$Task14CandidateSha256,
     [string]$Task14CandidateBuild,
@@ -29,6 +31,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if($Size -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $OutputDigest)){throw 'NR_QA_SIZE_SCOPE'}
+if($RetainedEvent -and (!$Size -or $Scenario -ne 'native-model')){throw 'NR_QA_RETAINED_EVENT_SCOPE'}
+if($RetainedEvent -and $RetainedEvent -cnotmatch '^Local\\nr-cost-retained-[0-9a-f]{32}$'){throw 'NR_QA_RETAINED_EVENT_NAME'}
+if($Size -and $Size -notin @('2560x1440','1920x1080','1280x720','959x539','480x270','64x64')){throw 'NR_QA_INVALID_SIZE'}
 if($OutputDigest -and ($Scenario -ne 'native-model' -or $CoreInitControl)){throw 'NR_QA_OUTPUT_DIGEST_SCOPE'}
 if($Scenario -eq 'ghost-baseline') {
     if($Task17CandidateManifest -or $Task17CandidateSha256){throw 'T17_PUBLIC_CANDIDATE_SCOPE'}
@@ -999,6 +1005,7 @@ $stderr = $null
 $output = ''
 $exitSignal = $null
 $nativeOutput = $null
+$retainedNotification = $null
 $nativeLog = $null
 $views = @()
 $patterns = @()
@@ -1014,6 +1021,10 @@ $modelRows = @()
 $modelContexts = @()
 $modelCleanup = @()
 $modelModules = @()
+$costCreate = @()
+$costFrames = @()
+$costModules = @()
+$costFailures = @()
 $bootstrapFrames=@();$bootstrapLanes=@();$bootstrapDecoded=@();$bootstrapCleanup=@()
 $bootstrapSlots=@();$bootstrapSlotCleanup=@();$bootstrapArtifacts=@();$artifactRoot=$null
 $lifecycleRows=@();$lifecycleCleanup=@();$lifecycleWitness=@();$retainedEvents=@()
@@ -1040,6 +1051,7 @@ try {
         $binding += FileIdentity (Join-Path (Split-Path $build) 'nr_color.dxil')
     }
     if ($Scenario -in @('native-model','native-bootstrap','ghost-calibration','ghost-baseline','lifecycle')) {
+        if($Size) {foreach($path in @('tools/host/nr_cost_driver.h','tools/host/nr_cost_driver.cpp','tools/host/nr_cost_completion.h','tools/host/nr_cost_scenario.h','tools/host/nr_cost_scenario.cpp')) {$binding += FileIdentity (Join-Path $work $path)}}
         foreach ($path in @('src/nr_model.h','src/nr_model.cpp','src/nr_runtime.h','src/nr_runtime.cpp',
             'src/nr_core.h','src/nr_core.cpp','src/nr_guides.h','src/nr_guides.cpp','src/nr_color.h','src/nr_color.cpp',
             'src/frame_pipeline.h','src/frame_pipeline.cpp','src/interop.h','src/interop.cpp','src/shaders/nr_codec.hlsl',
@@ -1120,6 +1132,7 @@ try {
     if ($Scenario -eq 'native-model') {
         $process.StartInfo.Arguments += $(if($CoreInitControl){' core-init-control'}else{' native-model'})
         if($OutputDigest){$process.StartInfo.Arguments += ' --output-digest "'+[IO.Path]::GetFullPath($OutputDigest)+'"'}
+        if($Size){$process.StartInfo.Arguments += ' --size '+$Size}
     }
     if ($Scenario -eq 'lifecycle') { $process.StartInfo.Arguments += $(if($LifecycleNative){' lifecycle-native'}else{' lifecycle'}) }
     if ($Scenario -eq 'native-bootstrap') { $process.StartInfo.Arguments += ' native-bootstrap "'+$artifactRoot+'"' }
@@ -1133,7 +1146,8 @@ try {
     $originalOwner.exitSignal=$exitSignal
     if ($Scenario -in @('native-model','native-bootstrap','ghost-calibration','ghost-baseline','lifecycle')) {
         $nativeLog=Join-Path $Evidence ('attempt-'+$nonce+'-native-host.log')
-        $nativeOutput=[NrHostOutput]::new($process,$nativeLog)
+        if($RetainedEvent){$retainedNotification=Open-NrCostRetainedEvent $RetainedEvent}
+        $nativeOutput=[NrHostOutput]::new($process,$nativeLog,$null,$retainedNotification)
         $originalOwner.nativeOutput=$nativeOutput
     }
     $command = $process.StartInfo.FileName + ' ' + $process.StartInfo.Arguments
@@ -1257,6 +1271,19 @@ try {
     }
     if($CoreInitControl) {
         Assert-CoreControl @(Read-CoreControlRows $output) @($output -split [char]10|Where-Object {$_.StartsWith('NR_CORE_CONTROL_CAPTURE ')}|ForEach-Object {$_.Substring(24)|ConvertFrom-Json}) @(Read-CoreControlContext $output)
+    } elseif ($Scenario -eq 'native-model' -and $Size) {
+        foreach($line in ($output -split [char]10)) {
+            if($line.StartsWith('NR_COST_CREATE ')){$costCreate+=($line.Substring(15)|ConvertFrom-Json)}
+            if($line.StartsWith('NR_COST_FRAME ')){$costFrames+=($line.Substring(14)|ConvertFrom-Json)}
+            if($line.StartsWith('NR_COST_MODULE ')){$costModules+=($line.Substring(15)|ConvertFrom-Json)}
+            if($line.StartsWith('NR_COST_EVALUATE_FAILURE ')){$costFailures+=($line.Substring(25)|ConvertFrom-Json)}
+        }
+        Assert-CostRows $costCreate $costFrames $Size $costFailures
+        if($costCreate[0].result -eq 1) {
+            if($costModules.Count -ne 1 -or [IO.Path]::GetFullPath($costModules[0].path) -ne [IO.Path]::GetFullPath($Runtime) -or
+                $costModules[0].sha256 -ne $spec.runtime.sha256 -or [UInt64]$costModules[0].base -eq 0){throw 'NR_QA_COST_MODULE_IDENTITY'}
+        }
+        if(!$output.Contains('NR_COST_CLEANUP complete=true')){throw 'NR_QA_COST_CLEANUP'}
     } elseif ($Scenario -eq 'native-model') {
         foreach ($line in ($output -split [char]10)) {
             if ($line.StartsWith('NR_MODEL_CASE ')) { $modelRows += $line.Substring(14) | ConvertFrom-Json }
@@ -1399,14 +1426,18 @@ try {
         $json=$record|ConvertTo-Json -Depth 20
     } elseif ($Scenario -eq 'native-model') {
         $receipt='native-model.json'
+        if($Size) {
+            $record.cost_create=$costCreate; $record.cost_frames=$costFrames; $record.cost_modules=$costModules; $record.cost_evaluation_failures=$costFailures
+            $record.cost_size=$Size
+        }
         $record.model_rows=$modelRows; $record.model_contexts=$modelContexts
         $record.model_cleanup=$modelCleanup; $record.model_modules=$modelModules
-        $record.runtime.loaded_during_inference=($modelModules.Count -gt 0)
+        $record.runtime.loaded_during_inference=(($modelModules.Count -gt 0) -or ($costModules.Count -gt 0))
         $record.runtime.loaded_after_cleanup=$false
         $record.native_raw_log=$nativeLog
         if ($nativeOutput -and !$physicalUnresolved) { $nativeOutput.Dispose() }
         if ($nativeLog -and (Test-Path $nativeLog)) { $record.native_raw_log_identity=FileIdentity $nativeLog }
-        $record.scope=@{class='physical-joined-Feature18-processor';NR=$true;Feature18=$true;recording=$false;HDR=$false;quality=$false;performance=$false;fixture_fps=1}
+        $record.scope=if($Size){@{class='physical-Feature18-cost-probe';NR=($costFrames.Count -gt 0);Feature18=($costFrames.Count -gt 0);recording=$false;HDR=$false;quality=$false;performance=$true}}else{@{class='physical-joined-Feature18-processor';NR=$true;Feature18=$true;recording=$false;HDR=$false;quality=$false;performance=$false;fixture_fps=1}}
         $record.assertions.exact_model_rows=$modelRows.Count
         $json=$record | ConvertTo-Json -Depth 12
     }
@@ -1518,6 +1549,7 @@ try {
             $originalOwner.kernelWait.Dispose();$originalOwner.unknownGate.Dispose()
         }
     }
+    if($retainedNotification){$retainedNotification.Dispose()}
 }
 if ($result -ne 'PASS' -and $originalOwner -and $originalOwner.primaryError) { throw $originalOwner.primaryError }
 if ($result -ne 'PASS') { throw $failure }

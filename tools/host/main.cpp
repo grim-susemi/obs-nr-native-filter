@@ -3,6 +3,7 @@
 #include "host_log_boundary.h"
 #include "nr_color_scenario.h"
 #include "nr_model_scenario.h"
+#include "nr_cost_scenario.h"
 #include "nr_model_ownership.h"
 #include "nr_bootstrap_scenario.h"
 #include "nr_bootstrap_images.h"
@@ -1946,7 +1947,12 @@ int wmain(int argc, wchar_t **argv)
         return nr_ghost_complete_service(argv[2],argv[3])?0:1;
     const bool modelDigest=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
         std::wstring_view(argv[8])==L"--output-digest";
-    if (argc != 7 && argc != 8 && argc != 9 && !modelDigest) return 64;
+    const bool modelCost=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
+        std::wstring_view(argv[8])==L"--size";
+    if(modelCost && std::wstring_view(argv[9])==L"0x0") {
+        std::cout<<"NR_COST_INVALID_SIZE 0x0"<<std::endl; return 64;
+    }
+    if (argc != 7 && argc != 8 && argc != 9 && !modelDigest && !modelCost) return 64;
     const bool recording=argc==9 && std::wstring(argv[7])==L"recording-output";
     const bool bootstrap=argc==9 && std::wstring(argv[7])==L"native-bootstrap";
     const bool ghostBaseline=argc==9 && std::wstring(argv[7])==L"ghost-baseline";
@@ -1959,7 +1965,7 @@ int wmain(int argc, wchar_t **argv)
     const bool flow = argc == 8 && std::wstring(argv[7]) == L"flow-translation";
     const bool color = argc == 8 && std::wstring(argv[7]) == L"color-alpha";
     const bool coreControl=argc==8 && std::wstring(argv[7])==L"core-init-control";
-    const bool model = (argc == 8 || modelDigest) && (std::wstring(argv[7]) == L"native-model" || coreControl);
+    const bool model = (argc == 8 || modelDigest || modelCost) && (std::wstring(argv[7]) == L"native-model" || coreControl);
     const bool lifecycleNative=argc==8 && std::wstring(argv[7])==L"lifecycle-native";
     const bool lifecycle = argc == 8 && (std::wstring(argv[7]) == L"lifecycle" || lifecycleNative);
     const bool instances=argc==8 && std::wstring(argv[7])==L"two-instances";
@@ -2039,6 +2045,8 @@ int wmain(int argc, wchar_t **argv)
                 }catch(const std::exception& error){retained=true;std::cout<<"NR_CORE_CONTROL_FAILURE "<<error.what()<<std::endl;}
             }
             if(!valid || retained)break;
+        } else if (modelCost) {
+            if(!nr_run_cost_scenario(root,argv[9],retained)) break;
         } else if (model && !nr_run_model_scenario(root,retained,
             modelDigest?std::filesystem::path(argv[9]):std::filesystem::path{})) break;
         if(lifecycle && !run_lifecycle(root,retained,lifecycleNative))break;
