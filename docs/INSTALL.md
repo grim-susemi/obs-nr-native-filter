@@ -1,6 +1,6 @@
 # Install guide
 
-How to install OBS Native NR 0.1.0 into OBS Studio on Windows. It takes about five minutes.
+How to install OBS Native NR 0.1.1 into OBS Studio on Windows. It takes about five minutes.
 
 [한국어 설치 안내는 아래에 있습니다](#한국어-설치-안내)
 
@@ -25,9 +25,9 @@ How to install OBS Native NR 0.1.0 into OBS Studio on Windows. It takes about fi
 
 ## Install with the installer
 
-1. Download `obs-nr-native-filter-0.1.0-windows-x64.zip` and `SHA256SUMS.txt` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest). Optional check: `(Get-FileHash .\obs-nr-native-filter-0.1.0-windows-x64.zip).Hash` must match the line in `SHA256SUMS.txt`.
+1. Download `obs-nr-native-filter-0.1.1-windows-x64.zip` and `SHA256SUMS.txt` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest). Optional check: `(Get-FileHash .\obs-nr-native-filter-0.1.1-windows-x64.zip).Hash` must match the line in `SHA256SUMS.txt`.
 2. Close OBS completely, including the tray icon.
-3. Extract the whole zip. You get a folder named `obs-nr-native-filter-0.1.0-windows-x64`.
+3. Extract the whole zip. You get a folder named `obs-nr-native-filter-0.1.1-windows-x64`.
 4. Double-click `install.bat` in that folder.
    - **Language**: press `2` for English. Enter alone picks Korean.
    - **OBS folder**: the installer finds it. Press Enter to accept, or pick a number or type the path if it asks.
@@ -86,7 +86,7 @@ The OBS log (Help > Log Files > View Current Log) has lines starting with `[obs-
 
 ## 한국어 설치 안내
 
-OBS Native NR 0.1.0을 Windows의 OBS Studio에 설치하는 방법입니다. 5분 정도 걸립니다.
+OBS Native NR 0.1.1을 Windows의 OBS Studio에 설치하는 방법입니다. 5분 정도 걸립니다.
 
 ### 준비
 
@@ -109,9 +109,9 @@ OBS Native NR 0.1.0을 Windows의 OBS Studio에 설치하는 방법입니다. 5�
 
 ### 설치기로 설치
 
-1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.1.0-windows-x64.zip`과 `SHA256SUMS.txt`를 받습니다.
+1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.1.1-windows-x64.zip`과 `SHA256SUMS.txt`를 받습니다.
 2. OBS를 완전히 끕니다. 작업 표시줄 오른쪽 트레이 아이콘도 닫으세요.
-3. zip을 전부 풉니다. `obs-nr-native-filter-0.1.0-windows-x64` 폴더가 생깁니다.
+3. zip을 전부 풉니다. `obs-nr-native-filter-0.1.1-windows-x64` 폴더가 생깁니다.
 4. 그 폴더의 `install.bat`을 더블클릭합니다.
    - **언어**: 그냥 Enter를 누르면 한국어입니다.
    - **OBS 폴더**: 설치기가 찾아 보여 줍니다. 맞으면 Enter. 여러 개면 번호를 고르고, 못 찾으면 경로를 입력합니다.

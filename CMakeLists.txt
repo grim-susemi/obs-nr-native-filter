@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-project(obs-nr-filter VERSION 0.1.0 LANGUAGES C CXX)
+project(obs-nr-filter VERSION 0.1.1 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # D2: the closure gate reads CodeView/COFF sections of every object, so whole-program
 # optimization (/GL IL objects) and /LTCG are forbidden in every configuration, for both

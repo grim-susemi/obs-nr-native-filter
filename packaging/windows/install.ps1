@@ -13,7 +13,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.1.0'
+$Version = '0.1.1'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $DefaultObs = 'C:\Program Files\obs-studio'
