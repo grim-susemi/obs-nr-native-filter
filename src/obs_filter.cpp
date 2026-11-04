@@ -26,6 +26,7 @@ struct Filter {
     const uint64_t instance;
     nr::PerInstanceTick ticks;
     gs_texrender_t *capture = nullptr;
+    gs_texrender_t *linearize = nullptr; // sRGB staging for drawing into GS_CS_SRGB_16F targets
     gs_texture_t *output = nullptr;
     std::unique_ptr<nr::obs_adapter::NativeOutput> native;
     nr::model::Config config;
@@ -418,6 +419,7 @@ void destroy(void *opaque)
     }
     gs_texture_destroy(f->output);f->output=nullptr;
     gs_texrender_destroy(f->capture);f->capture=nullptr;
+    gs_texrender_destroy(f->linearize);f->linearize=nullptr;
     // A video_tick already dispatched on the graphics thread may still be before its
     // graphics entry; it then reads only `destroyed`. Release every owner here, as before,
     // and let only the inert Filter shell wait for that thread's next render pass.
@@ -718,7 +720,32 @@ void render(void *opaque, gs_effect_t *)
     auto *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(false);
-    gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), texture);
+    auto *image = gs_effect_get_param_by_name(effect, "image");
+    // A GS_CS_SRGB_16F target (a projector on a >8-bit SDR monitor) stores linear light, but the
+    // sRGB output holds encoded values. Un-premultiply into an sRGB texrender, then sample it
+    // through its sRGB view, as libobs does for its own color-space conversions.
+    if (f.color == GS_CS_SRGB && gs_get_color_space() == GS_CS_SRGB_16F) {
+        if (!f.linearize) f.linearize = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+        gs_texrender_reset(f.linearize);
+        gs_blend_state_push();
+        gs_enable_blending(false);
+        if (gs_texrender_begin_with_color_space(f.linearize, f.width, f.height, GS_CS_SRGB)) {
+            gs_ortho(0, static_cast<float>(f.width), 0, static_cast<float>(f.height), -100, 100);
+            gs_effect_set_texture(image, texture);
+            while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, f.width, f.height);
+            gs_texrender_end(f.linearize);
+            texture = gs_texrender_get_texture(f.linearize);
+        } else texture = nullptr;
+        gs_blend_state_pop();
+        if (texture) {
+            gs_enable_framebuffer_srgb(true);
+            gs_effect_set_texture_srgb(image, texture);
+            while (gs_effect_loop(effect, "Draw")) gs_draw_sprite(texture, 0, f.width, f.height);
+        } else bypass(f);
+        gs_enable_framebuffer_srgb(srgb);
+        return;
+    }
+    gs_effect_set_texture(image, texture);
     // The private capture is premultiplied; OBS's normal scene blend expects straight RGB.
     while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, f.width, f.height);
     gs_enable_framebuffer_srgb(srgb);
