@@ -3,11 +3,14 @@
 #include "obs_native_output.h"
 #include "interop.h"
 #include "nr_properties.h"
+#include "capture_exclusion.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
 #include <atomic>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 using nr::sampler::Admission;
@@ -45,6 +48,7 @@ struct Filter {
     bool stopping = false, nativeFailed = false, deterministicQa = false;
     bool destroyed = false; // Graphics-owned: destroy() ran; deletion waits for the graphics thread.
     bool capacityEvidence = false;
+    bool captureExclusion = false; // Graphics-owned: holds nr::capture_exclusion (parent is a shown display capture).
     HANDLE capacityEvent = nullptr; // Non-owning; caller keeps it alive through unsubscribe.
     uint64_t capacityGeneration = 0;
     gs_color_space color = GS_CS_SRGB;
@@ -417,6 +421,7 @@ void destroy(void *opaque)
     // A video_tick already dispatched on the graphics thread may still be before its
     // graphics entry; it then reads only `destroyed`. Release every owner here, as before,
     // and let only the inert Filter shell wait for that thread's next render pass.
+    const bool exclusion=std::exchange(f->captureExclusion,false);
     f->destroyed=true;
     f->native.reset();f->callback.reset();f->deviceLifetime.Reset();
     f->configuration.store(nullptr,std::memory_order_release);
@@ -424,6 +429,7 @@ void destroy(void *opaque)
     const bool schedule=!reclaimScheduled;reclaimScheduled=true;
     destroyedFilters.emplace_back(f);
     obs_leave_graphics();
+    if(exclusion)nr::capture_exclusion::leave();
     if(schedule)obs_add_main_render_callback(reclaim,nullptr);
 }
 obs_properties_t *properties(void *opaque)
@@ -571,11 +577,23 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
     }
     return observation;
 }
+// A display capture of the monitor that shows an OBS projector re-captures this filter's own
+// output every frame; keep OBS windows out of screen capture while that can happen.
+void hold_capture_exclusion(Filter& f)
+{
+    obs_source_t* parent=obs_filter_get_parent(f.source);
+    const char* kind=parent?obs_source_get_unversioned_id(parent):nullptr;
+    const bool want=kind && std::strcmp(kind,"monitor_capture")==0 && obs_source_showing(parent);
+    if(want==f.captureExclusion) { if(want)nr::capture_exclusion::refresh();return; }
+    f.captureExclusion=want;
+    if(want)nr::capture_exclusion::enter();else nr::capture_exclusion::leave();
+}
 void video_tick(void* opaque,float)
 {
     auto& f=*static_cast<Filter*>(opaque);
     // destroy() mutates this state under graphics; read it only there.
     obs_enter_graphics();
+    if(!f.destroyed) hold_capture_exclusion(f);
     if(f.destroyed || !f.native || f.stopping || f.nativeFailed) { obs_leave_graphics();return; }
     try {
         if(f.native->latch_qa_failure()) {
@@ -595,7 +613,9 @@ void filter_remove(void* opaque,obs_source_t*)
     // A control-thread removal invalidates adapter publication immediately.
     // The next graphics observation applies the cut; no accepting pipeline or
     // Bridge operation may be created or mutated on the control thread.
+    const bool exclusion=std::exchange(f.captureExclusion,false);
     obs_leave_graphics();
+    if(exclusion)nr::capture_exclusion::leave();
 }
 void render(void *opaque, gs_effect_t *)
 {
