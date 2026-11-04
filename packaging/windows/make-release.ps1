@@ -24,6 +24,7 @@ $payload = [ordered]@{
     'obs-plugins\64bit\obs-nr-filter.dll'             = Join-Path $BuildDir 'Release\obs-nr-filter.dll'
     'data\obs-plugins\obs-nr-filter\locale\en-US.ini' = Join-Path $repo 'data\locale\en-US.ini'
     'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini' = Join-Path $repo 'data\locale\ko-KR.ini'
+    'data\obs-plugins\obs-nr-filter\locale\ru-RU.ini' = Join-Path $repo 'data\locale\ru-RU.ini'
 }
 foreach ($shader in 'nr_codec.dxil', 'nr_color.dxil', 'nr_guides.cso', 'nr_interop_vertex.cso', 'nr_interop_pixel.cso', 'nr_obs_analysis.cso') {
     $payload["bin\64bit\$shader"] = Join-Path $BuildDir $shader

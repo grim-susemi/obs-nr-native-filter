@@ -53,7 +53,7 @@ The filter looks for the model file at `C:\Program Files\obs-studio\bin\64bit\nv
 | File | Folder inside your OBS install |
 |---|---|
 | `obs-nr-filter.dll` | `obs-plugins\64bit` |
-| `en-US.ini`, `ko-KR.ini` | `data\obs-plugins\obs-nr-filter\locale` |
+| `en-US.ini`, `ko-KR.ini`, `ru-RU.ini` | `data\obs-plugins\obs-nr-filter\locale` |
 | `nr_codec.dxil`, `nr_color.dxil`, `nr_guides.cso`, `nr_interop_vertex.cso`, `nr_interop_pixel.cso`, `nr_obs_analysis.cso` | `bin\64bit` |
 | `nvngx_dlssnr.dll`, only if you gave it one | `bin\64bit` |
 

@@ -4,7 +4,7 @@
 [CmdletBinding()]
 param(
     [string]$ObsDir = '',
-    [ValidateSet('', 'ko', 'en')][string]$Lang = '',
+    [ValidateSet('', 'ko', 'en', 'ru')][string]$Lang = '',
     [string]$Runtime = '',
     [switch]$RuntimeDecided,
     [switch]$Uninstall,
@@ -129,6 +129,59 @@ $Text = @{
         log        = 'Log file: {0}'
         pause      = 'Press Enter to close'
     }
+    ru = @{
+        title      = 'Установка OBS Native NR {0}'
+        titleU     = 'Удаление OBS Native NR {0}'
+        sPayload   = 'Проверка файлов пакета'
+        sObs       = 'Поиск OBS'
+        sRuntime   = 'Проверка файла модели NR'
+        sCopy      = 'Копирование файлов'
+        sRemove    = 'Удаление файлов'
+        payloadBad = 'Файл пакета отсутствует или поврежден: {0}. Скачайте архив с релизом заново и распакуйте его полностью.'
+        payloadOk  = 'Файлы пакета в порядке ({0} шт.)'
+        obsFound   = 'Папка OBS: {0}'
+        obsConfirm = 'Использовать этот OBS? (Y/n)'
+        obsMany    = 'Найдено несколько копий OBS. Выберите номер:'
+        obsAsk     = 'Укажите папку установки OBS (например, C:\Program Files\obs-studio). Просто Enter для отмены'
+        obsNone    = 'Не удалось найти папку OBS.'
+        obsInvalid = 'В этой папке нет bin\64bit\obs64.exe: {0}'
+        obsVersion = 'Версия OBS {0}'
+        obsOld     = 'Примечание: этот плагин собран для OBS 32. В OBS {0} он может не загрузиться.'
+        obsRunning = 'OBS запущен. Полностью закройте OBS и нажмите Enter (Ctrl+C для отмены).'
+        obsRunStop = 'OBS запущен, установка прервана. Закройте OBS и запустите скрипт снова.'
+        admin      = 'Требуются права администратора. Нажмите «Да» в окне запроса Windows.'
+        adminFail  = 'Права администратора не получены, работа остановлена.'
+        adminDone  = 'Выполнено в окне администратора, результат показан там же (код выхода {0}).'
+        rtOk       = 'ОК: {0}'
+        rtMissing  = 'В этой папке OBS нет файла модели NR (nvngx_dlssnr.dll).'
+        rtWrong    = 'Файл nvngx_dlssnr.dll в этом OBS от другой сборки (SHA-256 {0}...). С ним NR работать не будет.'
+        rtNeed     = 'Требуется: совместимая сборка nvngx_dlssnr.dll 310.8.0.0, SHA-256 e67dee20...c989a (для RTX 20-50, не входит в этот пакет)'
+        rtAsk      = 'Перетащите ваш nvngx_dlssnr.dll в это окно и нажмите Enter (просто Enter — пропустить)'
+        rtNotFound = 'Файл не найден: {0}'
+        rtBadHash  = 'Этот файл от другой сборки (SHA-256 {0}...).'
+        rtWillCopy = 'Этот файл будет скопирован в OBS: {0}'
+        rtCopied   = 'Файл модели NR скопирован: {0}'
+        rtSkipped  = 'Продолжаем без файла модели NR. Позже положите его сюда: {0}'
+        backup     = 'Резервная копия: {0}'
+        copy       = 'Установлено: {0}'
+        verifyFail = 'Ошибка проверки после копирования: {0}'
+        rolledBack = 'Изменения установки отменены (выполнен откат).'
+        done       = 'Установка завершена'
+        next1      = '1. Запустите OBS.'
+        next2      = '2. ПКМ по источнику > Фильтры > Фильтры эффектов [+] > Native NR'
+        next3      = '3. Когда в свойствах фильтра появится «Статус: NR применяется» (или "Status: NR is being applied"), всё работает.'
+        pathNote   = 'OBS установлен не в стандартную папку, поэтому нужен ещё один шаг: укажите этот путь в поле «Исполняемый файл NR (runtime)» в свойствах фильтра, затем удалите фильтр и добавьте его заново:'
+        uninstHint = 'Для удаления запустите uninstall.bat в этой папке.'
+        uNoState   = 'Запись об установке не найдена, удаляются только файлы Native NR.'
+        uRemoved   = 'Удалено: {0}'
+        uChanged   = 'Оставлено (файл был изменен после установки): {0}'
+        uRestored  = 'Восстановлено: {0}'
+        uDone      = 'Удаление завершено'
+        cancelled  = 'Отменено.'
+        error      = 'Ошибка: {0}'
+        log        = 'Лог-файл: {0}'
+        pause      = 'Нажмите Enter для выхода'
+    }
 }
 
 function T([string]$Key, [object[]]$Arg = @()) {
@@ -215,7 +268,7 @@ function Select-Obs([string]$Hint) {
         Say 'obsFound' @($list[0]) 'Cyan'
         if ($Yes) { return $list[0] }
         $a = (Read-Host (T 'obsConfirm')).Trim()
-        if (-not $a -or $a -match '^(y|yes|ㅛ|예|네)$') { return $list[0] }
+        if (-not $a -or $a -match '^(y|yes|ㅛ|예|네|д|да)$') { return $list[0] }
     } elseif ($list.Count -gt 1) {
         if ($Yes) { Say 'obsFound' @($list[0]) 'Cyan'; return $list[0] }
         Say 'obsMany' @() 'Cyan'
@@ -482,8 +535,13 @@ if (-not $script:L) {
     if ($Yes) { $script:L = 'ko' }
     else {
         Write-Host ''
-        Write-Host '  1) 한국어    2) English' -ForegroundColor Cyan
-        $script:L = if ((Read-Host '  언어 / Language [1]').Trim() -eq '2') { 'en' } else { 'ko' }
+        Write-Host '  1) 한국어    2) English    3) Русский' -ForegroundColor Cyan
+        $choice = (Read-Host '  언어 / Language / Язык [1]').Trim()
+        $script:L = switch ($choice) {
+            '2' { 'en' }
+            '3' { 'ru' }
+            default { 'ko' }
+        }
     }
 }
 $code = 0
