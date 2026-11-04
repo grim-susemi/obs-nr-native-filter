@@ -792,7 +792,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         if(p.config.qaObservations||job->observation)job->qaTiming[3]=stamp();
         p.creationReceipt={};
         const CreateScope createScope(p.driver.get(),p.creationReceipt);
-        const auto code=p.pass->prepare(work.job.input.settings,size,work.job.key.historyEpoch,recording(job,r.creation.Get()));
+        const auto code=p.pass->prepare(work.job.input.settings,work.job.input.settings.tuning,size,work.job.key.historyEpoch,recording(job,r.creation.Get()));
         if(p.config.qaObservations||job->observation)job->qaTiming[4]=stamp();
         job->driverCreateCode=p.creationReceipt.code;job->driverHandle=p.creationReceipt.handle;
         HMODULE image=nullptr;

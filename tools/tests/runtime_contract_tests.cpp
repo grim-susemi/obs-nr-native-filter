@@ -20,7 +20,7 @@ struct Params final : NVSDK_NGX_Parameter {
 #undef PARAM
     void Reset() override { values.clear(); }
 };
-static unsigned creates=0,evaluates=0,releases=0,destroys=0,directCreates=0,allocations=0;
+static unsigned creates=0,evaluates=0,releases=0,destroys=0,directCreates=0,allocations=0,expectedWidth=1920;
 static std::map<const NVSDK_NGX_Handle*,const NVSDK_NGX_Parameter*> handles;
 static bool failCreate=false,failEval=false,failRelease=false,failDestroy=false;
 static std::string order;
@@ -29,7 +29,7 @@ static NVSDK_NGX_Result allocate(NVSDK_NGX_Parameter** p) { ++allocations; *p=la
 static NVSDK_NGX_Result destroy(NVSDK_NGX_Parameter* p) { if(failDestroy) return NVSDK_NGX_Result_Fail; for(const auto& h:handles) check(h.second!=p); delete static_cast<Params*>(p); ++destroys; order+='D'; return NVSDK_NGX_Result_Success; }
 static NVSDK_NGX_Result create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature f,NVSDK_NGX_Parameter* p,NVSDK_NGX_Handle** h) {
     ++creates; order+='C'; check(static_cast<unsigned>(f)==18); unsigned w=0; float skin=0;
-    check(p->Get("DLSSNR.Width",&w)==NVSDK_NGX_Result_Success && w==1920);
+    check(p->Get("DLSSNR.Width",&w)==NVSDK_NGX_Result_Success && w==expectedWidth);
     check(p->Get("DLSSNR.SkinStructureStrength",&skin)==NVSDK_NGX_Result_Success && skin==-1);
     if(failCreate) return NVSDK_NGX_Result_Fail;
     *h=new NVSDK_NGX_Handle{}; handles[*h]=p; return NVSDK_NGX_Result_Success;
@@ -59,7 +59,7 @@ static Recording recording(uint64_t epoch,const std::shared_ptr<Completion>& sta
 static void happy() {
     auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback);
     Pass pass(module); auto c=std::make_shared<Completion>(Completion::Recorded);
-    check(pass.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
+    check(pass.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
     check(!pass.ready(1) && !pass.ready(200)); *c=Completion::Complete;
     check(!pass.ready(1) && pass.ready(2));
     auto e=std::make_shared<Completion>(Completion::Recorded); auto j=job();
@@ -75,7 +75,7 @@ static void refused() {
     auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback);
     Pass pass(module); auto c=std::make_shared<Completion>(Completion::Recorded);
     const unsigned before=evaluates,freed=releases;
-    check(pass.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
+    check(pass.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
     check(pass.run(job(),inputs(),recording(900,c))!=NVSDK_NGX_Result_Success);
     check(evaluates==before && releases==freed);
     *c=Completion::SignalFailed; check(!pass.ready(901));
@@ -88,7 +88,7 @@ static void adversarial() {
     auto module=Module::controlled(api(),api(true),lease,Route::DriverFallback); lease.reset();
     auto c=std::make_shared<Completion>(Completion::Recorded); Pass pass(module);
     failCreate=true; const unsigned direct=directCreates;
-    check(pass.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
+    check(pass.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
     check(directCreates==direct+1); failCreate=false; *c=Completion::Complete; check(pass.ready(2));
     auto e=std::make_shared<Completion>(Completion::Recorded); failEval=true;
     check(pass.run(job(),inputs(),recording(2,e))!=NVSDK_NGX_Result_Success);
@@ -96,11 +96,11 @@ static void adversarial() {
     check(!pass.completed(job().key)->evaluated && pass.release()); failEval=false;
     Pass failed(Module::controlled(api(),{},std::make_shared<int>(1),Route::Driver));
     *c=Completion::Recorded; failCreate=true;
-    check(failed.prepare(settings(),{1920,1080},1,recording(1,c))!=NVSDK_NGX_Result_Success);
+    check(failed.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))!=NVSDK_NGX_Result_Success);
     check(!failed.release()); *c=Completion::Discarded; check(failed.release()); failCreate=false;
     Pass a(module),b(module); *c=Completion::Recorded;
-    check(a.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success); auto* pa=latest;
-    check(b.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success); check(pa!=latest);
+    check(a.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success); auto* pa=latest;
+    check(b.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success); check(pa!=latest);
     *c=Completion::Complete; check(a.ready(2) && b.ready(2));
     *e=Completion::Recorded; check(a.run(job(),inputs(),recording(2,e))==NVSDK_NGX_Result_Success);
     a.cancel(job().key); check(!a.publishable(job().key));
@@ -109,7 +109,7 @@ static void adversarial() {
     check(a.completed(job().key)->publication==PublicationState::Cancelled);
     check(a.release() && b.ready(2) && b.release()); check(!weak.expired());
     Pass history(module); *c=Completion::Recorded;
-    check(history.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
+    check(history.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
     *c=Completion::Complete; *e=Completion::Recorded;
     check(history.run(job(),inputs(),recording(2,e))==NVSDK_NGX_Result_Success);
     unsigned reset=0; check(latest->Get("DLSSNR.Reset",&reset)==NVSDK_NGX_Result_Success && reset==1);
@@ -124,12 +124,12 @@ static void adversarial() {
     check(!history.release()); *e3=Completion::Complete; check(history.release());
     Pass directPass(Module::controlled(api(),api(true),std::make_shared<int>(1),Route::Direct));
     *c=Completion::Recorded;
-    check(directPass.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
+    check(directPass.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
     *c=Completion::Discarded; check(!directPass.ready(2) && directPass.release());
     Submission real; check(real.state()==Completion::Recorded && real.discard());
     check(!real.submitted(nullptr) && real.state()==Completion::Discarded);
     Pass signaling(module); *c=Completion::Recorded;
-    check(signaling.prepare(settings(),{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
+    check(signaling.prepare(settings(),settings().tuning,{1920,1080},1,recording(1,c))==NVSDK_NGX_Result_Success);
     *c=Completion::Complete; auto s=std::make_shared<Completion>(Completion::Recorded);
     check(signaling.run(job(),inputs(),recording(2,s))==NVSDK_NGX_Result_Success);
     *s=Completion::SignalFailed; check(!signaling.publishable(job().key));
@@ -258,6 +258,7 @@ static void vendorTrace() {
     check(nr::lifecycle::close_model(proof)==nr::lifecycle::CloseBlock::CoreShutdown);
     puts("PASS bounded production VendorTrace first/latest/ordering/owner/default-unknown; no vendor execution");
 }
+#include "runtime_work_extent_tests.inc"
 int main(int argc,char** argv) {
     try {
         if(argc==2 && std::string(argv[1])=="happy") happy();
@@ -267,7 +268,7 @@ int main(int argc,char** argv) {
             check(r.accepted && !r.loaded); puts("owner canonical path/hash/PE64/direct exports PASS; not loaded");
         } else if(argc==2 && std::string(argv[1])=="close") ownedModuleRetry();
         else if(argc==2 && std::string(argv[1])=="trace") vendorTrace();
-        else if(argc==1) { happy(); refused(); adversarial(); metadataTests(); ownedModuleRetry(); vendorTrace(); }
+        else if(argc==1) { happy(); refused(); adversarial(); workExtentTests(); metadataTests(); ownedModuleRetry(); vendorTrace(); }
         else return 2;
         check(handles.empty() && allocations==destroys);
         printf("PASS runtime_contract: %u checks\n",checks); return 0;

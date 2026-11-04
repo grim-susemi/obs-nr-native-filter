@@ -104,7 +104,7 @@ public:
     ~Pass(); // unresolved ownership deliberately retained, not force-freed
     Pass(const Pass&)=delete;
     Pass& operator=(const Pass&)=delete;
-    NVSDK_NGX_Result prepare(const Settings&,Extent,uint64_t historyEpoch,Recording);
+    NVSDK_NGX_Result prepare(const Settings&,const ModelTuning&,Extent,uint64_t historyEpoch,Recording);
     bool ready(uint64_t laterEpoch) const;
     NVSDK_NGX_Result run(const JobContract&,const Inputs&,Recording);
     std::optional<CompletedFrame> completed(const JobKey&) const;

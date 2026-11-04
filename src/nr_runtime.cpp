@@ -533,7 +533,7 @@ struct Pass::Impl {
     std::shared_ptr<Module> module;
     NVSDK_NGX_Parameter* params=nullptr;
     NVSDK_NGX_Handle* feature=nullptr;
-    std::optional<Settings> settings;
+    std::optional<Settings> settings; std::optional<ModelTuning> passTuning;
     std::optional<Extent> extent;
     uint64_t history=0,creationEpoch=0,serial=0;
     std::optional<Recording> creation,evaluation;
@@ -558,18 +558,18 @@ Pass::~Pass() {
         --impl_->module->impl_->passOwners;
     }
 }
-NVSDK_NGX_Result Pass::prepare(const Settings& settings,Extent size,uint64_t history,Recording recording) {
+NVSDK_NGX_Result Pass::prepare(const Settings& settings,const ModelTuning& passTuning,Extent size,uint64_t history,Recording recording) {
     auto& p=*impl_; auto& m=*p.module->impl_; std::lock_guard lock(m.mutex);
-    if(p.failed || p.retired || !settings.valid() || !settings.enabled || !size.width || !size.height || !history || !valid(recording) ||
+    if(p.failed || p.retired || !settings.valid() || !passTuning.valid() || !settings.enabled || !size.width || !size.height || !history || !valid(recording) ||
         (!m.controlled && std::filesystem::path(settings.runtimePath)!=m.identity.canonicalPath)) return NVSDK_NGX_Result_Fail;
-    if(p.params) return p.settings==settings && p.extent==size && p.history==history?NVSDK_NGX_Result_Success:NVSDK_NGX_Result_Fail;
-    p.settings.emplace(settings); p.extent.emplace(size); p.history=history;
+    if(p.params) return p.settings==settings && p.passTuning==passTuning && p.extent==size && p.history==history?NVSDK_NGX_Result_Success:NVSDK_NGX_Result_Fail;
+    p.settings.emplace(settings); p.passTuning.emplace(passTuning); p.extent.emplace(size); p.history=history;
     auto result=m.driver.allocate(&p.params);
     if(result!=NVSDK_NGX_Result_Success || !p.params) { p.failed=true; return NVSDK_NGX_Result_Fail; }
     auto* params=p.params;
     params->Set("DLSSNR.Enabled",1u); params->Set("DLSSNR.Width",size.width); params->Set("DLSSNR.Height",size.height);
     params->Set("CreationNodeMask",1u); params->Set("VisibilityNodeMask",1u);
-    params->Set("DLSSNR.Hint.Render.Preset",settings.tuning.preset); tuning(params,settings.tuning);
+    params->Set("DLSSNR.Hint.Render.Preset",passTuning.preset); tuning(params,passTuning);
     params->Set("DLSSNR.UICorrection",1u);
     for(auto name:{"DLSSNR.ControlMask","DLSSNR.UI","DLSSNR.UIAlpha","DLSSNR.Backbuffer"})
         params->Set(name,static_cast<ID3D12Resource*>(nullptr));
@@ -599,7 +599,7 @@ NVSDK_NGX_Result Pass::run(const JobContract& job,const Inputs& input,Recording 
     const Epochs epochs{job.key.frame.instanceId,job.key.frame.contentEpoch,job.key.historyEpoch,job.key.resourceGeneration};
     if(!valid(recording) || !ready(recording.epoch) || !job.key.valid() || job.key.frame!=job.input.key ||
         input_problem(job.input,epochs)!=Reason::None || job.input.settings!=*p.settings ||
-        job.input.descriptor.active.width!=p.extent->width || job.input.descriptor.active.height!=p.extent->height ||
+        work_extent(job.input.descriptor.active,job.input.settings.workScale)!=*p.extent ||
         job.key.submissionSerial<=p.serial || job.key.historyEpoch<p.history ||
         (p.job && (job.key.frame.instanceId!=p.job->key.frame.instanceId ||
             job.key.resourceGeneration!=p.job->key.resourceGeneration || job.key.frame.contentEpoch<p.job->key.frame.contentEpoch ||
@@ -621,7 +621,7 @@ NVSDK_NGX_Result Pass::run(const JobContract& job,const Inputs& input,Recording 
     params->Set("DLSSNR.DepthInverted",input.depthInverted?1u:0u); params->Set("DLSSNR.Reset",(input.reset||p.reset)?1u:0u);
     region(params,"Color",{0,0,p.extent->width,p.extent->height}); region(params,"Output",{0,0,p.extent->width,p.extent->height});
     region(params,"Depth",input.depthRegion); region(params,"MVec",input.motionRegion);
-    params->Set("DLSSNR.MVecScaleX",input.mvScaleX); params->Set("DLSSNR.MVecScaleY",input.mvScaleY); tuning(params,p.settings->tuning);
+    params->Set("DLSSNR.MVecScaleX",input.mvScaleX); params->Set("DLSSNR.MVecScaleY",input.mvScaleY); tuning(params,*p.passTuning);
     CallerScope scope(p.direct && !m.controlled);
     const auto result=p.api().evaluate(p.evaluation->commands,p.feature,params,nullptr);
     p.evaluated=result==NVSDK_NGX_Result_Success; p.failed=!p.evaluated;

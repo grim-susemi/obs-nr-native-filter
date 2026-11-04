@@ -173,7 +173,7 @@ bool nr_run_cost_scenario(const std::filesystem::path& root,std::wstring_view te
         const Settings settings{{1},true,identity.canonicalPath.generic_string(),{1},core_default_tuning()};
         owner->work=std::make_shared<Work>(device);
         owner->images=resources(device,size,owner->work->list.Get());
-        const auto creation=owner->pass->prepare(settings,size,1,owner->work->recording(1,owner->work));
+        const auto creation=owner->pass->prepare(settings,settings.tuning,size,1,owner->work->recording(1,owner->work));
         std::cout<<"NR_COST_PREPARE_RETURN {\"result\":"<<static_cast<uint32_t>(creation)<<"}"<<std::endl;
         const double creationLatency=owner->work->submit(queue,qa::CostStage::Prepare,0);
         std::cout<<"NR_COST_CREATE {\"width\":"<<size.width<<",\"height\":"<<size.height
