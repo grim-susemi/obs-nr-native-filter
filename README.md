@@ -66,7 +66,7 @@ Newer or official files, such as `nvngx_dlssnr_2026_10_16.zip` (310.9.16.0) or N
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.1.0-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
+1. Download `obs-nr-native-filter-0.1.1-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
 2. Close OBS completely.
 3. Extract the whole zip and double-click **`install.bat`**. Pick a language, confirm your OBS folder and choose **Yes** at the admin prompt.
 4. When it asks for the NR model file, drag your `nvngx_dlssnr.dll` into the window and press Enter. Skip this if it is already in `obs-studio\bin\64bit`.
@@ -106,7 +106,7 @@ The OBS log (Help > Log Files > View Current Log) has lines starting with `[obs-
 
 ## Performance
 
-NR is heavy. In tests on an RTX 4090 with a 2528×1369 source at 60 fps, NR was applied to about 99% of frames; the rest reused the previous NR frame. Lower resolution or frame rate leaves more headroom.
+NR is heavy. In tests on an RTX 4090 with a 2528×1369 source at 60 fps, NR was applied to about 99% of frames; the rest reused the previous NR frame. With a 2560×1440 video at 60 fps, a frame took about 12 ms (the limit is 16.7 ms) and a few frames every 5 seconds reused the previous NR frame. Lower resolution or frame rate leaves more headroom.
 
 ## Known limitations
 
@@ -114,6 +114,7 @@ NR is heavy. In tests on an RTX 4090 with a 2528×1369 source at 60 fps, NR was 
 - The default model path assumes OBS in `C:\Program Files\obs-studio`. For Steam, portable or other folders, set **NR runtime file**; the installer prints the path to use.
 - SDR sources only. HDR colour spaces are refused and the original passes through.
 - If the graphics driver resets the GPU, NR stays off until OBS restarts.
+- While Native NR is on a display capture that is showing, OBS windows (projectors included) are hidden from all screen capture, so a projector on the captured monitor is not captured and processed again. Other apps that record or share the screen do not see OBS windows either. They come back when the filter is removed or the source is hidden.
 
 ## Uninstall
 
@@ -177,10 +178,12 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링)을 바로 거는 OBS 필터입니
 
 **설치**
 
-1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.1.0-windows-x64.zip`을 받습니다.
+1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.1.1-windows-x64.zip`을 받습니다.
 2. OBS를 완전히 끕니다.
 3. 압축을 전부 풀고 **`install.bat`** 을 더블클릭 → 한국어 선택 → OBS 폴더 확인 → 관리자 권한 창에서 **예**.
 4. NR 모델 파일을 물어보면 가지고 있는 `nvngx_dlssnr.dll`을 창에 끌어다 놓고 Enter.
 5. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터**의 **+** > **Native NR**.
+
+디스플레이 캡처에 Native NR을 걸면, 그 캡처가 보이는 동안 OBS 창(프로젝터 포함)이 모든 화면 캡처에서 숨겨집니다. 같은 모니터에 띄운 프로젝터를 다시 찍어 NR이 반복되는 것을 막기 위해서입니다. 디스코드 화면 공유 같은 다른 앱에도 OBS 창이 보이지 않고, 필터를 빼거나 소스를 숨기면 돌아옵니다.
 
 필터 속성에 **상태: NR 적용 중**이 보이면 성공입니다. 화면이 밝아지거나 초록빛이 돌면 **로컬 톤**이 0인지 확인하세요(기본값 0). 자세한 안내와 문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)에 있고, 제거는 같은 폴더의 `uninstall.bat`입니다.
