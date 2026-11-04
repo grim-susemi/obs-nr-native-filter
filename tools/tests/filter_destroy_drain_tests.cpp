@@ -98,6 +98,8 @@ const char* obs_data_get_string(obs_data_t*,const char*) {return "";}
 bool obs_data_get_bool(obs_data_t*,const char*) {return false;}
 double obs_data_get_double(obs_data_t*,const char*) {return 0;}
 long long obs_data_get_int(obs_data_t*,const char*) {return 0;}
+bool obs_data_has_user_value(obs_data_t*,const char*) {return false;}
+bool obs_data_has_default_value(obs_data_t*,const char*) {return false;}
 void obs_data_set_default_bool(obs_data_t*,const char*,bool) {}
 void obs_data_set_default_string(obs_data_t*,const char*,const char*) {}
 void obs_data_set_default_double(obs_data_t*,const char*,double) {}
@@ -115,6 +117,7 @@ obs_property_t* obs_properties_add_list(obs_properties_t*,const char*,const char
 size_t obs_property_list_add_int(obs_property_t*,const char*,long long) {return 0;}
 obs_property_t* obs_properties_add_text(obs_properties_t*,const char*,const char*,enum obs_text_type) {return nullptr;}
 void obs_property_set_enabled(obs_property_t*,bool) {}
+void obs_property_int_set_suffix(obs_property_t*,const char*) {}
 obs_property_t* obs_properties_get(obs_properties_t*,const char*) {return nullptr;}
 int gs_get_device_type(void) {return 0;}
 void* gs_get_device_obj(void) {return nullptr;}
