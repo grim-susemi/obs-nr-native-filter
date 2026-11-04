@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 using namespace nr::properties;
 void expect(bool value,const char* reason) { if(!value)throw std::runtime_error(reason); }
 unsigned inspections=0;
@@ -161,9 +162,68 @@ void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
         obs_property_next(&next) && std::string(obs_property_name(next))=="nr_work_scale","multipass control order");
     obs_properties_destroy(props);obs_data_release(data);
 }
-int main()
+void deadline_controls()
+{
+    struct Case {uint32_t total,late;std::optional<unsigned> percent;};
+    for(const auto& test:{Case{300,0,{}},Case{300,27,{}},Case{300,29,{}},Case{0,0,{}},
+            Case{300,30,10},Case{300,300,100},Case{300,600,100},Case{0,UINT32_MAX,{}},
+            Case{UINT32_MAX,UINT32_MAX,100},Case{UINT32_MAX,UINT32_MAX/10,{}},Case{6,1,17}}) {
+        // Given: an independently specified count boundary. When: deriving its warning.
+        const auto warning=deadline_warning(test.total,test.late);
+        // Then: threshold precedes rounded display and widened arithmetic saturates.
+        expect(warning==test.percent,"deadline threshold rounding and saturation");
+        Labels labels;if(warning)labels.deadlineText="warning";
+        auto* props=controls({"ready","none"},labels);
+        auto* row=obs_properties_get(props,"nr_deadline");
+        expect((row!=nullptr)==warning.has_value(),"deadline row iff warning");
+        if(row)expect(obs_property_text_type(row)==OBS_TEXT_INFO && !obs_property_enabled(row),"deadline row read-only");
+        for(const auto* key:{"nr_status","nr_reason"})
+            expect(obs_properties_get(props,key) && !obs_property_enabled(obs_properties_get(props,key)),"existing status rows retained");
+        obs_properties_destroy(props);
+    }
+}
+void deadline_windows()
+{
+    // Given: independent graphics-owned instances and synthetic monotonic video clocks.
+    DeadlineWindow a,b;
+    const StatusSnapshot ready{"ready","none"},priming{"priming","awaitingSample"};
+    const std::array<StatusSnapshot,8> frames{{priming,{"bypassed","awaitingSettingsObservation"},ready,
+        {"error","deadlineMiss"},{"bypassed","slotsFull"},{"bypassed","deadlineMiss"},
+        {"priming","deadlineMiss"},{"ready","deadlineMiss"}}};
+    for(size_t i=0;i<frames.size();++i) {
+        expect(!a.observe(i+1,frames[i]) && !b.observe(i+1,priming),"deadline does not publish early");
+    }
+    expect(!a.observe(5000000000ull,ready),"deadline waits for full five seconds");
+    // When: the exact five-second boundary closes each independent window.
+    const auto first=a.observe(5000000001ull,ready),other=b.observe(5000000001ull,priming);
+    // Then: only eligible ticks enter the denominator; only the two exact late keys enter late.
+    expect(first && first->packed==((uint64_t{7}<<32)|2) && first->warning==29u && first->changed,
+        "deadline exclusions exact late keys packed pair and on transition");
+    expect(other && other->packed==0 && !other->warning && !other->changed,"priming-only instance remains quiet");
+    expect(!a.observe(5000000002ull,ready),"next deadline window begins empty");
+    const auto changedPercent=a.observe(10000000001ull,{"bypassed","deadlineMiss"});
+    expect(changedPercent && changedPercent->packed==((uint64_t{2}<<32)|1) &&
+        changedPercent->warning==50u && !changedPercent->changed,"percent update does not toggle warning");
+    expect(!a.observe(10000000002ull,ready),"recovery window remains incomplete");
+    const auto off=a.observe(15000000001ull,ready);
+    expect(off && off->packed==(uint64_t{2}<<32) && !off->warning && off->changed,"warning off transition");
+    const auto quiet=a.observe(20000000001ull,ready);
+    expect(quiet && !quiet->warning && !quiet->changed,"warning off does not repeat");
+    const auto again=a.observe(25000000001ull,{"bypassed","slotsFull"});
+    expect(again && again->warning==100u && again->changed,"warning can turn on again");
+    DeadlineWindow waiting;
+    const StatusSnapshot awaiting{"bypassed","awaitingSettingsObservation"};
+    expect(!waiting.observe(1,awaiting),"settings window starts without warning");
+    const auto settingsOnly=waiting.observe(5000000001ull,awaiting);
+    expect(settingsOnly && settingsOnly->packed==0 && !settingsOnly->warning,"settings-only window has no denominator");
+}
+int main(int argc,char** argv)
 {
     try {
+        if(argc!=1 && !(argc==2 && std::string_view(argv[1])=="--deadline-only"))
+            throw std::runtime_error("unknown properties contract invocation");
+        deadline_controls();deadline_windows();
+        if(argc==2) {std::puts("deadline_contract: PASS thresholds actual OBS rows synthetic clock exclusions instances on-off transitions");return 0;}
         auto* data=obs_data_create();
         const std::u8string utf8=u8"C:/owned/\uD14C\uC2A4\uD2B8/runtime.dll";
         expect(utf8_path(std::string(reinterpret_cast<const char*>(utf8.data()),utf8.size())).generic_u8string()==utf8,"UTF8 path roundtrip");

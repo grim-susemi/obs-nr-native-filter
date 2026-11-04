@@ -2,6 +2,24 @@
 #include "nr_properties.h"
 #include "nr_core.h"
 namespace nr::properties {
+std::optional<unsigned> deadline_warning(uint32_t total,uint32_t late)
+{
+    if(!total || uint64_t{late}*10<total)return std::nullopt;
+    return static_cast<unsigned>(std::min(uint64_t{100},(uint64_t{late}*100+total/2)/total));
+}
+std::optional<DeadlineSnapshot> DeadlineWindow::observe(uint64_t now,const StatusSnapshot& snapshot)
+{
+    if(!start_)start_=now;
+    if(snapshot.state!="priming" && snapshot.reason!="awaitingSettingsObservation") {
+        ++total_;
+        if(snapshot.state=="bypassed" && (snapshot.reason=="deadlineMiss" || snapshot.reason=="slotsFull"))++late_;
+    }
+    if(now-start_<5000000000ull)return std::nullopt;
+    const auto warning=deadline_warning(total_,late_);
+    const DeadlineSnapshot result{(uint64_t{total_}<<32)|late_,warning,warning.has_value()!=warning_};
+    warning_=warning.has_value();start_=now;total_=late_=0;
+    return result;
+}
 std::filesystem::path utf8_path(const std::string& value)
 {
     return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(value.data()),value.size()));
@@ -145,6 +163,10 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     obs_properties_add_text(props,"nr_reason",labels.reasonText?labels.reasonText:snapshot.reason.c_str(),OBS_TEXT_INFO);
     obs_property_set_enabled(obs_properties_get(props,"nr_status"),false);
     obs_property_set_enabled(obs_properties_get(props,"nr_reason"),false);
+    if(labels.deadlineText) {
+        auto* deadline=obs_properties_add_text(props,"nr_deadline",labels.deadlineText,OBS_TEXT_INFO);
+        obs_property_set_enabled(deadline,false);
+    }
     return props;
 }
 }

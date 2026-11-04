@@ -63,6 +63,8 @@ struct Filter {
     // Display only: share of ticks that showed NR over the last full 5 s, packed (total<<32)|ready.
     // Kept apart from the capped diagnostic window so the properties text stays current.
     uint64_t recentStart=0;unsigned recentFrames=0,recentReady=0;std::atomic<uint64_t> recentShown{0};
+    nr::properties::DeadlineWindow deadlineWindow; // Graphics-owned, independent of the capped diagnostic log.
+    std::atomic<uint64_t> recentLate{0}; // Eligible total/late pair, published together for the properties thread.
     std::atomic<Admission> admission{Admission::NoTarget};
     explicit Filter(obs_source_t *s) : source(s), instance(nextInstance.fetch_add(1)), ticks(instance)
     {
@@ -478,6 +480,14 @@ obs_properties_t *properties(void *opaque)
         }
         else statusText+=share;
     }
+    std::string deadlineText;
+    const uint64_t late=opaque?static_cast<Filter*>(opaque)->recentLate.load(std::memory_order_acquire):0;
+    if(const auto warning=nr::properties::deadline_warning(static_cast<uint32_t>(late>>32),static_cast<uint32_t>(late))) {
+        deadlineText=plain("NR.Warning.Deadline");
+        if(const auto marker=deadlineText.find("%1");marker!=std::string::npos)
+            deadlineText.replace(marker,2,std::to_string(*warning));
+        labels.deadlineText=deadlineText.c_str();
+    }
     labels.statusText=statusText.c_str();labels.reasonText=reasonText.c_str();
     return nr::properties::controls(*value,labels);
 }
@@ -513,6 +523,15 @@ void publish_status(Filter& f)
         if(now-f.recentStart>=5000000000ull) {
             f.recentShown.store(static_cast<uint64_t>(f.recentFrames)<<32|f.recentReady,std::memory_order_release);
             f.recentFrames=f.recentReady=0;f.recentStart=now;
+        }
+        if(const auto completed=f.deadlineWindow.observe(now,value)) {
+            f.recentLate.store(completed->packed,std::memory_order_release);
+            if(completed->changed) {
+                if(completed->warning)blog(LOG_INFO,"[obs-nr-filter] deadline warning on %u%% (instance %llu)",
+                    *completed->warning,static_cast<unsigned long long>(f.instance));
+                else blog(LOG_INFO,"[obs-nr-filter] deadline warning off (instance %llu)",
+                    static_cast<unsigned long long>(f.instance));
+            }
         }
         if(!f.windowStart)f.windowStart=now;
         const std::string key=value.state+"/"+value.reason;

@@ -10,6 +10,16 @@ inline constexpr char runtime_sha256[]="e67dee209320cdafe0e93e45675d7aa34323a53a
 struct Values { bool enabled;std::string runtimePath;CompositionStrength strength;std::string reason;ModelTuning tuning;
     uint32_t passes=1,workScale=100; };
 struct StatusSnapshot {std::string state,reason;};
+std::optional<unsigned> deadline_warning(uint32_t total,uint32_t late);
+struct DeadlineSnapshot {const uint64_t packed;const std::optional<unsigned> warning;const bool changed;};
+// One graphics-thread owner per filter; caller supplies each distinct nonzero video timestamp.
+class DeadlineWindow {
+    uint64_t start_=0;
+    uint32_t total_=0,late_=0;
+    bool warning_=false;
+public:
+    std::optional<DeadlineSnapshot> observe(uint64_t now,const StatusSnapshot&);
+};
 struct Configuration {std::shared_ptr<const Settings> settings;std::string reason;};
 void defaults(obs_data_t*);
 std::filesystem::path utf8_path(const std::string&);
@@ -37,6 +47,7 @@ struct Labels {
     const char* autoMask="Automatic mask";
     const char* statusText=nullptr; // already localized status/reason line; null = raw code
     const char* reasonText=nullptr;
+    const char* deadlineText=nullptr;
 };
 obs_properties_t* controls(const StatusSnapshot&,const Labels& labels=Labels{});
 }
