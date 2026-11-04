@@ -47,7 +47,7 @@ CoreResult Core::record(const CoreInput& in) {
     if(result.state==EvaluationState::Error) return {CoreState::EvaluationError,false,false,result.code};
     if(result.state!=EvaluationState::Evaluated) return {CoreState::NotReady,false,false,result.code};
     c.mode=1;
-    if(!codec_->resolve(in,c)) return {CoreState::ResolveError,true,false,0};
+    if(!codec_->resolve(in,c,r.proxy,r.model)) return {CoreState::ResolveError,true,false,0};
     return {CoreState::Recorded,true,true,result.code};
 }
 namespace {
@@ -81,24 +81,30 @@ D3D12Codec::D3D12Codec(ID3D12Device* device,std::span<const std::byte> shader) :
     pso.CS={shader.data(),shader.size()};
     checked(device->CreateComputePipelineState(&pso,IID_PPV_ARGS(&pipeline_)));
 }
-bool D3D12Codec::dispatch(const CoreInput& in,const CodecConstants& constants,bool resolvePass) {
+bool D3D12Codec::dispatch(const CoreInput& in,const CodecConstants& constants,
+    const CoreTexture& source,const CoreTexture& model,const CoreTexture& original,
+    const CoreTexture& target,const CoreTexture& keep,uint32_t offset) {
     auto* cmd=static_cast<ID3D12GraphicsCommandList*>(in.commands);
     auto* heap=in.resources.codecHeap;
+    if(!cmd || !heap || !constants.width || !constants.height) return false;
     const auto hd=heap->GetDesc();
-    if(hd.Type!=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || hd.NumDescriptors<10 ||
+    if(hd.Type!=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || hd.NumDescriptors<25 ||
         !(hd.Flags&D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return false;
-    const auto& r=in.resources;
-    ID3D12Resource* textures[5]={static_cast<ID3D12Resource*>(resolvePass?r.proxy.native:r.raw.native),
-        static_cast<ID3D12Resource*>(r.model.native),static_cast<ID3D12Resource*>(r.keep.native),
-        static_cast<ID3D12Resource*>(resolvePass?r.output.native:r.proxy.native),static_cast<ID3D12Resource*>(r.keep.native)};
-    for(auto* texture:textures) {
+    const CoreTexture* inputs[5]={&source,&model,&original,&target,&keep};
+    ID3D12Resource* textures[5]{};
+    for(unsigned i=0;i<5;++i) {
+        const auto& input=*inputs[i];
+        if(!input.valid()) return false;
+        auto* texture=static_cast<ID3D12Resource*>(input.native);
+        textures[i]=texture;
         const auto d=texture->GetDesc();
-        if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width!=constants.width || d.Height!=constants.height ||
-            d.DepthOrArraySize!=1 || d.MipLevels!=1 || d.SampleDesc.Count!=1) return false;
+        if(d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width!=input.allocation.width ||
+            d.Height!=input.allocation.height || d.DepthOrArraySize!=1 || d.MipLevels!=1 ||
+            d.SampleDesc.Count!=1 || (i>=3 && !(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) return false;
         Microsoft::WRL::ComPtr<ID3D12Device> owner;
         if(FAILED(texture->GetDevice(IID_PPV_ARGS(&owner))) || owner.Get()!=device_.Get()) return false;
     }
-    const UINT offset=resolvePass?5u:0u;
+    if(target.active!=Rect{0,0,constants.width,constants.height}) return false;
     auto cpu=heap->GetCPUDescriptorHandleForHeapStart(); cpu.ptr+=static_cast<SIZE_T>(offset)*stride_;
     for(UINT i=0;i<5;++i) {
         const auto d=textures[i]->GetDesc();
@@ -108,23 +114,50 @@ bool D3D12Codec::dispatch(const CoreInput& in,const CodecConstants& constants,bo
             view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; view.Texture2D.MipLevels=1;
             device_->CreateShaderResourceView(textures[i],&view,cpu);
         } else {
-            if(!(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return false;
             D3D12_UNORDERED_ACCESS_VIEW_DESC view{}; view.Format=d.Format; view.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
             device_->CreateUnorderedAccessView(textures[i],nullptr,&view,cpu);
         }
         cpu.ptr+=stride_;
     }
-    if(resolvePass) transition(cmd,textures[1],D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if(constants.mode==1) transition(cmd,textures[1],D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if(constants.mode==3) transition(cmd,textures[0],D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); gpu.ptr+=static_cast<UINT64>(offset)*stride_;
     cmd->SetDescriptorHeaps(1,&heap); cmd->SetComputeRootSignature(root_.Get()); cmd->SetPipelineState(pipeline_.Get());
     cmd->SetComputeRoot32BitConstants(0,sizeof(CodecConstants)/4,&constants,0);
     cmd->SetComputeRootDescriptorTable(1,gpu); cmd->Dispatch((constants.width+7)/8,(constants.height+7)/8,1);
-    if(!resolvePass) {
+    if(constants.mode==0) {
         transition(cmd,textures[3],D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         transition(cmd,textures[4],D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
+    if(constants.mode==2) transition(cmd,textures[3],D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if(constants.mode==3) transition(cmd,textures[0],D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     return true;
 }
-bool D3D12Codec::encode(const CoreInput& in,const CodecConstants& c) { return dispatch(in,c,false); }
-bool D3D12Codec::resolve(const CoreInput& in,const CodecConstants& c) { return dispatch(in,c,true); }
+bool D3D12Codec::encode(const CoreInput& in,const CodecConstants& c) {
+    const auto& r=in.resources;
+    const Rect full{0,0,c.width,c.height};
+    if(r.raw.active!=full || r.proxy.active!=full || r.keep.active!=full) return false;
+    return dispatch(in,c,r.raw,r.model,r.keep,r.proxy,r.keep,0);
+}
+bool D3D12Codec::resolve(const CoreInput& in,const CodecConstants& c,const CoreTexture& source,const CoreTexture& answer) {
+    const auto& r=in.resources;
+    if(source.allocation!=answer.allocation || source.active!=answer.active ||
+        source.active!=Rect{0,0,source.allocation.width,source.allocation.height} ||
+        r.keep.active!=Rect{0,0,c.width,c.height}) return false;
+    return dispatch(in,c,source,answer,r.keep,r.output,r.keep,5);
+}
+bool D3D12Codec::downsample(const CoreInput& in,const CoreTexture& from,const CoreTexture& to) {
+    if(from.active!=Rect{0,0,from.allocation.width,from.allocation.height} ||
+        to.active!=Rect{0,0,to.allocation.width,to.allocation.height} ||
+        from.allocation.width<to.allocation.width || from.allocation.height<to.allocation.height ||
+        from.native==to.native) return false;
+    CodecConstants c;c.mode=2;c.width=to.active.width;c.height=to.active.height;
+    return dispatch(in,c,from,in.resources.model,in.resources.keep,to,in.resources.keep,10);
+}
+bool D3D12Codec::clamp(const CoreInput& in,const CoreTexture& from,const CoreTexture& to,uint32_t slot) {
+    if(slot>1 || from.allocation!=to.allocation || from.active!=to.active ||
+        from.active!=Rect{0,0,from.allocation.width,from.allocation.height} || from.native==to.native) return false;
+    CodecConstants c;c.mode=3;c.width=to.active.width;c.height=to.active.height;
+    return dispatch(in,c,from,in.resources.model,in.resources.keep,to,in.resources.keep,15+5*slot);
+}
 }

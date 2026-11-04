@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+// allow: SIZE_OK - The frozen vector harness and its D3D12 command-list proof share fixtures.
 #define NOMINMAX
 #include "nr_core.h"
 #include <d3d11.h>
@@ -21,7 +22,12 @@ struct TestCodec final : Codec {
         p.order.push_back(1); expect(c.mode==0 && c.width==16 && c.height==8,"full-size encode");
         expect(c.transferStrength==1 && c.colourStrength==1 && c.maxRatio==2,"source defaults"); return p.encode;
     }
-    bool resolve(const CoreInput&,const CodecConstants& c) override { p.order.push_back(3);expect(c.mode==1,"resolve mode");return p.resolve; }
+    bool downsample(const CoreInput&,const CoreTexture&,const CoreTexture&) override { return false; }
+    bool clamp(const CoreInput&,const CoreTexture&,const CoreTexture&,uint32_t) override { return false; }
+    bool resolve(const CoreInput& in,const CodecConstants& c,const CoreTexture& source,const CoreTexture& answer) override {
+        p.order.push_back(3);expect(c.mode==1 && source.native==in.resources.proxy.native &&
+            answer.native==in.resources.model.native,"resolve bindings");return p.resolve;
+    }
 };
 struct TestModel final : ModelEvaluator {
     Probe& p;
@@ -91,20 +97,21 @@ using Image=std::vector<Pixel>;
 struct ShaderRunner {
     ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11ComputeShader> shader;ComPtr<ID3D11SamplerState> sampler;
-    explicit ShaderRunner(std::span<const std::byte> bytes) {
-        check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context));
+    explicit ShaderRunner(std::span<const std::byte> bytes,D3D_DRIVER_TYPE driver=D3D_DRIVER_TYPE_WARP) {
+        check(D3D11CreateDevice(nullptr,driver,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context));
         check(device->CreateComputeShader(bytes.data(),bytes.size(),nullptr,&shader));
         D3D11_SAMPLER_DESC s{};s.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         s.AddressU=s.AddressV=s.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;s.MaxLOD=D3D11_FLOAT32_MAX;
         check(device->CreateSamplerState(&s,&sampler));
     }
-    std::pair<Image,Image> run(const void* constants,UINT size,const Image& src,const Image& model,const Image& raw) {
-        D3D11_TEXTURE2D_DESC d{};d.Width=16;d.Height=8;d.ArraySize=d.MipLevels=d.SampleDesc.Count=1;
+    std::pair<Image,Image> run(const void* constants,UINT size,const Image& src,const Image& model,const Image& raw,
+        UINT width=16,UINT height=8) {
+        D3D11_TEXTURE2D_DESC d{};d.Width=width;d.Height=height;d.ArraySize=d.MipLevels=d.SampleDesc.Count=1;
         d.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         ComPtr<ID3D11Texture2D> inputs[3];ComPtr<ID3D11ShaderResourceView> views[3];
         const Image* images[]={&src,&model,&raw};
         for(UINT i=0;i<3;++i) {
-            D3D11_SUBRESOURCE_DATA data{images[i]->data(),16*sizeof(Pixel),0};
+            D3D11_SUBRESOURCE_DATA data{images[i]->data(),width*sizeof(Pixel),0};
             check(device->CreateTexture2D(&d,&data,&inputs[i]));check(device->CreateShaderResourceView(inputs[i].Get(),nullptr,&views[i]));
         }
         d.BindFlags=D3D11_BIND_UNORDERED_ACCESS;
@@ -118,12 +125,12 @@ struct ShaderRunner {
         ID3D11UnorderedAccessView* outs[]={uavs[0].Get(),uavs[1].Get()};
         context->CSSetShader(shader.Get(),nullptr,0);context->CSSetConstantBuffers(0,1,buffer.GetAddressOf());
         context->CSSetSamplers(0,1,sampler.GetAddressOf());context->CSSetShaderResources(0,3,srvs);
-        context->CSSetUnorderedAccessViews(0,2,outs,nullptr);context->Dispatch(2,1,1);context->ClearState();
-        Image result[2]={Image(128),Image(128)};
+        context->CSSetUnorderedAccessViews(0,2,outs,nullptr);context->Dispatch((width+7)/8,(height+7)/8,1);context->ClearState();
+        Image result[2]={Image(width*height),Image(width*height)};
         for(UINT i=0;i<2;++i) {
             context->CopyResource(staging[i].Get(),outputs[i].Get());D3D11_MAPPED_SUBRESOURCE mapped{};
             check(context->Map(staging[i].Get(),0,D3D11_MAP_READ,0,&mapped));
-            for(UINT y=0;y<8;++y) memcpy(result[i].data()+y*16,static_cast<char*>(mapped.pData)+y*mapped.RowPitch,16*sizeof(Pixel));
+            for(UINT y=0;y<height;++y) memcpy(result[i].data()+y*width,static_cast<char*>(mapped.pData)+y*mapped.RowPitch,width*sizeof(Pixel));
             context->Unmap(staging[i].Get(),0);
         }
         return {result[0],result[1]};
@@ -133,6 +140,108 @@ std::vector<std::byte> binary(const char* path) {
     std::ifstream file(path,std::ios::binary|std::ios::ate);expect(file.good(),"shader binary missing");
     const auto size=file.tellg();expect(size>0,"empty shader binary");std::vector<std::byte> bytes(static_cast<size_t>(size));
     file.seekg(0);file.read(reinterpret_cast<char*>(bytes.data()),size);expect(file.good(),"shader binary read failed");return bytes;
+}
+void codec_list_proof(std::span<const std::byte> shader) {
+    ComPtr<ID3D12Device> device;
+    check(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)));
+    D3D12Codec codec(device.Get(),shader);
+    D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> queue;check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)));
+    ComPtr<ID3D12CommandAllocator> allocator;check(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocator)));
+    ComPtr<ID3D12GraphicsCommandList> list;check(device->CreateCommandList(0,q.Type,allocator.Get(),nullptr,IID_PPV_ARGS(&list)));
+    auto heap=[&](UINT count) {
+        D3D12_DESCRIPTOR_HEAP_DESC d{};d.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        d.NumDescriptors=count;d.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> h;check(device->CreateDescriptorHeap(&d,IID_PPV_ARGS(&h)));return h;
+    };
+    auto descriptors=heap(25),smallHeap=heap(24),clearHeap=heap(9);
+    const UINT stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_HEAP_PROPERTIES props{};props.Type=D3D12_HEAP_TYPE_DEFAULT;
+    std::array<ComPtr<ID3D12Resource>,9> textures;
+    for(UINT i=0;i<textures.size();++i) {
+        D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width=i<4?6:3;d.Height=i<4?4:2;d.DepthOrArraySize=d.MipLevels=1;
+        d.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;d.SampleDesc.Count=1;
+        d.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        check(device->CreateCommittedResource(&props,D3D12_HEAP_FLAG_NONE,&d,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&textures[i])));
+        auto cpu=clearHeap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=SIZE_T(i)*stride;
+        device->CreateUnorderedAccessView(textures[i].Get(),nullptr,nullptr,cpu);
+        auto gpu=clearHeap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=UINT64(i)*stride;
+        ID3D12DescriptorHeap* h=clearHeap.Get();list->SetDescriptorHeaps(1,&h);
+        const float values[4]={i==0?.2f:i==4?.8f:i==5?.1f:0.0f,
+            i==0?.3f:i==4?-.1f:i==5?.4f:0.0f,
+            i==0?.4f:i==4?1.7f:i==5?.7f:0.0f,.375f};
+        list->ClearUnorderedAccessViewFloat(gpu,cpu,textures[i].Get(),values,0,nullptr);
+        D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;b.UAV.pResource=textures[i].Get();
+        list->ResourceBarrier(1,&b);
+    }
+    auto transition=[&](UINT i,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition={textures[i].Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};
+        list->ResourceBarrier(1,&b);
+    };
+    transition(0,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    auto tex=[&](UINT i) {
+        const uint32_t w=i<4?6u:3u,h=i<4?4u:2u;
+        return CoreTexture{textures[i].Get(),{w,h},{0,0,w,h}};
+    };
+    const auto base=fixture();
+    auto makeInput=[&](ID3D12DescriptorHeap* h) {
+        CoreResources r{tex(0),tex(1),tex(2),tex(4),tex(3),tex(0),tex(0),h};
+        return CoreInput{base.job,base.epochs,r,base.history,list.Get(),1,1,1,
+            ColorSpace::Rec709Srgb,AlphaMode::Straight};
+    };
+    const auto in=makeInput(descriptors.Get()),tooSmall=makeInput(smallHeap.Get());
+    CodecConstants c;c.width=6;c.height=4;c.passthrough=1;
+    expect(!codec.encode(tooSmall,c),"24 descriptor heap accepted");
+    const CoreTexture wrong{textures[4].Get(),{2,2},{0,0,2,2}};
+    c.mode=1;
+    expect(!codec.resolve(in,c,tex(8),wrong),"mismatched resolve accepted");
+    c.mode=0;
+    expect(codec.encode(in,c),"encode recording");
+    expect(codec.downsample(in,tex(1),tex(8)),"downsample recording");
+    expect(codec.clamp(in,tex(4),tex(6),0),"first clamp recording");
+    expect(codec.clamp(in,tex(5),tex(7),1),"second clamp recording");
+    c.mode=1;
+    expect(codec.resolve(in,c,tex(8),tex(4)),"resolve recording");
+    const UINT indices[]={8,6,7,3};
+    D3D12_HEAP_PROPERTIES readProps{};readProps.Type=D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width=4096;buffer.Height=1;buffer.DepthOrArraySize=buffer.MipLevels=1;buffer.SampleDesc.Count=1;
+    buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    check(device->CreateCommittedResource(&readProps,D3D12_HEAP_FLAG_NONE,&buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback)));
+    for(UINT i=0;i<4;++i) {
+        const UINT index=indices[i];
+        transition(index,index==8?D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE:D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION src{};src.pResource=textures[index].Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION dst{};dst.pResource=readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset=UINT64(i)*1024;
+        dst.PlacedFootprint.Footprint={DXGI_FORMAT_R32G32B32A32_FLOAT,index==3?6u:3u,index==3?4u:2u,1,256};
+        list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+    }
+    check(list->Close());ID3D12CommandList* lists[]={list.Get()};queue->ExecuteCommandLists(1,lists);
+    ComPtr<ID3D12Fence> fence;check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
+    HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);expect(event!=nullptr,"fence event");
+    check(queue->Signal(fence.Get(),1));check(fence->SetEventOnCompletion(1,event));
+    const DWORD wait=WaitForSingleObject(event,30000);CloseHandle(event);expect(wait==WAIT_OBJECT_0,"GPU proof timeout");
+    void* memory=nullptr;D3D12_RANGE range{0,4096};
+    check(readback->Map(0,&range,&memory));
+    const auto* mapped=static_cast<const std::byte*>(memory);
+    const auto* down=reinterpret_cast<const Pixel*>(mapped);
+    const auto* first=reinterpret_cast<const Pixel*>(mapped+1024);
+    const auto* second=reinterpret_cast<const Pixel*>(mapped+2048);
+    const auto* resolved=reinterpret_cast<const Pixel*>(mapped+3072);
+    expect(std::abs(down->r-.2f)<1e-3f && std::abs(down->g-.3f)<1e-3f,"downsample descriptor overwritten");
+    expect(std::abs(first->r-.8f)<1e-3f && first->g==0 && first->b==1,"first clamp descriptor overwritten");
+    expect(std::abs(second->r-.1f)<1e-3f && std::abs(second->g-.4f)<1e-3f &&
+        std::abs(second->b-.7f)<1e-3f,"second clamp descriptor overwritten");
+    expect(std::isfinite(resolved->r) && std::abs(resolved->r-.2f)>1e-3f,"resolve descriptor overwritten");
+    D3D12_RANGE written{0,0};readback->Unmap(0,&written);
+    std::puts("PASS D3D12 codec one-list descriptor ranges and pre-record refusals");
 }
 float error(const Image& a,const Image& b) {
     float worst=0;expect(a.size()==b.size(),"image extent");
@@ -196,12 +305,40 @@ void vectors(const char* shaderPath,const char* referencePath,const char* output
     savedReference.write(static_cast<const char*>(referenceBlob->GetBufferPointer()),static_cast<std::streamsize>(referenceBlob->GetBufferSize()));
     expect(savedReference.good(),"compiled reference evidence write");
     ShaderRunner reference({static_cast<const std::byte*>(referenceBlob->GetBufferPointer()),referenceBlob->GetBufferSize()});
+    {
+        ShaderRunner hardware(bytes,D3D_DRIVER_TYPE_HARDWARE);
+        Image input(24);
+        for(size_t i=0;i<input.size();++i) input[i]={float(i%6),float(i/6),0,float(i)/24};
+        CodecConstants c;c.mode=2;c.width=3;c.height=2;
+        const auto half=hardware.run(&c,sizeof(c),input,input,input,6,4).first;
+        expect(std::abs(half[0].r-.5f)<1e-3f && std::abs(half[0].g-.5f)<1e-3f &&
+            half[0].a==input[7].a,"2:1 area or nearest-center alpha");
+        c.width=4;c.height=4;
+        const auto fractional=hardware.run(&c,sizeof(c),input,input,input,6,4).first;
+        expect(std::abs(fractional[0].r-1.0f/3.0f)<1e-3f &&
+            std::abs(fractional[1].r-5.0f/3.0f)<1e-3f && fractional[1].a==input[2].a,
+            "3:2 area or nearest-center alpha");
+        input[0]={std::numeric_limits<float>::quiet_NaN(),-1,1.7f,.375f};
+        input[1]={std::numeric_limits<float>::infinity(),-std::numeric_limits<float>::infinity(),.25f,.5f};
+        c.mode=3;c.width=6;c.height=4;
+        const auto clamped=hardware.run(&c,sizeof(c),input,input,input,6,4).first;
+        expect(clamped[0].r==.5f && clamped[0].g==0 && clamped[0].b==1 && clamped[0].a==.375f,
+            "finite range clamp");
+        expect(clamped[1].r==.5f && clamped[1].g==.5f && clamped[1].b==.25f &&
+            clamped[1].a==.5f,"infinite range clamp");
+        std::printf("PASS hardware shader box: 2:1=(%.9g,%.9g,a=%.9g), 3:2=(%.9g,%.9g,a=%.9g); clamp=(%.9g,%.9g,%.9g,a=%.9g), inf=(%.9g,%.9g)\n",
+            half[0].r,half[0].g,half[0].a,fractional[0].r,fractional[1].r,fractional[1].a,
+            clamped[0].r,clamped[0].g,clamped[0].b,clamped[0].a,clamped[1].r,clamped[1].g);
+    }
     if(red) {
         CodecConstants c;c.width=16;c.height=8;const auto rc=reference_constants(c);
         const Image raw(128,Pixel{-.1f,.2f,2.0f,.375f});const auto kept=reference.run(rc.data(),256,raw,raw,raw).second;
         expect(error(kept,raw)==0,"RED frozen source raw-copy clamps negative HDR; native exact raw contract requires preservation");
         throw std::runtime_error("RED fixture failed to detect raw-copy regression");
     }
+    const std::string path(shaderPath);
+    const auto dxil=binary((path.substr(0,path.find_last_of('.'))+".dxil").c_str());
+    codec_list_proof(dxil);
     Image recorded;float worstReference=0,worstAnalytic=0;unsigned cases=0;
     for(uint32_t hdr:{0u,1u}) for(float white:{.5f,1.0f,2.0f}) {
         CodecConstants c;c.width=16;c.height=8;c.passthrough=1-hdr;c.whitePoint=white;

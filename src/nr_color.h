@@ -25,7 +25,7 @@ std::optional<ColorPixel> color_restore(const ColorPlan&,ColorPixel original,Col
     bool referenceValid=true);
 // The model proxy remains the frozen nr_codec encode/resolve, not this pass and
 // not OFA's independently derived BGRA8 analysis. Original source never aliases
-// canonical/model/analysis/output. Full active rectangle only, no downscale.
+// canonical/analysis/output. Model-side textures alone may use a working extent.
 struct ColorConstants {
     uint32_t mode,color,alpha,width;
     uint32_t height,originX,originY,referenceValid;

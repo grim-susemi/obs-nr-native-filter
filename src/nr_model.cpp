@@ -499,8 +499,14 @@ struct TracedCodec final : Codec {
     bool encode(const CoreInput& input,const CodecConstants& constants) override {
         const bool result=codec.encode(input,constants); job.chronology[1]=stamp(); return result;
     }
-    bool resolve(const CoreInput& input,const CodecConstants& constants) override {
-        const bool result=codec.resolve(input,constants); job.chronology[3]=stamp(); return result;
+    bool downsample(const CoreInput& input,const CoreTexture& from,const CoreTexture& to) override {
+        return codec.downsample(input,from,to);
+    }
+    bool clamp(const CoreInput& input,const CoreTexture& from,const CoreTexture& to,uint32_t slot) override {
+        return codec.clamp(input,from,to,slot);
+    }
+    bool resolve(const CoreInput& input,const CodecConstants& constants,const CoreTexture& source,const CoreTexture& answer) override {
+        const bool result=codec.resolve(input,constants,source,answer); job.chronology[3]=stamp(); return result;
     }
 };
 bool typed(ID3D12Device* device,DXGI_FORMAT format,bool store) {
@@ -855,7 +861,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         for(auto& color:r.colors) color=texture(device,size,DXGI_FORMAT_R16G16B16A16_FLOAT);
         r.status=buffer(device,D3D12_HEAP_TYPE_DEFAULT); r.statusRead=buffer(device,D3D12_HEAP_TYPE_READBACK);
         r.zero=buffer(device,D3D12_HEAP_TYPE_UPLOAD);
-        r.codecHeap=heap(device,10); r.prepareHeap=heap(device,4); r.restoreHeap=heap(device,4);
+        r.codecHeap=heap(device,25); r.prepareHeap=heap(device,4); r.restoreHeap=heap(device,4);
     }
     const int64_t tAlloc1=stamp();
     auto* list=view->commands;

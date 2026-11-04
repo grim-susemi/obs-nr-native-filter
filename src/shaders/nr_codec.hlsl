@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Ported from source-lock shader f97fb3dffc2e305a4edbd83d00942849d222a2f21547d880788a897fdfdd80b5.
 // Default full-size soft-knee encode and RenoDX composition; no game routing.
+// allow: SIZE_OK - The single shader entry point shares frozen composition math and resource bindings.
 /*
 RenoDX
 ======
@@ -285,6 +286,33 @@ float3 SoftKnee(float3 display)
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= gWidth || id.y >= gHeight) return;
+    if (gMode == 3) {
+        float4 raw = gSource.Load(int3(id.xy,0));
+        gTarget[id.xy] = float4(saturate(SanitizeFinite3(raw.rgb,0.5)),raw.a);
+        return;
+    }
+    if (gMode == 2) {
+        uint srcW,srcH;
+        gSource.GetDimensions(srcW,srcH);
+        // Exact area-weighted downsampling avoids the aliasing of a single bilinear tap.
+        // Adapted from hhkbble's multi-pass contribution.
+        float2 start = float2(id.xy) * float2(srcW,srcH) / float2(gWidth,gHeight);
+        float2 end = float2(id.xy+1) * float2(srcW,srcH) / float2(gWidth,gHeight);
+        int2 first = int2(floor(start));
+        int2 last = int2(ceil(end))-1;
+        float3 sum = 0.0;
+        for (int y=first.y; y<=last.y; ++y) {
+            float wy = max(min(end.y,float(y)+1.0)-max(start.y,float(y)),0.0);
+            for (int x=first.x; x<=last.x; ++x) {
+                float wx = max(min(end.x,float(x)+1.0)-max(start.x,float(x)),0.0);
+                sum += gSource.Load(int3(x,y,0)).rgb * (wx*wy);
+            }
+        }
+        int2 center = min(int2(floor((start+end)*0.5)),int2(srcW-1,srcH-1));
+        gTarget[id.xy] = float4(sum / ((end.x-start.x)*(end.y-start.y)),
+                                gSource.Load(int3(center,0)).a);
+        return;
+    }
     if (gMode == 0) {
         float4 source = gSource.Load(int3(id.xy,0));
         float3 frame = max(source.rgb,0.0);

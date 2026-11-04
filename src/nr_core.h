@@ -26,7 +26,7 @@ struct CoreTexture {
 };
 struct CoreResources {
     const CoreTexture raw,proxy,keep,model,output,depth,motion;
-    // Shader-visible CBV/SRV/UAV heap: ten private descriptors per in-flight job.
+    // Shader-visible CBV/SRV/UAV heap: 25 private descriptors per in-flight job.
     ID3D12DescriptorHeap* const codecHeap;
 };
 struct CoreHistory { const uint64_t epoch; const bool valid,reset; };
@@ -37,7 +37,7 @@ struct CoreInput {
     const CoreHistory history;
     void* const commands;
     const float whitePoint; // Task9 supplies source-appropriate linear709 divisor, default 1.
-    const float mvScaleX,mvScaleY; // working-image pixels; no second resolution scaling.
+    const float mvScaleX,mvScaleY; // Working-image pixels; no second resolution scaling.
     const ColorSpace codecColor; // Task9 canonical linear709/SDR; original job descriptor stays intact.
     const AlphaMode codecAlpha; // Task9 unpremultiplies before codec, restores afterward.
 };
@@ -61,7 +61,9 @@ class Codec {
 public:
     virtual ~Codec()=default;
     virtual bool encode(const CoreInput&,const CodecConstants&)=0;
-    virtual bool resolve(const CoreInput&,const CodecConstants&)=0;
+    virtual bool downsample(const CoreInput&,const CoreTexture& from,const CoreTexture& to)=0;
+    virtual bool clamp(const CoreInput&,const CoreTexture& from,const CoreTexture& to,uint32_t slot)=0;
+    virtual bool resolve(const CoreInput&,const CodecConstants&,const CoreTexture& source,const CoreTexture& answer)=0;
 };
 enum class CoreState { InvalidInput, Disabled, NotReady, EncodeError, EvaluationError, ResolveError, Recorded };
 struct CoreResult {
@@ -89,10 +91,13 @@ class D3D12Codec final : public Codec {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_;
     UINT stride_;
-    bool dispatch(const CoreInput&,const CodecConstants&,bool);
+    bool dispatch(const CoreInput&,const CodecConstants&,const CoreTexture&,const CoreTexture&,
+        const CoreTexture&,const CoreTexture&,const CoreTexture&,uint32_t);
 public:
     D3D12Codec(ID3D12Device*,std::span<const std::byte> shader);
     bool encode(const CoreInput&,const CodecConstants&) override;
-    bool resolve(const CoreInput&,const CodecConstants&) override;
+    bool downsample(const CoreInput&,const CoreTexture&,const CoreTexture&) override;
+    bool clamp(const CoreInput&,const CoreTexture&,const CoreTexture&,uint32_t) override;
+    bool resolve(const CoreInput&,const CodecConstants&,const CoreTexture&,const CoreTexture&) override;
 };
 }
