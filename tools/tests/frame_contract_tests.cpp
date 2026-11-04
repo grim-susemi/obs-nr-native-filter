@@ -123,6 +123,25 @@ void immutable_settings()
     expect(captured.tuning == old.tuning && captured.runtimePath == old.runtimePath, "settings copy lost typed data");
     expect(!settings(0).valid() && !settings(1, -1).valid() && !settings(1, 1.01f).valid(), "invalid settings admitted");
     expect(!settings(1, std::numeric_limits<float>::quiet_NaN()).valid(), "nonfinite strength admitted");
+    // Given: same-revision settings differing only in one multipass field.
+    const Settings passes{{1},old.enabled,old.runtimePath,old.strength,old.tuning,2,100};
+    const Settings scale{{1},old.enabled,old.runtimePath,old.strength,old.tuning,1,50};
+    // When/Then: immutable equality distinguishes both fields without relying on revision.
+    expect(old.passes==1 && old.workScale==100 && old!=passes && old!=scale,"multipass settings equality/defaults");
+    for(const auto& values:std::array<std::array<uint32_t,2>,4>{{{0,100},{4,100},{1,49},{1,101}}})
+        expect(!Settings{{1},old.enabled,old.runtimePath,old.strength,old.tuning,values[0],values[1]}.valid(),
+            "multipass settings range");
+    struct SizeCase {const Rect active;const uint32_t pct;const Extent expected;};
+    for(const auto& test:std::array<SizeCase,6>{{
+            {{0,0,2560,1440},100,{2560,1440}},{{0,0,2560,1440},50,{1280,720}},
+            {{0,0,1281,721},50,{641,361}},{{17,23,1,1},50,{1,1}},
+            {{0,0,UINT32_MAX,UINT32_MAX},100,{UINT32_MAX,UINT32_MAX}},
+            {{0,0,1281,721},75,{961,541}}}}) {
+        // Given: active dimensions and a validated percentage. When: deriving the work size.
+        const auto extent=work_extent(test.active,test.pct);
+        // Then: one widened rounding rule determines both axes.
+        expect(extent==test.expected,"rounded work extent");
+    }
 }
 void adversarial(bool print)
 {

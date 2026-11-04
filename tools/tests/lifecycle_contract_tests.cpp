@@ -191,7 +191,7 @@ void selected(const FramePipeline& p, uint64_t tick, uint64_t content, OutputKin
 void observation_transitions()
 {
     struct Case { const Observation next; const ResetCause cause; const uint64_t generation; };
-    const std::array<Case, 8> cases{{
+    const std::array<Case, 10> cases{{
         {observation(101, 302), ResetCause::SourceChanged, 1},
         {observation(101, 301, 902), ResetCause::DeviceChanged, 2},
         {observation(101, 301, 901, SourceValidity::Valid, 2), ResetCause::SettingsChanged, 2},
@@ -203,13 +203,21 @@ void observation_transitions()
             ResetCause::ExtentChanged, 2},
         {{101, 301, 901, SourceValidity::Valid,
             {{1920,1080},{0,0,1920,1080},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Premultiplied,203},settings()},
-            ResetCause::FormatChanged, 2}}};
+            ResetCause::FormatChanged, 2},
+        // Given: same revision and all other fields, isolating each new comparison.
+        {{101,301,901,SourceValidity::Valid,descriptor(),
+            {{1},true,"C:/owned/not-loaded-runtime.dll",{.75f},{0,0,1,1,0,-1,true},2,100}},
+            ResetCause::SettingsChanged,2},
+        {{101,301,901,SourceValidity::Valid,descriptor(),
+            {{1},true,"C:/owned/not-loaded-runtime.dll",{.75f},{0,0,1,1,0,-1,true},1,50}},
+            ResetCause::SettingsChanged,2}}};
     for (const auto& test : cases) {
         Session s;
         const auto old = s.submit(observation(), 1, 7);
         await(s.records[0].gate->started);
         const auto frozenJob = old.admission->job;
-        const auto update = s.observer.prepare(test.next);
+        const auto update = s.observer.prepare(test.next); // When: observing the changed snapshot.
+        // Then: exactly one resource generation replaces the old snapshot.
         expect(update.cause == test.cause && update.resetTemporal &&
             update.epochs == Epochs{41,2,2,test.generation}, "observable transition did not jointly reset exact epochs");
         expect(old.admission->job == frozenJob && frozenJob.key == JobKey{{41,1,1},1,1,1},
@@ -224,6 +232,9 @@ void observation_transitions()
             s.submit(test.next, 2, 8);
             selected(s.pipeline, 101, 8, OutputKind::PrimingRaw);
         } else s.placeholder(test.next, 2);
+        const auto repeated=s.observer.prepare(test.next);
+        expect(!repeated.cause && !repeated.resetTemporal && repeated.epochs==update.epochs,
+            "unchanged observation repeated the resource replacement");
     }
     Session s;
     s.submit(observation(), 1, 4); s.complete(0);

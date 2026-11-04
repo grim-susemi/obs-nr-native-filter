@@ -444,6 +444,7 @@ obs_properties_t *properties(void *opaque)
     nr::properties::Labels labels;
     labels.enabled=obs_module_text("NR.Enabled");labels.runtime=obs_module_text("NR.Runtime");
     labels.strength=obs_module_text("NR.Strength");labels.preset=obs_module_text("NR.Preset");
+    labels.passes=obs_module_text("NR.Passes");labels.workScale=obs_module_text("NR.WorkScale");
     labels.style=obs_module_text("NR.Style");labels.styleStandard=obs_module_text("NR.Style.Standard");
     labels.styleNatural=obs_module_text("NR.Style.Natural");labels.styleCinematic=obs_module_text("NR.Style.Cinematic");
     labels.intensity=obs_module_text("NR.Intensity");labels.localStructure=obs_module_text("NR.LocalStructure");
@@ -586,7 +587,8 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
         hdr?nr::ColorSpace::ScRgbLinear:nr::ColorSpace::Rec709Srgb,nr::AlphaMode::Premultiplied,80};
     const nr::lifecycle::Observation observation{tick,f.sourceToken,f.deviceToken,validity,descriptor,
         {configured->revision,nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)),
-         !control->reason.empty()?std::string{}:configured->runtimePath,configured->strength,configured->tuning}};
+         !control->reason.empty()?std::string{}:configured->runtimePath,configured->strength,configured->tuning,
+         configured->passes,configured->workScale}};
     const bool cut=f.cut.exchange(false);
     const bool signalled=f.callback->cut.exchange(false,std::memory_order_acq_rel);
     const auto prepared=f.native->prepare(observation,device,cut || signalled);

@@ -7,7 +7,8 @@ inline constexpr char default_runtime[]="C:/Program Files/obs-studio/bin/64bit/n
 inline constexpr char runtime_sha256[]="e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a";
 // tuning is decoded from the seven nr_* model controls; ranges follow OptiScaler [DlssNr]
 // (preset 0..3, style 0..2, intensity/localStructure/localTone 0..2, skinStructure -1..2).
-struct Values { bool enabled;std::string runtimePath;CompositionStrength strength;std::string reason;ModelTuning tuning; };
+struct Values { bool enabled;std::string runtimePath;CompositionStrength strength;std::string reason;ModelTuning tuning;
+    uint32_t passes=1,workScale=100; };
 struct StatusSnapshot {std::string state,reason;};
 struct Configuration {std::shared_ptr<const Settings> settings;std::string reason;};
 void defaults(obs_data_t*);
@@ -22,6 +23,8 @@ struct Labels {
     const char* enabled="Enable native NR";
     const char* runtime="NR runtime file";
     const char* strength="Composition strength";
+    const char* passes="NR passes";
+    const char* workScale="NR working scale";
     const char* preset="NR model preset (0-3)";
     const char* style="NR style";
     const char* styleStandard="Standard";

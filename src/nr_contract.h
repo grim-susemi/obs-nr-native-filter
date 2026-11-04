@@ -4,6 +4,7 @@
 // Original native contracts; R1/R2 are behavior/provenance references, not copied source.
 // No OBS/D3D dependency, clock, global routing or worker implementation here.
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -40,7 +41,9 @@ struct Settings {
     const std::string runtimePath; // Loader validates the canonical path/PE/exports separately.
     const CompositionStrength strength;
     const ModelTuning tuning;
-    bool valid() const { return revision.value != 0 && !runtimePath.empty() && strength.valid() && tuning.valid(); }
+    const uint32_t passes=1, workScale=100;
+    bool valid() const { return revision.value != 0 && !runtimePath.empty() && strength.valid() && tuning.valid() &&
+        passes >= 1 && passes <= 3 && workScale >= 50 && workScale <= 100; }
     bool operator==(const Settings&) const = default;
 };
 
@@ -55,6 +58,12 @@ struct Rect {
     const uint32_t x, y, width, height;
     bool operator==(const Rect&) const = default;
 };
+// Percent is a validated Settings::workScale; widen before multiplying odd/large extents.
+inline constexpr Extent work_extent(Rect active, uint32_t pct)
+{
+    return {static_cast<uint32_t>(std::max(uint64_t{1}, (uint64_t{active.width} * pct + 50) / 100)),
+        static_cast<uint32_t>(std::max(uint64_t{1}, (uint64_t{active.height} * pct + 50) / 100))};
+}
 struct FrameDescriptor {
     const Extent allocation;
     const Rect active;

@@ -48,7 +48,8 @@ Decision Observer::prepare(const Observation& next, bool cut, Reason boundaryPro
             cause = ResetCause::ExtentChanged;
         else if (next.descriptor != old.descriptor) cause = ResetCause::FormatChanged;
         else if (next.settings.revision != old.settings.revision || next.settings.runtimePath != old.settings.runtimePath ||
-                 next.settings.strength != old.settings.strength || next.settings.tuning != old.settings.tuning)
+                 next.settings.strength != old.settings.strength || next.settings.tuning != old.settings.tuning ||
+                 next.settings.passes != old.settings.passes || next.settings.workScale != old.settings.workScale)
             cause = ResetCause::SettingsChanged;
         else if (next.sourceIdentity != old.sourceIdentity) cause = ResetCause::SourceChanged;
         else if (next.settings.enabled != old.settings.enabled) cause = ResetCause::Disabled;

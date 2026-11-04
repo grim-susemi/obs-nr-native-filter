@@ -115,6 +115,52 @@ void tuning_controls(const std::shared_ptr<const nr::Settings>& initial)
     }
     obs_data_release(data);
 }
+void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
+{
+    // Given: legacy OBS data without either new key, even without registered defaults.
+    auto* data=obs_data_create();defaults(data);
+    expect(obs_data_get_int(data,"nr_passes")==1 && obs_data_get_int(data,"nr_work_scale")==100,"multipass defaults");
+    obs_data_unset_default_value(data,"nr_passes");obs_data_unset_default_value(data,"nr_work_scale");
+    // When: decoding the legacy data.
+    const auto legacy=decode(data,default_runtime,initial->runtimePath);
+    // Then: old settings retain the default path.
+    expect(legacy.reason.empty() && legacy.passes==1 && legacy.workScale==100,"legacy multipass defaults");
+    for(const auto& values:std::array<std::array<uint32_t,2>,3>{{{2,100},{1,75},{3,50}}}) {
+        // Given: independently changed pass/scale values, including simultaneous changes.
+        obs_data_set_int(data,"nr_passes",values[0]);obs_data_set_int(data,"nr_work_scale",values[1]);
+        const auto decoded=decode(data,default_runtime,initial->runtimePath);
+        // When: updating the immutable settings.
+        const auto next=updated(initial,decoded);
+        // Then: values survive, with exactly one revision and stable identity on repeated updates.
+        expect(decoded.reason.empty() && next->passes==values[0] && next->workScale==values[1] &&
+            next->revision.value==initial->revision.value+1 && updated(next,decoded)==next,"multipass update revision once");
+    }
+    struct Edge {const char* key;long long value;const char* reason;};
+    for(const auto& edge:{Edge{"nr_passes",0,"invalidPasses"},Edge{"nr_passes",4,"invalidPasses"},
+            Edge{"nr_work_scale",49,"invalidWorkScale"},Edge{"nr_work_scale",101,"invalidWorkScale"}}) {
+        // Given: one out-of-range value in actual obs_data.
+        auto* invalid=obs_data_create();defaults(invalid);obs_data_set_int(invalid,edge.key,edge.value);
+        // When: decoding it.
+        const auto refused=decode(invalid,default_runtime,initial->runtimePath);
+        // Then: the reason is specific and safe defaults remain, without rewriting user data.
+        expect(refused.reason==edge.reason && refused.passes==1 && refused.workScale==100 &&
+            obs_data_get_int(invalid,edge.key)==edge.value,"invalid multipass rejected with defaults");
+        if(edge.value==4)std::puts("invalid obs_data nr_passes=4: reason=invalidPasses decoded=1/100 user_value=4");
+        obs_data_release(invalid);
+    }
+    auto* props=controls({"priming","awaitingSample"});
+    struct Slider {const char* key;int low,high,step;};
+    for(const auto& s:{Slider{"nr_passes",1,3,1},Slider{"nr_work_scale",50,100,5}}) {
+        auto* p=obs_properties_get(props,s.key);
+        expect(p && obs_property_get_type(p)==OBS_PROPERTY_INT && obs_property_int_type(p)==OBS_NUMBER_SLIDER &&
+            obs_property_int_min(p)==s.low && obs_property_int_max(p)==s.high && obs_property_int_step(p)==s.step,s.key);
+    }
+    expect(std::string(obs_property_int_suffix(obs_properties_get(props,"nr_work_scale")))=="%","work scale suffix");
+    auto* next=obs_properties_get(props,"nr_strength");
+    expect(obs_property_next(&next) && std::string(obs_property_name(next))=="nr_passes" &&
+        obs_property_next(&next) && std::string(obs_property_name(next))=="nr_work_scale","multipass control order");
+    obs_properties_destroy(props);obs_data_release(data);
+}
 int main()
 {
     try {
@@ -166,6 +212,7 @@ int main()
         const auto followed=updated(custom,{false,a->runtimePath,{.6f},{},chosen});
         expect(followed->tuning==chosen && followed->revision.value==9,"tuning follows decoded values");
         tuning_controls(a);
+        multipass_controls(a);
         obs_data_set_bool(data,"nr_enabled",false);
         obs_data_set_double(data,"nr_strength",0);
         obs_data_set_string(data,"foreign_owner","keep");

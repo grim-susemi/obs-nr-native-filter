@@ -12,6 +12,8 @@ void defaults(obs_data_t* data)
     obs_data_set_default_bool(data,"nr_enabled",true);
     obs_data_set_default_string(data,"nr_runtime_path",default_runtime);
     obs_data_set_default_double(data,"nr_strength",1);
+    obs_data_set_default_int(data,"nr_passes",1);
+    obs_data_set_default_int(data,"nr_work_scale",100);
     obs_data_set_default_int(data,"nr_preset",tuning.preset);
     obs_data_set_default_int(data,"nr_style",tuning.style);
     obs_data_set_default_double(data,"nr_intensity",tuning.intensity);
@@ -48,8 +50,17 @@ static Values read(obs_data_t* data)
     Values v{obs_data_get_bool(data,"nr_enabled"),obs_data_get_string(data,"nr_runtime_path"),
         {static_cast<float>(obs_data_get_double(data,"nr_strength"))},{},tuning};
     const double strength=obs_data_get_double(data,"nr_strength");
+    const auto passes=obs_data_has_user_value(data,"nr_passes") || obs_data_has_default_value(data,"nr_passes")?
+        obs_data_get_int(data,"nr_passes"):1;
+    const auto scale=obs_data_has_user_value(data,"nr_work_scale") || obs_data_has_default_value(data,"nr_work_scale")?
+        obs_data_get_int(data,"nr_work_scale"):100;
+    const bool passesValid=passes>=1 && passes<=3, scaleValid=scale>=50 && scale<=100;
+    if(passesValid)v.passes=static_cast<uint32_t>(passes);
+    if(scaleValid)v.workScale=static_cast<uint32_t>(scale);
     if(!std::isfinite(strength) || strength<0 || strength>1)v.reason="invalidStrength";
     else if(!tuningValid)v.reason="invalidTuning";
+    else if(!passesValid)v.reason="invalidPasses";
+    else if(!scaleValid)v.reason="invalidWorkScale";
     return v;
 }
 Values decode(obs_data_t* data,const std::string& admittedText,const std::string& immutableRuntime)
@@ -77,9 +88,10 @@ Values admit(obs_data_t* data,RuntimeInspector inspector)
 std::shared_ptr<const Settings> updated(const std::shared_ptr<const Settings>& old,const Values& v)
 {
     if(old && old->enabled==v.enabled && old->runtimePath==v.runtimePath && old->tuning==v.tuning &&
+       old->passes==v.passes && old->workScale==v.workScale &&
        (old->strength.value==v.strength.value || (std::isnan(old->strength.value) && std::isnan(v.strength.value))))return old;
     return std::make_shared<const Settings>(Settings{{old?old->revision.value+1:1},v.enabled,v.runtimePath,
-        v.strength,v.tuning});
+        v.strength,v.tuning,v.passes,v.workScale});
 }
 bool effective_enabled(bool configured,bool sourceEnabled) {return configured && sourceEnabled;}
 StatusSnapshot status(Status state,Reason reason)
@@ -117,6 +129,8 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     obs_properties_add_bool(props,"nr_enabled",labels.enabled);
     obs_properties_add_path(props,"nr_runtime_path",labels.runtime,OBS_PATH_FILE,"Runtime (*.dll)",nullptr);
     obs_properties_add_float_slider(props,"nr_strength",labels.strength,0,1,.01);
+    obs_properties_add_int_slider(props,"nr_passes",labels.passes,1,3,1);
+    obs_property_int_set_suffix(obs_properties_add_int_slider(props,"nr_work_scale",labels.workScale,50,100,5),"%");
     obs_properties_add_int_slider(props,"nr_preset",labels.preset,0,3,1);
     auto* style=obs_properties_add_list(props,"nr_style",labels.style,OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(style,labels.styleStandard,0);
