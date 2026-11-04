@@ -7,6 +7,7 @@ param(
     [switch]$LifecycleNative,
     [switch]$LifecycleDiagnosticR4,
     [switch]$CoreInitControl,
+    [string]$OutputDigest='',
     [string]$Task14CandidateManifest,
     [string]$Task14CandidateSha256,
     [string]$Task14CandidateBuild,
@@ -28,6 +29,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if($OutputDigest -and ($Scenario -ne 'native-model' -or $CoreInitControl)){throw 'NR_QA_OUTPUT_DIGEST_SCOPE'}
 if($Scenario -eq 'ghost-baseline') {
     if($Task17CandidateManifest -or $Task17CandidateSha256){throw 'T17_PUBLIC_CANDIDATE_SCOPE'}
     $Task17CandidateManifest=$Task27CandidateManifest
@@ -1115,7 +1117,10 @@ try {
     if ($Scenario -eq 'texture-roundtrip') { $process.StartInfo.Arguments += ' texture-roundtrip' }
     if ($Scenario -eq 'flow-translation') { $process.StartInfo.Arguments += ' flow-translation' }
     if ($Scenario -eq 'color-alpha') { $process.StartInfo.Arguments += ' color-alpha' }
-    if ($Scenario -eq 'native-model') { $process.StartInfo.Arguments += $(if($CoreInitControl){' core-init-control'}else{' native-model'}) }
+    if ($Scenario -eq 'native-model') {
+        $process.StartInfo.Arguments += $(if($CoreInitControl){' core-init-control'}else{' native-model'})
+        if($OutputDigest){$process.StartInfo.Arguments += ' --output-digest "'+[IO.Path]::GetFullPath($OutputDigest)+'"'}
+    }
     if ($Scenario -eq 'lifecycle') { $process.StartInfo.Arguments += $(if($LifecycleNative){' lifecycle-native'}else{' lifecycle'}) }
     if ($Scenario -eq 'native-bootstrap') { $process.StartInfo.Arguments += ' native-bootstrap "'+$artifactRoot+'"' }
     if ($Scenario -eq 'ghost-calibration') { $process.StartInfo.Arguments += ' ghost-calibration "'+$artifactRoot+'"' }

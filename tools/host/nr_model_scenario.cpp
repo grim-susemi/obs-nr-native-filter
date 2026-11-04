@@ -4,6 +4,7 @@
 #include "nr_model_ownership.h"
 #include "capture_pin_observation.h"
 #include "nr_color_scenario.h"
+#include "nr_model_digest.h"
 #include <obs.h>
 #include <algorithm>
 #include <atomic>
@@ -388,7 +389,17 @@ void proof(Harness& h,unsigned lane,unsigned step) {
             if(raw[i]!=output[i+2] || raw[i+1]!=output[i+1] || raw[i+2]!=output[i]) ++changed;
             require(raw[i+3]==output[i+3],"native actual output alpha");
         }
-        require(changed!=0,"native actual source-relative changed output pixels");
+        require(job.referenceValid==(!job.flow->reset && job.guideReferenceKey.has_value()),
+            "native actual reference relationship");
+        if(job.referenceValid) require(h.samples.size()>1 &&
+            *job.guideReferenceKey==h.samples[h.samples.size()-2]->contract.key,
+            "native actual exact n-1 guide reference");
+        if(lane==0) {
+            const bool reset=step==1 || step==4;
+            require(job.flow->reset==reset && job.referenceValid==!reset,
+                "native fixed reset/reference mapping");
+        }
+        require(job.referenceValid?changed>0:changed==0,"native actual source-relative reference pixels");
         require(job.epoch>job.creationEpoch,"native explicit next submission epoch");
         for(size_t i=1;i<job.chronology.size()-1;++i) require(job.chronology[i] && job.chronology[i]<=job.chronology[i+1],
             "native chronological encode/evaluate/compose/submit/physical/status");
@@ -412,7 +423,8 @@ void proof(Harness& h,unsigned lane,unsigned step) {
                     target[i+2]==oldOutput[i] && target[i+3]==oldOutput[i+3],"native actual output Consumer pixel ownership");
                 if(target[i]!=oldRaw[i] || target[i+1]!=oldRaw[i+1] || target[i+2]!=oldRaw[i+2]) ++targetChanged;
             }
-            require(targetChanged,"native actual delayed NR Consumer changed pixels");
+            require(selected.job->referenceValid?targetChanged>0:targetChanged==0,
+                "native actual delayed NR Consumer reference pixels");
         }
     }
     const auto completion=job.completion();
@@ -440,7 +452,8 @@ void proof(Harness& h,unsigned lane,unsigned step) {
         <<"\",\"analysis_resource\":\""<<reinterpret_cast<uintptr_t>(job.frame->analysis.Get())
         <<"\",\"output_resource\":\""<<reinterpret_cast<uintptr_t>(job.output)
         <<"\",\"status_resource\":\""<<reinterpret_cast<uintptr_t>(job.invalid_status_resource())<<"\""
-        <<",\"reset\":"<<(job.flow && job.flow->reset?"true":"false")<<",\"selected\":"<<static_cast<unsigned>(h.selected)
+        <<",\"reset\":"<<(job.flow && job.flow->reset?"true":"false")
+        <<",\"reference_valid\":"<<(job.referenceValid?"true":"false")<<",\"selected\":"<<static_cast<unsigned>(h.selected)
         <<",\"selected_sequence\":"<<h.selectedSequence<<",\"target_hash\":\""<<targetHash
         <<"\",\"target_changed_pixels\":"<<targetChanged<<",\"producer\":"<<job.frame->producer.value
         <<",\"producer_done\":"<<job.frame->producer.fence->GetCompletedValue()
@@ -599,7 +612,7 @@ bool nr_start_core_control(const std::filesystem::path& root,std::unique_ptr<nr:
     owner->attach();
     return borrowed->initialize_capture();
 }
-bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained) {
+bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,const std::filesystem::path& outputDigest) {
     // This function runs on the coordinator, not the graphics/NR worker.
     nr_color_refuse_unrelated();
     const model::Fault controls[]{model::Fault::None,model::Fault::Capability,model::Fault::Creation,
@@ -629,6 +642,11 @@ bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained) {
             const auto applied=h->processor->applied();
             if(lane==0) require(h->eligibleJobs==5 && applied==3,"native five physical inferences and three actual n-1 publications");
             else require(applied==0,"native failed capability/create/evaluation/submit cannot apply compose");
+            if(lane==0 && !outputDigest.empty()) {
+                const auto& final=*h->samples.back()->job;
+                require(final.eligible && final.composed,"native final composed golden output");
+                nr::qa::write_model_digest(outputDigest,readback(*h->context,final.output),final.output->GetDesc());
+            }
             h->execute(Action::Stop); if(h->consumerValue) require(h->consumerEnd &&
                 WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
                 interop::completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==

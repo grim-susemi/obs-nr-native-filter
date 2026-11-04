@@ -29,6 +29,8 @@ function Reject([string]$Evidence,[string]$Root,[string]$Runtime,[string]$Token,
     Write-Output ('PASS native guard '+$Token)
 }
 if((Test-Path $producer) -or (Test-Path $verifier)){throw 'Native model CPU guards require absent owned host roots'}
+Reject $evidence $producer $runtime 'NR_QA_OUTPUT_DIGEST_SCOPE' '-CoreInitControl -OutputDigest Z:/nope/x.json'
+Reject $evidence $producer 'C:/not-selected/runtime.dll' 'NR_QA_RUNTIME_REFUSED' '-OutputDigest Z:/nope/x.json'
 foreach($pair in @(@($evidence,$producer,$verifier),@((Join-Path $evidence 'verifier'),$verifier,$producer))){
     Reject $pair[0] $pair[1] 'C:/not-selected/runtime.dll' 'NR_QA_RUNTIME_REFUSED'
     Reject $pair[0] $pair[1] $runtime 'NR_QA_FOREIGN_PROCESS' ('-ForeignPid '+$PID)
@@ -78,21 +80,61 @@ try{
     }
 }
 Write-Output 'PASS native public pair and fresh build refusal probes; CPU only, no model/GPU claim'
-# Machine-proof regression: a higher completed Consumer must not overtake an
-# open lower capture pin. Fixtures stop at this exact production-parser boundary.
+# Given: complete receipts for all five lanes, including cold and valid history.
 $pinRows=@()
 foreach($lane in 0..4){
     $count=if($lane -eq 0){6}elseif($lane -lt 3){1}else{3}
     foreach($step in 0..($count-1)){
-        $pinRows+=@{lane=$lane;step=$step;created=$false;evaluated=$false;composed=$false;
-            submitted=$false;gpu_composed=$false;reset=$false;driver_handle=$false;
-            capture_pin_open=$true;capture_pin=3;consumer_done=4}
+        $eligible=$lane -eq 0 -and $step -gt 0
+        $reference=$eligible -and $step -in @(2,3,5)
+        $selected=$lane -eq 0 -and $step -in @(2,3,5)
+        $pinRows+=@{lane=$lane;step=$step;created=($step -eq 0);evaluated=$eligible;composed=$eligible;
+            submitted=$eligible;gpu_composed=$eligible;reset=($eligible -and !$reference);
+            reference_valid=$reference;driver_handle=$false;capture_pin_open=$true;capture_pin=5;consumer_done=4;
+            instance_id=(111+$lane);ingress_sequence=($step+1);submission_serial=($step+1);
+            settings_revision=1;resource_generation=1;clock=0;interval=1;tick=1;deadline=2;slot=0;
+            feature=18;width=1920;height=1080;raw_hash='10';analysis_hash='10';raw_resource='1';analysis_resource='2';
+            source_format=87;producer=1;producer_done=1;consumer=4;code=$(if($eligible){1}else{0});
+            invalid_status=0;changed_pixels=$(if($reference){1}else{0});physical_done=1;epoch=2;creation_epoch=1;
+            module_base='3';input_hash='11';model_hash='12';motion_hash='13';depth_hash='14';output_hash='15';
+            color_resources=@('1','2','3','4','5');descriptor_heaps=@('6','7','8');status_resource='9';
+            output_resource='10';motion_resource='11';depth_resource='12';mv_scale_x=1;mv_scale_y=1;
+            pre_exposure=1;exposure=1;chronology=@(0,1,2,3,4,5,6,7);
+            selected=$(if($selected){3}elseif($lane -ge 3 -and $step -eq 2){2}else{1});
+            selected_sequence=$step;target_hash='10';target_changed_pixels=$(if($lane -eq 0 -and $step -eq 3){1}else{0})}
     }
 }
 $contexts=@(0..4 | ForEach-Object {@{lane=$_;software=$false;private_direct_queue=$true;
     adapter='RTX 4090';device='1';queue='2';renderer_luid_high=0;worker_luid_high=0;renderer_luid_low=1;worker_luid_low=1}})
 $cleanup=@(0..4 | ForEach-Object {@{lane=$_;worker_exit=$true;closed=$true;retained=$false;
     applied=$(if($_ -eq 0){3}else{0});nr_selections=3;raw_selections=0}})
+# When: the production receipt validator consumes the full valid fixture.
+Assert-ModelRows $pinRows $contexts $cleanup @(@{})
+# Then: both strict pixel branches and selected n-1 rows are accepted.
+Write-Output 'PASS complete native receipt fixture accepted'
+$validJson=ConvertTo-Json -InputObject $pinRows -Depth 8
+foreach($case in @(
+    @{row=1;field='changed_pixels';value=1;error='NR_QA_MODEL_REFERENCE_PIXELS'},
+    @{row=2;field='changed_pixels';value=0;error='NR_QA_MODEL_REFERENCE_PIXELS'},
+    @{row=2;field='target_changed_pixels';value=1;error='NR_QA_MODEL_SELECTED_REFERENCE_PIXELS'},
+    @{row=3;field='target_changed_pixels';value=0;error='NR_QA_MODEL_SELECTED_REFERENCE_PIXELS'},
+    @{row=1;field='reference_valid';value=$null;error='NR_QA_MODEL_BOOLEAN'},
+    @{row=1;field='reference_valid';value='false';error='NR_QA_MODEL_BOOLEAN'},
+    @{row=1;field='reset';value=$false;error='NR_QA_MODEL_RESET'},
+    @{row=2;field='reset';value=$true;error='NR_QA_MODEL_RESET'}
+)){
+    # Given: a fresh accepted fixture with exactly one machine field changed.
+    $rows=ConvertFrom-Json $validJson
+    if($null -eq $case.value){$rows[$case.row].PSObject.Properties.Remove($case.field)}
+    else{$rows[$case.row].($case.field)=$case.value}
+    $refused=$false
+    # When: the actual production validator consumes the mutation.
+    try{Assert-ModelRows $rows $contexts $cleanup @(@{})}
+    # Then: only the intended exact rejection counts as success.
+    catch{if($_.Exception.Message -ne $case.error){throw};$refused=$true}
+    if(!$refused){throw ('Native receipt mutation accepted: '+$case.field)}
+    Write-Output ('PASS native receipt refusal '+$case.error+' row='+$case.row+' field='+$case.field)
+}
 foreach($case in @(@(3,4,$true),@(4,4,$true),@(5,4,$false))){
     $pinRows[0].capture_pin=$case[0];$pinRows[0].consumer_done=$case[1];$pinRows[0].capture_pin_open=$case[2]
     $refused=$false

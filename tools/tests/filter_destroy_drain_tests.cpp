@@ -130,6 +130,8 @@ void gs_blend_state_pop(void) {}
 void gs_blend_function_separate(enum gs_blend_type,enum gs_blend_type,enum gs_blend_type,enum gs_blend_type) {}
 bool gs_framebuffer_srgb_enabled(void) {return false;}
 void gs_enable_framebuffer_srgb(bool) {}
+void gs_enable_blending(bool) {}
+enum gs_color_space gs_get_color_space(void) {return GS_CS_SRGB;}
 void gs_clear(uint32_t,const struct vec4*,float,uint8_t) {}
 void gs_ortho(float,float,float,float,float,float) {}
 uint32_t gs_texture_get_width(const gs_texture_t*) {return 0;}
@@ -139,6 +141,7 @@ void* gs_texture_get_obj(gs_texture_t*) {return nullptr;}
 gs_effect_t* obs_get_base_effect(enum obs_base_effect) {return nullptr;}
 gs_eparam_t* gs_effect_get_param_by_name(const gs_effect_t*,const char*) {return nullptr;}
 void gs_effect_set_texture(gs_eparam_t*,gs_texture_t*) {}
+void gs_effect_set_texture_srgb(gs_eparam_t*,gs_texture_t*) {}
 bool gs_effect_loop(gs_effect_t*,const char*) {return false;}
 void gs_draw_sprite(gs_texture_t*,uint32_t,uint32_t,uint32_t) {}
 }

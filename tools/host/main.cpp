@@ -1944,7 +1944,9 @@ int wmain(int argc, wchar_t **argv)
         return nr_ghost_storage_metadata()?0:1;
     if(argc==4&&std::wstring_view(argv[1])==L"--task26-complete-service")
         return nr_ghost_complete_service(argv[2],argv[3])?0:1;
-    if (argc != 7 && argc != 8 && argc != 9) return 64;
+    const bool modelDigest=argc==10 && std::wstring_view(argv[7])==L"native-model" &&
+        std::wstring_view(argv[8])==L"--output-digest";
+    if (argc != 7 && argc != 8 && argc != 9 && !modelDigest) return 64;
     const bool recording=argc==9 && std::wstring(argv[7])==L"recording-output";
     const bool bootstrap=argc==9 && std::wstring(argv[7])==L"native-bootstrap";
     const bool ghostBaseline=argc==9 && std::wstring(argv[7])==L"ghost-baseline";
@@ -1957,7 +1959,7 @@ int wmain(int argc, wchar_t **argv)
     const bool flow = argc == 8 && std::wstring(argv[7]) == L"flow-translation";
     const bool color = argc == 8 && std::wstring(argv[7]) == L"color-alpha";
     const bool coreControl=argc==8 && std::wstring(argv[7])==L"core-init-control";
-    const bool model = argc == 8 && (std::wstring(argv[7]) == L"native-model" || coreControl);
+    const bool model = (argc == 8 || modelDigest) && (std::wstring(argv[7]) == L"native-model" || coreControl);
     const bool lifecycleNative=argc==8 && std::wstring(argv[7])==L"lifecycle-native";
     const bool lifecycle = argc == 8 && (std::wstring(argv[7]) == L"lifecycle" || lifecycleNative);
     const bool instances=argc==8 && std::wstring(argv[7])==L"two-instances";
@@ -2037,7 +2039,8 @@ int wmain(int argc, wchar_t **argv)
                 }catch(const std::exception& error){retained=true;std::cout<<"NR_CORE_CONTROL_FAILURE "<<error.what()<<std::endl;}
             }
             if(!valid || retained)break;
-        } else if (model && !nr_run_model_scenario(root,retained)) break;
+        } else if (model && !nr_run_model_scenario(root,retained,
+            modelDigest?std::filesystem::path(argv[9]):std::filesystem::path{})) break;
         if(lifecycle && !run_lifecycle(root,retained,lifecycleNative))break;
         if(instances && !run_instances(root,retained))break;
         if(instances && !run_capacity(root,retained))break;

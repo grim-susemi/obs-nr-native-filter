@@ -542,7 +542,10 @@ function Assert-ModelRows($Rows,$Contexts,$Cleanup,$Modules) {
         if ($group.Count -ne $count) { throw 'NR_QA_MODEL_CASE_SET' }
         for ($step=0;$step -lt $count;$step++) {
             $row=$group[$step]
-            foreach ($field in @('created','evaluated','composed','submitted','gpu_composed','reset','driver_handle','capture_pin_open')) {
+            $hasReference=if($row -is [Collections.IDictionary]){$row.Contains('reference_valid')}
+                else{$null -ne $row.PSObject.Properties['reference_valid']}
+            if(!$hasReference){throw 'NR_QA_MODEL_BOOLEAN'}
+            foreach ($field in @('created','evaluated','composed','submitted','gpu_composed','reset','reference_valid','driver_handle','capture_pin_open')) {
                 if ($row.$field -isnot [bool]) { throw 'NR_QA_MODEL_BOOLEAN' }
             }
             if (!$row.capture_pin_open -or $row.capture_pin -le 0 -or $row.consumer_done -ge $row.capture_pin) {
@@ -558,8 +561,10 @@ function Assert-ModelRows($Rows,$Contexts,$Cleanup,$Modules) {
                 $row.producer -le 0 -or $row.producer_done -lt $row.producer -or $row.consumer_done -lt $row.consumer) { throw 'NR_QA_MODEL_INPUT_OR_FENCE' }
             if ($row.gpu_composed) {
                 if (!$row.evaluated -or !$row.composed -or !$row.submitted -or $row.code -ne 1 -or
-                    $row.invalid_status -ne 0 -or $row.changed_pixels -le 0 -or $row.physical_done -ne 1 -or
+                    $row.invalid_status -ne 0 -or $row.physical_done -ne 1 -or
                     $row.epoch -le $row.creation_epoch -or [UInt64]$row.module_base -eq 0 -or $row.driver_handle) { throw 'NR_QA_MODEL_INFERENCE' }
+                if (($row.reference_valid -and $row.changed_pixels -le 0) -or
+                    (!$row.reference_valid -and $row.changed_pixels -ne 0)) { throw 'NR_QA_MODEL_REFERENCE_PIXELS' }
                 foreach ($field in @('input_hash','model_hash','motion_hash','depth_hash','output_hash')) {
                     if (!$row.$field -or [UInt64]$row.$field -eq 0) { throw 'NR_QA_MODEL_HASH' }
                 }
@@ -578,9 +583,16 @@ function Assert-ModelRows($Rows,$Contexts,$Cleanup,$Modules) {
             if ($lane -eq 0) {
                 if (($step -eq 0 -and (!$row.created -or $row.gpu_composed)) -or
                     ($step -gt 0 -and !$row.gpu_composed)) { throw 'NR_QA_MODEL_WARM_SET' }
-                if ($step -in @(1,4) -and !$row.reset) { throw 'NR_QA_MODEL_RESET' }
+                if (($step -in @(1,4) -and (!$row.reset -or $row.reference_valid)) -or
+                    ($step -in @(2,3,5) -and ($row.reset -or !$row.reference_valid))) { throw 'NR_QA_MODEL_RESET' }
                 if ($step -in @(2,3,5) -and ($row.reset -or $row.selected -ne 3 -or
-                    $row.selected_sequence -ne $step -or $row.target_changed_pixels -le 0 -or [UInt64]$row.target_hash -eq 0)) { throw 'NR_QA_MODEL_PUBLICATION' }
+                    $row.selected_sequence -ne $step -or [UInt64]$row.target_hash -eq 0)) { throw 'NR_QA_MODEL_PUBLICATION' }
+                if ($step -in @(2,3,5)) {
+                    $selected=@($group | Where-Object {$_.ingress_sequence -eq $row.selected_sequence})
+                    if ($selected.Count -ne 1 -or $selected[0].step -ne ($step-1)) { throw 'NR_QA_MODEL_PUBLICATION' }
+                    if (($selected[0].reference_valid -and $row.target_changed_pixels -le 0) -or
+                        (!$selected[0].reference_valid -and $row.target_changed_pixels -ne 0)) { throw 'NR_QA_MODEL_SELECTED_REFERENCE_PIXELS' }
+                }
                 if ($step -eq 1 -and $row.selected -ne 1) { throw 'NR_QA_MODEL_RAW_PHASE' }
             } elseif (($lane -lt 3 -or $step -ge 1) -and ($row.gpu_composed -or $row.submitted -or $row.code -eq 1)) {
                 throw 'NR_QA_MODEL_FAILURE_CONTROL'
