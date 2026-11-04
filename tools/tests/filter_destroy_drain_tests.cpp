@@ -34,6 +34,12 @@ void run_render_callbacks() // One main render pass of the graphics thread.
 }
 }
 
+namespace nr::capture_exclusion {
+void enter() {}
+void leave() {}
+void refresh() {}
+}
+
 extern "C" {
 void obs_enter_graphics(void)
 {
@@ -75,6 +81,8 @@ bool proc_handler_call(proc_handler_t*,const char*,calldata_t*) {return false;}
 bool obs_source_enabled(const obs_source_t*) {return true;}
 obs_source_t* obs_filter_get_target(const obs_source_t*) {return nullptr;}
 obs_source_t* obs_filter_get_parent(const obs_source_t*) {return nullptr;}
+const char* obs_source_get_unversioned_id(const obs_source_t*) {return nullptr;}
+bool obs_source_showing(const obs_source_t*) {return false;}
 void obs_source_skip_video_filter(obs_source_t*) {}
 uint32_t obs_source_get_width(obs_source_t*) {return 0;}
 uint32_t obs_source_get_height(obs_source_t*) {return 0;}
