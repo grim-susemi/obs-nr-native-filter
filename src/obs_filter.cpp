@@ -60,6 +60,9 @@ struct Filter {
     uint64_t heldLogged=0;
     std::vector<std::pair<std::string,unsigned>> windowCounts; // frames per state/reason in the current 5 s window
     uint64_t windowStart=0,lastCountTime=0;unsigned windowFrames=0,windowLines=0;
+    // Display only: share of ticks that showed NR over the last full 5 s, packed (total<<32)|ready.
+    // Kept apart from the capped diagnostic window so the properties text stays current.
+    uint64_t recentStart=0;unsigned recentFrames=0,recentReady=0;std::atomic<uint64_t> recentShown{0};
     std::atomic<Admission> admission{Admission::NoTarget};
     explicit Filter(obs_source_t *s) : source(s), instance(nextInstance.fetch_add(1)), ticks(instance)
     {
@@ -459,8 +462,21 @@ obs_properties_t *properties(void *opaque)
         const char* text=obs_module_text(key.c_str());
         return text && key!=text?std::string(text)+" ("+code+")":code;
     };
-    const auto statusText=localized("NR.State.",value->state);
-    const auto reasonText=localized("NR.Reason.",value->reason);
+    auto statusText=localized("NR.State.",value->state);
+    auto reasonText=localized("NR.Reason.",value->reason);
+    const auto plain=[](const char* key){const char* text=obs_module_text(key);return std::string(text?text:key);};
+    // A single late frame is not the filter's state: when most recent ticks showed NR, say so.
+    if(const uint64_t shown=opaque?static_cast<Filter*>(opaque)->recentShown.load(std::memory_order_acquire):0) {
+        const auto total=static_cast<unsigned>(shown>>32),ready=static_cast<unsigned>(shown&0xffffffffu);
+        const unsigned percent=(ready*100+total/2)/total;
+        const std::string share=" - "+plain("NR.Recent")+" "+std::to_string(percent)+"%";
+        const bool late=value->state=="bypassed" && (value->reason=="deadlineMiss" || value->reason=="slotsFull");
+        if((value->state=="ready" || late) && ready*2>=total) {
+            statusText=localized("NR.State.","ready")+share;
+            reasonText=percent<100?plain("NR.Reason.lateFrames")+" ("+std::to_string(100-percent)+"%)":localized("NR.Reason.","none");
+        }
+        else statusText+=share;
+    }
     labels.statusText=statusText.c_str();labels.reasonText=reasonText.c_str();
     return nr::properties::controls(*value,labels);
 }
@@ -491,6 +507,12 @@ void publish_status(Filter& f)
     }
     if(const auto now=obs_get_video_frame_time(); now && now!=f.lastCountTime) {
         f.lastCountTime=now;
+        if(!f.recentStart)f.recentStart=now;
+        ++f.recentFrames;if(value.state=="ready")++f.recentReady;
+        if(now-f.recentStart>=5000000000ull) {
+            f.recentShown.store(static_cast<uint64_t>(f.recentFrames)<<32|f.recentReady,std::memory_order_release);
+            f.recentFrames=f.recentReady=0;f.recentStart=now;
+        }
         if(!f.windowStart)f.windowStart=now;
         const std::string key=value.state+"/"+value.reason;
         bool found=false;
