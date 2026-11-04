@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <array>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 #include <thread>
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 using Microsoft::WRL::ComPtr;
@@ -43,6 +45,9 @@ public:
 void checked(HRESULT hr,const char* what) { if(FAILED(hr)) throw interop::HResultError(hr,what); }
 void require(bool value,const char* what) { if(!value) throw std::runtime_error(what); }
 int64_t stamp() { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return value.QuadPart; }
+// Diagnostic split of the per-job "prep" stage (CPU time before the codec encode).
+std::atomic<int64_t> prepPre{0},prepGuide{0},prepWorker{0},prepAlloc{0},prepColor{0},prepMid{0},prepCore{0},prepTotal{0};
+std::atomic<uint32_t> prepJobs{0};
 struct TimingAgg {
     std::atomic<unsigned> jobs{0};
     std::atomic<int64_t> sumSubmit{0},maxSubmit{0},sumEncode{0},maxEncode{0},sumAdmit{0},maxAdmit{0};
@@ -331,6 +336,36 @@ Job::Job(std::shared_ptr<const Frame> input,const JobContract& sample,ColorExpos
     require(frame && observed && gpu,"model job and exact completion events");
 }
 Job::~Job() { if(observed) CloseHandle(observed); if(gpu) CloseHandle(gpu); }
+// Per-job model scratch (five FP16 colors, status buffers, three descriptor heaps) took ~6 ms of CPU per job at
+// 1440p, enough on its own to push 60 fps jobs past their one-tick deadline. A slab returns here only when its
+// job's Resources dies (where it used to be released) and only if its own command list executed, so every
+// resource ends in COMMON; take() also requires that job's completion fence. Every pass writes each texel and
+// descriptor before reading it, so a reused slab never shows stale contents.
+struct ColorSlab {
+    std::array<ComPtr<ID3D12Resource>,5> colors;
+    ComPtr<ID3D12Resource> status,statusRead,zero;
+    ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap;
+    ComPtr<ID3D12Fence> complete;
+};
+struct ColorSlabPool {
+    const Extent size;
+    std::mutex lock;
+    std::vector<ColorSlab> free;
+    explicit ColorSlabPool(Extent value):size(value) {}
+    std::optional<ColorSlab> take() {
+        std::lock_guard<std::mutex> guard(lock);
+        for(auto it=free.begin();it!=free.end();++it) {
+            const auto done=it->complete->GetCompletedValue();
+            if(done==UINT64_MAX || done<1) continue;
+            ColorSlab slab=std::move(*it); free.erase(it); return slab;
+        }
+        return std::nullopt;
+    }
+    void give(ColorSlab slab) {
+        std::lock_guard<std::mutex> guard(lock);
+        if(free.size()<2) free.push_back(std::move(slab));
+    }
+};
 struct Job::Resources {
     const std::shared_ptr<interop::Bridge> bridge;
     ComPtr<ID3D12CommandAllocator> allocator;
@@ -345,7 +380,14 @@ struct Job::Resources {
     std::shared_ptr<runtime::Submission> submission=std::make_shared<runtime::Submission>();
     HANDLE wait=nullptr;
     bool statusRecorded=false;
+    std::shared_ptr<ColorSlabPool> pool;
+    bool slabExecuted=false; // the worker list holding the end-of-job COMMON barriers was submitted
     explicit Resources(std::shared_ptr<interop::Bridge> transport):bridge(std::move(transport)) {}
+    ~Resources() {
+        if(!pool || !slabExecuted || !colors[0] || !complete) return;
+        try { pool->give({colors,status,statusRead,zero,codecHeap,prepareHeap,restoreHeap,complete}); }
+        catch(...) {} // Not pooling only means the next job allocates afresh.
+    }
     void unsubscribe() {
         if(wait) { require(UnregisterWaitEx(wait,INVALID_HANDLE_VALUE)!=FALSE,"model completion unsubscribe"); wait=nullptr; }
     }
@@ -484,6 +526,7 @@ struct Processor::Impl {
     std::optional<JobKey> previousKey;
     std::shared_ptr<const Frame> previousFrame;
     std::shared_ptr<Job> pending;
+    std::shared_ptr<ColorSlabPool> pool;
     std::optional<JobKey> pendingGuide;
     std::atomic<uint64_t> appliedCount{0};
     std::atomic<std::shared_ptr<const GuidePreparation>> preparation;
@@ -782,6 +825,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(p.config.qaPreparation && !p.preparation.load(std::memory_order_relaxed))
         p.preparation.store(std::make_shared<const GuidePreparation>(GuidePreparation{
             work.job.key,p.guides->observation_descriptors(),p.guides->grid_size()}),std::memory_order_release);
+    const int64_t tGuide0=stamp();
     const FlowImage current{work.job.key,job->frame->analysis.Get(),producer};
     std::optional<FlowImage> previous;
     if(!reset) previous.emplace(FlowImage{*p.previousKey,p.previousFrame->analysis.Get(),p.previousFrame->producer});
@@ -794,21 +838,40 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(previous) job->guideReferenceKey.emplace(previous->key);
     p.pendingGuide.emplace(work.job.key);
     checked(p.context->queue()->Wait(guide->complete.fence,guide->complete.value),"native guide queue dependency");
+    const int64_t tGuide1=stamp();
     const auto view=work.binding.transport->begin_worker(work.binding.ticket);
     require(view.has_value(),"actual Bridge worker admission");
     job->output=view->output;
-    for(auto& color:r.colors) color=texture(device,size,DXGI_FORMAT_R16G16B16A16_FLOAT);
-    r.status=buffer(device,D3D12_HEAP_TYPE_DEFAULT); r.statusRead=buffer(device,D3D12_HEAP_TYPE_READBACK);
-    r.zero=buffer(device,D3D12_HEAP_TYPE_UPLOAD);
-    r.codecHeap=heap(device,10); r.prepareHeap=heap(device,4); r.restoreHeap=heap(device,4);
+    const int64_t tAlloc0=stamp();
+    if(!p.pool || p.pool->size.width!=size.width || p.pool->size.height!=size.height)
+        p.pool=std::make_shared<ColorSlabPool>(size);
+    r.pool=p.pool;
+    auto slab=p.pool->take();
+    if(slab) {
+        r.colors=std::move(slab->colors); r.status=std::move(slab->status); r.statusRead=std::move(slab->statusRead);
+        r.zero=std::move(slab->zero); r.codecHeap=std::move(slab->codecHeap);
+        r.prepareHeap=std::move(slab->prepareHeap); r.restoreHeap=std::move(slab->restoreHeap);
+    } else {
+        for(auto& color:r.colors) color=texture(device,size,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        r.status=buffer(device,D3D12_HEAP_TYPE_DEFAULT); r.statusRead=buffer(device,D3D12_HEAP_TYPE_READBACK);
+        r.zero=buffer(device,D3D12_HEAP_TYPE_UPLOAD);
+        r.codecHeap=heap(device,10); r.prepareHeap=heap(device,4); r.restoreHeap=heap(device,4);
+    }
+    const int64_t tAlloc1=stamp();
     auto* list=view->commands;
+    if(slab) { // Fresh colors start UAV and fresh status COPY_DEST; a reused slab ended its last job in COMMON.
+        for(auto& color:r.colors) barrier(list,color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     void* mapped=nullptr; const D3D12_RANGE empty{0,0};
     checked(r.zero->Map(0,&empty,&mapped),"owned status zero upload");
     memset(mapped,0,4); r.zero->Unmap(0,nullptr);
     list->CopyBufferRegion(r.status.Get(),0,r.zero.Get(),0,4);
     barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(list,job->frame->original.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const int64_t tColor0=stamp();
     r.color=std::make_unique<D3D12ColorPass>(device,p.config.color);
+    const int64_t tColor1=stamp();
     barrier(list,r.colors[2].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     require(r.color->record(list,r.prepareHeap.Get(),*plan,job->frame->original.Get(),
         r.colors[2].Get(),r.colors[0].Get(),r.status.Get(),false),"actual canonical color prepare");
@@ -825,10 +888,19 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         work.job.key.historyEpoch,work.job.key.resourceGeneration};
     const CoreInput input{work.job,epochs,resources,{work.job.key.historyEpoch,!reset,reset},list,
         plan->whitePoint,1,1,plan->codecColor,plan->codecAlpha};
+    const int64_t tCore0=stamp();
     r.core=std::make_unique<Core>(p.instance,std::make_unique<TracedCodec>(device,p.config.codec,*job),
         std::make_unique<Evaluator>(*p.pass,job));
+    const int64_t tCore1=stamp();
     p.subscribe(job);
     const auto result=r.core->record(input);
+    if(job->chronology[1]>tCore1) {
+        prepPre.fetch_add(tGuide0-job->qaTiming[1],std::memory_order_relaxed);prepGuide.fetch_add(tGuide1-tGuide0,std::memory_order_relaxed);
+        prepWorker.fetch_add(tAlloc0-tGuide1,std::memory_order_relaxed);prepAlloc.fetch_add(tAlloc1-tAlloc0,std::memory_order_relaxed);
+        prepColor.fetch_add(tColor1-tColor0,std::memory_order_relaxed);prepMid.fetch_add(tCore0-tColor1,std::memory_order_relaxed);
+        prepCore.fetch_add(tCore1-tCore0,std::memory_order_relaxed);prepTotal.fetch_add(job->chronology[1]-job->qaTiming[1],std::memory_order_relaxed);
+        prepJobs.fetch_add(1,std::memory_order_relaxed);
+    }
     job->evaluated=result.evaluated; job->composed=result.composed; job->code=result.error;
     if(result.state!=CoreState::Recorded || job->fault==Fault::Submission) {
         require(r.submission->discard(),"unsubmitted evaluation discard");
@@ -875,6 +947,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         }
     }
     job->submitted=work.binding.transport->submit_worker(work.binding.ticket);
+    r.slabExecuted=job->submitted;
     job->chronology[4]=stamp();
     if(job->submitted) job->submitted=r.submission->submitted(p.context->queue());
     job->chronology[5]=stamp();
@@ -922,7 +995,7 @@ void Processor::worker_stopping() noexcept {
                 return true;
             case 1:
                 if(p.pass && !p.pass->release())return false;
-                p.pass.reset();p.previousFrame.reset();p.previousKey.reset();
+                p.pass.reset();p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
                 return true;
             case 2:
                 if(p.guides && !p.guides->close())return false;
@@ -994,6 +1067,13 @@ std::string take_job_trace() {
         out+=buf;
     }
     out+=")";
+    if(const auto jobs=prepJobs.exchange(0)) {
+        const auto ms=[&](std::atomic<int64_t>& v){return qpc_ms(v.exchange(0))/jobs;};
+        const double pre=ms(prepPre),guide=ms(prepGuide),worker=ms(prepWorker),alloc=ms(prepAlloc),color=ms(prepColor),mid=ms(prepMid),core=ms(prepCore),total=ms(prepTotal);
+        std::snprintf(buf,sizeof buf," | prep n%u pre%.2f guide%.2f worker%.2f alloc%.2f colorPso%.2f mid%.2f corePso%.2f encode%.2f total%.2f",
+            jobs,pre,guide,worker,alloc,color,mid,core,total-pre-guide-worker-alloc-color-mid-core,total);
+        out+=buf;
+    }
     return out;
 }
 JobTimingWindow take_job_timing() {
