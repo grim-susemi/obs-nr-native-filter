@@ -1955,13 +1955,13 @@ int wmain(int argc, wchar_t **argv)
         (std::wstring_view(argv[9])==L"two" || std::wstring_view(argv[9])==L"create2" ||
          std::wstring_view(argv[9])==L"eval2" || std::wstring_view(argv[9])==L"scale50" ||
          std::wstring_view(argv[9])==L"odd50" || std::wstring_view(argv[9])==L"quality1" ||
-         std::wstring_view(argv[9])==L"quality2" || std::wstring_view(argv[9])==L"quality3" ||
+         std::wstring_view(argv[9])==L"quality2" ||
          std::wstring_view(argv[9])==L"align100" || std::wstring_view(argv[9])==L"align50" ||
          std::wstring_view(argv[9])==L"hdr50" || std::wstring_view(argv[9])==L"pair" ||
          std::wstring_view(argv[9])==L"churn") &&
         (!modelCaseDigest || std::wstring_view(argv[9])==L"scale50" || std::wstring_view(argv[9])==L"odd50" ||
          std::wstring_view(argv[9])==L"quality1" || std::wstring_view(argv[9])==L"quality2" ||
-         std::wstring_view(argv[9])==L"quality3" || std::wstring_view(argv[9])==L"align100" ||
+         std::wstring_view(argv[9])==L"align100" ||
          std::wstring_view(argv[9])==L"align50" || std::wstring_view(argv[9])==L"hdr50" ||
          std::wstring_view(argv[9])==L"pair" || std::wstring_view(argv[9])==L"churn");
     if(modelCost && std::wstring_view(argv[9])==L"0x0") {
@@ -2073,8 +2073,7 @@ int wmain(int argc, wchar_t **argv)
                     std::wstring_view(argv[9])==L"odd50"?NrModelPassCase::Odd50:
                     std::wstring_view(argv[9])==L"quality1"?NrModelPassCase::Quality1:
                     std::wstring_view(argv[9])==L"quality2"?NrModelPassCase::Quality2:
-                    std::wstring_view(argv[9])==L"quality3"?NrModelPassCase::Quality3:
-                    std::wstring_view(argv[9])==L"align100"?NrModelPassCase::Align100:
+                                        std::wstring_view(argv[9])==L"align100"?NrModelPassCase::Align100:
                     std::wstring_view(argv[9])==L"align50"?NrModelPassCase::Align50:
                     std::wstring_view(argv[9])==L"hdr50"?NrModelPassCase::Hdr50:
                     std::wstring_view(argv[9])==L"pair"?NrModelPassCase::Pair:NrModelPassCase::Churn):

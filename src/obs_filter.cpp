@@ -3,6 +3,7 @@
 #include "obs_native_output.h"
 #include "interop.h"
 #include "nr_properties.h"
+#include "nr_fps_hud.h"
 #include "capture_exclusion.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
@@ -28,6 +29,13 @@ struct Filter {
     gs_texrender_t *capture = nullptr;
     gs_texrender_t *linearize = nullptr; // sRGB staging for drawing into GS_CS_SRGB_16F targets
     gs_texture_t *output = nullptr;
+    gs_texture_t *hudTex = nullptr;
+    uint32_t hudW = 0, hudH = 0;
+    std::string hudText;
+    std::atomic<uint32_t> fpsOverlay{0};
+    int64_t hudWindowQpc = 0;
+    uint64_t hudInFrames = 0, hudOutFrames = 0;
+    double hudInFps = 0.0, hudOutFps = 0.0;
     std::unique_ptr<nr::obs_adapter::NativeOutput> native;
     nr::model::Config config;
     std::string initializationReason;
@@ -325,6 +333,7 @@ void snapshot(void *opaque, calldata_t *data)
 void update(void* opaque,obs_data_t* values)
 {
     auto& f=*static_cast<Filter*>(opaque);
+    f.fpsOverlay.store(static_cast<uint32_t>(std::clamp<long long>(obs_data_get_int(values,"nr_fps_overlay"),0,2)),std::memory_order_release);
     auto decoded=nr::properties::decode(values,f.admittedRuntimeText,f.config.runtime.canonicalPath.generic_string());
     const auto before=f.configuration.load(std::memory_order_acquire);
     const auto old=before?before->settings:nullptr;
@@ -391,9 +400,41 @@ void *create(obs_data_t *settings, obs_source_t *source)
             f->config.data=std::filesystem::canonical(dataRoot);
             f->config.codec=bytes(shaderRoot/"nr_codec.dxil");f->config.color=bytes(shaderRoot/"nr_color.dxil");
             f->config.guides=bytes(shaderRoot/"nr_guides.cso");
+            const auto stabPath=shaderRoot/"nr_stabilize.dxil";
+            if(!f->deterministicQa && !obs_data_get_bool(settings,"nr_qa_prepare") && std::filesystem::is_regular_file(stabPath))
+                f->config.stabilize=bytes(stabPath);
+            const auto casPath=shaderRoot/"nr_cas.dxil";
+            if(!f->deterministicQa && !obs_data_get_bool(settings,"nr_qa_prepare") && std::filesystem::is_regular_file(casPath))
+                f->config.cas=bytes(casPath);
+            if(!f->deterministicQa && !obs_data_get_bool(settings,"nr_qa_prepare")) {
+                const char* srRaw=obs_data_get_string(settings,"nr_sr_runtime_path");
+                const std::string srStr=(srRaw && *srRaw)?std::string(srRaw):std::string(nr::properties::default_sr_runtime);
+                auto srP=nr::properties::utf8_path(srStr);
+                if(!srP.is_absolute() || !std::filesystem::is_regular_file(srP)) {
+                    wchar_t exeBuf[4096]{};
+                    const DWORD n=GetModuleFileNameW(nullptr,exeBuf,ARRAYSIZE(exeBuf));
+                    if(n && n<ARRAYSIZE(exeBuf)) {
+                        const auto relSr=std::filesystem::path(exeBuf).parent_path()/L"dlss"/L"nvngx_dlss.dll";
+                        if(std::filesystem::is_regular_file(relSr)) srP=relSr;
+                    }
+                }
+                if(srP.is_absolute() && std::filesystem::is_regular_file(srP)) {
+                    const auto canonSrDir=std::filesystem::canonical(srP).parent_path();
+                    if(canonSrDir!=f->config.runtime.canonicalPath.parent_path()) f->config.srDir=canonSrDir;
+                }
+            }
             f->config.frameIntervalNs=obs_get_frame_interval_ns();
             f->config.qaObservations=obs_data_get_bool(settings,"nr_qa_observe");
             f->config.qaPreparation=obs_data_get_bool(settings,"nr_qa_prepare");
+            if(!f->deterministicQa) {
+                if(HMODULE gdi=GetModuleHandleW(L"gdi32.dll")) {
+                    using SetPrioFn=LONG(NTAPI*)(HANDLE,int);
+                    if(auto setFn=reinterpret_cast<SetPrioFn>(GetProcAddress(gdi,"D3DKMTSetProcessSchedulingPriorityClass"))) {
+                        const LONG st=setFn(GetCurrentProcess(),4 /* D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH */);
+                        blog(LOG_INFO,"[obs-nr-filter] D3DKMT GPU priority HIGH(4) ntstatus=0x%08lX",static_cast<unsigned long>(st));
+                    }
+                }
+            }
             f->native=std::make_unique<nr::obs_adapter::NativeOutput>(f->instance,f->config,
                 bytes(shaderRoot/"nr_interop_vertex.cso"),bytes(shaderRoot/"nr_interop_pixel.cso"),
                 bytes(shaderRoot/"nr_obs_analysis.cso"),f->deterministicQa);
@@ -424,6 +465,7 @@ void destroy(void *opaque)
                 reinterpret_cast<LPCWSTR>(&retire),&module);
         }
     }
+    gs_texture_destroy(f->hudTex);f->hudTex=nullptr;f->hudText.clear();
     gs_texture_destroy(f->output);f->output=nullptr;
     gs_texrender_destroy(f->capture);f->capture=nullptr;
     gs_texrender_destroy(f->linearize);f->linearize=nullptr;
@@ -454,6 +496,57 @@ obs_properties_t *properties(void *opaque)
     labels.intensity=obs_module_text("NR.Intensity");labels.localStructure=obs_module_text("NR.LocalStructure");
     labels.localTone=obs_module_text("NR.LocalTone");labels.skinStructure=obs_module_text("NR.SkinStructure");
     labels.autoMask=obs_module_text("NR.AutoMask");
+    labels.pass2Custom=obs_module_text("NR.Pass2Custom");
+    labels.pass2Preset=obs_module_text("NR.Pass2Preset");
+    labels.pass2Style=obs_module_text("NR.Pass2Style");
+    labels.pass2Intensity=obs_module_text("NR.Pass2Intensity");
+    labels.pass2LocalStructure=obs_module_text("NR.Pass2LocalStructure");
+    labels.pass2LocalTone=obs_module_text("NR.Pass2LocalTone");
+    labels.pass2SkinStructure=obs_module_text("NR.Pass2SkinStructure");
+    labels.pass2AutoMask=obs_module_text("NR.Pass2AutoMask");
+    labels.groupBasic=obs_module_text("NR.Group.Basic");
+    labels.groupPass1=obs_module_text("NR.Group.Pass1");
+    labels.groupPass2=obs_module_text("NR.Group.Pass2");
+    labels.groupStabilize=obs_module_text("NR.Group.Stabilize");
+    labels.groupUpscale=obs_module_text("NR.Group.Upscale");
+    labels.srMode=obs_module_text("NR.SrMode");
+    labels.srModeOff=obs_module_text("NR.SrMode.Off");
+    labels.srMode1440=obs_module_text("NR.SrMode.1440p");
+    labels.srMode4k=obs_module_text("NR.SrMode.4K");
+    labels.srModeDlaa=obs_module_text("NR.SrMode.DLAA");
+    labels.srModel=obs_module_text("NR.SrModel");
+    labels.srModelK=obs_module_text("NR.SrModel.K");
+    labels.srModelM=obs_module_text("NR.SrModel.M");
+    labels.srModelL=obs_module_text("NR.SrModel.L");
+    labels.casSharpness=obs_module_text("NR.CasSharpness");
+    labels.srRuntime=obs_module_text("NR.SrRuntime");
+    labels.hintSr=obs_module_text("NR.Hint.Sr");
+    labels.hintCas=obs_module_text("NR.Hint.Cas");
+    labels.groupStatus=obs_module_text("NR.Group.Status");
+    labels.quickPreset=obs_module_text("NR.QuickPreset");
+    labels.quickPresetCustom=obs_module_text("NR.QuickPreset.Custom");
+    labels.quickPresetVeyra=obs_module_text("NR.QuickPreset.Veyra");
+    labels.quickPresetCombo=obs_module_text("NR.QuickPreset.Combo");
+    labels.quickPresetNatural=obs_module_text("NR.QuickPreset.Natural");
+    labels.quickPresetFast=obs_module_text("NR.QuickPreset.Fast");
+    labels.temporalStability=obs_module_text("NR.TemporalStability");
+    labels.holdEnabled=obs_module_text("NR.HoldEnabled");
+    labels.holdStrength=obs_module_text("NR.HoldStrength");
+    labels.holdTolerance=obs_module_text("NR.HoldTolerance");
+    labels.motionMode=obs_module_text("NR.MotionMode");
+    labels.motionRefined=obs_module_text("NR.MotionMode.Refined");
+    labels.motionBilinear=obs_module_text("NR.MotionMode.Bilinear");
+    labels.motionZero=obs_module_text("NR.MotionMode.Zero");
+    labels.hintMotion=obs_module_text("NR.Hint.Motion");
+    labels.fpsOverlay=obs_module_text("NR.FpsOverlay");
+    labels.fpsOverlayOff=obs_module_text("NR.FpsOverlay.Off");
+    labels.fpsOverlayTopLeft=obs_module_text("NR.FpsOverlay.TopLeft");
+    labels.fpsOverlayTopRight=obs_module_text("NR.FpsOverlay.TopRight");
+    labels.hintQuickPreset=obs_module_text("NR.Hint.QuickPreset");
+    labels.hintWorkScale=obs_module_text("NR.Hint.WorkScale");
+    labels.hintPass2=obs_module_text("NR.Hint.Pass2");
+    labels.hintTemporal=obs_module_text("NR.Hint.Temporal");
+    labels.hintHold=obs_module_text("NR.Hint.Hold");
     // Display only: public state/reason codes stay stable (host tests and QA read them); translate here.
     const auto localized=[](const char* prefix,std::string code)->std::string {
         struct Sentence{const char* text;const char* id;};
@@ -503,7 +596,14 @@ obs_properties_t *properties(void *opaque)
         (value->state=="bypassed" && (value->reason=="deadlineMiss" || value->reason=="slotsFull")))) {
         reasonText=localized("NR.Reason.","passFailed");labels.reasonText=reasonText.c_str();
     }
-    return nr::properties::controls(*value,labels);
+    auto* props=nr::properties::controls(*value,labels);
+    if(opaque) {
+        if(auto* cur=obs_source_get_settings(static_cast<Filter*>(opaque)->source)) {
+            nr::properties::sync_visibility(props,cur);
+            obs_data_release(cur);
+        }
+    }
+    return props;
 }
 void publish_status(Filter& f)
 {
@@ -582,6 +682,43 @@ void publish_status(Filter& f)
     }
     f.publicStatus.store(std::make_shared<const nr::properties::StatusSnapshot>(std::move(value)),std::memory_order_release);
 }
+void draw_hud_overlay(Filter& f,gs_effect_t* effect,gs_eparam_t* image,uint32_t outW,uint32_t outH)
+{
+    const uint32_t pos=f.fpsOverlay.load(std::memory_order_acquire);
+    if(!pos || outW<240 || outH<120) return;
+    char left[32]{}, right[32]{};
+    std::snprintf(left,sizeof(left),"IN %5.1f",f.hudInFps);
+    std::snprintf(right,sizeof(right),"NR %5.1f FPS",f.hudOutFps);
+    const std::string key=std::string(left)+"|"+right+"|"+std::to_string(outH>=1440?3:2);
+    if(!f.hudTex || f.hudText!=key) {
+        const uint32_t scale=outH>=1440?3u:2u;
+        const bool ok=f.hudOutFps >= f.hudInFps*0.95;
+        const auto color=ok?nr::hud::rgba(0x3D,0xDC,0x84,0xFF):nr::hud::rgba(0xFF,0x8A,0x3D,0xFF);
+        const auto img=nr::hud::render_fps_pill(left," -> ",right,scale,215,color);
+        if(f.hudTex && (f.hudW!=img.width || f.hudH!=img.height)) {
+            gs_texture_destroy(f.hudTex);f.hudTex=nullptr;
+        }
+        const uint8_t* dataPtr=reinterpret_cast<const uint8_t*>(img.pixels.data());
+        if(!f.hudTex) {
+            f.hudTex=gs_texture_create(img.width,img.height,GS_RGBA,1,&dataPtr,GS_DYNAMIC);
+            f.hudW=img.width;f.hudH=img.height;
+        } else {
+            gs_texture_set_image(f.hudTex,dataPtr,img.width*4,false);
+        }
+        f.hudText=key;
+    }
+    if(!f.hudTex || f.hudW+32>outW || f.hudH+32>outH) return;
+    const float x=pos==2?static_cast<float>(outW-f.hudW-16):16.f;
+    gs_blend_state_push();
+    gs_enable_blending(true);
+    gs_blend_function(GS_BLEND_SRCALPHA,GS_BLEND_INVSRCALPHA);
+    gs_matrix_push();
+    gs_matrix_translate3f(x,16.f,0.f);
+    gs_effect_set_texture(image,f.hudTex);
+    while(gs_effect_loop(effect,"Draw")) gs_draw_sprite(f.hudTex,0,f.hudW,f.hudH);
+    gs_matrix_pop();
+    gs_blend_state_pop();
+}
 void bypass(Filter &f)
 {
     // OBS skip dereferences the parent; unattached filters draw nothing.
@@ -634,7 +771,7 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
     const nr::lifecycle::Observation observation{tick,f.sourceToken,f.deviceToken,validity,descriptor,
         {configured->revision,nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)),
          !control->reason.empty()?std::string{}:configured->runtimePath,configured->strength,configured->tuning,
-         configured->passes,configured->workScale}};
+         configured->passes,configured->workScale,configured->pass2Tuning,configured->stabilize,configured->upscale}};
     const bool cut=f.cut.exchange(false);
     const bool signalled=f.callback->cut.exchange(false,std::memory_order_acq_rel);
     const auto prepared=f.native->prepare(observation,device,cut || signalled);
@@ -755,10 +892,12 @@ void render(void *opaque, gs_effect_t *)
         if(f.native && f.admission==Admission::Ready && !f.placeholder && !f.nativeFailed) {
             try {
                 const bool hdr=space==GS_CS_709_SCRGB;
-                if(f.output && (gs_texture_get_width(f.output)!=f.width || gs_texture_get_height(f.output)!=f.height)) {
+                const auto outExt=f.deterministicQa?nr::Extent{f.width,f.height}:
+                    nr::upscale_extent({f.width,f.height},configured->upscale.mode);
+                if(f.output && (gs_texture_get_width(f.output)!=outExt.width || gs_texture_get_height(f.output)!=outExt.height)) {
                     gs_texture_destroy(f.output);f.output=nullptr;
                 }
-                if(!f.output) f.output=gs_texture_create(f.width,f.height,hdr?GS_RGBA16F:GS_RGBA_UNORM,1,nullptr,0);
+                if(!f.output) f.output=gs_texture_create(outExt.width,outExt.height,hdr?GS_RGBA16F:GS_RGBA_UNORM,1,nullptr,0);
                 if(!f.output) throw std::runtime_error("native filter output texture unavailable");
                 const auto epochs=f.native->epochs();
                 const nr::IngressSample input{{f.instance,epochs.contentEpoch,f.ingress},tick,tick-1,
@@ -774,6 +913,17 @@ void render(void *opaque, gs_effect_t *)
             } catch(const std::exception& e) { f.nativeFailed=true;blog(LOG_WARNING,"[obs-nr-filter] native tick failed: %s",e.what());note_gpu_reset(f,e); }
         }
         f.ticks.latch(tick, selected);
+        ++f.hudInFrames;
+        if(selected.kind==nr::OutputKind::DelayedNr) ++f.hudOutFrames;
+        const auto nowQpc=nr::model::qpc_now();
+        if(!f.hudWindowQpc) f.hudWindowQpc=nowQpc;
+        const double elapsedMs=nr::model::qpc_ms(nowQpc-f.hudWindowQpc);
+        if(elapsedMs>=250.0) {
+            const double sec=elapsedMs/1000.0;
+            f.hudInFps=static_cast<double>(f.hudInFrames)/sec;
+            f.hudOutFps=static_cast<double>(f.hudOutFrames)/sec;
+            f.hudInFrames=0;f.hudOutFrames=0;f.hudWindowQpc=nowQpc;
+        }
     }
     if (!tick) f.admission = Admission::ClockUnavailable;
     const auto* latched=selection(f,tick);
@@ -786,7 +936,11 @@ void render(void *opaque, gs_effect_t *)
         bypass(f);
         return;
     }
-    auto *texture = f.native && !f.nativeFailed?f.output:gs_texrender_get_texture(f.capture);
+    const auto outExt=f.deterministicQa?nr::Extent{f.width,f.height}:
+        nr::upscale_extent({f.width,f.height},configured->upscale.mode);
+    const bool outScaled=outExt.width!=f.width || outExt.height!=f.height;
+    const bool useOutput=!outScaled || latched->kind==nr::OutputKind::DelayedNr || (f.native && f.native->holding_output());
+    auto *texture = (f.native && !f.nativeFailed && useOutput)?f.output:gs_texrender_get_texture(f.capture);
     auto *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(false);
@@ -799,10 +953,10 @@ void render(void *opaque, gs_effect_t *)
         gs_texrender_reset(f.linearize);
         gs_blend_state_push();
         gs_enable_blending(false);
-        if (gs_texrender_begin_with_color_space(f.linearize, f.width, f.height, GS_CS_SRGB)) {
-            gs_ortho(0, static_cast<float>(f.width), 0, static_cast<float>(f.height), -100, 100);
+        if (gs_texrender_begin_with_color_space(f.linearize, outExt.width, outExt.height, GS_CS_SRGB)) {
+            gs_ortho(0, static_cast<float>(outExt.width), 0, static_cast<float>(outExt.height), -100, 100);
             gs_effect_set_texture(image, texture);
-            while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, f.width, f.height);
+            while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, outExt.width, outExt.height);
             gs_texrender_end(f.linearize);
             texture = gs_texrender_get_texture(f.linearize);
         } else texture = nullptr;
@@ -810,15 +964,46 @@ void render(void *opaque, gs_effect_t *)
         if (texture) {
             gs_enable_framebuffer_srgb(true);
             gs_effect_set_texture_srgb(image, texture);
-            while (gs_effect_loop(effect, "Draw")) gs_draw_sprite(texture, 0, f.width, f.height);
+            while (gs_effect_loop(effect, "Draw")) gs_draw_sprite(texture, 0, outExt.width, outExt.height);
+            gs_enable_framebuffer_srgb(false);
+            draw_hud_overlay(f,effect,image,outExt.width,outExt.height);
         } else bypass(f);
         gs_enable_framebuffer_srgb(srgb);
         return;
     }
     gs_effect_set_texture(image, texture);
     // The private capture is premultiplied; OBS's normal scene blend expects straight RGB.
-    while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, f.width, f.height);
+    while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, outExt.width, outExt.height);
+    draw_hud_overlay(f,effect,image,outExt.width,outExt.height);
     gs_enable_framebuffer_srgb(srgb);
+}
+uint32_t filter_width(void* opaque)
+{
+    auto& f=*static_cast<Filter*>(opaque);
+    auto* target=obs_filter_get_target(f.source);
+    if(!target)return 0;
+    const uint32_t w=obs_source_get_width(target), h=obs_source_get_height(target);
+    if(!w || !h)return w;
+    const auto control=f.configuration.load(std::memory_order_acquire);
+    const auto configured=control?control->settings:nullptr;
+    if(!configured || f.nativeFailed || (control && !control->reason.empty()) ||
+        !nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)) || f.deterministicQa)
+        return w;
+    return nr::upscale_extent({w,h},configured->upscale.mode).width;
+}
+uint32_t filter_height(void* opaque)
+{
+    auto& f=*static_cast<Filter*>(opaque);
+    auto* target=obs_filter_get_target(f.source);
+    if(!target)return 0;
+    const uint32_t w=obs_source_get_width(target), h=obs_source_get_height(target);
+    if(!w || !h)return h;
+    const auto control=f.configuration.load(std::memory_order_acquire);
+    const auto configured=control?control->settings:nullptr;
+    if(!configured || f.nativeFailed || (control && !control->reason.empty()) ||
+        !nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)) || f.deterministicQa)
+        return h;
+    return nr::upscale_extent({w,h},configured->upscale.mode).height;
 }
 gs_color_space color_space(void* opaque,size_t count,const gs_color_space* preferred)
 {
@@ -839,6 +1024,8 @@ extern "C" void nr_register_obs_filter(void)
     info.type = OBS_SOURCE_TYPE_FILTER;
     info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
     info.get_name = name;
+    info.get_width = filter_width;
+    info.get_height = filter_height;
     info.create = create;
     info.destroy = destroy;
     info.update = update;

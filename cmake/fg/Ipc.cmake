@@ -1,0 +1,25 @@
+# Standalone FG transport targets; no OBS or Veyra runtime linkage.
+get_filename_component(NR_FG_IPC_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+foreach(target IN ITEMS fg_ipc fg_ipc_test_transport)
+  add_library(${target} STATIC
+    "${NR_FG_IPC_ROOT}/src/fg/fg_ipc.cpp"
+    "${NR_FG_IPC_ROOT}/src/fg/fg_ipc_sequence.cpp")
+  target_include_directories(${target} PUBLIC "${NR_FG_IPC_ROOT}/src")
+  target_compile_features(${target} PUBLIC cxx_std_20)
+  target_compile_definitions(${target} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(${target} PRIVATE /W4 /WX /permissive-)
+  target_link_libraries(${target} PUBLIC d3d11 d3d12 dxgi)
+endforeach()
+# The post-submit checkpoint does not exist in the product fg_ipc library.
+target_compile_definitions(fg_ipc_test_transport PUBLIC NR_FG_IPC_TEST_PROBE)
+add_executable(fg_ipc_tests "${NR_FG_IPC_ROOT}/tools/tests/fg_ipc_tests.cpp")
+target_link_libraries(fg_ipc_tests PRIVATE fg_ipc_test_transport)
+target_compile_options(fg_ipc_tests PRIVATE /W4 /WX /permissive-)
+add_executable(fg_ipc_sequence_tests "${NR_FG_IPC_ROOT}/tools/tests/fg_ipc_sequence_tests.cpp")
+target_link_libraries(fg_ipc_sequence_tests PRIVATE fg_ipc)
+target_compile_options(fg_ipc_sequence_tests PRIVATE /W4 /WX /permissive-)
+add_test(NAME fg_ipc_sequence_cpu COMMAND fg_ipc_sequence_tests)
+add_test(NAME fg_ipc_cpu COMMAND fg_ipc_tests --cpu)
+add_test(NAME fg_ipc_gpu COMMAND fg_ipc_tests --gpu)
+set_tests_properties(fg_ipc_cpu fg_ipc_sequence_cpu PROPERTIES TIMEOUT 30)
+set_tests_properties(fg_ipc_gpu PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE LABELS "gpu")

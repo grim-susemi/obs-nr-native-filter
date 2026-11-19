@@ -805,7 +805,7 @@ namespace {
 bool run_pair_scenario(const std::filesystem::path& root,bool& retained,const NrModelScenario& options) {
     auto a=std::make_unique<Harness>(root,model::Fault::None,0);
     auto b=std::make_unique<Harness>(root,model::Fault::None,1);
-    a->requestedPasses=3;b->requestedPasses=1;
+    a->requestedPasses=2;b->requestedPasses=1;
     if(!options.outputDigest.empty())b->imagePrefix=options.outputDigest;
     bool callbackA=false,callbackB=false,closedA=false,closedB=false;
     auto close_one=[&](Harness& h,bool& callback,bool& closed) {
@@ -844,8 +844,8 @@ bool run_pair_scenario(const std::filesystem::path& root,bool& retained,const Nr
             capture_one(*a,0,step);capture_one(*b,1,step);
         }
         const auto statusA=a->processor->pass_status(),statusB=b->processor->pass_status();
-        require(a->creationJobs==3 && b->creationJobs==1 && a->eligibleJobs==2 && b->eligibleJobs==4 &&
-            statusA.requested==3 && statusA.effective==3 && !statusA.failedPass && !statusA.code &&
+        require(a->creationJobs==2 && b->creationJobs==1 && a->eligibleJobs==3 && b->eligibleJobs==4 &&
+            statusA.requested==2 && statusA.effective==2 && !statusA.failedPass && !statusA.code &&
             statusB.requested==1 && statusB.effective==1 && !statusB.failedPass && !statusB.code,
             "pair independent live pass statuses");
         std::cout<<"NR_PAIR_STATUS {\"stage\":\"live\",\"a_requested\":"<<statusA.requested
@@ -905,7 +905,7 @@ bool run_pair_scenario(const std::filesystem::path& root,bool& retained,const Nr
 }
 bool run_churn_scenario(const std::filesystem::path& root,bool& retained,const NrModelScenario& options) {
     auto h=std::make_unique<Harness>(root,model::Fault::None,0);
-    h->width=1280;h->height=720;h->requestedPasses=3;h->churn=true;h->imageStep=26;
+    h->width=1280;h->height=720;h->requestedPasses=2;h->churn=true;h->imageStep=26;
     if(!options.outputDigest.empty())h->imagePrefix=options.outputDigest;
     bool callback=false,closed=false;
     auto capture_one=[&](unsigned step,Action action) {
@@ -935,7 +935,7 @@ bool run_churn_scenario(const std::filesystem::path& root,bool& retained,const N
             if(step>0)h->execute(Action::Cut);
             capture_one(step,Action::Capture);
         }
-        require(h->creationJobs==3 && h->eligibleJobs==2,"churn initial live three-pass generation");
+        require(h->creationJobs==2 && h->eligibleJobs==3,"churn initial live two-pass generation");
         const auto started=GetTickCount64();
         for(unsigned change=0;change<20;++change) {
             h->execute(Action::PrepareChange);
@@ -943,7 +943,7 @@ bool run_churn_scenario(const std::filesystem::path& root,bool& retained,const N
                 WaitForSingleObject(h->consumerComplete->handle(),30000)==WAIT_OBJECT_0 &&
                 interop::completion(h->consumerEnd->completionValue,h->consumerEnd->consumer.fence->GetCompletedValue())==
                     interop::Completion::Complete,"churn exact pre-change consumer completion");
-            h->requestedPasses=change%2?1u:3u;h->workScale=change%2?100u:50u;
+            h->requestedPasses=change%2?1u:2u;h->workScale=change%2?100u:50u;
             capture_one(change+5,Action::ChangeCapture);
             const auto& sample=*h->samples.back();const auto& job=*sample.job;
             const auto completion=job.completion();
@@ -960,7 +960,7 @@ bool run_churn_scenario(const std::filesystem::path& root,bool& retained,const N
         h->execute(Action::Cut);
         capture_one(25,Action::Capture);h->execute(Action::Cut);capture_one(26,Action::Capture);
         const auto status=h->processor->pass_status();
-        require(h->creationJobs==23 && h->eligibleJobs==4 && status.requested==1 && status.effective==1 &&
+        require(h->creationJobs==22 && h->eligibleJobs==5 && status.requested==1 && status.effective==1 &&
             !status.failedPass && !status.code && h->samples.back()->contract.key.resourceGeneration==21,
             "churn final live one-pass status");
         std::cout<<"NR_CHURN_SUMMARY {\"changes\":20,\"elapsed_ms\":"<<elapsed
@@ -1015,7 +1015,6 @@ bool nr_run_model_scenario(const std::filesystem::path& root,bool& retained,cons
     case NrModelPassCase::Odd50:scaled=true;break;
     case NrModelPassCase::Quality1:quality=1;break;
     case NrModelPassCase::Quality2:quality=2;break;
-    case NrModelPassCase::Quality3:quality=3;break;
     case NrModelPassCase::Align100:alignment=true;break;
     case NrModelPassCase::Align50:alignment=true;scaled=true;break;
     case NrModelPassCase::Hdr50:hdr=true;scaled=true;multipass=true;break;

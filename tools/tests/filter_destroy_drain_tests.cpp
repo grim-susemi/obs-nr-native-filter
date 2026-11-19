@@ -147,6 +147,21 @@ void gs_effect_set_texture(gs_eparam_t*,gs_texture_t*) {}
 void gs_effect_set_texture_srgb(gs_eparam_t*,gs_texture_t*) {}
 bool gs_effect_loop(gs_effect_t*,const char*) {return false;}
 void gs_draw_sprite(gs_texture_t*,uint32_t,uint32_t,uint32_t) {}
+void obs_data_release(obs_data_t*) {}
+obs_data_t* obs_source_get_settings(const obs_source_t*) {return nullptr;}
+void obs_data_set_bool(obs_data_t*,const char*,bool) {}
+void obs_data_set_double(obs_data_t*,const char*,double) {}
+void obs_data_set_int(obs_data_t*,const char*,long long) {}
+obs_property_t* obs_properties_add_group(obs_properties_t*,const char*,const char*,enum obs_group_type,obs_properties_t*) {return nullptr;}
+void obs_property_set_modified_callback(obs_property_t*,obs_property_modified_t) {}
+void obs_property_set_visible(obs_property_t*,bool) {}
+void obs_property_set_long_description(obs_property_t*,const char*) {}
+const char* obs_property_name(obs_property_t*) {return nullptr;}
+void gs_matrix_push(void) {}
+void gs_matrix_pop(void) {}
+void gs_matrix_translate3f(float,float,float) {}
+void gs_texture_set_image(gs_texture_t*,const uint8_t*,uint32_t,bool) {}
+void gs_blend_function(enum gs_blend_type,enum gs_blend_type) {}
 }
 
 namespace {

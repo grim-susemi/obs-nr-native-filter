@@ -298,7 +298,7 @@ struct D3D12Guides::Impl {
 };
 void D3D12Guides::Impl::create_pipeline(std::span<const std::byte> shader) {
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
-    ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors=1;
+    ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors=4;
     ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors=3;
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -315,18 +315,21 @@ void D3D12Guides::Impl::create_pipeline(std::span<const std::byte> shader) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pso{}; pso.pRootSignature=root.Get(); pso.CS={shader.data(),shader.size()};
     checked(device->CreateComputePipelineState(&pso,IID_PPV_ARGS(&pipeline)),"guide PSO");
     D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors=5; hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hd.NumDescriptors=8; hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     checked(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)),"guide descriptor heap");
     const auto stride=device->GetDescriptorHandleIncrementSize(hd.Type);
     auto cpu=heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{}; srv.Format=DXGI_FORMAT_R16G16_SINT;
     srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D; srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels=1; device->CreateShaderResourceView(hardware.Get(),&srv,cpu);
+    cpu.ptr+=stride; srv.Format=costFormat; device->CreateShaderResourceView(cost.Get(),&srv,cpu);
+    cpu.ptr+=stride; srv.Format=DXGI_FORMAT_B8G8R8A8_UNORM; device->CreateShaderResourceView(bootstrapCurrent.Get(),&srv,cpu);
+    cpu.ptr+=stride; srv.Format=DXGI_FORMAT_B8G8R8A8_UNORM; device->CreateShaderResourceView(bootstrapPrevious.Get(),&srv,cpu);
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{}; uav.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
     cpu.ptr+=stride; uav.Format=DXGI_FORMAT_R16G16_FLOAT; device->CreateUnorderedAccessView(motion.Get(),nullptr,&uav,cpu);
     cpu.ptr+=stride; uav.Format=DXGI_FORMAT_R32_FLOAT; device->CreateUnorderedAccessView(depth.Get(),nullptr,&uav,cpu);
     cpu.ptr+=stride; uav.Format=DXGI_FORMAT_R16G16_SINT; device->CreateUnorderedAccessView(hints.Get(),nullptr,&uav,cpu);
-    cpu.ptr+=stride; device->CreateShaderResourceView(global.Get(),&srv,cpu);
+    cpu.ptr+=stride; srv.Format=DXGI_FORMAT_R16G16_SINT; device->CreateShaderResourceView(global.Get(),&srv,cpu);
 }
 bool D3D12Guides::Impl::image_valid(const FlowImage& image) const {
     if(!image.analysis || !image.ready.fence || !image.ready.value || image.ready.value==UINT64_MAX) return false;
@@ -433,9 +436,9 @@ FlowProblem D3D12Guides::Impl::submit(const FlowInput& in) {
             const std::array<uint32_t,8> predictorParams{hintWidth,hintHeight,hintGrid,2,0,0,0,0};
             predictorList->SetComputeRoot32BitConstants(0,8,predictorParams.data(),0);
             const auto stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            auto predictorGpu=heap->GetGPUDescriptorHandleForHeapStart(); predictorGpu.ptr+=4ull*stride;
+            auto predictorGpu=heap->GetGPUDescriptorHandleForHeapStart(); predictorGpu.ptr+=7ull*stride;
             predictorList->SetComputeRootDescriptorTable(1,predictorGpu);
-            predictorGpu=heap->GetGPUDescriptorHandleForHeapStart(); predictorGpu.ptr+=stride;
+            predictorGpu=heap->GetGPUDescriptorHandleForHeapStart(); predictorGpu.ptr+=4ull*stride;
             predictorList->SetComputeRootDescriptorTable(2,predictorGpu);
             predictorList->Dispatch((hintWidth+7)/8,(hintHeight+7)/8,1);
             barrier(predictorList.Get(),global.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
@@ -460,18 +463,26 @@ FlowProblem D3D12Guides::Impl::submit(const FlowInput& in) {
         }
         checked(allocator->Reset(),"guide allocator reset"); checked(list->Reset(allocator.Get(),pipeline.Get()),"guide list reset");
         barrier(list.Get(),hardware.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(list.Get(),cost.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(list.Get(),bootstrapCurrent.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(list.Get(),bootstrapPrevious.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(list.Get(),motion.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(list.Get(),depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap* heaps[]{heap.Get()}; list->SetDescriptorHeaps(1,heaps);
         list->SetComputeRootSignature(root.Get());
-        const std::array<uint32_t,8> params{size.width,size.height,grid,in.reset?1u:0u,
+        const uint32_t shaderMode=in.reset?1u:(in.motionMode==1u?3u:(in.motionMode==2u?4u:0u));
+        const std::array<uint32_t,8> params{size.width,size.height,grid,shaderMode,
             in.active.x,in.active.y,in.active.width,in.active.height};
         list->SetComputeRoot32BitConstants(0,8,params.data(),0);
+        const auto stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto gpu=heap->GetGPUDescriptorHandleForHeapStart(); list->SetComputeRootDescriptorTable(1,gpu);
-        gpu.ptr+=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        gpu.ptr+=4ull*stride;
         list->SetComputeRootDescriptorTable(2,gpu);
         list->Dispatch((size.width+7)/8,(size.height+7)/8,1);
         barrier(list.Get(),hardware.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        barrier(list.Get(),cost.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        barrier(list.Get(),bootstrapCurrent.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        barrier(list.Get(),bootstrapPrevious.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         barrier(list.Get(),motion.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         barrier(list.Get(),depth.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         checked(list->Close(),"guide submit list close");

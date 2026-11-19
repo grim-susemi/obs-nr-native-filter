@@ -26,7 +26,7 @@ CoreResult Core::record(const CoreInput& in) {
         !job.deadlineTick || job.deadlineTick<=job.input.canonicalTick ||
         !in.commands || !r.codecHeap || !compact(r.raw,native) || !compact(r.proxy,native) || !compact(r.keep,native) ||
         !compact(r.model,work) || !compact(r.output,native) || !r.depth.valid() || !r.motion.valid() ||
-        !in.passes || in.passes>3 || in.passes>job.input.settings.passes ||
+        !in.passes || in.passes>2 || in.passes>job.input.settings.passes ||
         (reduced && !compact(in.workProxy,work)) ||
         (in.passes>1 && (!compact(in.modelB,work) || !compact(in.modelC,work))) ||
         !in.history.epoch || in.history.epoch!=job.key.historyEpoch || (!in.history.valid && !in.history.reset) ||
@@ -50,7 +50,9 @@ CoreResult Core::record(const CoreInput& in) {
     if(!codec_->encode(in,c)) return {CoreState::EncodeError,false,false,0};
     const auto& source=reduced?in.workProxy:r.proxy;
     if(reduced && !codec_->downsample(in,r.proxy,source)) return {CoreState::EncodeError,false,false,0};
-    const ModelTuning later{t.preset,t.style,t.intensity,t.localStructure,0,t.skinStructure,t.autoMask};
+    const auto& p2=job.input.settings.pass2Tuning?*job.input.settings.pass2Tuning:t;
+    const ModelTuning later{p2.preset,p2.style,p2.intensity,p2.localStructure,
+        job.input.settings.pass2Tuning?p2.localTone:0.0f,p2.skinStructure,p2.autoMask};
     uint32_t completed=0,code=0,passError=0,failedPass=0;
     for(uint32_t pass=0;pass<in.passes;++pass) {
         const auto& answer=pass%2?in.modelB:r.model;

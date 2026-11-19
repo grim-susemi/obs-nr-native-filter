@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.1.1'
+    [string]$Version = '0.2.0'
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -22,10 +22,11 @@ if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 # Release payload, laid out exactly as inside the OBS install folder.
 $payload = [ordered]@{
     'obs-plugins\64bit\obs-nr-filter.dll'             = Join-Path $BuildDir 'Release\obs-nr-filter.dll'
+    'bin\64bit\obs-nr-fg-presenter.exe'                = Join-Path $BuildDir 'Release\obs-nr-fg-presenter.exe'
     'data\obs-plugins\obs-nr-filter\locale\en-US.ini' = Join-Path $repo 'data\locale\en-US.ini'
     'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini' = Join-Path $repo 'data\locale\ko-KR.ini'
 }
-foreach ($shader in 'nr_codec.dxil', 'nr_color.dxil', 'nr_guides.cso', 'nr_interop_vertex.cso', 'nr_interop_pixel.cso', 'nr_obs_analysis.cso') {
+foreach ($shader in 'nr_codec.dxil', 'nr_color.dxil', 'nr_stabilize.dxil', 'nr_cas.dxil', 'nr_guides.cso', 'nr_interop_vertex.cso', 'nr_interop_pixel.cso', 'nr_obs_analysis.cso') {
     $payload["bin\64bit\$shader"] = Join-Path $BuildDir $shader
 }
 $lines = @()

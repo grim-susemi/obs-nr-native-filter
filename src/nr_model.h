@@ -14,8 +14,8 @@
 namespace nr::model {
 struct Config {
     runtime::RuntimeIdentity runtime;
-    std::filesystem::path driver, data;
-    std::vector<std::byte> codec, color, guides;
+    std::filesystem::path driver, data, srDir;
+    std::vector<std::byte> codec, color, guides, stabilize, cas;
     bool qaObservations=false; // Explicit bounded technical host only; no inference input.
     bool qaPreparation=false; // Read-only allocation metadata, no image lease.
     uint64_t frameIntervalNs=0; // OBS frame interval for the automatic estimator cost policy; 0 = unknown.

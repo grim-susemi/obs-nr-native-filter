@@ -2,7 +2,7 @@
 void passes_status_controls()
 {
     for(const auto& status:std::array<nr::model::PassStatus,6>{{
-            {1,1,0,0},{1,0,0,0},{2,2,0,0},{3,3,0,0},{3,1,2,0xbad00001u},{2,0,0,0}}}) {
+            {1,1,0,0},{1,0,0,0},{2,2,0,0},{2,1,2,0xbad00001u},{2,0,0,0},{1,0,2,0xbad00001u}}}) {
         // Given an independent requested/effective/failed worker status.
         Labels labels;labels.passStatus=status;labels.passesText="machine-observed-counts";
         // When actual OBS properties are built.

@@ -60,6 +60,7 @@ struct NativeOutput::Impl {
     struct Generation final:pipeline::Processor {
     const uint64_t id;
     const FrameDescriptor descriptor;
+    const Extent outputExtent;
     ComPtr<ID3D11Device> renderer;
     ComPtr<ID3D11DeviceContext4> graphics;
     ComPtr<ID3D11VertexShader> vertex;
@@ -77,15 +78,17 @@ struct NativeOutput::Impl {
     uint64_t graphicsSerial=0;
     std::atomic<bool> closeRequested{false},closed{false};
     lifecycle::SnapshotRetirement cutoffRaw;
-    Generation(uint64_t generation,ID3D11Device* device,const FrameDescriptor& frame,
+    Generation(uint64_t generation,ID3D11Device* device,const FrameDescriptor& frame,Extent outExt,
         const model::Config& config,uint64_t instance,bool deterministicQa,
         const std::vector<std::byte>& vertexBytes,const std::vector<std::byte>& pixelBytes,
-        const std::vector<std::byte>& analysisBytes):id(generation),descriptor(frame),renderer(device),cutoffRaw(generation)
+        const std::vector<std::byte>& analysisBytes)
+        :id(generation),descriptor(frame),outputExtent(outExt.width&&outExt.height?outExt:frame.allocation),
+         renderer(device),cutoffRaw(generation)
     {
         ComPtr<ID3D11DeviceContext> immediate;renderer->GetImmediateContext(&immediate);
         checked(immediate.As(&graphics),"native graphics owner context");
         context=interop::Context::create(renderer.Get());
-        bridge=std::make_shared<interop::Bridge>(context,id,descriptor,vertexBytes,pixelBytes);
+        bridge=std::make_shared<interop::Bridge>(context,id,descriptor,vertexBytes,pixelBytes,outputExtent);
         if(deterministicQa) { copy=std::make_shared<CopyProcessor>();processor=copy; }
         else { model=std::make_shared<model::Processor>(context,config,instance);processor=model; }
         checked(renderer->CreateVertexShader(vertexBytes.data(),vertexBytes.size(),nullptr,&vertex),"native analysis vertex shader");
@@ -377,8 +380,10 @@ lifecycle::Decision NativeOutput::prepare(const lifecycle::Observation& observat
     if(!p.active || p.active->id!=decision.epochs.resourceGeneration) {
         size_t index=0;for(;index<p.generations.size() && p.generations[index];++index) {}
         require(index<p.generations.size(),"native bounded physical generation budget");
+        const Extent outExt=p.deterministicQa?observation.descriptor.allocation:
+            upscale_extent(observation.descriptor.allocation,observation.settings.upscale.mode);
         auto replacement=std::make_shared<Impl::Generation>(decision.epochs.resourceGeneration,renderer,
-            observation.descriptor,p.config,p.instance,p.deterministicQa,p.vertexBytes,p.pixelBytes,p.analysisBytes);
+            observation.descriptor,outExt,p.config,p.instance,p.deterministicQa,p.vertexBytes,p.pixelBytes,p.analysisBytes);
         require(p.pipeline->hold_generation(replacement->id,replacement),"native exact feature/upload generation hold");
         p.generations[index]=replacement;
         p.maintenance->generations[index].store(replacement,std::memory_order_release);
@@ -450,8 +455,11 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
         p.selectedJob=old->job;
     } else if(selected.kind==OutputKind::DelayedRaw) {
         require(p.previousRaw && p.previousKey==selected.frame,"native independent delayed raw owner");
-        if(!holdNr) g.graphics->CopyResource(target,p.previousRaw->original11.Get()); // else target keeps the previous NR frame
-    } else g.graphics->CopyResource(target,immutable->original11.Get());
+        if(!holdNr && g.outputExtent==g.descriptor.allocation)
+            g.graphics->CopyResource(target,p.previousRaw->original11.Get()); // else target keeps the previous NR frame or filter draws scaled capture
+    } else if(g.outputExtent==g.descriptor.allocation) {
+        g.graphics->CopyResource(target,immutable->original11.Get());
+    }
     p.nrHeld=holdNr?p.nrHeld+1:0;p.heldFrames+=holdNr?1:0;
     p.nrTarget=selected.kind==OutputKind::DelayedNr||holdNr?target:nullptr;p.nrTargetTick=input.canonicalTick;
     auto raw=std::make_shared<const pipeline::RawFrame>(pipeline::RawFrame{input,immutable});
@@ -626,6 +634,7 @@ std::shared_ptr<model::Job> NativeOutput::current_job() const
     return impl_->records.empty()?nullptr:impl_->records.back().job;
 }
 std::shared_ptr<model::Job> NativeOutput::selected_job() const { return impl_->selectedJob; }
+bool NativeOutput::holding_output() const { return impl_->nrHeld>0 && impl_->nrTarget!=nullptr; }
 uint64_t NativeOutput::held_frames() const { return impl_->heldFrames; }
 model::PassStatus NativeOutput::pass_status() const {
     const auto& p=*impl_;

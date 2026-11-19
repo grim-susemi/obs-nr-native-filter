@@ -44,6 +44,7 @@ struct FlowInput {
     const Extent working;
     const Rect active; // Coordinates already in working pixels: scale is exactly one.
     const bool reset; // Explicit cold/reset only; never infer reset from failed OFA.
+    const uint32_t motionMode=0; // 0 = refined NvofDensify, 1 = bilinear, 2 = zero motion
 };
 struct FlowResult {
     const JobKey key;

@@ -16,11 +16,11 @@ struct FakePass {
     bool ready(uint64_t epoch) const {return creationComplete && epoch>creationEpoch;}
     bool release() {if(!creationComplete || !evaluationComplete)return false;++releases;return true;}
 };
-using Passes=std::array<std::unique_ptr<FakePass>,3>;
+using Passes=std::array<std::unique_ptr<FakePass>,2>;
 void creation_gate() {
     // Given three independent requested histories and no created object.
-    PassChain chain;chain.reset(3);Passes passes;unsigned releases=0;
-    for(uint32_t i=0;i<3;++i) {
+    PassChain chain;chain.reset(2);Passes passes;unsigned releases=0;
+    for(uint32_t i=0;i<2;++i) {
         const auto before=chain.gate(passes,i+1);
         expect(before.create==i && before.ready==i && !before.primed(),"create only first missing history");
         passes[i]=std::make_unique<FakePass>(i+1,releases);
@@ -32,17 +32,17 @@ void creation_gate() {
         const auto sameEpoch=chain.gate(passes,i+1);
         expect(!sameEpoch.primed() && !sameEpoch.create,"two creations in same job epoch");
     }
-    const auto ready=chain.gate(passes,4);
-    expect(ready.primed() && ready.ready==3 && !ready.create,"all requested histories gate inference");
-    expect(chain.status()==PassStatus{3,0,0,0},"readiness is not physical evaluated output");
-    expect(release_passes(passes) && releases==3,"all independent histories retired");
+    const auto ready=chain.gate(passes,3);
+    expect(ready.primed() && ready.ready==2 && !ready.create,"all requested histories gate inference");
+    expect(chain.status()==PassStatus{2,0,0,0},"readiness is not physical evaluated output");
+    expect(release_passes(passes) && releases==2,"all independent histories retired");
 }
 void failures() {
-    for(uint32_t failed:{2u,3u}) for(bool composed:{false,true}) {
-        // Given a settled three-history chain that previously published three passes.
-        PassChain chain;chain.reset(3);Passes passes;unsigned releases=0;
-        for(uint32_t i=0;i<3;++i) {passes[i]=std::make_unique<FakePass>(1,releases);passes[i]->creationComplete=true;}
-        expect(chain.settle({3,0,0,true,true}),"initial physical result");
+    for(uint32_t failed:{2u}) for(bool composed:{false,true}) {
+        // Given a settled two-history chain that previously published two passes.
+        PassChain chain;chain.reset(2);Passes passes;unsigned releases=0;
+        for(uint32_t i=0;i<2;++i) {passes[i]=std::make_unique<FakePass>(1,releases);passes[i]->creationComplete=true;}
+        expect(chain.settle({2,0,0,true,true}),"initial physical result");
         const auto before=chain.status();passes[failed-1]->evaluationComplete=false;
         const uint32_t code=composed?0xe019u:0xbad00001u;
         // When the failed evaluation or safe clamp has only been recorded, not physically settled.
@@ -54,33 +54,33 @@ void failures() {
         // Given the original completion/discard receipt. When settling that exact result.
         expect(chain.settle({failed-1,failed,code,true,composed}),"exact result settlement");
         // Then the next count is permanently reduced, including safe clamp fallback.
-        expect(chain.status()==PassStatus{3,failed-1,failed,code},"failed pass/status convention");
+        expect(chain.status()==PassStatus{2,failed-1,failed,code},"failed pass/status convention");
         expect(release_passes(passes,chain.limit()),"failed and following histories did not retire");
         for(uint64_t epoch=4;epoch<12;++epoch) {
             const auto gate=chain.gate(passes,epoch);
             expect(gate.primed() && !gate.create && gate.ready==failed-1,"latched history retried");
         }
-        expect(chain.settle({3,0,0,true,true}) && chain.status().effective==failed-1,"effective count increased after failure");
+        expect(chain.settle({2,0,0,true,true}) && chain.status().effective==failed-1,"effective count increased after failure");
         const auto encoded=pack_pass_status(chain.status());
-        expect(unpack_pass_status(encoded)==PassStatus{3,failed-1,failed,code},"atomic snapshot lost full code/count");
+        expect(unpack_pass_status(encoded)==PassStatus{2,failed-1,failed,code},"atomic snapshot lost full code/count");
         expect(release_passes(passes),"remaining histories retire");
-        chain.reset(3);
-        expect(chain.status()==PassStatus{3,0,0,0} && chain.gate(passes,20).create==0u,"regeneration did not clear failure");
+        chain.reset(2);
+        expect(chain.status()==PassStatus{2,0,0,0} && chain.gate(passes,20).create==0u,"regeneration did not clear failure");
     }
 }
 void creation_failure_and_instances() {
     // Given a first ready history and an incomplete failed second creation.
-    PassChain a,b;a.reset(3);b.reset(1);Passes passes;unsigned releases=0;
+    PassChain a,b;a.reset(2);b.reset(1);Passes passes;unsigned releases=0;
     passes[0]=std::make_unique<FakePass>(1,releases);passes[0]->creationComplete=true;
     passes[1]=std::make_unique<FakePass>(2,releases);
     // When the second creation's completion is still unknown.
     expect(!a.settle({0,2,0xbad00002u,false,false}),"creation API failure invented completion");
     // Then no effective inference or reduction is published.
-    expect(!a.gate(passes,3).primed() && a.status()==PassStatus{3,0,0,0},"unsettled creation exposed NR");
+    expect(!a.gate(passes,3).primed() && a.status()==PassStatus{2,0,0,0},"unsettled creation exposed NR");
     passes[1]->creationComplete=true;
     expect(a.settle({0,2,0xbad00002u,true,false}) && release_passes(passes,a.limit()),"failed creation retirement");
     expect(a.gate(passes,4).primed() && !a.gate(passes,4).create,"failed creation retried");
-    expect(a.settle({1,0,0,true,true}) && a.status()==PassStatus{3,1,2,0xbad00002u},"reduced first physical inference");
+    expect(a.settle({1,0,0,true,true}) && a.status()==PassStatus{2,1,2,0xbad00002u},"reduced first physical inference");
     expect(b.status()==PassStatus{1,0,0,0},"instances shared pass status");
     expect(a.settle({0,1,0xbad00003u,true,false}) && a.status().effective==1 && a.status().failedPass==2,
         "first-history retry cleared generation-local later failure");
@@ -103,7 +103,7 @@ void layouts() {
             initial[3]==(reduced || multi?D3D12_RESOURCE_STATE_COMMON:write) &&
             initial[5]==D3D12_RESOURCE_STATE_COMMON && initial[6]==D3D12_RESOURCE_STATE_COMMON &&
             initial[7]==D3D12_RESOURCE_STATE_COMMON,"discarded new work scratch does not remain COMMON");
-        for(uint32_t count:{1u,2u,3u}) {
+        for(uint32_t count:{1u,2u}) {
             const auto states=final_color_states(count);
             expect(states[0]==read && states[1]==read && states[2]==read && states[4]==read && states[5]==read &&
                 states[3]==(count%2?read:write) && states[6]==(count%2?write:read) && states[7]==write,

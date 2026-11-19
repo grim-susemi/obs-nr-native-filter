@@ -144,6 +144,9 @@ class Bridge final {
 public:
  Bridge(std::shared_ptr<Context>,uint64_t generation,const FrameDescriptor&,
         std::span<const std::byte> vertexShader,std::span<const std::byte> pixelShader);
+ Bridge(std::shared_ptr<Context>,uint64_t generation,const FrameDescriptor&,
+        std::span<const std::byte> vertexShader,std::span<const std::byte> pixelShader,
+        Extent outputExtent);
  ~Bridge();
  Bridge(const Bridge&)=delete;
  Bridge& operator=(const Bridge&)=delete;

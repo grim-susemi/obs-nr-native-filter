@@ -1,6 +1,7 @@
 # Owned leaf; shared steward includes this after interface freeze.
 get_filename_component(NR_COLOR_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
-add_library(nr_color STATIC "${NR_COLOR_ROOT}/src/nr_color.cpp")
+add_library(nr_color STATIC "${NR_COLOR_ROOT}/src/nr_color.cpp" "${NR_COLOR_ROOT}/src/nr_stabilize.cpp" "${NR_COLOR_ROOT}/src/nr_upscale.cpp")
+target_include_directories(nr_color PUBLIC "${NR_COLOR_ROOT}/deps/ngx")
 target_include_directories(nr_color PUBLIC "${NR_COLOR_ROOT}/src")
 target_compile_features(nr_color PUBLIC cxx_std_20)
 target_compile_definitions(nr_color PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -27,12 +28,34 @@ find_program(NR_COLOR_FXC NAMES fxc.exe HINTS "C:/Program Files (x86)/Windows Ki
 find_program(NR_COLOR_DXC NAMES dxc.exe HINTS "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64" REQUIRED)
 set(NR_COLOR_DXBC "${CMAKE_CURRENT_BINARY_DIR}/nr_color.cso")
 set(NR_COLOR_DXIL "${CMAKE_CURRENT_BINARY_DIR}/nr_color.dxil")
+set(NR_STABILIZE_DXBC "${CMAKE_CURRENT_BINARY_DIR}/nr_stabilize.cso")
+set(NR_STABILIZE_DXIL "${CMAKE_CURRENT_BINARY_DIR}/nr_stabilize.dxil")
+set(NR_CAS_DXBC "${CMAKE_CURRENT_BINARY_DIR}/nr_cas.cso")
+set(NR_CAS_DXIL "${CMAKE_CURRENT_BINARY_DIR}/nr_cas.dxil")
 add_custom_command(OUTPUT "${NR_COLOR_DXBC}" "${NR_COLOR_DXIL}"
   COMMAND "${NR_COLOR_FXC}" /nologo /WX /Ges /Gis /T cs_5_0 /E main /Fo "${NR_COLOR_DXBC}" "${NR_COLOR_ROOT}/src/shaders/nr_color.hlsl"
   COMMAND "${NR_COLOR_DXC}" -WX -Ges -Gis -T cs_6_0 -E main -Fo "${NR_COLOR_DXIL}" "${NR_COLOR_ROOT}/src/shaders/nr_color.hlsl"
   DEPENDS "${NR_COLOR_ROOT}/src/shaders/nr_color.hlsl" VERBATIM)
-add_custom_target(nr_color_shaders DEPENDS "${NR_COLOR_DXBC}" "${NR_COLOR_DXIL}")
+add_custom_command(OUTPUT "${NR_STABILIZE_DXBC}" "${NR_STABILIZE_DXIL}"
+  COMMAND "${NR_COLOR_FXC}" /nologo /WX /Ges /Gis /T cs_5_0 /E main /Fo "${NR_STABILIZE_DXBC}" "${NR_COLOR_ROOT}/src/shaders/nr_stabilize.hlsl"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -Gis -T cs_6_0 -E main -Fo "${NR_STABILIZE_DXIL}" "${NR_COLOR_ROOT}/src/shaders/nr_stabilize.hlsl"
+  DEPENDS "${NR_COLOR_ROOT}/src/shaders/nr_stabilize.hlsl" VERBATIM)
+add_custom_command(OUTPUT "${NR_CAS_DXBC}" "${NR_CAS_DXIL}"
+  COMMAND "${NR_COLOR_FXC}" /nologo /WX /Ges /Gis /T cs_5_0 /E main /Fo "${NR_CAS_DXBC}" "${NR_COLOR_ROOT}/src/shaders/nr_cas.hlsl"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -Gis -T cs_6_0 -E main -Fo "${NR_CAS_DXIL}" "${NR_COLOR_ROOT}/src/shaders/nr_cas.hlsl"
+  DEPENDS "${NR_COLOR_ROOT}/src/shaders/nr_cas.hlsl" VERBATIM)
+add_custom_target(nr_color_shaders DEPENDS "${NR_COLOR_DXBC}" "${NR_COLOR_DXIL}" "${NR_STABILIZE_DXBC}" "${NR_STABILIZE_DXIL}" "${NR_CAS_DXBC}" "${NR_CAS_DXIL}")
 add_dependencies(color_software_tests nr_color_shaders)
 # DXIL is the actual D3D12 production shader. FXC bytecode is a strict compile
 # audit only: retained WARP receipts show its double lowering is not admitted.
 add_test(NAME color_software COMMAND color_software_tests "${NR_COLOR_DXIL}")
+add_executable(stabilize_tests "${NR_COLOR_ROOT}/tools/tests/stabilize_tests.cpp")
+target_link_libraries(stabilize_tests PRIVATE nr_color dxgi)
+target_compile_options(stabilize_tests PRIVATE /W4 /WX /permissive-)
+add_dependencies(stabilize_tests nr_color_shaders)
+add_test(NAME stabilize_gpu COMMAND stabilize_tests "${NR_STABILIZE_DXIL}")
+add_executable(upscale_cas_tests "${NR_COLOR_ROOT}/tools/tests/upscale_cas_tests.cpp")
+target_link_libraries(upscale_cas_tests PRIVATE nr_color nr_runtime dxgi)
+target_compile_options(upscale_cas_tests PRIVATE /W4 /WX /permissive-)
+add_dependencies(upscale_cas_tests nr_color_shaders)
+add_test(NAME upscale_cas_gpu COMMAND upscale_cas_tests "${NR_CAS_DXIL}")

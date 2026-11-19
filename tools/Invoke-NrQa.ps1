@@ -9,7 +9,7 @@ param(
     [switch]$CoreInitControl,
     [string]$OutputDigest='',
     [string]$Size='',
-    [ValidateSet('','two','create2','eval2','scale50','odd50','quality1','quality2','quality3','align100','align50','hdr50','pair','churn')][string]$PassCase='',
+    [ValidateSet('','two','create2','eval2','scale50','odd50','quality1','quality2','align100','align50','hdr50','pair','churn')][string]$PassCase='',
     [string]$RetainedEvent='',
     [string]$Task14CandidateManifest,
     [string]$Task14CandidateSha256,
@@ -33,7 +33,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if($PassCase -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $Size -or
-    ($OutputDigest -and $PassCase -notin @('scale50','odd50','quality1','quality2','quality3','align100','align50','hdr50','pair','churn')))){
+    ($OutputDigest -and $PassCase -notin @('scale50','odd50','quality1','quality2','align100','align50','hdr50','pair','churn')))){
     throw 'NR_QA_PASS_CASE_SCOPE'
 }
 if($Size -and ($Scenario -ne 'native-model' -or $CoreInitControl -or $OutputDigest)){throw 'NR_QA_SIZE_SCOPE'}

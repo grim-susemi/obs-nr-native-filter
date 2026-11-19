@@ -2,6 +2,8 @@
 // Driver ABI and Feature18 use R2 / tests/nr_compatibility/HardwareSmoke.cpp.
 #include "nr_model.h"
 #include "nr_model_layout.h"
+#include "nr_stabilize.h"
+#include "nr_upscale.h"
 #include <string>
 #include <cstring>
 #include <algorithm>
@@ -169,6 +171,7 @@ struct Driver {
     ComPtr<ID3D12Device> device;
     HMODULE module=nullptr;
     runtime::Dispatch dispatch;
+    decltype(dispatch.allocate) allocateParams=nullptr;
     decltype(dispatch.create) createRaw=nullptr;
     HANDLE pinnedFile=INVALID_HANDLE_VALUE;
     bool initUnreturned=false,initFailed=false;
@@ -260,6 +263,7 @@ struct Driver {
         auto init=symbol<Init>(result->module,"NVSDK_NGX_D3D12_Init_Ext");
         auto& d=result->dispatch;
         d.allocate=symbol<decltype(d.allocate)>(result->module,"NVSDK_NGX_D3D12_GetCapabilityParameters");
+        result->allocateParams=reinterpret_cast<decltype(result->allocateParams)>(GetProcAddress(result->module,"NVSDK_NGX_D3D12_AllocateParameters"));
         d.destroy=symbol<decltype(d.destroy)>(result->module,"NVSDK_NGX_D3D12_DestroyParameters");
         result->createRaw=symbol<decltype(d.create)>(result->module,"NVSDK_NGX_D3D12_CreateFeature");
         d.create=&Driver::create;
@@ -270,8 +274,16 @@ struct Driver {
         // and load its unrelated SR DLL. The selected NR image is opened by the
         // accepted direct fallback only after actual driver create failure.
         const auto directory=canonicalData.wstring();
-        const wchar_t* paths[]{directory.c_str()};
-        NVSDK_NGX_FeatureCommonInfo info{}; info.PathListInfo.Path=paths; info.PathListInfo.Length=1;
+        std::wstring srDirectory;
+        std::vector<const wchar_t*> paths{directory.c_str()};
+        if(!config.srDir.empty() && std::filesystem::is_directory(config.srDir)) {
+            const auto canonSr=std::filesystem::canonical(config.srDir);
+            if(canonSr!=config.runtime.canonicalPath.parent_path()) {
+                srDirectory=canonSr.wstring();
+                paths.push_back(srDirectory.c_str());
+            }
+        }
+        NVSDK_NGX_FeatureCommonInfo info{}; info.PathListInfo.Path=paths.data(); info.PathListInfo.Length=static_cast<unsigned>(paths.size());
         result->initUnreturned=true;
         const auto receipt=ownerTrace.call(lifecycle::VendorStage::CoreInit,
             {reinterpret_cast<uintptr_t>(result->module),reinterpret_cast<uintptr_t>(init),GetCurrentThreadId()},[&] {
@@ -345,7 +357,7 @@ Job::~Job() { if(observed) CloseHandle(observed); if(gpu) CloseHandle(gpu); }
 struct ColorSlab {
     std::array<ComPtr<ID3D12Resource>,8> colors;
     ComPtr<ID3D12Resource> status,statusRead,zero;
-    ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap;
+    ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap,stabilizeHeap,casPrepHeap,casOutHeap;
     ComPtr<ID3D12Fence> complete;
 };
 struct ColorSlabPool {
@@ -374,7 +386,7 @@ struct Job::Resources {
     std::array<ComPtr<ID3D12Resource>,8> colors;
     std::array<ComPtr<ID3D12Resource>,4> guideObservations;
     ComPtr<ID3D12Resource> status, statusRead, zero;
-    ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap;
+    ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap,stabilizeHeap,casPrepHeap,casOutHeap;
     std::unique_ptr<D3D12ColorPass> color;
     std::unique_ptr<Core> core;
     ComPtr<ID3D12Fence> complete;
@@ -386,7 +398,7 @@ struct Job::Resources {
     explicit Resources(std::shared_ptr<interop::Bridge> transport):bridge(std::move(transport)) {}
     ~Resources() {
         if(!pool || !slabExecuted || !colors[0] || !complete) return;
-        try { pool->give({colors,status,statusRead,zero,codecHeap,prepareHeap,restoreHeap,complete}); }
+        try { pool->give({colors,status,statusRead,zero,codecHeap,prepareHeap,restoreHeap,stabilizeHeap,casPrepHeap,casOutHeap,complete}); }
         catch(...) {} // Not pooling only means the next job allocates afresh.
     }
     void unsubscribe() {
@@ -479,9 +491,9 @@ runtime::Recording recording(const std::shared_ptr<Job>& job,ID3D12GraphicsComma
     return {commands,job->epoch,job,[submission]{return submission->state();}};
 }
 struct Evaluator final : ModelEvaluator {
-    const std::array<runtime::Pass*,3> passes;
+    const std::array<runtime::Pass*,2> passes;
     const std::weak_ptr<Job> current;
-    Evaluator(std::array<runtime::Pass*,3> value,const std::shared_ptr<Job>& job):passes(value),current(job) {}
+    Evaluator(std::array<runtime::Pass*,2> value,const std::shared_ptr<Job>& job):passes(value),current(job) {}
     EvaluationResult evaluate(const ModelInput& in) override {
         auto job=current.lock(); require(job!=nullptr,"live model evaluation lease");
         if(job->fault==Fault::Evaluation || (job->fault==Fault::LaterEvaluation && in.pass==1))
@@ -534,7 +546,7 @@ struct Processor::Impl {
     std::shared_ptr<SdkSession> session; // Exactly one explicit owner lease.
     std::shared_ptr<Driver> driver;
     std::shared_ptr<runtime::Module> module;
-    std::array<std::unique_ptr<runtime::Pass>,3> passes;
+    std::array<std::unique_ptr<runtime::Pass>,2> passes;
     PassChain chain;
     std::atomic<uint64_t> passStatus{pack_pass_status({})};
     std::unique_ptr<D3D12Guides> guides;
@@ -544,6 +556,15 @@ struct Processor::Impl {
     std::shared_ptr<const Frame> previousFrame;
     std::shared_ptr<Job> pending;
     std::shared_ptr<ColorSlabPool> pool;
+    std::unique_ptr<D3D12StabilizePass> stabilizer;
+    std::optional<Extent> stabilizeExtent;
+    std::array<ComPtr<ID3D12Resource>,2> stabilizeOrig,stabilizeTemporal,stabilizeHold;
+    bool stabilizeValid=false;
+    uint32_t stabilizeIndex=0;
+    std::unique_ptr<D3D12CasPass> casPass;
+    std::unique_ptr<D3D12DlssSr> dlssSr;
+    std::optional<Extent> upscaleInExt,upscaleOutExt;
+    ComPtr<ID3D12Resource> srInTex,srOutTex,casTex;
     std::optional<JobKey> pendingGuide;
     std::atomic<uint64_t> appliedCount{0};
     std::atomic<std::shared_ptr<const GuidePreparation>> preparation;
@@ -767,6 +788,9 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         p.generation!=work.job.key.resourceGeneration;
     if(adapterChanged || !p.settings) {
         if(!release_passes(p.passes))return fail(0xe007);
+        if(p.dlssSr && !p.dlssSr->release())return fail(0xe007);
+        p.dlssSr.reset(); p.srInTex.Reset(); p.srOutTex.Reset(); p.casTex.Reset();
+        p.upscaleInExt.reset(); p.upscaleOutExt.reset();
         p.previousFrame.reset(); p.previousKey.reset();
         if(adapterChanged && p.guides) {
             require(p.guides->close(),"old generation guides close"); p.guides.reset();
@@ -827,9 +851,19 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         if(p.config.qaObservations||job->observation)job->qaTiming[3]=stamp();
         p.creationReceipt={};
         const CreateScope createScope(p.driver.get(),p.creationReceipt);
-        const auto& t=work.job.input.settings.tuning;
-        const ModelTuning tuning{t.preset,t.style,t.intensity,t.localStructure,index?0:t.localTone,t.skinStructure,t.autoMask};
+        const auto& s=work.job.input.settings;
+        const auto& src=(index && s.pass2Tuning)?*s.pass2Tuning:s.tuning;
+        const float tone=(index && !s.pass2Tuning)?0.0f:src.localTone;
+        const ModelTuning tuning{src.preset,src.style,src.intensity,src.localStructure,tone,src.skinStructure,src.autoMask};
         const auto code=p.passes[index]->prepare(work.job.input.settings,tuning,working,work.job.key.historyEpoch,recording(job,r.creation.Get()));
+        if(index==0 && code==NVSDK_NGX_Result_Success && s.upscale.srActive() && !p.dlssSr && !p.config.srDir.empty() && p.driver) {
+            const Extent outExt=upscale_extent(size,s.upscale.mode);
+            p.dlssSr=std::make_unique<D3D12DlssSr>();
+            auto srDispatch=p.driver->dispatch;
+            if(p.driver->allocateParams) srDispatch.allocate=p.driver->allocateParams;
+            srDispatch.create=p.driver->createRaw;
+            (void)p.dlssSr->create(srDispatch,r.creation.Get(),size,outExt,s.upscale.dlssModel,s.upscale.mode==3);
+        }
         if(p.config.qaObservations||job->observation)job->qaTiming[4]=stamp();
         job->driverCreateCode=p.creationReceipt.code;job->driverHandle=p.creationReceipt.handle;
         HMODULE image=nullptr;
@@ -873,7 +907,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const FlowImage current{work.job.key,job->frame->analysis.Get(),producer};
     std::optional<FlowImage> previous;
     if(!reset) previous.emplace(FlowImage{*p.previousKey,p.previousFrame->analysis.Get(),p.previousFrame->producer});
-    const auto flow=p.guides->submit({current,previous?&*previous:nullptr,d.allocation,d.active,reset});
+    const auto flow=p.guides->submit({current,previous?&*previous:nullptr,d.allocation,d.active,reset,work.job.input.settings.stabilize.motionMode});
     if(flow!=FlowProblem::None) return fail(0xe100+static_cast<uint32_t>(flow));
     const auto* guide=p.guides->result(); require(guide && guide->key==work.job.key,"exact native guides");
     job->flow.emplace(*guide);
@@ -895,6 +929,8 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         r.colors=std::move(slab->colors); r.status=std::move(slab->status); r.statusRead=std::move(slab->statusRead);
         r.zero=std::move(slab->zero); r.codecHeap=std::move(slab->codecHeap);
         r.prepareHeap=std::move(slab->prepareHeap); r.restoreHeap=std::move(slab->restoreHeap);
+        r.stabilizeHeap=std::move(slab->stabilizeHeap);
+        r.casPrepHeap=std::move(slab->casPrepHeap); r.casOutHeap=std::move(slab->casOutHeap);
     } else {
         const auto extents=layout.extents();
         const auto initial=layout.initial_states();
@@ -903,6 +939,8 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         r.status=buffer(device,D3D12_HEAP_TYPE_DEFAULT); r.statusRead=buffer(device,D3D12_HEAP_TYPE_READBACK);
         r.zero=buffer(device,D3D12_HEAP_TYPE_UPLOAD);
         r.codecHeap=heap(device,25); r.prepareHeap=heap(device,4); r.restoreHeap=heap(device,4);
+        if(!p.config.stabilize.empty()) r.stabilizeHeap=heap(device,9);
+        if(!p.config.cas.empty()) { r.casPrepHeap=heap(device,3); r.casOutHeap=heap(device,3); }
     }
     const int64_t tAlloc1=stamp();
     auto* list=view->commands;
@@ -943,7 +981,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         plan->codecColor,plan->codecAlpha,gate.ready,ct(5),ct(6),ct(7)};
     const int64_t tCore0=stamp();
     r.core=std::make_unique<Core>(p.instance,std::make_unique<TracedCodec>(device,p.config.codec,*job),
-        std::make_unique<Evaluator>(std::array{p.passes[0].get(),p.passes[1].get(),p.passes[2].get()},job));
+        std::make_unique<Evaluator>(std::array{p.passes[0].get(),p.passes[1].get()},job));
     const int64_t tCore1=stamp();
     p.subscribe(job);
     const auto result=r.core->record(input);
@@ -963,12 +1001,114 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         p.reset=true; p.lastResetSetter="core-record-refused"; p.signal(job); return {work.job,false,{}};
     }
     barrier(list,r.colors[4].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const auto& stabCfg=work.job.input.settings.stabilize;
+    const bool useStabilizer=!p.config.stabilize.empty() && stabCfg.active();
+    ID3D12Resource* canonicalOutput=r.colors[4].Get();
+    uint32_t stabCur=p.stabilizeIndex, stabPrev=stabCur^1u;
+    bool stabDispatched=false;
+    if(useStabilizer) {
+        if(!p.stabilizer) p.stabilizer=std::make_unique<D3D12StabilizePass>(device,p.config.stabilize);
+        if(!r.stabilizeHeap) r.stabilizeHeap=heap(device,9);
+        if(!p.stabilizeExtent || *p.stabilizeExtent!=size || !p.stabilizeOrig[0]) {
+            for(size_t i=0;i<2;++i) {
+                p.stabilizeOrig[i]=texture(device,size,D3D12_RESOURCE_STATE_COMMON);
+                p.stabilizeTemporal[i]=texture(device,size,D3D12_RESOURCE_STATE_COMMON);
+                p.stabilizeHold[i]=texture(device,size,D3D12_RESOURCE_STATE_COMMON);
+            }
+            p.stabilizeExtent.emplace(size); p.stabilizeValid=false; p.stabilizeIndex=0;
+            stabCur=0; stabPrev=1;
+        }
+        const bool hasStabHistory=!reset && previous.has_value() && p.stabilizeValid;
+        for(auto* res:{p.stabilizeOrig[stabPrev].Get(),p.stabilizeTemporal[stabPrev].Get(),p.stabilizeHold[stabPrev].Get()})
+            barrier(list,res,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        for(auto* res:{p.stabilizeHold[stabCur].Get(),p.stabilizeTemporal[stabCur].Get(),p.stabilizeOrig[stabCur].Get()})
+            barrier(list,res,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        require(p.stabilizer->record(list,r.stabilizeHeap.Get(),size,stabCfg,hasStabHistory,
+            r.colors[0].Get(),r.colors[4].Get(),guide->motion,
+            p.stabilizeOrig[stabPrev].Get(),p.stabilizeTemporal[stabPrev].Get(),p.stabilizeHold[stabPrev].Get(),
+            p.stabilizeHold[stabCur].Get(),p.stabilizeTemporal[stabCur].Get(),p.stabilizeOrig[stabCur].Get()),
+            "actual anti-flicker stabilize pass");
+        barrier(list,p.stabilizeHold[stabCur].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(list,p.stabilizeTemporal[stabCur].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        barrier(list,p.stabilizeOrig[stabCur].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        for(auto* res:{p.stabilizeOrig[stabPrev].Get(),p.stabilizeTemporal[stabPrev].Get(),p.stabilizeHold[stabPrev].Get()})
+            barrier(list,res,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        canonicalOutput=p.stabilizeHold[stabCur].Get();
+        stabDispatched=true;
+    } else {
+        p.stabilizeValid=false;
+    }
     barrier(list,view->output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     D3D12_RESOURCE_BARRIER order{}; order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; order.UAV.pResource=r.status.Get();
     list->ResourceBarrier(1,&order);
     job->referenceValid=!reset&&previous.has_value();
-    require(r.color->record(list,r.restoreHeap.Get(),*plan,job->frame->original.Get(),r.colors[4].Get(),
-        view->output,r.status.Get(),true,job->referenceValid),"actual source-relative color restore");
+    const auto& upCfg=work.job.input.settings.upscale;
+    const Extent outExt=upscale_extent(size,upCfg.mode);
+    const bool needResize=outExt!=size;
+    const bool srReady=upCfg.srActive() && p.dlssSr && p.dlssSr->created();
+    const bool useUpscaleOrCas=!p.config.cas.empty() && (srReady || needResize || upCfg.casSharpness>0.0f);
+    if(useUpscaleOrCas) {
+        if(!p.casPass) p.casPass=std::make_unique<D3D12CasPass>(device,p.config.cas);
+        if(!r.casPrepHeap) r.casPrepHeap=heap(device,3);
+        if(!r.casOutHeap) r.casOutHeap=heap(device,3);
+        if(!p.upscaleInExt || *p.upscaleInExt!=size || !p.upscaleOutExt || *p.upscaleOutExt!=outExt) {
+            p.srInTex=texture(device,size,D3D12_RESOURCE_STATE_COMMON);
+            p.srOutTex=texture(device,outExt,D3D12_RESOURCE_STATE_COMMON);
+            p.casTex=!needResize?texture(device,size,D3D12_RESOURCE_STATE_COMMON):ComPtr<ID3D12Resource>{};
+            p.upscaleInExt.emplace(size); p.upscaleOutExt.emplace(outExt);
+        }
+        const uint32_t csCode=static_cast<uint32_t>(plan->source.color);
+        const uint32_t amCode=static_cast<uint32_t>(plan->source.alpha);
+        const bool isSrgb=plan->source.color==ColorSpace::Rec709Srgb;
+        if(!srReady && !needResize) {
+            barrier(list,p.casTex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            require(p.casPass->record(list,r.casOutHeap.Get(),
+                {2u,size.width,size.height,size.width,size.height,csCode,amCode,isSrgb?1u:0u,upCfg.casSharpness,plan->linearScale},
+                canonicalOutput,nullptr,p.casTex.Get()),"CAS 1:1 pass");
+            barrier(list,p.casTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            require(r.color->record(list,r.restoreHeap.Get(),*plan,job->frame->original.Get(),p.casTex.Get(),
+                view->output,r.status.Get(),true,job->referenceValid),"actual source-relative color restore");
+            barrier(list,p.casTex.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        } else {
+            if(srReady) {
+                barrier(list,p.srInTex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                require(p.casPass->record(list,r.casPrepHeap.Get(),
+                    {0u,size.width,size.height,size.width,size.height,csCode,amCode,isSrgb?1u:0u,0.0f,plan->linearScale},
+                    canonicalOutput,nullptr,p.srInTex.Get()),"SR linear prepare");
+                barrier(list,p.srInTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                require(p.dlssSr->evaluate(list,p.srInTex.Get(),p.srOutTex.Get(),guide->depth,guide->motion,reset),
+                    "DLSS SR evaluate");
+                barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                barrier(list,p.srInTex.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+            } else {
+                barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                require(p.casPass->record(list,r.casPrepHeap.Get(),
+                    {0u,size.width,size.height,outExt.width,outExt.height,csCode,amCode,isSrgb?1u:0u,0.0f,plan->linearScale},
+                    canonicalOutput,nullptr,p.srOutTex.Get()),"bilinear resize linear prepare");
+                barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+            if(!needResize) {
+                barrier(list,p.casTex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                require(p.casPass->record(list,r.casOutHeap.Get(),
+                    {2u,size.width,size.height,size.width,size.height,csCode,amCode,isSrgb?2u:0u,upCfg.casSharpness,plan->linearScale},
+                    p.srOutTex.Get(),nullptr,p.casTex.Get()),"DLAA CAS + transfer restore");
+                barrier(list,p.casTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                require(r.color->record(list,r.restoreHeap.Get(),*plan,job->frame->original.Get(),p.casTex.Get(),
+                    view->output,r.status.Get(),true,job->referenceValid),"actual source-relative color restore");
+                barrier(list,p.casTex.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+            } else {
+                require(p.casPass->record(list,r.casOutHeap.Get(),
+                    {1u,size.width,size.height,outExt.width,outExt.height,csCode,amCode,0u,upCfg.casSharpness,plan->linearScale},
+                    p.srOutTex.Get(),job->frame->original.Get(),view->output),"upscaled CAS + color encode");
+            }
+            barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        }
+    } else {
+        require(r.color->record(list,r.restoreHeap.Get(),*plan,job->frame->original.Get(),canonicalOutput,
+            view->output,r.status.Get(),true,job->referenceValid),"actual source-relative color restore");
+    }
+    if(stabDispatched) barrier(list,p.stabilizeHold[stabCur].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(r.statusRead.Get(),0,r.status.Get(),0,4); r.statusRecorded=true;
     barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
@@ -1007,6 +1147,8 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(job->submitted) job->submitted=r.submission->submitted(p.context->queue());
     job->chronology[5]=stamp();
     p.reset=!job->submitted; p.lastResetSetter="submission-result";
+    if(stabDispatched && job->submitted) { p.stabilizeValid=true; p.stabilizeIndex=stabCur^1u; }
+    else p.stabilizeValid=false;
     p.previousKey.emplace(work.job.key); p.previousFrame=job->frame;
     p.signal(job);
     p.diagOk.fetch_add(1);
@@ -1050,7 +1192,13 @@ void Processor::worker_stopping() noexcept {
                 return true;
             case 1:
                 if(!release_passes(p.passes))return false;
+                if(p.dlssSr && !p.dlssSr->release())return false;
+                p.dlssSr.reset();p.casPass.reset();
+                p.srInTex.Reset();p.srOutTex.Reset();p.casTex.Reset();
+                p.upscaleInExt.reset();p.upscaleOutExt.reset();
                 p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
+                p.stabilizeOrig={};p.stabilizeTemporal={};p.stabilizeHold={};p.stabilizer.reset();
+                p.stabilizeValid=false;p.stabilizeExtent.reset();
                 return true;
             case 2:
                 if(p.guides && !p.guides->close())return false;

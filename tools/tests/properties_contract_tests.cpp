@@ -127,7 +127,7 @@ void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
     const auto legacy=decode(data,default_runtime,initial->runtimePath);
     // Then: old settings retain the default path.
     expect(legacy.reason.empty() && legacy.passes==1 && legacy.workScale==100,"legacy multipass defaults");
-    for(const auto& values:std::array<std::array<uint32_t,2>,3>{{{2,100},{1,75},{3,50}}}) {
+    for(const auto& values:std::array<std::array<uint32_t,2>,3>{{{2,100},{1,75},{2,50}}}) {
         // Given: independently changed pass/scale values, including simultaneous changes.
         obs_data_set_int(data,"nr_passes",values[0]);obs_data_set_int(data,"nr_work_scale",values[1]);
         const auto decoded=decode(data,default_runtime,initial->runtimePath);
@@ -138,7 +138,7 @@ void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
             next->revision.value==initial->revision.value+1 && updated(next,decoded)==next,"multipass update revision once");
     }
     struct Edge {const char* key;long long value;const char* reason;};
-    for(const auto& edge:{Edge{"nr_passes",0,"invalidPasses"},Edge{"nr_passes",4,"invalidPasses"},
+    for(const auto& edge:{Edge{"nr_passes",0,"invalidPasses"},Edge{"nr_passes",3,"invalidPasses"},
             Edge{"nr_work_scale",49,"invalidWorkScale"},Edge{"nr_work_scale",101,"invalidWorkScale"}}) {
         // Given: one out-of-range value in actual obs_data.
         auto* invalid=obs_data_create();defaults(invalid);obs_data_set_int(invalid,edge.key,edge.value);
@@ -147,12 +147,12 @@ void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
         // Then: the reason is specific and safe defaults remain, without rewriting user data.
         expect(refused.reason==edge.reason && refused.passes==1 && refused.workScale==100 &&
             obs_data_get_int(invalid,edge.key)==edge.value,"invalid multipass rejected with defaults");
-        if(edge.value==4)std::puts("invalid obs_data nr_passes=4: reason=invalidPasses decoded=1/100 user_value=4");
+        if(edge.value==3)std::puts("invalid obs_data nr_passes=3: reason=invalidPasses decoded=1/100 user_value=3");
         obs_data_release(invalid);
     }
     auto* props=controls({"priming","awaitingSample"});
     struct Slider {const char* key;int low,high,step;};
-    for(const auto& s:{Slider{"nr_passes",1,3,1},Slider{"nr_work_scale",50,100,5}}) {
+    for(const auto& s:{Slider{"nr_passes",1,2,1},Slider{"nr_work_scale",50,100,5}}) {
         auto* p=obs_properties_get(props,s.key);
         expect(p && obs_property_get_type(p)==OBS_PROPERTY_INT && obs_property_int_type(p)==OBS_NUMBER_SLIDER &&
             obs_property_int_min(p)==s.low && obs_property_int_max(p)==s.high && obs_property_int_step(p)==s.step,s.key);
@@ -161,6 +161,44 @@ void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
     auto* next=obs_properties_get(props,"nr_strength");
     expect(obs_property_next(&next) && std::string(obs_property_name(next))=="nr_passes" &&
         obs_property_next(&next) && std::string(obs_property_name(next))=="nr_work_scale","multipass control order");
+    {
+        auto* p2data=obs_data_create();defaults(p2data);
+        obs_data_set_int(p2data,"nr_passes",2);
+        obs_data_set_int(p2data,"nr_style",0);
+        obs_data_set_bool(p2data,"nr_pass2_custom",true);
+        obs_data_set_int(p2data,"nr_pass2_style",2);
+        obs_data_set_double(p2data,"nr_pass2_intensity",1.5);
+        obs_data_set_double(p2data,"nr_pass2_local_tone",0.25);
+        const auto decoded2=decode(p2data,default_runtime,initial->runtimePath);
+        expect(decoded2.reason.empty() && decoded2.pass2Tuning.has_value() &&
+            decoded2.tuning.style==0 && decoded2.pass2Tuning->style==2 &&
+            decoded2.pass2Tuning->intensity==1.5f && decoded2.pass2Tuning->localTone==0.25f,
+            "custom pass2 decode");
+        const auto next2=updated(initial,decoded2);
+        expect(next2->pass2Tuning==decoded2.pass2Tuning && updated(next2,decoded2)==next2,"pass2 revision stability");
+        obs_data_set_int(p2data,"nr_pass2_style",9);
+        expect(decode(p2data,default_runtime,initial->runtimePath).reason=="invalidTuning","invalid pass2 style rejected");
+        obs_data_release(p2data);
+    }
+    {
+        auto* sdata=obs_data_create();defaults(sdata);
+        const auto def=decode(sdata,default_runtime,initial->runtimePath);
+        expect(def.reason.empty() && def.stabilize.temporalStrength==0.8f &&
+            def.stabilize.holdStrength==0.8f && def.stabilize.holdTolerance==0.02f,
+            "anti-flicker defaults");
+        obs_data_set_bool(sdata,"nr_hold_enabled",false);
+        obs_data_set_double(sdata,"nr_temporal_stability",0.0);
+        const auto off=decode(sdata,default_runtime,initial->runtimePath);
+        expect(off.reason.empty() && !off.stabilize.active(),"anti-flicker toggle off");
+        obs_data_set_double(sdata,"nr_temporal_stability",1.5);
+        expect(decode(sdata,default_runtime,initial->runtimePath).reason=="invalidTuning","invalid temporal rejected");
+        obs_data_release(sdata);
+        expect(obs_properties_get(props,"nr_temporal_stability") && obs_properties_get(props,"nr_hold_enabled") &&
+            obs_properties_get(props,"nr_hold_strength") && obs_properties_get(props,"nr_hold_tolerance") &&
+            obs_properties_get(props,"nr_quick_preset") && obs_properties_get(props,"nr_fps_overlay") &&
+            obs_properties_get(props,"nr_grp_basic") && obs_properties_get(props,"nr_grp_stabilize"),
+            "anti-flicker and UX/UI properties exposed");
+    }
     obs_properties_destroy(props);obs_data_release(data);
 }
 void deadline_controls()
@@ -275,6 +313,20 @@ int main(int argc,char** argv)
         tuning_controls(a);
         multipass_controls(a);
         passes_status_controls();
+    {
+        auto* udata = obs_data_create(); defaults(udata);
+        expect(obs_data_get_int(udata, "nr_sr_mode") == 0 && obs_data_get_int(udata, "nr_sr_model") == 1 &&
+            obs_data_get_double(udata, "nr_cas_sharpness") == 0.0, "upscale defaults");
+        obs_data_set_int(udata, "nr_sr_mode", 1);
+        obs_data_set_int(udata, "nr_sr_model", 2);
+        obs_data_set_double(udata, "nr_cas_sharpness", 0.45);
+        const auto dec = decode(udata, default_runtime, a->runtimePath);
+        expect(dec.reason.empty() && dec.upscale.mode == 1 && dec.upscale.dlssModel == 2 &&
+            std::abs(dec.upscale.casSharpness - 0.45f) < 1e-5f, "upscale decode");
+        obs_data_set_int(udata, "nr_sr_mode", 5);
+        expect(decode(udata, default_runtime, a->runtimePath).reason == "invalidTuning", "invalid sr_mode");
+        obs_data_release(udata);
+    }
         obs_data_set_bool(data,"nr_enabled",false);
         obs_data_set_double(data,"nr_strength",0);
         obs_data_set_string(data,"foreign_owner","keep");

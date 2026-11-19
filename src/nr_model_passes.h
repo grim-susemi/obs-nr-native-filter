@@ -30,7 +30,7 @@ struct PassCompletion {
 // Worker-owned policy; runtime::Pass continues to own all features/recordings.
 class PassChain {
     uint32_t requested_=1,effective_=0;
-    std::array<std::optional<uint32_t>,3> failures_{};
+    std::array<std::optional<uint32_t>,2> failures_{};
 public:
     void reset(uint32_t requested) {requested_=requested;effective_=0;failures_={};}
     PassStatus status() const {
@@ -40,7 +40,7 @@ public:
     }
     uint32_t limit() const {const auto s=status();return s.failedPass?s.failedPass-1:requested_;}
     template<class Pass>
-    PassGate gate(const std::array<std::unique_ptr<Pass>,3>& passes,uint64_t epoch) const {
+    PassGate gate(const std::array<std::unique_ptr<Pass>,2>& passes,uint64_t epoch) const {
         const auto target=limit();uint32_t ready=0;
         while(ready<target && passes[ready] && passes[ready]->ready(epoch))++ready;
         return {ready,target,ready<target && !passes[ready]?std::optional{ready}:std::nullopt};
@@ -58,7 +58,7 @@ public:
 };
 // Caller must settle the last job first. A refusing feature retains its exact owner.
 template<class Pass>
-bool release_passes(std::array<std::unique_ptr<Pass>,3>& passes,uint32_t first=0) {
+bool release_passes(std::array<std::unique_ptr<Pass>,2>& passes,uint32_t first=0) {
     for(size_t i=passes.size();i>first;--i) if(passes[i-1]) {
         if(!passes[i-1]->release())return false;
         passes[i-1].reset();

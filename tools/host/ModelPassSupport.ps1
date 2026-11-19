@@ -7,7 +7,7 @@ function Assert-ModelChurnRows($Rows,$Modules,$Contexts,$Changes,$Summary,$Clean
         $context.frame_interval_ns -lt 16000000 -or $context.frame_interval_ns -gt 17000000){
         throw 'NR_QA_MODEL_CHURN_CONTEXT'
     }
-    if($summary.changes -ne 20 -or $summary.elapsed_ms -le 0 -or $summary.creations -ne 23 -or
+    if($summary.changes -ne 20 -or $summary.elapsed_ms -le 0 -or $summary.creations -ne 22 -or
         $summary.requested -ne 1 -or $summary.effective -ne 1 -or $summary.generation -ne 21 -or
         $close.closed -isnot [bool] -or !$close.closed -or $close.worker_exit -isnot [bool] -or !$close.worker_exit -or
         $close.retained -isnot [bool] -or $close.retained){throw 'NR_QA_MODEL_CHURN_SUMMARY'}
@@ -22,20 +22,20 @@ function Assert-ModelChurnRows($Rows,$Modules,$Contexts,$Changes,$Summary,$Clean
             !$r.raw_hash -or $r.raw_hash -ne $r.analysis_hash){throw 'NR_QA_MODEL_CHURN_IDENTITY'}
         if($i -ge 5 -and $i -lt 25) {
             $change=$i-4;$c=$Changes[$change-1]
-            $passes=if($change%2){3}else{1};$scale=if($change%2){50}else{100}
+            $passes=if($change%2){2}else{1};$scale=if($change%2){50}else{100}
             if($c.change -ne $change -or $c.revision -ne $change+1 -or $c.generation -ne $change+1 -or
-                $c.passes -ne $passes -or $c.scale -ne $scale -or $c.creation_jobs -ne $change+3 -or
+                $c.passes -ne $passes -or $c.scale -ne $scale -or $c.creation_jobs -ne $change+2 -or
                 $c.created -isnot [bool] -or !$c.created -or $c.physical_complete -isnot [bool] -or !$c.physical_complete -or
                 $r.settings_revision -ne $c.revision -or $r.resource_generation -ne $c.generation -or
                 $r.requested_passes -ne $passes -or $r.work_scale -ne $scale -or
                 !$r.created -or !$r.submitted -or $r.creation_pass -ne 1 -or $r.gpu_composed -or
                 $r.completed_passes -ne 0){throw 'NR_QA_MODEL_CHURN_CHANGE'}
-        } elseif($i -lt 3) {
-            if(!$r.created -or !$r.submitted -or $r.creation_pass -ne $i+1 -or $r.requested_passes -ne 3){
+        } elseif($i -lt 2) {
+            if(!$r.created -or !$r.submitted -or $r.creation_pass -ne $i+1 -or $r.requested_passes -ne 2){
                 throw 'NR_QA_MODEL_CHURN_INITIAL'
             }
         } else {
-            $wanted=if($i -lt 5){3}else{1}
+            $wanted=if($i -lt 5){2}else{1}
             if(!$r.evaluated -or !$r.composed -or !$r.submitted -or !$r.gpu_composed -or
                 $r.completed_passes -ne $wanted -or $r.code -ne 1 -or $r.invalid_status -ne 0 -or
                 [UInt64]$r.answer_resource -eq 0 -or !$r.model_hash -or !$r.output_hash){
@@ -52,8 +52,8 @@ function Assert-ModelPairRows($Rows,$Modules,$Contexts,$Status,$Close) {
     if([UInt64]$context.processor_a -eq 0 -or [UInt64]$context.processor_b -eq 0 -or
         $context.processor_a -eq $context.processor_b -or [UInt64]$context.device_a -eq 0 -or
         $context.device_a -ne $context.device_b){throw 'NR_QA_MODEL_PAIR_CONTEXT'}
-    if($live.stage -cne 'live' -or $live.a_requested -ne 3 -or $live.a_effective -ne 3 -or
-        $live.b_requested -ne 1 -or $live.b_effective -ne 1 -or $live.a_creations -ne 3 -or $live.b_creations -ne 1 -or
+    if($live.stage -cne 'live' -or $live.a_requested -ne 2 -or $live.a_effective -ne 2 -or
+        $live.b_requested -ne 1 -or $live.b_effective -ne 1 -or $live.a_creations -ne 2 -or $live.b_creations -ne 1 -or
         $after.stage -cne 'after_a' -or $after.b_requested -ne 1 -or $after.b_effective -ne 1 -or
         $after.b_creations -ne 1 -or $after.b_completed -ne 5){throw 'NR_QA_MODEL_PAIR_STATUS'}
     if($a.lane -cne 'A' -or $b.lane -cne 'B' -or !$a.session -or $a.session -ne $b.session -or
@@ -64,7 +64,7 @@ function Assert-ModelPairRows($Rows,$Modules,$Contexts,$Status,$Close) {
         $r=$Rows[$i]
         $lane=if($i -eq 10){1}else{$i%2}
         $step=if($i -eq 10){5}else{[Math]::Floor($i/2)}
-        $wanted=if($lane -eq 0){3}else{1}
+        $wanted=if($lane -eq 0){2}else{1}
         foreach($field in @('created','evaluated','composed','submitted','gpu_composed','capture_pin_open')){
             if($r.$field -isnot [bool]){throw 'NR_QA_MODEL_PAIR_BOOLEAN'}
         }
@@ -140,7 +140,7 @@ function Assert-ModelHdrRows($Rows,$Contexts,$Cleanup,$Modules,$Status,$HdrRows,
     }
 }
 function Assert-ModelQualityRows($Rows,$Contexts,$Cleanup,$Modules,$Status,[string]$PassCase) {
-    if($PassCase -cnotmatch '^quality([123])$'){throw 'NR_QA_MODEL_QUALITY_CASE'}
+    if($PassCase -cnotmatch '^quality([12])$'){throw 'NR_QA_MODEL_QUALITY_CASE'}
     $n=[int]$Matches[1]
     if($Rows.Count -ne $n+6 -or $Contexts.Count -ne 1 -or $Cleanup.Count -ne 1 -or !$Modules.Count -or $Status.Count -ne 1){
         throw 'NR_QA_MODEL_QUALITY_SET'

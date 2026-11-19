@@ -52,7 +52,7 @@ Context::Context(ID3D11Device* renderer):graphicsThread_(GetCurrentThreadId()),l
   }
  }
  check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device_)));
- D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+ D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;q.Priority=D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
  check(device_->CreateCommandQueue(&q,IID_PPV_ARGS(&queue_)));
  if(!compatible_context(renderer,device_.Get(),queue_.Get()))throw std::runtime_error("interop adapter/canonical queue identity mismatch");
 }
@@ -106,6 +106,7 @@ struct Bridge::Impl {
  std::shared_ptr<Context> context;
  const uint64_t generation;
  const FrameDescriptor descriptor;
+ const Extent outputExtent;
  Ptr<ID3D11Device5> device11;
  Ptr<ID3D11DeviceContext4> graphics;
  Ptr<ID3D11Fence> producer11,worker11,consumer11;
@@ -118,8 +119,10 @@ struct Bridge::Impl {
  FenceCursor producerCursor,workerCursor,consumerCursor,leaseCursor;
  uint64_t lastSubmission=0;
  std::atomic<DWORD> workerThread{0};
- Impl(std::shared_ptr<Context> c,uint64_t g,const FrameDescriptor& d,ID3D11Device5* renderer,
-      std::span<const std::byte> vs,std::span<const std::byte> ps):context(std::move(c)),generation(g),descriptor(d),device11(renderer){
+ Impl(std::shared_ptr<Context> c,uint64_t g,const FrameDescriptor& d,Extent outExt,ID3D11Device5* renderer,
+      std::span<const std::byte> vs,std::span<const std::byte> ps)
+      :context(std::move(c)),generation(g),descriptor(d),
+       outputExtent(outExt.width&&outExt.height?outExt:d.allocation),device11(renderer){
   if(!generation||!descriptor.valid()||vs.empty()||ps.empty())throw std::runtime_error("invalid interop generation/descriptor/shader");
   Ptr<ID3D11DeviceContext> immediate;device11->GetImmediateContext(&immediate);check(immediate.As(&graphics));
   D3D_FEATURE_LEVEL selected{};const D3D_FEATURE_LEVEL levels[]{D3D_FEATURE_LEVEL_11_0};
@@ -143,11 +146,12 @@ struct Bridge::Impl {
    check(device11->CreateTexture2D(&td,nullptr,&s.raw));
    td.Format=canonical_format(descriptor.format);td.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS;
    td.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
-   auto share=[&](Ptr<ID3D11Texture2D>& texture,Ptr<ID3D12Resource>& resource){
+   auto share=[&](Ptr<ID3D11Texture2D>& texture,Ptr<ID3D12Resource>& resource,Extent ext){
+    td.Width=ext.width;td.Height=ext.height;
     check(device11->CreateTexture2D(&td,nullptr,&texture));Ptr<IDXGIResource1> dxgi;check(texture.As(&dxgi));Handle h;
     check(dxgi->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,nullptr,&h.value));
     check(open_shared_resource(context->device(),h.value,&resource));
-   };share(s.input11,s.input12);share(s.output11,s.output12);
+   };share(s.input11,s.input12,descriptor.allocation);share(s.output11,s.output12,outputExtent);
    check(context->device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&s.allocator)));
    check(context->device()->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,s.allocator.Get(),nullptr,IID_PPV_ARGS(&s.commands)));
    check(s.commands->Close());
@@ -164,11 +168,12 @@ struct Bridge::Impl {
    producer11->GetCompletedValue(),worker12->GetCompletedValue(),consumer11->GetCompletedValue(),
    s.consumerOpen.load(),s.cancelled.load(),s.failed.load(),s.consumerLease.load()};
  }
- bool shape(ID3D11Texture2D* texture,DXGI_FORMAT format,bool borrowed=false)const{
+ bool shape(ID3D11Texture2D* texture,DXGI_FORMAT format,bool borrowed=false,bool output=false)const{
   if(!texture)return false;Ptr<ID3D11Device> device;texture->GetDevice(&device);
   if(!same_identity(device.Get(),device11.Get()))return false;D3D11_TEXTURE2D_DESC d{};texture->GetDesc(&d);
   const bool compatible=borrowed?source_format_compatible(d.Format,descriptor.format):d.Format==format;
-  return d.Width==descriptor.allocation.width&&d.Height==descriptor.allocation.height&&compatible&&
+  const Extent exp=output?outputExtent:descriptor.allocation;
+  return d.Width==exp.width&&d.Height==exp.height&&compatible&&
    d.MipLevels==1&&d.ArraySize==1&&d.SampleDesc.Count==1;
  }
  void convert(ID3D11Texture2D* from,ID3D11Texture2D* to){
@@ -188,9 +193,11 @@ struct Bridge::Impl {
   ID3D11ShaderResourceView* image=srv.Get();graphics->PSSetShaderResources(0,1,&image);graphics->Draw(3,0);
  }
 };
-Bridge::Bridge(std::shared_ptr<Context> c,uint64_t g,const FrameDescriptor& d,std::span<const std::byte> vs,std::span<const std::byte> ps){
+Bridge::Bridge(std::shared_ptr<Context> c,uint64_t g,const FrameDescriptor& d,std::span<const std::byte> vs,std::span<const std::byte> ps)
+ :Bridge(std::move(c),g,d,vs,ps,d.allocation){}
+Bridge::Bridge(std::shared_ptr<Context> c,uint64_t g,const FrameDescriptor& d,std::span<const std::byte> vs,std::span<const std::byte> ps,Extent outExt){
  if(!c||GetCurrentThreadId()!=c->graphics_thread())throw std::runtime_error("interop graphics owner required");
- impl_=std::make_unique<Impl>(c,g,d,c->renderer_.Get(),vs,ps);
+ impl_=std::make_unique<Impl>(c,g,d,outExt,c->renderer_.Get(),vs,ps);
 }
 Bridge::~Bridge(){if(impl_&&!quiescent())(void)impl_.release();} // Deliberately retain unresolved physical ownership, never wait/free.
 std::optional<Ticket> Bridge::capture(const JobKey& key,ID3D11Texture2D* borrowed){
@@ -269,7 +276,7 @@ bool Bridge::owns_consumer(const Consumer& c)const{
     s->consumerRaw==c.raw&&c.texture==(c.raw?s->raw.Get():s->output11.Get());
 }
 bool Bridge::copy_to(const Consumer& c,ID3D11Texture2D* target){
- if(!owns_consumer(c)||!impl_->shape(target,source_format(impl_->descriptor.format)))return false;
+ if(!owns_consumer(c)||!impl_->shape(target,source_format(impl_->descriptor.format),false,!c.raw))return false;
  auto* s=impl_->find(c.ticket);
  try{impl_->convert(c.texture,target);}catch(const std::exception&){s->failed=true;return false;}return true;
 }

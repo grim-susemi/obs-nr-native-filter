@@ -82,7 +82,7 @@ foreach($case in @('scale50','odd50','align100','align50')) {
     }
     Write-Output "PASS native scaled receipt fixture and mutation refusals $case CPU_only=true"
 }
-foreach($n in 1..3) {
+foreach($n in 1..2) {
     $rows=@(foreach($step in 0..($n+5)){
         $create=$step -lt $n;$reset=$step -eq $n -or $step -eq $n+3
         @{lane=0;step=$step;width=1920;height=1080;work_scale=100;requested_passes=$n;
@@ -138,7 +138,7 @@ if($reason -ne 'NR_QA_MODEL_HDR_GUIDE_INPUT'){throw "Wrong HDR guide format refu
 Write-Output 'PASS native HDR receipt fixture and mutation refusals CPU_only=true'
 $pairRows=@(foreach($i in 0..10){
     $lane=if($i -eq 10){1}else{$i%2};$step=if($i -eq 10){5}else{[Math]::Floor($i/2)}
-    $wanted=if($lane -eq 0){3}else{1};$created=$step -lt $wanted
+    $wanted=if($lane -eq 0){2}else{1};$created=$step -lt $wanted
     @{lane=$lane;step=$step;instance_id=111+$lane;width=1920;height=1080;work_scale=100;
       requested_passes=$wanted;creation_jobs=[Math]::Min($step+1,$wanted);physical_done=1;capture_pin_open=$true;
       producer=1;producer_done=1;raw_hash='1';analysis_hash='1';created=$created;evaluated=!$created;
@@ -147,7 +147,7 @@ $pairRows=@(foreach($i in 0..10){
       model_hash='2';output_hash='3'}
 })
 $pairContext=@(@{processor_a='1';processor_b='2';device_a='3';device_b='3'})
-$pairStatus=@(@{stage='live';a_requested=3;a_effective=3;b_requested=1;b_effective=1;a_creations=3;b_creations=1},
+$pairStatus=@(@{stage='live';a_requested=2;a_effective=2;b_requested=1;b_effective=1;a_creations=2;b_creations=1},
     @{stage='after_a';b_requested=1;b_effective=1;b_creations=1;b_completed=5})
 $pairClose=@(@{lane='A';session=9;sdk=2;owners_at_detachment=2;feature_closed=$true},
     @{lane='B';session=9;sdk=4;owners_at_detachment=1;feature_closed=$true})
@@ -162,24 +162,24 @@ foreach($mutation in @(@{row=0;field='creation_pass';value=2;reason='NR_QA_MODEL
 }
 Write-Output 'PASS native pair receipt fixture and mutation refusals CPU_only=true'
 $churnChanges=@(foreach($change in 1..20){
-    @{change=$change;revision=$change+1;generation=$change+1;passes=$(if($change%2){3}else{1});
-      scale=$(if($change%2){50}else{100});creation_jobs=$change+3;created=$true;physical_complete=$true}
+    @{change=$change;revision=$change+1;generation=$change+1;passes=$(if($change%2){2}else{1});
+      scale=$(if($change%2){50}else{100});creation_jobs=$change+2;created=$true;physical_complete=$true}
 })
 $churnRows=@(foreach($i in 0..26){
     $changing=$i -ge 5 -and $i -lt 25
-    $created=$i -lt 3 -or $changing
+    $created=$i -lt 2 -or $changing
     $c=if($changing){$churnChanges[$i-5]}else{$null}
-    $wanted=if($changing){$c.passes}elseif($i -lt 5){3}else{1}
+    $wanted=if($changing){$c.passes}elseif($i -lt 5){2}else{1}
     @{lane=0;step=$i;instance_id=111;width=1280;height=720;physical_done=1;capture_pin_open=$true;
       producer=1;producer_done=1;raw_hash='1';analysis_hash='1';created=$created;evaluated=!$created;
-      composed=!$created;submitted=$true;gpu_composed=!$created;creation_pass=$(if($i -lt 3){$i+1}elseif($changing){1}else{0});
+      composed=!$created;submitted=$true;gpu_composed=!$created;creation_pass=$(if($i -lt 2){$i+1}elseif($changing){1}else{0});
       settings_revision=$(if($changing){$c.revision}elseif($i -lt 5){1}else{21});
       resource_generation=$(if($changing){$c.generation}elseif($i -lt 5){1}else{21});
       requested_passes=$wanted;work_scale=$(if($changing){$c.scale}else{100});
       completed_passes=$(if($created){0}else{$wanted});code=1;invalid_status=0;answer_resource='1';model_hash='2';output_hash='3'}
 })
 $churnContext=@(@{device='1';instance=111;width=1280;height=720;frame_interval_ns=16666666})
-$churnSummary=@(@{changes=20;elapsed_ms=1;creations=23;requested=1;effective=1;generation=21})
+$churnSummary=@(@{changes=20;elapsed_ms=1;creations=22;requested=1;effective=1;generation=21})
 $churnClose=@(@{closed=$true;worker_exit=$true;retained=$false})
 Assert-ModelChurnRows $churnRows @(@{}) $churnContext $churnChanges $churnSummary $churnClose
 foreach($mutation in @(@{row=5;field='resource_generation';value=1;reason='NR_QA_MODEL_CHURN_CHANGE'},

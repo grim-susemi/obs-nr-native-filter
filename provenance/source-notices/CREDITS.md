@@ -30,3 +30,8 @@ This project uses [FreeType](https://gitlab.freedesktop.org/freetype/freetype), 
 Upstream credits [SignPath.io](https://signpath.io/) for Windows code signing and the [SignPath Foundation](https://signpath.org/) for its certificate.
 
 Support upstream: [cdozdil](https://github.com/sponsors/cdozdil?frequency=one-time) and [nitec](https://buymeacoffee.com/nitec).
+
+## OBS Native NR 0.2.0 additions
+
+- Anti-flicker (`nr_stabilize.hlsl`), refined NVOF optical flow (`nr_guides.hlsl`), NVIDIA VFG low-latency presenter architecture, and NGX DLSS Super Resolution integration adapted from [Likely7/Veyra-NRVideo](https://github.com/Likely7/Veyra-NRVideo) (GPL-3.0-only).
+- Contrast Adaptive Sharpening (`nr_cas.hlsl`) derived from AMD FidelityFX CAS (MIT).

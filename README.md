@@ -4,7 +4,7 @@
 
 <br />
 
-**NVIDIA DLSS Neural Rendering as an OBS Studio filter.**<br />
+**NVIDIA DLSS Neural Rendering, 2-Pass Combo, Anti-Flicker, DLSS 4.5 SR + CAS Upscaling, and NVIDIA VFG Preview for OBS Studio.**<br />
 Put it on a capture card, game capture, window or media source. No ReShade, no injector, nothing added to the game.
 
 <br />
@@ -19,15 +19,15 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 </div>
 
 > [!NOTE]
-> Community project, not affiliated with NVIDIA or the OBS Project. The NVIDIA NR model file (`nvngx_dlssnr.dll`) is **not included** and not hosted here. You supply it yourself, see [The NR model file](#the-nr-model-file).
+> Community project, not affiliated with NVIDIA or the OBS Project. NVIDIA runtime DLLs are **not redistributed** inside this repository or release zip. `install.bat` guides you through placing `nvngx_dlssnr.dll` and can automatically download & verify the official NVIDIA-signed DLSS 4.5 SR and NVIDIA VFG runtimes from NVIDIA's servers.
 
-## What it does
+## What's new in 0.2.0
 
-- Adds a **Native NR** filter to OBS. Put it on a source and the picture goes through NVIDIA's DLSS Neural Rendering model before it reaches your preview, stream and recording.
-- Runs inside OBS as an ordinary plugin. The game, console or app you capture is not touched.
-- Works on any video source, so console footage through a capture card works too.
-- If a frame is not ready in time, the previous processed frame is shown (up to 2 in a row) instead of flashing back to the original, so 60 fps output does not flicker.
-- NVIDIA's NR controls are filter properties: model preset, style, intensity, local structure, local tone, skin structure and automatic mask.
+- **2-Pass NR Combo & Working Scale**: Run 1 or 2 NR passes with independent styles (e.g. Pass 1 Standard + Pass 2 Cinematic) and adjustable working resolution (50–100%).
+- **Veyra-style Anti-Flicker & Refined Optical Flow**: Motion-compensated temporal stabilizer, static pixel hold (zero ghosting), and cost-gated 5-cell refined NVOF (`nr_guides`) to eliminate edge wobble.
+- **DLSS 4.5 Super Resolution + AMD FidelityFX CAS**: Built-in 1080p→1440p/4K/DLAA upscaler with Preset K / M (DLSS 4.5) / L + linear-space CAS sharpening (falls back cleanly to bilinear+CAS if `nvngx_dlss.dll` is absent).
+- **NVIDIA VFG Preview Window (2× / 3× / 4×)**: Right-click an OBS source/scene projector preview or open via filter/VFG controller for low-latency 120/180/240 fps frame generation (RTX 40/50) with NVIDIA Reflex markers and Pre/Post FPS HUD.
+- **One-Click Official Runtime Setup**: `install.bat` optionally downloads and signature-verifies `nvngx_dlss.dll` (from NVIDIA/DLSS GitHub) and the 5 official NVIDIA VFG DLLs (from `pypi.nvidia.com`).
 
 ## Requirements
 
@@ -35,155 +35,84 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 |---|---|
 | OS | Windows 10 or 11, 64-bit |
 | OBS Studio | 32.x, Direct3D 11 renderer (the default). Built and tested with 32.2.2 |
-| GPU | NVIDIA RTX 20, 30, 40 or 50 series |
+| GPU | NVIDIA RTX 20, 30, 40 or 50 series (NVIDIA VFG preview requires RTX 40/50) |
 | NR model file | `nvngx_dlssnr.dll` 310.8.0.0 compatibility build, **not included** ([details](#the-nr-model-file)) |
+| Optional runtimes | `nvngx_dlss.dll` (DLSS 4.5 SR) & NVIDIA VFG 1.3.0 DLLs — **auto-installed from official NVIDIA sources by `install.bat`** |
 
-Tested on an RTX 4090 with driver 617.14 on Windows 11. Other RTX cards should work with the same model file but have not been tested yet. Reports are welcome in [Issues](https://github.com/grim-susemi/obs-nr-native-filter/issues).
+Tested on an RTX 4090 with driver 617.14 on Windows 11. Other RTX cards should work with the same NR model file.
 
 ### The NR model file
 
-The filter accepts exactly one build of `nvngx_dlssnr.dll`: the 310.8.0.0 compatibility build shared in the RenoDX community (ShortFuse's DLSS thread). It contains GPU code for RTX 20, 30, 40 and 50 cards.
-
-This is the **only** file you need besides the release zip. Everything else the plugin uses comes with OBS, Windows and the NVIDIA driver.
+The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`), which supports RTX 20, 30, 40 and 50 cards.
 
 **How to get it**
 
 1. Join the RenoDX Discord: https://discord.gg/F6AUTeWJHM
-2. Open this channel (the link works after you have joined): https://discord.com/channels/1408098019194310818/1543975158937821315
-3. Download the `nvngx_dlssnr.dll` **310.8.0.0 compatibility build** (165,840,496 bytes). Unzip it if it comes as a zip.
-4. Check the hash below. The installer checks it too and tells you if you picked the wrong file.
-
-| | |
-|---|---|
-| SHA-256 | `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a` |
-| Size | 165,840,496 bytes |
-
-Newer or official files, such as `nvngx_dlssnr_2026_10_16.zip` (310.9.16.0) or NVIDIA's signed 310.8.0.0 (`e16bcf15...`), only contain RTX 50 code and are refused by this version. To check a file yourself:
-
-```powershell
-(Get-FileHash 'C:\path\to\nvngx_dlssnr.dll' -Algorithm SHA256).Hash   # must start with E67DEE209320
-```
+2. Open this channel: https://discord.com/channels/1408098019194310818/1543975158937821315
+3. Download the `nvngx_dlssnr.dll` **310.8.0.0 compatibility build** (165,840,496 bytes). Unzip it if needed.
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.1.1-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
-2. Close OBS completely.
-3. Extract the whole zip and double-click **`install.bat`**. Pick a language, confirm your OBS folder and choose **Yes** at the admin prompt.
-4. When it asks for the NR model file, drag your `nvngx_dlssnr.dll` into the window and press Enter. Skip this if it is already in `obs-studio\bin\64bit`.
-5. Start OBS, right-click your source > **Filters** > **Effect Filters** > **+** > **Native NR**.
+1. Download `obs-nr-native-filter-0.2.0-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
+2. Close OBS completely (including tray icon).
+3. Extract the entire zip and double-click **`install.bat`**.
+4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
+5. Drag your `nvngx_dlssnr.dll` into the window (or press Enter to skip and add later).
+6. Choose **Y** when prompted to automatically download and verify **DLSS 4.5 SR** (`nvngx_dlss.dll`, ~56 MB) and **NVIDIA VFG** (5 official signed DLLs, RTX 40/50), then approve the Windows Admin prompt.
+7. Start OBS, right-click your source > **Filters** > **Effect Filters** > **+** > **Native NR**.
 
-The filter properties show **Status: NR is being applied** when it works. Step-by-step guide, manual install and uninstall: [docs/INSTALL.md](docs/INSTALL.md).
+Step-by-step guide, manual install and uninstall: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Settings
 
-| Setting | Range | Default | What it does |
+| Group | Key Settings | Default | Notes |
 |---|---|---|---|
-| Enable native NR | on / off | on | Turns NR on for this source. |
-| NR runtime file | path | `C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll` | Where the model file is. Change it only if OBS lives elsewhere, then remove and re-add the filter. |
-| Composition strength | 0 to 1 | 1 | 0 shows the original, 1 the full NR result. |
-| NR model preset | 0 to 3 | 0 | NVIDIA's model preset. |
-| NR style | Standard / Natural / Cinematic | Standard | NVIDIA's look presets. |
-| NR intensity | 0 to 2 | 1 | How strongly the model changes the picture. |
-| Local structure | 0 to 2 | 1 | Fine detail and texture. |
-| Local tone | 0 to 2 | **0** | Local brightness and contrast. NVIDIA's default is 1, which lifts shadows and adds a slight green tint, so this filter starts at 0 and keeps your source's brightness. |
-| Skin structure | -1 to 2 | -1 | Detail on skin. -1 follows Local structure. |
-| Automatic mask | on / off | on | NVIDIA's automatic mask. |
-
-Changing a value restarts NR for that filter, so the original can show for a moment. The status and reason lines in the filter properties tell you what the filter is doing.
-
-## Troubleshooting
-
-| What you see | What to do |
-|---|---|
-| **Native NR** is not in the filter list | The plugin is not in this OBS. Run `install.bat` again and check the OBS folder it shows. OBS must be 32.x, 64-bit. |
-| Reason: the NR runtime file does not exist | Put `nvngx_dlssnr.dll` in `obs-studio\bin\64bit`, or set **NR runtime file** to its full path, then remove and re-add the filter. |
-| Reason: ... (hash differs) | Wrong build of the model file. See [The NR model file](#the-nr-model-file). |
-| Reason: D3D11 renderer required | OBS Settings > Advanced > Video > Renderer: Direct3D 11, then restart OBS. |
-| Reason: the graphics driver reset the GPU | Restart OBS. If it keeps happening, lower the source resolution or frame rate. |
-| Picture looks brighter or greenish | Set **Local tone** to 0. |
-
-The OBS log (Help > Log Files > View Current Log) has lines starting with `[obs-nr-filter]`. A line with `native=1 failed=0` means NR started. Please include those lines when you report a problem.
-
-## Performance
-
-NR is heavy. In tests on an RTX 4090 with a 2528×1369 source at 60 fps, NR was applied to about 99% of frames; the rest reused the previous NR frame. With a 2560×1440 video at 60 fps, a frame took about 12 ms (the limit is 16.7 ms) and a few frames every 5 seconds reused the previous NR frame. Lower resolution or frame rate leaves more headroom.
-
-## Known limitations
-
-- Only tested on an RTX 4090.
-- The default model path assumes OBS in `C:\Program Files\obs-studio`. For Steam, portable or other folders, set **NR runtime file**; the installer prints the path to use.
-- SDR sources only. HDR colour spaces are refused and the original passes through.
-- If the graphics driver resets the GPU, NR stays off until OBS restarts.
-- While Native NR is on a display capture that is showing, OBS windows (projectors included) are hidden from all screen capture, so a projector on the captured monitor is not captured and processed again. Other apps that record or share the screen do not see OBS windows either. They come back when the filter is removed or the source is hidden.
+| **Basic / Preset** | Quick preset, Composition strength, NR passes (1–2), Working scale (50–100%) | 1 pass, 100% | Use 75% working scale or 1 pass on 1440p/4K when running VFG simultaneously. |
+| **1st / 2nd Pass** | Preset (0–3), Style (Standard/Natural/Cinematic), Intensity, Local structure, Local tone, Skin structure, Auto mask | Local tone **0** | Independent 2nd pass styles supported when passes = 2 and Custom 2nd pass is checked. |
+| **Anti-flicker** | Temporal stability (0–1), Static stabilizer, Tolerance, Motion mode | 0.80, Static ON, Refined | Refined NVOF eliminates 4×4 block wobble; Static hold locks stationary UI/backgrounds with zero ghosting. |
+| **DLSS 4.5 & CAS** | Output upscale (Off / 1440p / 4K / DLAA), DLSS SR model (K / M / L), CAS sharpening (0–1) | Off, Model M, CAS 0 | Automatically uses `bin/64bit/dlss/nvngx_dlss.dll`; falls back to bilinear+CAS if absent. |
+| **FPS HUD / Status** | Pre/Post FPS overlay (Off / Top-Left / Top-Right), Status & Reason | Off | Shows live `IN -> NR FPS` on output. |
 
 ## Uninstall
 
-Close OBS and run **`uninstall.bat`** from the release folder. It removes the plugin files, puts back anything the installer replaced, and removes `nvngx_dlssnr.dll` only if the installer copied it.
+Close OBS and run **`uninstall.bat`** from the extracted release folder. It removes plugin files, restores any backed-up files, and removes `nvngx_dlssnr.dll`, `dlss/nvngx_dlss.dll`, and `nvidia-vfg/*.dll` only if the installer copied them.
 
 ## Build from source
-
-The build is currently set up for one machine layout:
-
-- Visual Studio 2022 Build Tools with MSVC 14.44.35207 (path set in [`cmake/nr/Libobs.cmake`](cmake/nr/Libobs.cmake)) and CMake 3.28 or newer.
-- OBS Studio 32.2.2 installed in `C:\Program Files\obs-studio`. The build imports its `obs.dll` and checks the hash; OBS 32.2.2 headers are included in `deps/obs-headers`.
-- NVIDIA NGX SDK headers (API 1.5.0) and Optical Flow SDK 5.0.7 headers, which are not included. Paths and hashes: [`deps/THIRD-PARTY-NOT-INCLUDED.md`](deps/THIRD-PARTY-NOT-INCLUDED.md).
 
 ```powershell
 cmake --preset windows-x64-release
 cmake --build --preset windows-x64-release --parallel 4
-ctest --preset windows-x64-release            # GPU tests need an RTX card and the model file
+ctest --preset windows-x64-release
 .\packaging\windows\make-release.ps1 -BuildDir out\build\windows-x64-release
 ```
 
-## How it works
+See [`deps/THIRD-PARTY-NOT-INCLUDED.md`](deps/THIRD-PARTY-NOT-INCLUDED.md) for the pinned NVIDIA NGX & Optical Flow SDK headers required to compile.
 
-1. OBS renders the source. The filter hands the frame to its own Direct3D 12 device.
-2. NVIDIA Optical Flow measures motion between frames.
-3. The NR model processes the frame with that motion information.
-4. A colour step derived from RenoDX keeps the source's colour range and alpha.
-5. The result goes back into OBS. A late frame reuses the previous NR result (up to 2), otherwise the original is shown.
+## Credits & License
 
-## Credits
-
-- NR integration ported from the OptiScaler DLSS NR work: [OptiScaler](https://github.com/optiscaler/OptiScaler), [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR) and the contributors in [CREDITS](provenance/source-notices/CREDITS.md).
+- NR integration ported from [OptiScaler](https://github.com/optiscaler/OptiScaler) & [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR).
+- Anti-flicker, refined NVOF, DLSS SR, and NVIDIA VFG presenter architecture adapted from [Likely7/Veyra-NRVideo](https://github.com/Likely7/Veyra-NRVideo) (GPL-3.0-only).
 - Colour composition derived from [RenoDX](https://github.com/clshortfuse/renodx) by clshortfuse ([MIT notice](provenance/source-notices/RenoDX-MIT.txt)).
-- RTX 20 to 50 compatible model build by ShortFuse (RenoDX community).
-- Project layout from [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate).
-- NVIDIA DLSS, NGX and Optical Flow belong to NVIDIA and are not included.
+- Contrast Adaptive Sharpening derived from AMD FidelityFX CAS (MIT).
+
+Source code is licensed under [GNU GPL v3](LICENSE) (GPL-3.0-only).
 
 Related: [OptiScaler-Susemi](https://github.com/grim-susemi/OptiScaler-Susemi) · [DLSS5 NR guide](https://github.com/grim-susemi/dlss5-nr-guide)
-
-## License
-
-Source code is licensed under the [GNU GPL v3](LICENSE) (GPL-3.0-only). Parts derived from RenoDX are MIT-licensed. NVIDIA SDK files and the NR model file are not part of this repository and stay under NVIDIA's terms.
 
 ---
 
 ## 한국어 요약
 
-OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링)을 바로 거는 OBS 필터입니다. 캡처보드로 받은 콘솔 화면, 게임 캡처, 창 캡처 어디에나 쓸 수 있고 ReShade나 주입 DLL이 필요 없습니다. 60fps에서 한 프레임이 늦어도 원본으로 깜빡이지 않고 직전 NR 화면을 유지합니다.
+OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안티플리커, DLSS 4.5 업스케일(1440p/4K/DLAA) + CAS 선명도, 그리고 RTX 40/50용 NVIDIA VFG(2배~4배 미리보기 프레임 생성)를 한 번에 제공하는 OBS 플러그인입니다.
 
-**준비물**
+**설치 방법 (원클릭)**
 
-- Windows 10/11 64비트, OBS Studio 32.x (32.2.2에서 시험)
-- NVIDIA RTX 20~50 시리즈 (RTX 4090에서 시험)
-- `nvngx_dlssnr.dll` 310.8.0.0 호환판 (165,840,496바이트, SHA-256 `e67dee20…c989a`). **이 저장소와 릴리즈에는 들어 있지 않습니다.** 릴리즈 zip 말고 따로 필요한 건 이 파일 하나뿐이고, 나머지는 OBS·Windows·NVIDIA 드라이버에 들어 있습니다.
-
-**NR 모델 파일 받는 법**
-
-1. RenoDX 디스코드에 들어갑니다: https://discord.gg/F6AUTeWJHM
-2. 이 채널을 엽니다 (서버에 들어간 뒤에 열립니다): https://discord.com/channels/1408098019194310818/1543975158937821315
-3. `nvngx_dlssnr.dll` **310.8.0.0 호환판**(165,840,496바이트)을 받습니다. zip이면 풉니다.
-4. 설치기가 해시를 확인해 맞는 파일인지 알려 줍니다. `nvngx_dlssnr_2026_10_16.zip`(310.9.16) 같은 새 판이나 NVIDIA 정품 310.8은 RTX 50 전용이라 받지 않습니다.
-
-**설치**
-
-1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.1.1-windows-x64.zip`을 받습니다.
+1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.2.0-windows-x64.zip`을 내려받아 압축을 풉니다.
 2. OBS를 완전히 끕니다.
-3. 압축을 전부 풀고 **`install.bat`** 을 더블클릭 → 한국어 선택 → OBS 폴더 확인 → 관리자 권한 창에서 **예**.
-4. NR 모델 파일을 물어보면 가지고 있는 `nvngx_dlssnr.dll`을 창에 끌어다 놓고 Enter.
-5. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터**의 **+** > **Native NR**.
+3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
+4. `nvngx_dlssnr.dll`(310.8.0.0 호환판, SHA-256 `e67dee20…c989a`)이 OBS에 없으면 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)
+5. **DLSS 4.5 SR(`nvngx_dlss.dll`)** 과 **NVIDIA VFG(5개 DLL)** 자동 다운로드 안내가 나오면 Enter(Y)를 누르세요. 설치기가 NVIDIA 공식 서버에서 직접 받아 서명·SHA-256 검증까지 끝내고 OBS에 배치합니다.
+6. 관리자 권한 창에서 **예**를 누르면 설치가 끝납니다.
+7. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터 [+]** > **Native NR** 을 추가합니다. (기존 `rtx-superresolution` 구형 필터는 끄고 사용하세요.)
 
-디스플레이 캡처에 Native NR을 걸면, 그 캡처가 보이는 동안 OBS 창(프로젝터 포함)이 모든 화면 캡처에서 숨겨집니다. 같은 모니터에 띄운 프로젝터를 다시 찍어 NR이 반복되는 것을 막기 위해서입니다. 디스코드 화면 공유 같은 다른 앱에도 OBS 창이 보이지 않고, 필터를 빼거나 소스를 숨기면 돌아옵니다.
-
-필터 속성에 **상태: NR 적용 중**이 보이면 성공입니다. 화면이 밝아지거나 초록빛이 돌면 **로컬 톤**이 0인지 확인하세요(기본값 0). 자세한 안내와 문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)에 있고, 제거는 같은 폴더의 `uninstall.bat`입니다.
+자세한 안내와 제거(`uninstall.bat`)·문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)를 참고하세요.

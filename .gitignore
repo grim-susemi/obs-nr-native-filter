@@ -29,6 +29,7 @@
 !/tools/tests/
 !/tools/Invoke-NrQa.ps1
 !/tools/host/
+!/tools/fg-presenter/
 !/provenance/
 /provenance/*
 !/provenance/inputs.spec.json
@@ -39,7 +40,8 @@
 /deps/*
 !/deps/obs-headers/
 !/deps/ngx/
-!/deps/nvofa/
+/deps/ngx/*
+!/deps/ngx/README.md
 
 # Exclude macOS legacy resource forks
 .DS_Store

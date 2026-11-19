@@ -153,7 +153,7 @@ int acceptance(const char* codecPath,const char* modelPath,const char* outputPat
     std::ofstream output(outputPath,std::ios::binary);require(output.good(),"GPU evidence output");
     const Artifacts a{bytes(codecPath),bytes(modelPath),output};
     scenario(a,{}); // Exact native trace: descriptor 0, evaluate(0), descriptor 5.
-    for(uint32_t scale:{50u,55u,75u}) for(uint32_t passes:{1u,2u,3u}) {
+    for(uint32_t scale:{50u,55u,75u}) for(uint32_t passes:{1u,2u}) {
         scenario(a,{scale,passes}); // HDR proxy encoding, coloured native spatial detail.
         scenario(a,{scale,passes,0,1,false}); // SDR proxy encoding, same spatial detail.
         scenario(a,{scale,passes,.0625f,.5f,false}); // Known nonzero residual, one final strength blend.

@@ -35,6 +35,33 @@ struct ModelTuning {
     }
     bool operator==(const ModelTuning&) const = default;
 };
+struct StabilizeSettings {
+    float temporalStrength = 0.0f; // 0..1 (0 disables motion-compensated temporal stability)
+    float holdStrength = 0.0f;     // 0..1 (0 disables static-area output hold)
+    float holdTolerance = 0.02f;   // 0.005..0.10 relative luma tolerance
+    uint32_t motionMode = 0;       // 0 = refined NvofDensify, 1 = bilinear, 2 = zero motion
+    bool valid() const {
+        return std::isfinite(temporalStrength) && temporalStrength >= 0.0f && temporalStrength <= 1.0f &&
+               std::isfinite(holdStrength) && holdStrength >= 0.0f && holdStrength <= 1.0f &&
+               std::isfinite(holdTolerance) && holdTolerance >= 0.001f && holdTolerance <= 0.25f &&
+               motionMode <= 2u;
+    }
+    bool active() const { return temporalStrength > 0.0f || holdStrength > 0.0f; }
+    bool operator==(const StabilizeSettings&) const = default;
+};
+struct UpscaleSettings {
+    uint32_t mode = 0;         // 0 = Off (1:1), 1 = 1440p (2560x1440), 2 = 4K (3840x2160), 3 = DLAA (1:1)
+    uint32_t dlssModel = 1;    // 0 = DLSS 4 (preset K), 1 = DLSS 4.5 (preset M), 2 = DLSS 4.5 UltraPerf (preset L)
+    float casSharpness = 0.0f; // 0.0..1.0 AMD FidelityFX CAS
+    std::string srRuntimePath{};
+    bool valid() const {
+        return mode <= 3u && dlssModel <= 2u &&
+            std::isfinite(casSharpness) && casSharpness >= 0.0f && casSharpness <= 1.0f;
+    }
+    bool srActive() const { return mode >= 1u && mode <= 3u; }
+    bool active() const { return srActive() || casSharpness > 0.0f; }
+    bool operator==(const UpscaleSettings&) const = default;
+};
 struct Settings {
     const SettingsRevision revision;
     const bool enabled;
@@ -42,8 +69,12 @@ struct Settings {
     const CompositionStrength strength;
     const ModelTuning tuning;
     const uint32_t passes=1, workScale=100;
+    const std::optional<ModelTuning> pass2Tuning{};
+    const StabilizeSettings stabilize{};
+    const UpscaleSettings upscale{};
     bool valid() const { return revision.value != 0 && !runtimePath.empty() && strength.valid() && tuning.valid() &&
-        passes >= 1 && passes <= 3 && workScale >= 50 && workScale <= 100; }
+        (!pass2Tuning || pass2Tuning->valid()) && stabilize.valid() && upscale.valid() &&
+        passes >= 1 && passes <= 2 && workScale >= 50 && workScale <= 100; }
     bool operator==(const Settings&) const = default;
 };
 
@@ -63,6 +94,13 @@ inline constexpr Extent work_extent(Rect active, uint32_t pct)
 {
     return {static_cast<uint32_t>(std::max(uint64_t{1}, (uint64_t{active.width} * pct + 50) / 100)),
         static_cast<uint32_t>(std::max(uint64_t{1}, (uint64_t{active.height} * pct + 50) / 100))};
+}
+inline constexpr Extent upscale_extent(Extent src, uint32_t mode)
+{
+    if (!src.width || !src.height) return src;
+    if (mode == 1u) return {(std::max)(src.width, 2560u), (std::max)(src.height, 1440u)};
+    if (mode == 2u) return {(std::max)(src.width, 3840u), (std::max)(src.height, 2160u)};
+    return src;
 }
 struct FrameDescriptor {
     const Extent allocation;
@@ -231,7 +269,7 @@ inline Selection select_for_tick(const Epochs& active, Phase phase, const Ingres
 
 // A late NR result keeps the temporal history, so the frame between two NR frames re-shows the NR frame
 // already in the output instead of flashing the raw frame. Bounded so a stalled runtime still falls back to raw.
-inline constexpr unsigned kMaxHeldNrFrames = 2;
+inline constexpr unsigned kMaxHeldNrFrames = 6;
 inline bool hold_previous_nr(const Selection& selected, bool targetHoldsNr, uint64_t targetTick, unsigned held) noexcept
 {
     return selected.kind == OutputKind::DelayedRaw && selected.reason == Reason::DeadlineMiss && !selected.resetTemporal &&
