@@ -893,7 +893,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const Epochs epochs{work.job.key.frame.instanceId,work.job.key.frame.contentEpoch,
         work.job.key.historyEpoch,work.job.key.resourceGeneration};
     const CoreInput input{work.job,epochs,resources,{work.job.key.historyEpoch,!reset,reset},list,
-        plan->whitePoint,1,1,plan->codecColor,plan->codecAlpha};
+        plan->whitePoint,1,1,plan->codecColor,plan->codecAlpha,1};
     const int64_t tCore0=stamp();
     r.core=std::make_unique<Core>(p.instance,std::make_unique<TracedCodec>(device,p.config.codec,*job),
         std::make_unique<Evaluator>(*p.pass,job));

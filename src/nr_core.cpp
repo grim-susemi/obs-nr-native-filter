@@ -12,43 +12,68 @@ CoreResult Core::record(const CoreInput& in) {
     const auto& r=in.resources;
     const auto& d=job.input.descriptor;
     const auto& t=job.input.settings.tuning;
-    const auto compact=[&](const CoreTexture& x) {
-        return x.valid() && x.allocation==Extent{d.active.width,d.active.height} &&
-            x.active==Rect{0,0,d.active.width,d.active.height};
+    const Extent native{d.active.width,d.active.height};
+    const auto work=work_extent(d.active,job.input.settings.workScale);
+    const bool reduced=job.input.settings.workScale<100;
+    const auto compact=[](const CoreTexture& x,Extent size) {
+        return x.valid() && x.allocation==size && x.active==Rect{0,0,size.width,size.height};
     };
-    // Worker supplies compact full-size linear709/SDR images after Task9 conversion.
+    // Canonical source/keep/output stay native; only model-side images use the work extent.
     // Guide subrects remain independent, exactly as R2 SetModelRegions.
     if(input_problem(job.input,in.epochs)!=Reason::None || !job.key.valid() ||
         job.key.frame!=job.input.key || job.key.frame.instanceId!=instanceId_ ||
         job.key.historyEpoch!=in.epochs.historyEpoch || job.key.resourceGeneration!=in.epochs.resourceGeneration ||
         !job.deadlineTick || job.deadlineTick<=job.input.canonicalTick ||
-        !in.commands || !r.codecHeap || !compact(r.raw) || !compact(r.proxy) || !compact(r.keep) ||
-        !compact(r.model) || !compact(r.output) || !r.depth.valid() || !r.motion.valid() ||
+        !in.commands || !r.codecHeap || !compact(r.raw,native) || !compact(r.proxy,native) || !compact(r.keep,native) ||
+        !compact(r.model,work) || !compact(r.output,native) || !r.depth.valid() || !r.motion.valid() ||
+        !in.passes || in.passes>3 || in.passes>job.input.settings.passes ||
+        (reduced && !compact(in.workProxy,work)) ||
+        (in.passes>1 && (!compact(in.modelB,work) || !compact(in.modelC,work))) ||
         !in.history.epoch || in.history.epoch!=job.key.historyEpoch || (!in.history.valid && !in.history.reset) ||
         !std::isfinite(in.whitePoint) || in.whitePoint<=0 ||
         !std::isfinite(in.mvScaleX) || !std::isfinite(in.mvScaleY) ||
         (in.codecColor!=ColorSpace::Rec709Srgb && in.codecColor!=ColorSpace::ScRgbLinear) ||
         ((d.color==ColorSpace::Rec709Srgb)!=(in.codecColor==ColorSpace::Rec709Srgb)) ||
-        (in.codecAlpha!=AlphaMode::Straight && in.codecAlpha!=AlphaMode::Opaque) ||
-        r.proxy.native==r.raw.native || r.keep.native==r.raw.native || r.output.native==r.raw.native ||
-        r.model.native==r.proxy.native || r.model.native==r.raw.native || r.model.native==r.keep.native ||
-        r.output.native==r.proxy.native || r.output.native==r.keep.native ||
-        r.output.native==r.model.native || r.keep.native==r.proxy.native)
+        (in.codecAlpha!=AlphaMode::Straight && in.codecAlpha!=AlphaMode::Opaque))
         return {CoreState::InvalidInput,false,false,0};
+    std::array<const CoreTexture*,8> textures{&r.raw,&r.proxy,&r.keep,&r.model,&r.output};
+    size_t count=5;
+    if(reduced) textures[count++]=&in.workProxy;
+    if(in.passes>1) { textures[count++]=&in.modelB; textures[count++]=&in.modelC; }
+    for(size_t i=0;i<count;++i) for(size_t j=0;j<i;++j)
+        if(textures[i]->native==textures[j]->native) return {CoreState::InvalidInput,false,false,0};
     if(!job.input.settings.enabled) return {CoreState::Disabled,false,false,0};
     CodecConstants c;
     c.width=d.active.width; c.height=d.active.height; c.whitePoint=in.whitePoint;
     c.passthrough=in.codecColor==ColorSpace::Rec709Srgb ? 1u : 0u;
     c.strength=job.input.settings.strength.value;
-    // R1 EncodeInput -> R2 Context::Run -> R1 resolve; one history, one pass, full size.
     if(!codec_->encode(in,c)) return {CoreState::EncodeError,false,false,0};
-    const ModelInput model{in,r.proxy,r.depth,r.motion,r.model,t};
-    const auto result=evaluator_->evaluate(model);
-    if(result.state==EvaluationState::Error) return {CoreState::EvaluationError,false,false,result.code};
-    if(result.state!=EvaluationState::Evaluated) return {CoreState::NotReady,false,false,result.code};
+    const auto& source=reduced?in.workProxy:r.proxy;
+    if(reduced && !codec_->downsample(in,r.proxy,source)) return {CoreState::EncodeError,false,false,0};
+    const ModelTuning later{t.preset,t.style,t.intensity,t.localStructure,0,t.skinStructure,t.autoMask};
+    uint32_t completed=0,code=0,passError=0,failedPass=0;
+    for(uint32_t pass=0;pass<in.passes;++pass) {
+        const auto& answer=pass%2?in.modelB:r.model;
+        const ModelInput model{in,pass?in.modelC:source,r.depth,r.motion,answer,pass?later:t,pass};
+        const auto result=evaluator_->evaluate(model);
+        code=result.code;
+        switch(result.state) {
+        case EvaluationState::Error:
+            return {CoreState::EvaluationError,completed!=0,false,code,completed,0,pass+1};
+        case EvaluationState::NotReady:
+            return {CoreState::NotReady,completed!=0,false,code,completed,0,pass+1};
+        case EvaluationState::Evaluated: break;
+        }
+        ++completed;
+        if(completed<in.passes && !codec_->clamp(in,answer,in.modelC,pass)) {
+            // No clamp commands recorded: A/B retains the last answer, so one final resolve is safe.
+            passError=core_clamp_refused;failedPass=pass+2;break;
+        }
+    }
     c.mode=1;
-    if(!codec_->resolve(in,c,r.proxy,r.model)) return {CoreState::ResolveError,true,false,0};
-    return {CoreState::Recorded,true,true,result.code};
+    const auto& answer=completed%2?r.model:in.modelB;
+    if(!codec_->resolve(in,c,source,answer)) return {CoreState::ResolveError,true,false,0,completed,passError,failedPass};
+    return {CoreState::Recorded,true,true,code,completed,passError,failedPass};
 }
 namespace {
 void checked(HRESULT result) { if(FAILED(result)) throw std::runtime_error("D3D12 codec initialization failed"); }

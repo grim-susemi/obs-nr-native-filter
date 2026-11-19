@@ -331,6 +331,27 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (gStrength == 0.0) { gTarget[id.xy] = originalSample; return; }
     const float normScale = gPassthrough != 0 ? 1.0 : WhitePoint();
     float3 original = originalSample.rgb / normScale;
+    uint proxyWidth,proxyHeight;
+    gSource.GetDimensions(proxyWidth,proxyHeight);
+    if (proxyWidth != gWidth || proxyHeight != gHeight)
+    {
+        // Matched residual, adapted from hhkbble's multi-pass contribution:
+        // carry only the same-UV model edit, never the reduced picture's lost chromatic detail.
+        // Identity gives edit=0 at every UV, preserving the native proxy for all working scales.
+        float3 edit = model - proxy;
+        proxy = gPassthrough != 0 ? max(original,0.0) : saturate(SoftKnee(max(original,0.0)));
+        if (gPassthrough == 0)
+        {
+            float scale = 1.0;
+            [unroll] for (int ch=0; ch<3; ++ch)
+            {
+                if (edit[ch] > 1e-6) scale = min(scale,(1.0-proxy[ch])/edit[ch]);
+                else if (edit[ch] < -1e-6) scale = min(scale,-proxy[ch]/edit[ch]);
+            }
+            edit *= saturate(scale);
+        }
+        model = proxy + edit;
+    }
     float originalLuma = dot(original,kLuma);
     float proxyLuma = dot(proxy,kLuma);
     // Rescale the model answer to the original luminance and restore headroom lost by the proxy.

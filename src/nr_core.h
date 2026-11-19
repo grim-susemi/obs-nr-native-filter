@@ -40,6 +40,10 @@ struct CoreInput {
     const float mvScaleX,mvScaleY; // Working-image pixels; no second resolution scaling.
     const ColorSpace codecColor; // Task9 canonical linear709/SDR; original job descriptor stays intact.
     const AlphaMode codecAlpha; // Task9 unpremultiplies before codec, restores afterward.
+    const uint32_t passes=1; // Actual contiguous ready count, not the requested Settings::passes.
+    const CoreTexture workProxy{nullptr,{0,0},{0,0,0,0}}; // Required only below 100%.
+    const CoreTexture modelB{nullptr,{0,0},{0,0,0,0}},modelC{nullptr,{0,0},{0,0,0,0}};
+    // A=resources.model; B/C required only for actual passes>1. All three use the work extent.
 };
 struct ModelInput {
     const CoreInput& input;
@@ -48,6 +52,7 @@ struct ModelInput {
     const CoreTexture& motion;
     const CoreTexture& output;
     const ModelTuning& tuning;
+    const uint32_t pass=0; // Zero-based runtime::Pass selector.
 };
 enum class EvaluationState { NotReady, Evaluated, Error };
 struct EvaluationResult { EvaluationState state; uint32_t code; };
@@ -66,10 +71,14 @@ public:
     virtual bool resolve(const CoreInput&,const CodecConstants&,const CoreTexture& source,const CoreTexture& answer)=0;
 };
 enum class CoreState { InvalidInput, Disabled, NotReady, EncodeError, EvaluationError, ResolveError, Recorded };
+inline constexpr uint32_t core_clamp_refused=0xe019; // Codec refused before recording commands.
 struct CoreResult {
     CoreState state;
     bool evaluated,composed;
     uint32_t error;
+    uint32_t passes=0,passError=0,failedPass=0;
+    // passes=completed evaluations; failedPass=one-based first failed/skipped pass, or zero.
+    // passError is core_clamp_refused only for safe inter-pass refusal; error retains evaluator code.
     // Recorded is NOT GPU-completed, publication-ready, or an inference-quality claim.
 };
 class Core {
@@ -83,8 +92,10 @@ public:
     CoreResult record(const CoreInput&);
 };
 // Production D3D12 encode/resolve, using actual compiled nr_codec.hlsl bytes.
-// Raw arrives NON_PIXEL_SHADER_RESOURCE, proxy/keep/model/output UAV.
-// Encode leaves proxy/keep readable. Resolve leaves model readable and output UAV.
+// Raw arrives NON_PIXEL_SHADER_RESOURCE; native proxy/keep/output and work-size A/B/C/workProxy UAV.
+// Encode leaves proxy/keep readable; downsample leaves workProxy readable.
+// Clamp restores its answer to UAV and leaves C UAV; evaluator temporarily makes C readable.
+// Resolve leaves the final A/B answer readable and output UAV. Other A/B/C remain UAV.
 // The worker owns lists, barriers to external COMMON and fence retirement, never OBS context.
 class D3D12Codec final : public Codec {
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
