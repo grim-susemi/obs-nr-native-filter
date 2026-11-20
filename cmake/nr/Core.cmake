@@ -33,3 +33,7 @@ add_executable(nr_core_multipass_gpu_tests "${NR_CORE_ROOT}/tools/tests/nr_core_
 target_link_libraries(nr_core_multipass_gpu_tests PRIVATE nr_core)
 target_compile_options(nr_core_multipass_gpu_tests PRIVATE /W4 /WX /permissive-)
 add_dependencies(nr_core_multipass_gpu_tests nr_core_fake_model_shader)
+add_test(NAME nr_core_multipass_gpu COMMAND nr_core_multipass_gpu_tests
+  "${NR_CODEC_DXIL}" "${CMAKE_CURRENT_BINARY_DIR}/nr_core_fake_model.dxil"
+  "${CMAKE_CURRENT_BINARY_DIR}/nr_core_multipass_gpu.bin")
+set_tests_properties(nr_core_multipass_gpu PROPERTIES RESOURCE_LOCK nr_gpu TIMEOUT 60)

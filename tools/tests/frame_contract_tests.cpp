@@ -142,6 +142,14 @@ void immutable_settings()
         // Then: one widened rounding rule determines both axes.
         expect(extent==test.expected,"rounded work extent");
     }
+    struct UpscaleCase {const Extent source;const uint32_t mode;const Extent expected;};
+    for(const auto& test:std::array<UpscaleCase,10>{{
+            {{1920,1080},1,{2560,1440}},{{1920,1080},2,{3840,2160}},
+            {{1080,1920},1,{2560,4552}},{{3440,1440},2,{5160,2160}},
+            {{1281,721},1,{2560,1441}},{{1,1},1,{2560,2560}},
+            {{3840,2160},1,{3840,2160}},{{0,720},1,{0,720}},
+            {{1920,1080},3,{1920,1080}},{{UINT32_MAX,1},1,{UINT32_MAX,1}}}})
+        expect(upscale_extent(test.source,test.mode)==test.expected,"aspect-preserving upscale extent");
 }
 void adversarial(bool print)
 {

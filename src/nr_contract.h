@@ -98,9 +98,18 @@ inline constexpr Extent work_extent(Rect active, uint32_t pct)
 inline constexpr Extent upscale_extent(Extent src, uint32_t mode)
 {
     if (!src.width || !src.height) return src;
-    if (mode == 1u) return {(std::max)(src.width, 2560u), (std::max)(src.height, 1440u)};
-    if (mode == 2u) return {(std::max)(src.width, 3840u), (std::max)(src.height, 2160u)};
-    return src;
+    if (mode != 1u && mode != 2u) return src;
+    const uint32_t targetW = mode == 1u ? 2560u : 3840u;
+    const uint32_t targetH = mode == 1u ? 1440u : 2160u;
+    if (src.width >= targetW && src.height >= targetH) return src;
+    // Cover the target without stretching or downscaling; round the other axis up.
+    const bool widthLimits = uint64_t{targetW} * src.height >= uint64_t{targetH} * src.width;
+    const uint64_t width = widthLimits ? targetW :
+        (uint64_t{src.width} * targetH + src.height - 1) / src.height;
+    const uint64_t height = widthLimits ?
+        (uint64_t{src.height} * targetW + src.width - 1) / src.width : targetH;
+    if (width > UINT32_MAX || height > UINT32_MAX) return src;
+    return {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
 }
 struct FrameDescriptor {
     const Extent allocation;

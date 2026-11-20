@@ -580,6 +580,8 @@ struct Processor::Impl {
     const char* lastResetSetter="initial-reset";
     // N23 worker diagnostics (no behavior change).
     std::atomic<uint64_t> diagOk{0},diagFail{0},diagExc{0};std::atomic<uint32_t> diagSettle{0},diagLastCode{0},diagFirstN{0};
+    std::atomic<uint64_t> diagSrRecorded{0};
+    std::atomic<uint32_t> diagSrFallback{0};
     std::array<std::atomic<uint64_t>,8> diagFirst{};std::array<char,160> diagWhat{};std::atomic<bool> diagWhatSet{false};
     void diag_fail(uint32_t code) {
         diagFail.fetch_add(1);diagLastCode.store(code);const auto n=diagFirstN.load();
@@ -737,6 +739,8 @@ std::string Processor::diag() const {
     std::snprintf(b,sizeof b," last=%x",p.diagLastCode.load());s+=b;
     for(uint32_t i=0;i<p.diagFirstN.load()&&i<p.diagFirst.size();++i){std::snprintf(b,sizeof b," f%u=%llx",i,(unsigned long long)p.diagFirst[i].load());s+=b;}
     if(p.diagWhatSet.load(std::memory_order_acquire)){s+=" what=";s+=p.diagWhat.data();}
+    std::snprintf(b,sizeof b," srRecorded=%llu srFallback=%08x",
+        static_cast<unsigned long long>(p.diagSrRecorded.load()),p.diagSrFallback.load());s+=b;
     return s;
 }
 pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_token stop) {
@@ -862,7 +866,8 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
             auto srDispatch=p.driver->dispatch;
             if(p.driver->allocateParams) srDispatch.allocate=p.driver->allocateParams;
             srDispatch.create=p.driver->createRaw;
-            (void)p.dlssSr->create(srDispatch,r.creation.Get(),size,outExt,s.upscale.dlssModel,s.upscale.mode==3);
+            if(!p.dlssSr->create(srDispatch,r.creation.Get(),size,outExt,s.upscale.dlssModel,s.upscale.mode==3))
+                p.diagSrFallback.store(p.dlssSr->last_error());
         }
         if(p.config.qaObservations||job->observation)job->qaTiming[4]=stamp();
         job->driverCreateCode=p.creationReceipt.code;job->driverHandle=p.creationReceipt.handle;
@@ -1045,7 +1050,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const auto& upCfg=work.job.input.settings.upscale;
     const Extent outExt=upscale_extent(size,upCfg.mode);
     const bool needResize=outExt!=size;
-    const bool srReady=upCfg.srActive() && p.dlssSr && p.dlssSr->created();
+    const bool srReady=upCfg.srActive() && p.dlssSr && p.dlssSr->created() && !p.dlssSr->failed();
     const bool useUpscaleOrCas=!p.config.cas.empty() && (srReady || needResize || upCfg.casSharpness>0.0f);
     if(useUpscaleOrCas) {
         if(!p.casPass) p.casPass=std::make_unique<D3D12CasPass>(device,p.config.cas);
@@ -1077,8 +1082,21 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
                     canonicalOutput,nullptr,p.srInTex.Get()),"SR linear prepare");
                 barrier(list,p.srInTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                require(p.dlssSr->evaluate(list,p.srInTex.Get(),p.srOutTex.Get(),guide->depth,guide->motion,reset),
-                    "DLSS SR evaluate");
+                if(!p.dlssSr->evaluate(list,p.srInTex.Get(),p.srOutTex.Get(),guide->depth,guide->motion,reset)) {
+                    // The vendor may have recorded partial commands. Discard before fencing the
+                    // already-submitted guide work, then let the next frame use bilinear/CAS.
+                    require(r.submission->discard(),"unsubmitted SR evaluation discard");
+                    require(work.binding.transport->discard_recording(work.binding.ticket),"failed SR Bridge discard");
+                    job->code=p.dlssSr->last_error();
+                    p.diagSrFallback.store(job->code);
+                    job->evaluated=false;
+                    job->composed=false;
+                    p.reset=true; p.lastResetSetter="sr-evaluation-fallback";
+                    p.stabilizeValid=false;
+                    p.signal(job);
+                    return {work.job,false,{}};
+                }
+                p.diagSrRecorded.fetch_add(1);
                 barrier(list,p.srOutTex.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 barrier(list,p.srInTex.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
             } else {

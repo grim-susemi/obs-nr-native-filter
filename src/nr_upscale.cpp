@@ -211,6 +211,7 @@ bool D3D12DlssSr::evaluate(ID3D12GraphicsCommandList* cmd, ID3D12Resource* color
     const NVSDK_NGX_Result res = seh_eval_sr(dispatch_.evaluate, cmd, handle_, params_, seh);
     if (res != NVSDK_NGX_Result_Success || seh) {
         lastError_ = seh ? seh : static_cast<uint32_t>(res);
+        failed_ = true;
         return false;
     }
     return true;

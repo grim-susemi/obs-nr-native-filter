@@ -123,9 +123,9 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
         while ((pos = content.find("event=present_original", pos)) != std::string::npos) { ++c; pos += 22; }
         return c;
     }();
-    std::printf("PASS vfg_native_smoke multiplier=%ux subframes=%zu originals=%zu\n", mult, subCount, origCount);
     expect(subCount >= (mult - 1) * 5, "insufficient VFG interpolated subframes presented");
     expect(origCount >= 5, "insufficient original frames presented");
+    std::printf("PASS vfg_native_smoke multiplier=%ux subframes=%zu originals=%zu\n", mult, subCount, origCount);
 }
 } // namespace
 
@@ -137,6 +137,7 @@ int wmain(int argc, wchar_t** argv)
         const std::filesystem::path logDir = argv[2];
         const auto monId = secondary_monitor_id();
         run_multiplier(2, presenter, (logDir / L"smoke-2x.log").wstring(), monId);
+        run_multiplier(3, presenter, (logDir / L"smoke-3x.log").wstring(), monId);
         run_multiplier(4, presenter, (logDir / L"smoke-4x.log").wstring(), monId);
         return 0;
     } catch (const std::exception& e) {

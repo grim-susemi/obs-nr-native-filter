@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "fg_controller.h"
+#include "fg_monitor_text.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
 #include <wrl/client.h>
@@ -61,26 +62,6 @@ struct Tap {
 };
 std::atomic_uint64_t nextTap{0};
 
-std::wstring utf8_to_wide(const std::string& s)
-{
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring out(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
-    return out;
-}
-
-std::string wide_to_utf8(const wchar_t* s)
-{
-    if (!s || !*s) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
-    if (n <= 1) return {};
-    std::string out(static_cast<size_t>(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, s, -1, out.data(), n - 1, nullptr, nullptr);
-    return out;
-}
-
 std::vector<MonitorItem> list_monitors()
 {
     std::vector<MonitorItem> list;
@@ -109,7 +90,8 @@ std::vector<MonitorItem> list_monitors()
         const long h = mi.rcMonitor.bottom - mi.rcMonitor.top;
         const bool primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
         std::string label = wide_to_utf8(mi.szDevice) + " (" + std::to_string(w) + "x" + std::to_string(h) +
-            " @ " + std::to_string(dm.dmDisplayFrequency) + "Hz" + (primary ? ", 주 모니터" : "") + ")";
+            " @ " + std::to_string(dm.dmDisplayFrequency) + "Hz" +
+            (primary ? std::string(", ") + obs_module_text("VFG.Monitor.Primary") : "") + ")";
         a->list->push_back({std::move(label), wide_to_utf8(devId.c_str())});
         return TRUE;
     }, reinterpret_cast<LPARAM>(&arg));
@@ -403,6 +385,7 @@ obs_properties_t* properties(void* opaque)
     obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Best"), 0);
     obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Balanced"), 1);
     obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Fast"), 2);
+    obs_property_set_long_description(qual, obs_module_text("VFG.Hint.Reopen"));
 
     auto* mon = obs_properties_add_list(coreGrp, "vfg_monitor", obs_module_text("VFG.Monitor"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -410,6 +393,7 @@ obs_properties_t* properties(void* opaque)
     for (const auto& m : list_monitors()) {
         obs_property_list_add_string(mon, m.label.c_str(), m.deviceId.c_str());
     }
+    obs_property_set_long_description(mon, obs_module_text("VFG.Hint.Reopen"));
 
     auto* hud = obs_properties_add_list(coreGrp, "vfg_fps_overlay", obs_module_text("VFG.FpsOverlay"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -441,7 +425,7 @@ obs_properties_t* properties(void* opaque)
     obs_properties_add_button2(ctrlGrp, "vfg_off", obs_module_text("VFG.OpenOff"),
         [](obs_properties_t*, obs_property_t*, void* data) { return data && start(*static_cast<Tap*>(data), true); }, opaque);
     obs_properties_add_button2(ctrlGrp, "vfg_stop", obs_module_text("VFG.Close"),
-        [](obs_properties_t*, obs_property_t*, void* data) { if (data) stop(data); return false; }, opaque);
+        [](obs_properties_t*, obs_property_t*, void* data) { if (!data) return false; stop(data); return true; }, opaque);
     obs_properties_add_group(p, "vfg_grp_control", obs_module_text("VFG.Group.Control"), OBS_GROUP_NORMAL, ctrlGrp);
     return p;
 }

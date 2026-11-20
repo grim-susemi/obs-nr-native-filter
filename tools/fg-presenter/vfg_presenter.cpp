@@ -162,7 +162,7 @@ void frames(Feed& f)
             return;
         }
         char left[32]{}, right[48]{};
-        std::snprintf(left, sizeof(left), "IN %5.1f", hudInFps);
+        std::snprintf(left, sizeof(left), "ORIG %5.1f", hudInFps);
         if (mult > 1) std::snprintf(right, sizeof(right), "VFG %5.1f FPS (%uX)", hudOutFps, mult);
         else std::snprintf(right, sizeof(right), "OFF %5.1f FPS", hudOutFps);
         const std::string key = std::string(left) + "|" + right + "|" + std::to_string(pos);

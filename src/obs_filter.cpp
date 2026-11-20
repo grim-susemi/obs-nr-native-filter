@@ -355,6 +355,13 @@ std::filesystem::path module_path(bool config,const char* relative)
     bfree(raw);
     return path;
 }
+std::filesystem::path executable_dir()
+{
+    wchar_t path[32768]{};
+    const DWORD count=GetModuleFileNameW(nullptr,path,ARRAYSIZE(path));
+    if(!count || count>=ARRAYSIZE(path))return {};
+    return std::filesystem::path(path).parent_path();
+}
 // A driver GPU reset (TDR) removes the D3D12 device. D3D12 hands that same removed device to every later
 // filter in this OBS process, so only an OBS restart recovers; name that cause instead of a generic failure.
 // A running filter reads its device removed reason; a filter made after the reset has no active device yet,
@@ -383,12 +390,14 @@ void *create(obs_data_t *settings, obs_source_t *source)
     signal_handler_connect(obs_source_get_signal_handler(source),"enable",discontinuity,f->callback.get());
     const auto shaderOverride=obs_data_get_string(settings,"nr_shader_root");
     const auto dataOverride=obs_data_get_string(settings,"nr_data_root");
-    const auto shaderRoot=*shaderOverride?nr::properties::utf8_path(shaderOverride):module_path(false,"shaders");
     f->admittedRuntimeText=obs_data_get_string(settings,"nr_runtime_path");
     const auto decoded=nr::properties::admit(settings);
     f->initialAdmissionReason=decoded.reason;
     if(decoded.reason.empty()) {
         try {
+            auto shaderRoot=*shaderOverride?nr::properties::utf8_path(shaderOverride):module_path(false,"shaders");
+            if(shaderRoot.empty())shaderRoot=executable_dir(); // Shaders from the Windows release zip.
+            if(shaderRoot.empty())throw std::runtime_error("native filter shader directory unavailable");
             f->deterministicQa=obs_data_get_bool(settings,"nr_qa_deterministic");
             f->capacityEvidence=(f->deterministicQa || obs_data_get_bool(settings,"nr_qa_observe")) &&
                 obs_data_get_bool(settings,"nr_qa_capacity_evidence");
@@ -411,10 +420,9 @@ void *create(obs_data_t *settings, obs_source_t *source)
                 const std::string srStr=(srRaw && *srRaw)?std::string(srRaw):std::string(nr::properties::default_sr_runtime);
                 auto srP=nr::properties::utf8_path(srStr);
                 if(!srP.is_absolute() || !std::filesystem::is_regular_file(srP)) {
-                    wchar_t exeBuf[4096]{};
-                    const DWORD n=GetModuleFileNameW(nullptr,exeBuf,ARRAYSIZE(exeBuf));
-                    if(n && n<ARRAYSIZE(exeBuf)) {
-                        const auto relSr=std::filesystem::path(exeBuf).parent_path()/L"dlss"/L"nvngx_dlss.dll";
+                    const auto exeDir=executable_dir();
+                    if(!exeDir.empty()) {
+                        const auto relSr=exeDir/L"dlss"/L"nvngx_dlss.dll";
                         if(std::filesystem::is_regular_file(relSr)) srP=relSr;
                     }
                 }
