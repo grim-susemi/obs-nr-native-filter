@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+﻿# SPDX-License-Identifier: GPL-3.0-only
 # OBS Native NR installer and uninstaller (Windows PowerShell 5.1 or later).
 # install.bat and uninstall.bat in the release zip run this script.
 [CmdletBinding()]
@@ -18,7 +18,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.5'
+$Version = '0.2.6'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'
@@ -49,7 +49,7 @@ $Text = @{
         obsFound   = 'OBS 폴더: {0}'
         obsConfirm = '이 OBS에 진행할까요? (Y/n)'
         obsMany    = 'OBS가 여러 곳에 있습니다. 번호를 고르세요:'
-        obsAsk     = 'OBS 설치 폴더 경로를 입력하세요 (예: C:\Program Files\obs-studio, 취소는 그냥 Enter)'
+        obsAsk     = 'OBS 폴더 경로 (취소는 그냥 Enter)'
         obsNone    = 'OBS 폴더를 찾지 못했습니다.'
         obsInvalid = '이 폴더에는 bin\64bit\obs64.exe가 없습니다: {0}'
         obsVersion = 'OBS 버전 {0}'
@@ -63,21 +63,21 @@ $Text = @{
         rtMissing  = 'OBS에 NR 모델 파일(nvngx_dlssnr.dll)이 없습니다.'
         rtWrong    = 'OBS에 있는 nvngx_dlssnr.dll은 이 필터가 받는 판이 아닙니다 (SHA-256 {0}…). 이대로는 NR이 동작하지 않습니다.'
          rtNeed     = 'Native NR용 모델: nvngx_dlssnr.dll 310.8.0.0 호환판, SHA-256 e67dee20…c989a (이 패키지에는 없음). 독립 CAS에는 필요하지 않습니다.'
-        rtAsk      = '가지고 있는 nvngx_dlssnr.dll을 이 창에 끌어다 놓고 Enter (건너뛰기: 그냥 Enter)'
+        rtAsk      = 'nvngx_dlssnr.dll을 끌어놓고 Enter (건너뛰기: 그냥 Enter)'
         rtNotFound = '파일이 없습니다: {0}'
         rtBadHash  = '이 파일은 다른 판입니다 (SHA-256 {0}…).'
         rtWillCopy = '이 파일을 OBS 폴더에 넣습니다: {0}'
         rtCopied   = 'NR 모델 파일을 넣었습니다: {0}'
         rtSkipped  = 'NR 모델 파일 없이 계속합니다. 나중에 여기에 넣어 주세요: {0}'
         srOk       = 'DLSS 4.5 SR 런타임 확인됨: {0}'
-        srPrompt   = '1440p/4K DLSS 4.5 업스케일용 공식 nvngx_dlss.dll(약 56 MB)을 NVIDIA 공식 서버에서 자동 설치할까요? (Y/n)'
+        srPrompt   = '공식 DLSS 4.5 SR (1440p/4K, 약 56 MB) 설치? (Y/n)'
         srDown     = 'NVIDIA 공식 GitHub에서 nvngx_dlss.dll을 내려받는 중...'
         srSigOk    = 'NVIDIA 공식 서명 확인됨: nvngx_dlss.dll'
         srFail     = 'DLSS 4.5 SR 자동 설치 건너뜀({0}). 없어도 이중선형+CAS 업스케일은 동작합니다.'
         srCopied   = 'DLSS 4.5 SR 런타임을 넣었습니다: {0}'
         vfgOk      = 'NVIDIA VFG 런타임 확인됨: {0}'
         vfgLocal   = '로컬 Veyra의 공식 NVIDIA VFG DLL 5개를 재사용합니다.'
-        vfgPrompt  = 'RTX 40/50 NVIDIA VFG(2x~4x 미리보기) 공식 런타임(약 415 MB wheel에서 5개 서명 DLL 추출)을 자동 설치할까요? (Y/n)'
+        vfgPrompt  = '공식 NVIDIA VFG (RTX 40/50, 2x~4x, 약 415 MB) 설치? (Y/n)'
         vfgDown    = 'NVIDIA 공식 PyPI에서 nvidia-vfx 0.2.0.0을 내려받는 중 (약 415 MB)...'
         vfgVerify  = 'wheel SHA-256 검증 및 VFG DLL 5개 추출 중...'
         vfgFail    = 'NVIDIA VFG 자동 설치 건너뜀({0}). NR/업스케일 필터는 정상 동작합니다.'
@@ -176,17 +176,76 @@ function T([string]$Key, [object[]]$Arg = @()) {
     if ($Arg.Count) { $s = $s -f $Arg }
     return $s
 }
+function Show-Screen([string]$Heading) {
+    if (-not $script:SingleScreen) { return }
+    try { [Console]::Clear() }
+    catch { $script:SingleScreen = $false; return }
+    if ($Heading) {
+        $script:LogDetails.Add($Heading)
+        Write-Host $Heading -ForegroundColor Cyan
+        Write-Host ''
+    }
+}
+function Format-Console([string]$Message) {
+    try {
+        $width = [Math]::Max(20, [Console]::BufferWidth - 3)
+        if ($Host.UI.RawUI.LengthInBufferCells($Message) -le $width) { return $Message }
+    } catch { return $Message }
+    $line = ''
+    $lines = foreach ($word in ($Message -split '\s+')) {
+        $candidate = if ($line) { "$line $word" } else { $word }
+        if ($line -and $Host.UI.RawUI.LengthInBufferCells($candidate) -gt $width) {
+            $line
+            $line = $word
+        } else { $line = $candidate }
+    }
+    return (@($lines) + $line) -join "`n"
+}
 function Say([string]$Key, [object[]]$Arg = @(), [string]$Color = 'Gray') {
-    Write-Host (T $Key $Arg) -ForegroundColor $Color
+    $message = T $Key $Arg
+    if ($Key -in 'copy','backup','error','srFail','vfgFail' -or $script:SingleScreen) { $script:LogDetails.Add($message) }
+    $status = switch ($Key) {
+        {$_ -in 'done','uDone','payloadOk','rtOk','srOk','vfgOk','srSigOk','uRestored'} { 'OK' }
+        {$_ -in 'rtSkipped','srFail','vfgFail','uChanged','cancelled','uNoState'} { '-' }
+        {$_ -in 'error','adminFail','obsInvalid','obsOld','obsRunning','rtWrong','rtNotFound','rtBadHash','rolledBack'} { '!' }
+        {$_ -in 'admin','srDown','vfgDown','vfgVerify','rtWillCopy'} { '>' }
+    }
+    if ($Key -in 'copy','backup') { return }
+    $ko = $script:L -eq 'ko'
+    switch ($Key) {
+        'rtSkipped' { $message = if ($ko) {'NR 모델 건너뜀'} else {'NR model skipped'} }
+        'rtNeed' { $message = if ($ko) {'Native NR 모델: 310.8.0.0 호환판 (ZIP 미포함)'} else {'Native NR model: compatible 310.8.0.0 (not in ZIP)'} }
+        'srFail' { $message = if ($ko) {'DLSS 설치 건너뜀. 이중선형과 CAS는 사용 가능.'} else {'DLSS skipped. Bilinear and CAS still work.'} }
+        'vfgFail' { $message = if ($ko) {'VFG 설치 건너뜀. NR과 업스케일은 사용 가능.'} else {'VFG skipped. NR and upscale still work.'} }
+        'error' {
+            if (-not $script:SingleScreen) { break }
+            $reason = [string]$Arg[0]
+            if ($reason.StartsWith((T 'payloadBad').Split('{')[0])) {
+                $message = if ($ko) {'설치 파일이 없거나 손상됐습니다.'} else {'An installer file is missing or damaged.'}
+                $advice = if ($ko) {'다음: ZIP을 다시 받아 새 폴더에 전부 풀어 주세요.'} else {'Next: Download the ZIP again and extract all files to a new folder.'}
+            } elseif ($reason -eq (T 'obsRunStop')) {
+                $message = if ($ko) {'OBS가 실행 중입니다.'} else {'OBS is running.'}
+                $advice = if ($ko) {'다음: OBS를 완전히 닫고 다시 실행하세요.'} else {'Next: Close OBS completely and rerun the installer.'}
+            } elseif ($reason.StartsWith((T 'obsInvalid').Split('{')[0])) {
+                $message = if ($ko) {'선택한 폴더에 OBS가 없습니다.'} else {'OBS was not found in the selected folder.'}
+                $advice = if ($ko) {'다음: obs64.exe가 있는 OBS 설치 폴더를 확인하세요.'} else {'Next: Check the OBS installation folder for obs64.exe.'}
+            } else {
+                $message = if ($ko) {'작업을 완료하지 못했습니다.'} else {'The operation could not finish.'}
+                $advice = if ($ko) {'다음: 로그에서 원인을 확인하세요.'} else {'Next: Check the log for the cause.'}
+            }
+        }
+    }
+    if ($status) { $message = "[$status] $message" }
+    Write-Host (Format-Console $message) -ForegroundColor $Color
+    if ($Key -eq 'error' -and $script:SingleScreen) {
+        Write-Host (Format-Console $advice) -ForegroundColor Gray
+    }
 }
 function Write-Title([string]$Line) {
-    Write-Host ''
-    Write-Host ('  ' + $Line) -ForegroundColor Cyan
-    Write-Host '  github.com/grim-susemi/obs-nr-native-filter' -ForegroundColor DarkGray
+    Write-Host $Line -ForegroundColor Cyan
 }
 function Write-Step([int]$N, [int]$Total, [string]$Label) {
-    Write-Host ''
-    Write-Host ('[{0}/{1}] {2}' -f $N, $Total, $Label) -ForegroundColor White
+    Write-Host (Format-Console ('[>] {0}/{1} {2}' -f $N, $Total, $Label)) -ForegroundColor Cyan
 }
 function Get-Sha([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -301,13 +360,16 @@ function Select-Obs([string]$Hint) {
         return $d
     }
     $list = @(if ($Hint) { $Hint } else { Find-ObsDirs })
+    $heading = '[2/{0}] {1}' -f $(if ($Uninstall) {3} else {5}), (T 'sObs')
     if ($list.Count -eq 1) {
+        Show-Screen $heading
         Say 'obsFound' @($list[0]) 'Cyan'
         if ($Yes) { return $list[0] }
         $a = (Read-Host (T 'obsConfirm')).Trim()
         if (-not $a -or $a -match '^(y|yes|ㅛ|예|네)$') { return $list[0] }
     } elseif ($list.Count -gt 1) {
         if ($Yes) { Say 'obsFound' @($list[0]) 'Cyan'; return $list[0] }
+        Show-Screen $heading
         Say 'obsMany' @() 'Cyan'
         for ($i = 0; $i -lt $list.Count; $i++) { Write-Host ('  {0}) {1}' -f ($i + 1), $list[$i]) }
         $n = (Read-Host '>').Trim()
@@ -316,11 +378,13 @@ function Select-Obs([string]$Hint) {
         Say 'obsNone' @() 'Yellow'
         if ($Yes) { throw (T 'obsNone') }
     }
+    Show-Screen $heading
     while ($true) {
-        $p = (Read-Host (T 'obsAsk')).Trim()
+        $p = (Read-Host (Format-Console (T 'obsAsk'))).Trim()
         if (-not $p) { throw 'cancel' }
         $d = Get-FullPath $p
         if (Test-ObsDir $d) { return $d }
+        Show-Screen $heading
         Say 'obsInvalid' @($d) 'Red'
     }
 }
@@ -347,6 +411,7 @@ function Test-ObsRunning([string]$Dir) {
 function Wait-ObsClosed([string]$Dir) {
     while (Test-ObsRunning $Dir) {
         if ($Yes) { throw (T 'obsRunStop') }
+        Show-Screen $(if ($script:L -eq 'ko') {'OBS 종료 대기'} else {'Waiting for OBS to close'})
         Say 'obsRunning' @() 'Yellow'
         [void](Read-Host)
     }
@@ -363,6 +428,7 @@ function Test-Writable([string]$Dir) {
 }
 
 function Invoke-Elevated([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, [string]$StageDir) {
+    Show-Screen $(if ($script:L -eq 'ko') {'관리자 권한'} else {'Administrator permission'})
     Say 'admin' @() 'Yellow'
     $quote = { param($s) '"' + $s + '"' }
     $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote $PSCommandPath),
@@ -375,8 +441,9 @@ function Invoke-Elevated([string]$Dir, [string]$RuntimeSource, [string]$SrSource
     if ($Yes) { $argv += '-Yes' }
     if ($NoPause) { $argv += '-NoPause' }
     try { $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argv -Wait -PassThru }
-    catch { Say 'adminFail' @() 'Red'; return 1 }
+    catch { Show-Screen ''; Say 'adminFail' @() 'Red'; return 1 }
     $script:Relaunched = $true
+    Show-Screen ''
     Say 'adminDone' @($p.ExitCode) 'Gray'
     return $p.ExitCode
 }
@@ -401,13 +468,23 @@ function Resolve-Runtime([string]$Dir) {
     }
     Say 'rtNeed' @() 'Gray'
     if ($Yes -or $RuntimeDecided) { Say 'rtSkipped' @($target) 'Yellow'; return '' }
+    Show-Screen ('[3/5] ' + (T 'sRuntime'))
+    if ($script:SingleScreen) { Say 'rtNeed' @() 'Gray' }
     for ($i = 0; $i -lt 3; $i++) {
-        $answer = (Read-Host (T 'rtAsk')).Trim()
+        $answer = (Read-Host (Format-Console (T 'rtAsk'))).Trim()
         if (-not $answer) { break }
         $p = Get-FullPath $answer
-        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { Say 'rtNotFound' @($p) 'Red'; continue }
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+            Show-Screen ('[3/5] ' + (T 'sRuntime'))
+            Say 'rtNotFound' @($p) 'Red'
+            continue
+        }
         $h = Get-Sha $p
-        if ($h -ne $RuntimeSha) { Say 'rtBadHash' @($h.Substring(0, 16)) 'Red'; continue }
+        if ($h -ne $RuntimeSha) {
+            Show-Screen ('[3/5] ' + (T 'sRuntime'))
+            Say 'rtBadHash' @($h.Substring(0, 16)) 'Red'
+            continue
+        }
         Say 'rtWillCopy' @($p) 'Green'
         return $p
     }
@@ -435,11 +512,24 @@ function Resolve-OptionalRuntimes([string]$Dir, [string]$StageDir) {
         } elseif ($allowDownload) {
             $doSr = $true
             if (-not $Yes) {
-                $ans = (Read-Host (T 'srPrompt')).Trim()
+                $prompt = T 'srPrompt'
+                Show-Screen $(if ($script:L -eq 'ko') {'[4/5] DLSS 업스케일'} else {'[4/5] DLSS upscaling'})
+                if ($script:SingleScreen) {
+                    if ($script:L -eq 'ko') {
+                        Write-Host '공식 DLSS 4.5 SR · 1440p/4K · 약 56 MB'
+                        $prompt = '[Y/Enter] 설치  [N] 건너뛰기'
+                    } else {
+                        Write-Host 'Official DLSS 4.5 SR · 1440p/4K · about 56 MB'
+                        $prompt = '[Y/Enter] Install  [N] Skip'
+                    }
+                    $script:LogDetails.Add((T 'srPrompt'))
+                }
+                $ans = (Read-Host (Format-Console $prompt)).Trim()
                 $doSr = (-not $ans) -or ($ans -match '^(y|yes|ㅛ|예|네)$')
             }
             if ($doSr) {
                 try {
+                    Show-Screen $(if ($script:L -eq 'ko') {'[4/5] DLSS 업스케일'} else {'[4/5] DLSS upscaling'})
                     Say 'srDown' @() 'Cyan'
                     $dl = Join-Path $StageDir 'nvngx_dlss.dll'
                     Get-HttpFile $SrUrl $dl
@@ -466,12 +556,25 @@ function Resolve-OptionalRuntimes([string]$Dir, [string]$StageDir) {
             } elseif ($allowDownload) {
                 $doVfg = $true
                 if (-not $Yes) {
-                    $ans = (Read-Host (T 'vfgPrompt')).Trim()
+                    $prompt = T 'vfgPrompt'
+                    Show-Screen '[4/5] NVIDIA VFG'
+                    if ($script:SingleScreen) {
+                        if ($script:L -eq 'ko') {
+                            Write-Host '공식 NVIDIA VFG · RTX 40/50 · 2x~4x · 약 415 MB'
+                            $prompt = '[Y/Enter] 설치  [N] 건너뛰기'
+                        } else {
+                            Write-Host 'Official NVIDIA VFG · RTX 40/50 · 2x–4x · about 415 MB'
+                            $prompt = '[Y/Enter] Install  [N] Skip'
+                        }
+                        $script:LogDetails.Add((T 'vfgPrompt'))
+                    }
+                    $ans = (Read-Host (Format-Console $prompt)).Trim()
                     $doVfg = (-not $ans) -or ($ans -match '^(y|yes|ㅛ|예|네)$')
                 }
                 if ($doVfg) {
                     $whl = Join-Path $StageDir 'nvidia_vfx.whl'
                     try {
+                        Show-Screen '[4/5] NVIDIA VFG'
                         Say 'vfgDown' @() 'Cyan'
                         Get-HttpFile $VfgWhlUrl $whl
                         Say 'vfgVerify' @() 'Cyan'
@@ -710,6 +813,7 @@ function Invoke-Install {
     try {
         $opt = Resolve-OptionalRuntimes $dir $stageDir
         if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir $runtimeSource $opt.sr $opt.vfg $stageDir) }
+        Show-Screen ''
         Write-Step 5 5 (T 'sCopy')
         Install-Files $dir $runtimeSource $opt.sr $opt.vfg $manifest
     } finally {
@@ -718,14 +822,17 @@ function Invoke-Install {
             Remove-Item -LiteralPath $StageCleanupDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Write-Host ''
-    Say 'done' @() 'Green'
-    Say 'next1' @() 'White'
-    Say 'next2' @() 'White'
-    Say 'next3' @() 'White'
-    Say 'pathNote' @() 'Gray'
-    Write-Host ''
-    Say 'uninstHint' @() 'DarkGray'
+    $copied = @($script:LogDetails | Where-Object { $_.StartsWith((T 'copy').Split('{')[0]) }).Count
+    Show-Screen ''
+    if ($script:L -eq 'ko') {
+        Write-Host "[OK] 설치 완료 (복사 ${copied}개)" -ForegroundColor Green
+        Write-Host '다음: OBS 실행 > 소스 우클릭 > 필터 > 효과 필터 [+]'
+        Write-Host '효과 안내: INSTALL-ONECLICK.md / 제거: uninstall.bat'
+    } else {
+        Write-Host "[OK] Install complete ($copied files copied)" -ForegroundColor Green
+        Write-Host 'Next: Start OBS > right-click source > Filters > Effect Filters [+]'
+        Write-Host 'Filter guide: INSTALL-ONECLICK.md / Remove: uninstall.bat'
+    }
     return 0
 }
 
@@ -750,12 +857,16 @@ function Invoke-Uninstall {
 
 $script:L = $Lang
 $script:Relaunched = $false
+$script:LogDetails = [Collections.Generic.List[string]]::new()
+$script:SingleScreen = -not $Yes -and -not $NoPause -and -not $Uninstall -and $Host.Name -eq 'ConsoleHost' -and
+    -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and -not [Console]::IsErrorRedirected
 if (-not $script:L) {
     if ($Yes) { $script:L = 'ko' }
     else {
-        Write-Host ''
+        Show-Screen 'OBS Native NR'
         Write-Host '  1) 한국어    2) English' -ForegroundColor Cyan
         $script:L = if ((Read-Host '  언어 / Language [1]').Trim() -eq '2') { 'en' } else { 'ko' }
+        if ($script:SingleScreen) { $script:LogDetails.Add("Language: $script:L") }
     }
 }
 $code = 0
@@ -766,13 +877,18 @@ try {
     try { Start-Transcript -LiteralPath $log -Append | Out-Null } catch { $log = '' }
     if ($Uninstall) { $code = Invoke-Uninstall } else { $code = Invoke-Install }
 } catch {
+    Show-Screen ''
     if ($_.Exception.Message -eq 'cancel') { Say 'cancelled' @() 'Yellow'; $code = 2 }
     else { Say 'error' @($_.Exception.Message) 'Red'; $code = 1 }
 } finally {
     if ($log) {
         try { Stop-Transcript | Out-Null } catch {}
-        if (-not $script:Relaunched) { Say 'log' @($log) 'DarkGray' }
+        try { if ($script:LogDetails.Count) { $script:LogDetails | Add-Content -LiteralPath $log -Encoding UTF8 } }
+        catch { foreach ($detail in $script:LogDetails) { Write-Host $detail } }
+        if (-not $script:Relaunched) { Say 'log' @($log) 'Gray' }
+    } else {
+        foreach ($detail in $script:LogDetails) { Write-Host $detail }
     }
 }
-if (-not $NoPause -and -not $script:Relaunched) { Write-Host ''; [void](Read-Host (T 'pause')) }
+if (-not $NoPause -and -not $script:Relaunched) { [void](Read-Host (T 'pause')) }
 exit $code

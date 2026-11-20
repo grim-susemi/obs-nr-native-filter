@@ -21,6 +21,10 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 > [!NOTE]
 > Community project, not affiliated with NVIDIA or the OBS Project. NVIDIA runtime DLLs are **not redistributed** inside this repository or release zip. `install.bat` guides you through placing `nvngx_dlssnr.dll` and can automatically download & verify the official NVIDIA-signed DLSS 4.5 SR and NVIDIA VFG runtimes from NVIDIA's servers.
 
+## What's new in 0.2.6
+
+- The Windows one-click installer shows one question at a time and keeps details in its log. See the [illustrated guide](docs/INSTALL-ONECLICK.md). The OBS filters and optional runtime checks are unchanged.
+
 ## What's new in 0.2.5
 
 - **Native NR remains denoising only.** Saved standalone upscale filters still load. Add new upscale settings in **Video Upscale & Frame Generation**.
@@ -58,7 +62,7 @@ The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (1
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.2.5-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.5 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.5).
+1. Download `obs-nr-native-filter-0.2.6-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.6 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.6).
 2. Close OBS completely (including tray icon).
 3. Extract the entire zip and double-click **`install.bat`**.
 4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
@@ -113,7 +117,7 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 
 **설치 방법 (원클릭)**
 
-1. [v0.2.5 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.5)에서 `obs-nr-native-filter-0.2.5-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
+1. [v0.2.6 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.6)에서 `obs-nr-native-filter-0.2.6-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
 2. OBS를 완전히 끕니다.
 3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
 4. `nvngx_dlssnr.dll`(310.8.0.0 호환판, SHA-256 `e67dee20…c989a`)이 OBS에 없으면 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)

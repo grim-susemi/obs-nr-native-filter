@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.5',
+    [string]$Version = '0.2.6',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
@@ -46,6 +46,7 @@ $extra = [ordered]@{
     'INSTALL.md'           = Join-Path $repo 'docs\INSTALL.md'
     'INSTALL-ONECLICK.md'  = Join-Path $repo 'docs\INSTALL-ONECLICK.md'
     'oneclick\installer.png' = Join-Path $repo 'docs\oneclick\installer.png'
+    'oneclick\dlss-prompt.png' = Join-Path $repo 'docs\oneclick\dlss-prompt.png'
     'oneclick\obs-filters.png' = Join-Path $repo 'docs\oneclick\obs-filters.png'
     'standalone-upscale.md' = Join-Path $repo 'docs\standalone-upscale.md'
     'LICENSE.txt'          = Join-Path $repo 'LICENSE'
