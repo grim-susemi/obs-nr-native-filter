@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.0'
+    [string]$Version = '0.2.1'
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path

@@ -79,13 +79,22 @@ proc_handler_t* obs_get_proc_handler(void) {return nullptr;}
 void proc_handler_add(proc_handler_t*,const char*,proc_handler_proc_t,void*) {}
 bool proc_handler_call(proc_handler_t*,const char*,calldata_t*) {return false;}
 bool obs_source_enabled(const obs_source_t*) {return true;}
-obs_source_t* obs_filter_get_target(const obs_source_t*) {return nullptr;}
+obs_source_t* fake_target=nullptr;
+obs_source_t* obs_filter_get_target(const obs_source_t*) {return fake_target;}
 obs_source_t* obs_filter_get_parent(const obs_source_t*) {return nullptr;}
 const char* obs_source_get_unversioned_id(const obs_source_t*) {return nullptr;}
 bool obs_source_showing(const obs_source_t*) {return false;}
 void obs_source_skip_video_filter(obs_source_t*) {}
-uint32_t obs_source_get_width(obs_source_t*) {return 0;}
-uint32_t obs_source_get_height(obs_source_t*) {return 0;}
+uint32_t obs_source_get_width(obs_source_t* s) {
+    if (s) std::abort();
+    return 0;
+}
+uint32_t obs_source_get_height(obs_source_t* s) {
+    if (s) std::abort();
+    return 0;
+}
+uint32_t obs_source_get_base_width(obs_source_t* s) {return s?1920u:0u;}
+uint32_t obs_source_get_base_height(obs_source_t* s) {return s?1080u:0u;}
 enum gs_color_space obs_source_get_color_space(obs_source_t*,size_t,const enum gs_color_space*) {return GS_CS_SRGB;}
 uint64_t obs_get_video_frame_time(void) {return 0;}
 uint64_t obs_get_frame_interval_ns(void) {return 1;}
@@ -247,6 +256,17 @@ int main() try {
         "second destroy released owners and scheduled one reclaim");
     fake_obs::run_render_callbacks();
     expect(storageFreed.load()==1 && fake_obs::renderCallbacks.empty(),"second shell reclaimed by the next render pass");
+    {
+        auto* dummyParent = reinterpret_cast<obs_source_t*>(0x1234);
+        fake_target = dummyParent;
+        auto* probe = make_filter(reinterpret_cast<obs_source_t*>(0x5678));
+        expect(filter_width(probe) == 1920u && filter_height(probe) == 1080u, "filter_width/height use base extent without recursion");
+        fake_target = static_cast<Filter*>(probe)->source;
+        expect(filter_width(probe) == 0u && filter_height(probe) == 0u, "self-target returns 0");
+        fake_target = nullptr;
+        destroy(probe);
+        fake_obs::run_render_callbacks();
+    }
     std::printf("PASS filter_destroy_drain checks=%u tick_drained_before_free=true owners_released_in_destroy=true "
         "fake_libobs=true CPU_only=true\n",checks);
     return 0;

@@ -740,7 +740,17 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
     if(device && (!f.deviceLifetime || !nr::interop::same_identity(device,f.deviceLifetime.Get()))) {
         f.deviceLifetime=device;f.deviceToken=nextLifetime.fetch_add(1);
     } else if(!device) { f.deviceLifetime.Reset();f.deviceToken=0; }
-    f.width=attached?obs_source_get_width(target):0;f.height=attached?obs_source_get_height(target):0;
+    uint32_t tw=0, th=0;
+    if(attached) {
+        tw=obs_source_get_base_width(target); th=obs_source_get_base_height(target);
+        if((!tw || !th) && target!=obs_filter_get_parent(f.source)) {
+            if(auto* par=obs_filter_get_parent(f.source)) {
+                if(!tw) tw=obs_source_get_base_width(par);
+                if(!th) th=obs_source_get_base_height(par);
+            }
+        }
+    }
+    f.width=tw; f.height=th;
     const gs_color_space preferred[]{GS_CS_709_SCRGB,GS_CS_SRGB};
     f.color=attached?obs_source_get_color_space(target,2,preferred):GS_CS_SRGB;
     f.admission=nr::sampler::admit(attached,device!=nullptr,f.width,f.height,
@@ -977,12 +987,23 @@ void render(void *opaque, gs_effect_t *)
     draw_hud_overlay(f,effect,image,outExt.width,outExt.height);
     gs_enable_framebuffer_srgb(srgb);
 }
+std::pair<uint32_t,uint32_t> target_base_extent(const Filter& f)
+{
+    auto* target=obs_filter_get_target(f.source);
+    if(!target || target==f.source)return {0u,0u};
+    uint32_t w=obs_source_get_base_width(target), h=obs_source_get_base_height(target);
+    if((!w || !h) && target!=obs_filter_get_parent(f.source)) {
+        if(auto* par=obs_filter_get_parent(f.source)) {
+            if(!w) w=obs_source_get_base_width(par);
+            if(!h) h=obs_source_get_base_height(par);
+        }
+    }
+    return {w,h};
+}
 uint32_t filter_width(void* opaque)
 {
     auto& f=*static_cast<Filter*>(opaque);
-    auto* target=obs_filter_get_target(f.source);
-    if(!target)return 0;
-    const uint32_t w=obs_source_get_width(target), h=obs_source_get_height(target);
+    const auto [w,h]=target_base_extent(f);
     if(!w || !h)return w;
     const auto control=f.configuration.load(std::memory_order_acquire);
     const auto configured=control?control->settings:nullptr;
@@ -994,9 +1015,7 @@ uint32_t filter_width(void* opaque)
 uint32_t filter_height(void* opaque)
 {
     auto& f=*static_cast<Filter*>(opaque);
-    auto* target=obs_filter_get_target(f.source);
-    if(!target)return 0;
-    const uint32_t w=obs_source_get_width(target), h=obs_source_get_height(target);
+    const auto [w,h]=target_base_extent(f);
     if(!w || !h)return h;
     const auto control=f.configuration.load(std::memory_order_acquire);
     const auto configured=control?control->settings:nullptr;
