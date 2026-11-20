@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.2',
+    [string]$Version = '0.2.3',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
@@ -44,6 +44,7 @@ $extra = [ordered]@{
     'uninstall.bat'        = Join-Path $PSScriptRoot 'uninstall.bat'
     'scripts\install.ps1'  = Join-Path $PSScriptRoot 'install.ps1'
     'INSTALL.md'           = Join-Path $repo 'docs\INSTALL.md'
+    'standalone-upscale.md' = Join-Path $repo 'docs\standalone-upscale.md'
     'LICENSE.txt'          = Join-Path $repo 'LICENSE'
     'notices\CREDITS.md'   = Join-Path $repo 'provenance\source-notices\CREDITS.md'
     'notices\RenoDX-MIT.txt' = Join-Path $repo 'provenance\source-notices\RenoDX-MIT.txt'
@@ -52,7 +53,12 @@ $extra = [ordered]@{
 foreach ($rel in $extra.Keys) {
     $dst = Join-Path $stage $rel
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
-    Copy-Item -LiteralPath $extra[$rel] -Destination $dst
+    if ($rel -eq 'scripts\install.ps1') {
+        # Windows PowerShell 5.1 needs the BOM to decode Korean on non-UTF-8 systems.
+        [IO.File]::WriteAllText($dst, [IO.File]::ReadAllText($extra[$rel]), [Text.UTF8Encoding]::new($true))
+    } else {
+        Copy-Item -LiteralPath $extra[$rel] -Destination $dst
+    }
 }
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem

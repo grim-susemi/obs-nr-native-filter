@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-project(obs-nr-filter VERSION 0.2.2 LANGUAGES C CXX)
+project(obs-nr-filter VERSION 0.2.3 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # D2: the closure gate reads CodeView/COFF sections of every object, so whole-program
 # optimization (/GL IL objects) and /LTCG are forbidden in every configuration, for both
@@ -11,7 +11,7 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Task2 supports Windows x64 only")
 endif()
 include(cmake/nr/Libobs.cmake)
-add_library(obs-nr-filter MODULE src/plugin-main.c src/obs_filter.cpp src/capture_exclusion.cpp)
+add_library(obs-nr-filter MODULE src/plugin-main.c src/obs_filter.cpp src/obs_upscale_filter.cpp src/capture_exclusion.cpp)
 target_compile_features(obs-nr-filter PRIVATE cxx_std_20)
 target_link_libraries(obs-nr-filter PRIVATE OBS::libobs)
 set_target_properties(obs-nr-filter PROPERTIES PREFIX "" OUTPUT_NAME "obs-nr-filter")
@@ -30,6 +30,7 @@ include(cmake/nr/Guides.cmake)
 set_tests_properties(flow_contract PROPERTIES
   ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")
 include(cmake/nr/Color.cmake)
+add_dependencies(obs-nr-filter nr_color_shaders)
 include(cmake/nr/Scheduler.cmake)
 target_link_libraries(nr_scheduler PUBLIC nr_interop)
 include(cmake/nr/Lifecycle.cmake)

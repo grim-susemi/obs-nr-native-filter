@@ -18,7 +18,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.2'
+$Version = '0.2.3'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'
@@ -62,7 +62,7 @@ $Text = @{
         rtOk       = '확인됨: {0}'
         rtMissing  = 'OBS에 NR 모델 파일(nvngx_dlssnr.dll)이 없습니다.'
         rtWrong    = 'OBS에 있는 nvngx_dlssnr.dll은 이 필터가 받는 판이 아닙니다 (SHA-256 {0}…). 이대로는 NR이 동작하지 않습니다.'
-        rtNeed     = '필요한 파일: nvngx_dlssnr.dll 310.8.0.0 호환판, SHA-256 e67dee20…c989a (RTX 20~50 공용, 이 패키지에는 없음)'
+         rtNeed     = 'Native NR용 모델: nvngx_dlssnr.dll 310.8.0.0 호환판, SHA-256 e67dee20…c989a (이 패키지에는 없음). 독립 CAS에는 필요하지 않습니다.'
         rtAsk      = '가지고 있는 nvngx_dlssnr.dll을 이 창에 끌어다 놓고 Enter (건너뛰기: 그냥 Enter)'
         rtNotFound = '파일이 없습니다: {0}'
         rtBadHash  = '이 파일은 다른 판입니다 (SHA-256 {0}…).'
@@ -88,9 +88,9 @@ $Text = @{
         rolledBack = '설치를 되돌렸습니다.'
         done       = '설치 완료'
         next1      = '1. OBS를 실행합니다.'
-        next2      = '2. 소스 우클릭 > 필터 > 효과 필터의 [+] > Native NR (미리보기 창에서 우클릭 메뉴 NVIDIA VFG 사용 가능)'
-        next3      = '3. 필터 속성에 "상태: NR 적용 중"이 보이면 성공입니다.'
-        pathNote   = 'OBS가 기본 위치가 아니라서 한 가지가 더 필요합니다. 필터 속성의 "NR 런타임 파일" 칸에 아래 경로를 넣고, 필터를 지웠다 다시 추가하세요:'
+         next2      = '2. 소스 우클릭 > 필터 > 효과 필터 [+] > 업스케일 및 선명화 (CAS). NVIDIA 런타임 없이 작동합니다.'
+         next3      = '3. 모델을 설치했다면 Native NR도 사용할 수 있습니다. NVIDIA VFG는 해당 효과에서 엽니다.'
+         pathNote   = '기본 위치가 아닌 OBS에서 Native NR을 쓸 경우에만, 필터를 새로 추가하고 "NR 런타임 파일"에 아래 경로를 지정하세요:'
         uninstHint = '제거하려면 이 폴더의 uninstall.bat을 실행하세요.'
         uNoState   = '설치 기록이 없어 파일을 변경하지 않습니다.'
         uRemoved   = '삭제: {0}'
@@ -129,7 +129,7 @@ $Text = @{
         rtOk       = 'OK: {0}'
         rtMissing  = 'The NR model file (nvngx_dlssnr.dll) is not in this OBS.'
         rtWrong    = 'The nvngx_dlssnr.dll in this OBS is a different build (SHA-256 {0}...). NR will not run with it.'
-        rtNeed     = 'Needed: nvngx_dlssnr.dll 310.8.0.0 compatibility build, SHA-256 e67dee20...c989a (RTX 20-50, not in this package)'
+         rtNeed     = 'Native NR model: nvngx_dlssnr.dll 310.8.0.0 compatibility build, SHA-256 e67dee20...c989a (not bundled). Standalone CAS does not need it.'
         rtAsk      = 'Drag your nvngx_dlssnr.dll into this window and press Enter (Enter alone skips)'
         rtNotFound = 'File not found: {0}'
         rtBadHash  = 'That file is a different build (SHA-256 {0}...).'
@@ -155,9 +155,9 @@ $Text = @{
         rolledBack = 'The install was rolled back.'
         done       = 'Install complete'
         next1      = '1. Start OBS.'
-        next2      = '2. Right-click a source > Filters > Effect Filters [+] > Native NR (NVIDIA VFG available on preview window)'
-        next3      = '3. When the filter properties show "Status: NR is being applied", it works.'
-        pathNote   = 'OBS is not in the default folder, so one more step: put this path into "NR runtime file" in the filter properties, then remove the filter and add it again:'
+         next2      = '2. Right-click a source > Filters > Effect Filters [+] > Upscale & Sharpen (CAS). No NVIDIA runtime required.'
+         next3      = '3. If you installed the model, you can also use Native NR. Open NVIDIA VFG from its own filter.'
+         pathNote   = 'For Native NR only: on a non-default OBS installation, add a new Native NR filter and set its "NR runtime file" to this path:'
         uninstHint = 'To uninstall, run uninstall.bat in this folder.'
         uNoState   = 'No install record; leaving files unchanged.'
         uRemoved   = 'Removed: {0}'
@@ -194,12 +194,15 @@ function Get-Sha([string]$Path) {
 function Get-FullPath([string]$Path) {
     return [IO.Path]::GetFullPath(($Path.Trim().Trim('"') -replace '/', '\')).TrimEnd('\')
 }
-function Test-PackagePath([string]$Relative) {
-    return $Relative -in @('obs-plugins\64bit\obs-nr-filter.dll', 'bin\64bit\obs-nr-fg-presenter.exe',
+function Get-PackagePaths {
+    return @('obs-plugins\64bit\obs-nr-filter.dll', 'bin\64bit\obs-nr-fg-presenter.exe',
         'data\obs-plugins\obs-nr-filter\locale\en-US.ini', 'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini',
         'bin\64bit\nr_codec.dxil', 'bin\64bit\nr_color.dxil', 'bin\64bit\nr_guides.cso',
         'bin\64bit\nr_stabilize.dxil', 'bin\64bit\nr_cas.dxil', 'bin\64bit\nr_obs_analysis.cso',
         'bin\64bit\nr_interop_vertex.cso', 'bin\64bit\nr_interop_pixel.cso')
+}
+function Test-PackagePath([string]$Relative) {
+    return $Relative -in (Get-PackagePaths)
 }
 function Assert-ReceiptFile([string]$Relative, [string]$Backup) {
     $allowed = (Test-PackagePath $Relative) -or $Relative -in @($RuntimeRel, $SrRel) -or
@@ -248,13 +251,17 @@ function Get-Manifest {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw (T 'payloadBad' @('files\manifest.sha256')) }
     $m = [ordered]@{}
     foreach ($line in [IO.File]::ReadAllLines($file)) {
-        if ($line -match '^([0-9a-f]{64})\s+(\S.*)$') { $m[$Matches[2].Trim()] = $Matches[1] }
+        if ($line -notmatch '^([0-9a-f]{64})\s+(\S.*)$') { throw (T 'payloadBad' @('files\manifest.sha256')) }
+        $hash = $Matches[1]
+        $rel = $Matches[2].Trim()
+        if (-not (Test-PackagePath $rel) -or $m.Contains($rel)) { throw (T 'payloadBad' @($rel)) }
+        $m[$rel] = $hash
     }
-    if ($m.Count -eq 0) { throw (T 'payloadBad' @('files\manifest.sha256')) }
-    foreach ($rel in @($m.Keys)) {
-        if (-not (Test-PackagePath $rel)) { throw (T 'payloadBad' @($rel)) }
+    foreach ($rel in (Get-PackagePaths)) {
         $src = Join-Path $Payload $rel
-        if (-not (Test-Path -LiteralPath $src -PathType Leaf) -or (Get-Sha $src) -ne $m[$rel]) { throw (T 'payloadBad' @($rel)) }
+        if (-not $m.Contains($rel) -or -not (Test-Path -LiteralPath $src -PathType Leaf) -or (Get-Sha $src) -ne $m[$rel]) {
+            throw (T 'payloadBad' @($rel))
+        }
     }
     return $m
 }
@@ -609,6 +616,17 @@ function Read-State {
     try { return (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json) } catch { return $null }
 }
 
+function Remove-EmptyPluginDirs([string]$Dir) {
+    foreach ($sub in 'data\obs-plugins\obs-nr-filter\locale', 'data\obs-plugins\obs-nr-filter', $VfgDirRel, 'bin\64bit\dlss') {
+        $path = Join-Path $Dir $sub
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($item -and $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+                -not (Get-ChildItem -LiteralPath $path -Force | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+}
+
 function Remove-Files([string]$Dir, $Manifest, $State) {
     $useState = [bool]($State -and $State.obsDir -and (Test-SamePath ([string]$State.obsDir) $Dir))
     if ($useState -and $State.PSObject.Properties['ownedFiles']) {
@@ -629,6 +647,7 @@ function Remove-Files([string]$Dir, $Manifest, $State) {
                 Say 'uRestored' @($rel) 'Green'
             }
         }
+        Remove-EmptyPluginDirs $Dir
         Remove-Item -LiteralPath (Join-Path $StateDir 'install-state.json') -Force
         return
     }
@@ -672,12 +691,7 @@ function Remove-Files([string]$Dir, $Manifest, $State) {
         # Legacy optional-runtime receipts have no hashes; ownership cannot be verified.
         Remove-Item -LiteralPath (Join-Path $StateDir 'install-state.json') -Force
     }
-    foreach ($sub in 'data\obs-plugins\obs-nr-filter\locale', 'data\obs-plugins\obs-nr-filter', $VfgDirRel, 'bin\64bit\dlss') {
-        $p = Join-Path $Dir $sub
-        if ((Test-Path -LiteralPath $p) -and -not (Get-ChildItem -LiteralPath $p -Force | Select-Object -First 1)) {
-            Remove-Item -LiteralPath $p -Force
-        }
-    }
+    Remove-EmptyPluginDirs $Dir
 }
 
 function Invoke-Install {

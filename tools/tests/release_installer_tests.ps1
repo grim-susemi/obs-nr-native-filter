@@ -142,8 +142,12 @@ try {
     Copy-Item -LiteralPath $installer -Destination $packageScript
     Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $installer) 'uninstall.bat') -Destination $package
     function Write-Manifest {
-        $file = Join-Path $packagePayload $rel
-        [IO.File]::WriteAllText((Join-Path $packagePayload 'manifest.sha256'), ((Get-Sha $file) + '  ' + $rel))
+        $lines = foreach ($required in (Get-PackagePaths)) {
+            $file = Join-Path $packagePayload $required
+            if (-not (Test-Path -LiteralPath $file)) { Put $file "fixture-$required" }
+            (Get-Sha $file) + '  ' + $required
+        }
+        [IO.File]::WriteAllLines((Join-Path $packagePayload 'manifest.sha256'), [string[]]$lines)
     }
     function Run-Installer([bool]$uninstall) {
         $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $packageScript, '-ObsDir', $realObs, '-StateDir', $realState, '-Lang', 'en', '-Yes', '-NoPause', '-SkipOptional')
@@ -151,7 +155,16 @@ try {
         $output = & powershell.exe @argsList | Out-String
         if ($LASTEXITCODE -ne 0) { throw "installer process failed: $LASTEXITCODE`n$output" }
     }
-    Write-Manifest; Run-Installer $false
+    Write-Manifest
+    $manifestFile = Join-Path $packagePayload 'manifest.sha256'
+    $complete = [IO.File]::ReadAllLines($manifestFile)
+    [IO.File]::WriteAllLines($manifestFile, [string[]]($complete | Where-Object { -not $_.EndsWith('nr_cas.dxil') }))
+    $partialResult = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $packageScript -ObsDir $realObs -StateDir $realState -Lang en -Yes -NoPause -SkipOptional | Out-String
+    Assert-Equal $LASTEXITCODE 1 'installer must reject a manifest missing a required shader'
+    if ($partialResult -notmatch 'nr_cas\.dxil') { throw "installer must identify the missing shader: $partialResult" }
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $realObs $rel))) 'entry-foreign' 'incomplete manifest must not write the OBS plugin'
+    [IO.File]::WriteAllLines($manifestFile, $complete)
+    Run-Installer $false
     Put (Join-Path $packagePayload $rel) 'entry-v2'
     Write-Manifest; Run-Installer $false
     Assert-Equal ([IO.File]::ReadAllText((Join-Path $realObs $rel))) 'entry-v2' 'real reinstall must upgrade an unchanged owned file'

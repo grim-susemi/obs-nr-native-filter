@@ -21,6 +21,11 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 > [!NOTE]
 > Community project, not affiliated with NVIDIA or the OBS Project. NVIDIA runtime DLLs are **not redistributed** inside this repository or release zip. `install.bat` guides you through placing `nvngx_dlssnr.dll` and can automatically download & verify the official NVIDIA-signed DLSS 4.5 SR and NVIDIA VFG runtimes from NVIDIA's servers.
 
+## What's new in 0.2.3
+
+- **Standalone Upscale & Sharpen (CAS)**: Add it to any SDR source to upscale 1080p to 1440p or 4K, or sharpen at the original size. It needs no NVIDIA runtime DLLs. See the [filter guide](docs/standalone-upscale.md) for using it with Native NR or VFG.
+- **Installer payload validation**: Rejects incomplete or damaged packages before modifying OBS.
+
 ## What's new in 0.2.0
 
 - **2-Pass NR Combo & Working Scale**: Run 1 or 2 NR passes with independent styles (e.g. Pass 1 Standard + Pass 2 Cinematic) and adjustable working resolution (50–100%).
@@ -53,13 +58,13 @@ The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (1
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.2.2-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
+1. Download `obs-nr-native-filter-0.2.3-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
 2. Close OBS completely (including tray icon).
 3. Extract the entire zip and double-click **`install.bat`**.
 4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
 5. Drag your `nvngx_dlssnr.dll` into the window (or press Enter to skip and add later).
 6. Choose **Y** when prompted to automatically download and verify **DLSS 4.5 SR** (`nvngx_dlss.dll`, ~56 MB) and **NVIDIA VFG** (5 official signed DLLs, RTX 40/50), then approve the Windows Admin prompt.
-7. Start OBS, right-click your source > **Filters** > **Effect Filters** > **+** > **Native NR**.
+7. Start OBS, right-click your source > **Filters** > **Effect Filters** > **+**. Choose **Upscale & Sharpen (CAS)** for standalone SDR scaling, or **Native NR** for neural rendering.
 
 Step-by-step guide, manual install and uninstall: [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -107,12 +112,12 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 
 **설치 방법 (원클릭)**
 
-1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.2.2-windows-x64.zip`을 내려받아 압축을 풉니다.
+1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.2.3-windows-x64.zip`을 내려받아 압축을 풉니다.
 2. OBS를 완전히 끕니다.
 3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
 4. `nvngx_dlssnr.dll`(310.8.0.0 호환판, SHA-256 `e67dee20…c989a`)이 OBS에 없으면 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)
 5. **DLSS 4.5 SR(`nvngx_dlss.dll`)** 과 **NVIDIA VFG(5개 DLL)** 자동 다운로드 안내가 나오면 Enter(Y)를 누르세요. 설치기가 NVIDIA 공식 서버에서 직접 받아 서명·SHA-256 검증까지 끝내고 OBS에 배치합니다.
 6. 관리자 권한 창에서 **예**를 누르면 설치가 끝납니다.
-7. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터 [+]** > **Native NR** 을 추가합니다. (기존 `rtx-superresolution` 구형 필터는 끄고 사용하세요.)
+7. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터 [+]**에서 **업스케일 및 선명화 (CAS)** 또는 **Native NR**을 선택합니다. 독립 CAS만 쓰려면 모델과 선택 런타임 설치를 건너뛰어도 됩니다.
 
 자세한 안내와 제거(`uninstall.bat`)·문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)를 참고하세요.
