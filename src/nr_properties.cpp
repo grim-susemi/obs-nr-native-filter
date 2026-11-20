@@ -55,10 +55,6 @@ void defaults(obs_data_t* data)
     obs_data_set_default_double(data,"nr_hold_tolerance",0.020);
     obs_data_set_default_int(data,"nr_motion_mode",0);
     obs_data_set_default_int(data,"nr_quick_preset",0);
-    obs_data_set_default_int(data,"nr_sr_mode",0);
-    obs_data_set_default_int(data,"nr_sr_model",1);
-    obs_data_set_default_double(data,"nr_cas_sharpness",0.0);
-    obs_data_set_default_string(data,"nr_sr_runtime_path",default_sr_runtime);
     obs_data_set_default_int(data,"nr_fps_overlay",0);
 }
 static bool within(double value,double low,double high)
@@ -115,19 +111,8 @@ static Values read(obs_data_t* data)
         v.stabilize={static_cast<float>(temporal),holdOn?static_cast<float>(holdStrength):0.0f,
             static_cast<float>(holdTolerance),static_cast<uint32_t>(motionMode)};
     }
-    const auto srMode=obs_data_has_user_value(data,"nr_sr_mode") || obs_data_has_default_value(data,"nr_sr_mode")?
-        obs_data_get_int(data,"nr_sr_mode"):0;
-    const auto srModel=obs_data_has_user_value(data,"nr_sr_model") || obs_data_has_default_value(data,"nr_sr_model")?
-        obs_data_get_int(data,"nr_sr_model"):1;
-    const double casSharp=obs_data_has_user_value(data,"nr_cas_sharpness") || obs_data_has_default_value(data,"nr_cas_sharpness")?
-        obs_data_get_double(data,"nr_cas_sharpness"):0.0;
-    const std::string srPath=obs_data_get_string(data,"nr_sr_runtime_path");
-    const bool upscaleValid=srMode>=0 && srMode<=3 && srModel>=0 && srModel<=2 && within(casSharp,0,1);
-    if(upscaleValid) {
-        v.upscale={static_cast<uint32_t>(srMode),static_cast<uint32_t>(srModel),static_cast<float>(casSharp),srPath};
-    }
     if(!std::isfinite(strength) || strength<0 || strength>1)v.reason="invalidStrength";
-    else if(!tuningValid || !pass2Valid || !stabValid || !upscaleValid)v.reason="invalidTuning";
+    else if(!tuningValid || !pass2Valid || !stabValid)v.reason="invalidTuning";
     else if(!passesValid)v.reason="invalidPasses";
     else if(!scaleValid)v.reason="invalidWorkScale";
     return v;
@@ -158,10 +143,10 @@ std::shared_ptr<const Settings> updated(const std::shared_ptr<const Settings>& o
 {
     if(old && old->enabled==v.enabled && old->runtimePath==v.runtimePath && old->tuning==v.tuning &&
        old->passes==v.passes && old->workScale==v.workScale && old->pass2Tuning==v.pass2Tuning &&
-       old->stabilize==v.stabilize && old->upscale==v.upscale &&
+       old->stabilize==v.stabilize &&
        (old->strength.value==v.strength.value || (std::isnan(old->strength.value) && std::isnan(v.strength.value))))return old;
     return std::make_shared<const Settings>(Settings{{old?old->revision.value+1:1},v.enabled,v.runtimePath,
-        v.strength,v.tuning,v.passes,v.workScale,v.pass2Tuning,v.stabilize,v.upscale});
+        v.strength,v.tuning,v.passes,v.workScale,v.pass2Tuning,v.stabilize});
 }
 bool effective_enabled(bool configured,bool sourceEnabled) {return configured && sourceEnabled;}
 StatusSnapshot status(Status state,Reason reason)
@@ -207,10 +192,6 @@ void sync_visibility(obs_properties_t* props,obs_data_t* data)
     }
     for(const auto* k:{"nr_hold_strength","nr_hold_tolerance"}) {
         if(auto* p=obs_properties_get(props,k))obs_property_set_visible(p,holdOn);
-    }
-    const bool srOn=obs_data_get_int(data,"nr_sr_mode")>0;
-    for(const auto* k:{"nr_sr_model","nr_sr_runtime_path"}) {
-        if(auto* p=obs_properties_get(props,k))obs_property_set_visible(p,srOn);
     }
 }
 static bool on_nr_preset_or_layout_changed(obs_properties_t* props,obs_property_t* prop,obs_data_t* data)
@@ -336,23 +317,6 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     obs_property_list_add_int(pMot,labels.motionZero,2);
     obs_property_set_long_description(pMot,labels.hintMotion);
     obs_properties_add_group(props,"nr_grp_stabilize",labels.groupStabilize,OBS_GROUP_NORMAL,grpStab);
-
-    auto* grpUpscale=obs_properties_create();
-    auto* srModeList=obs_properties_add_list(grpUpscale,"nr_sr_mode",labels.srMode,OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(srModeList,labels.srModeOff,0);
-    obs_property_list_add_int(srModeList,labels.srMode1440,1);
-    obs_property_list_add_int(srModeList,labels.srMode4k,2);
-    obs_property_list_add_int(srModeList,labels.srModeDlaa,3);
-    obs_property_set_long_description(srModeList,labels.hintSr);
-    obs_property_set_modified_callback(srModeList,on_nr_preset_or_layout_changed);
-    auto* srModelList=obs_properties_add_list(grpUpscale,"nr_sr_model",labels.srModel,OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(srModelList,labels.srModelK,0);
-    obs_property_list_add_int(srModelList,labels.srModelM,1);
-    obs_property_list_add_int(srModelList,labels.srModelL,2);
-    auto* casSlider=obs_properties_add_float_slider(grpUpscale,"nr_cas_sharpness",labels.casSharpness,0,1,.05);
-    obs_property_set_long_description(casSlider,labels.hintCas);
-    obs_properties_add_path(grpUpscale,"nr_sr_runtime_path",labels.srRuntime,OBS_PATH_FILE,"DLSS SR (nvngx_dlss.dll)",nullptr);
-    obs_properties_add_group(props,"nr_grp_upscale",labels.groupUpscale,OBS_GROUP_NORMAL,grpUpscale);
 
     auto* grpStatus=obs_properties_create();
     auto* fpsList=obs_properties_add_list(grpStatus,"nr_fps_overlay",labels.fpsOverlay,OBS_COMBO_TYPE_LIST,OBS_COMBO_FORMAT_INT);

@@ -315,16 +315,22 @@ int main(int argc,char** argv)
         passes_status_controls();
     {
         auto* udata = obs_data_create(); defaults(udata);
-        expect(obs_data_get_int(udata, "nr_sr_mode") == 0 && obs_data_get_int(udata, "nr_sr_model") == 1 &&
-            obs_data_get_double(udata, "nr_cas_sharpness") == 0.0, "upscale defaults");
-        obs_data_set_int(udata, "nr_sr_mode", 1);
+        const auto clean=updated({},decode(udata,default_runtime,a->runtimePath));
+        obs_data_set_int(udata, "nr_sr_mode", 2);
         obs_data_set_int(udata, "nr_sr_model", 2);
-        obs_data_set_double(udata, "nr_cas_sharpness", 0.45);
-        const auto dec = decode(udata, default_runtime, a->runtimePath);
-        expect(dec.reason.empty() && dec.upscale.mode == 1 && dec.upscale.dlssModel == 2 &&
-            std::abs(dec.upscale.casSharpness - 0.45f) < 1e-5f, "upscale decode");
-        obs_data_set_int(udata, "nr_sr_mode", 5);
-        expect(decode(udata, default_runtime, a->runtimePath).reason == "invalidTuning", "invalid sr_mode");
+        obs_data_set_double(udata, "nr_cas_sharpness", 1.0);
+        obs_data_set_string(udata, "nr_sr_runtime_path", "C:/legacy/nvngx_dlss.dll");
+        const auto legacy=decode(udata,default_runtime,a->runtimePath);
+        expect(legacy.reason.empty() && updated(clean,legacy)==clean,
+            "old 4K/CAS scene keys do not change the Native NR configuration");
+        obs_data_set_int(udata, "nr_sr_mode", 99);
+        const auto invalidLegacy=decode(udata,default_runtime,a->runtimePath);
+        expect(invalidLegacy.reason.empty() && updated(clean,invalidLegacy)==clean,
+            "invalid obsolete SR mode does not disable Native NR");
+        auto* ui=controls({"ready","none"});
+        for(const auto* key:{"nr_grp_upscale","nr_sr_mode","nr_sr_model","nr_cas_sharpness","nr_sr_runtime_path"})
+            expect(!obs_properties_get(ui,key),"legacy upscale control is absent from Native NR");
+        obs_properties_destroy(ui);
         obs_data_release(udata);
     }
         obs_data_set_bool(data,"nr_enabled",false);

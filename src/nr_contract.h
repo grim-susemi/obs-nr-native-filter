@@ -49,19 +49,6 @@ struct StabilizeSettings {
     bool active() const { return temporalStrength > 0.0f || holdStrength > 0.0f; }
     bool operator==(const StabilizeSettings&) const = default;
 };
-struct UpscaleSettings {
-    uint32_t mode = 0;         // 0 = Off (1:1), 1 = 1440p (2560x1440), 2 = 4K (3840x2160), 3 = DLAA (1:1)
-    uint32_t dlssModel = 1;    // 0 = DLSS 4 (preset K), 1 = DLSS 4.5 (preset M), 2 = DLSS 4.5 UltraPerf (preset L)
-    float casSharpness = 0.0f; // 0.0..1.0 AMD FidelityFX CAS
-    std::string srRuntimePath{};
-    bool valid() const {
-        return mode <= 3u && dlssModel <= 2u &&
-            std::isfinite(casSharpness) && casSharpness >= 0.0f && casSharpness <= 1.0f;
-    }
-    bool srActive() const { return mode >= 1u && mode <= 3u; }
-    bool active() const { return srActive() || casSharpness > 0.0f; }
-    bool operator==(const UpscaleSettings&) const = default;
-};
 struct Settings {
     const SettingsRevision revision;
     const bool enabled;
@@ -71,9 +58,8 @@ struct Settings {
     const uint32_t passes=1, workScale=100;
     const std::optional<ModelTuning> pass2Tuning{};
     const StabilizeSettings stabilize{};
-    const UpscaleSettings upscale{};
     bool valid() const { return revision.value != 0 && !runtimePath.empty() && strength.valid() && tuning.valid() &&
-        (!pass2Tuning || pass2Tuning->valid()) && stabilize.valid() && upscale.valid() &&
+        (!pass2Tuning || pass2Tuning->valid()) && stabilize.valid() &&
         passes >= 1 && passes <= 2 && workScale >= 50 && workScale <= 100; }
     bool operator==(const Settings&) const = default;
 };

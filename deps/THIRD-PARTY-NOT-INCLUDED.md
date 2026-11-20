@@ -26,4 +26,8 @@ The filter needs them to build. Download them from NVIDIA and place them at the 
 
 Sources: NVIDIA DLSS/NGX SDK (`deps/ngx`: headers and `nvsdk_ngx_d.lib`) and NVIDIA Optical Flow SDK (`deps/nvofa`: headers and license PDFs). The pinned SDK versions are recorded in `provenance/sdk-lock.json`.
 
+The `nvsdk_ngx_d.lib` entry above is historical. The current OBS plugin does
+not link an NVIDIA NGX SDK library. It uses the installed NVIDIA driver
+and separately installed runtime files; neither ships in the ZIP.
+
 한국어: NVIDIA SDK 파일은 저장소와 전체 기록에서 제외했습니다. 빌드하려면 위 경로에 공식 배포본을 직접 받아 넣어야 합니다.

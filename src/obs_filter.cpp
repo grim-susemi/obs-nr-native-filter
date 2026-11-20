@@ -412,25 +412,6 @@ void *create(obs_data_t *settings, obs_source_t *source)
             const auto stabPath=shaderRoot/"nr_stabilize.dxil";
             if(!f->deterministicQa && !obs_data_get_bool(settings,"nr_qa_prepare") && std::filesystem::is_regular_file(stabPath))
                 f->config.stabilize=bytes(stabPath);
-            const auto casPath=shaderRoot/"nr_cas.dxil";
-            if(!f->deterministicQa && !obs_data_get_bool(settings,"nr_qa_prepare") && std::filesystem::is_regular_file(casPath))
-                f->config.cas=bytes(casPath);
-            if(!f->deterministicQa && !obs_data_get_bool(settings,"nr_qa_prepare")) {
-                const char* srRaw=obs_data_get_string(settings,"nr_sr_runtime_path");
-                const std::string srStr=(srRaw && *srRaw)?std::string(srRaw):std::string(nr::properties::default_sr_runtime);
-                auto srP=nr::properties::utf8_path(srStr);
-                if(!srP.is_absolute() || !std::filesystem::is_regular_file(srP)) {
-                    const auto exeDir=executable_dir();
-                    if(!exeDir.empty()) {
-                        const auto relSr=exeDir/L"dlss"/L"nvngx_dlss.dll";
-                        if(std::filesystem::is_regular_file(relSr)) srP=relSr;
-                    }
-                }
-                if(srP.is_absolute() && std::filesystem::is_regular_file(srP)) {
-                    const auto canonSrDir=std::filesystem::canonical(srP).parent_path();
-                    if(canonSrDir!=f->config.runtime.canonicalPath.parent_path()) f->config.srDir=canonSrDir;
-                }
-            }
             f->config.frameIntervalNs=obs_get_frame_interval_ns();
             f->config.qaObservations=obs_data_get_bool(settings,"nr_qa_observe");
             f->config.qaPreparation=obs_data_get_bool(settings,"nr_qa_prepare");
@@ -516,20 +497,6 @@ obs_properties_t *properties(void *opaque)
     labels.groupPass1=obs_module_text("NR.Group.Pass1");
     labels.groupPass2=obs_module_text("NR.Group.Pass2");
     labels.groupStabilize=obs_module_text("NR.Group.Stabilize");
-    labels.groupUpscale=obs_module_text("NR.Group.Upscale");
-    labels.srMode=obs_module_text("NR.SrMode");
-    labels.srModeOff=obs_module_text("NR.SrMode.Off");
-    labels.srMode1440=obs_module_text("NR.SrMode.1440p");
-    labels.srMode4k=obs_module_text("NR.SrMode.4K");
-    labels.srModeDlaa=obs_module_text("NR.SrMode.DLAA");
-    labels.srModel=obs_module_text("NR.SrModel");
-    labels.srModelK=obs_module_text("NR.SrModel.K");
-    labels.srModelM=obs_module_text("NR.SrModel.M");
-    labels.srModelL=obs_module_text("NR.SrModel.L");
-    labels.casSharpness=obs_module_text("NR.CasSharpness");
-    labels.srRuntime=obs_module_text("NR.SrRuntime");
-    labels.hintSr=obs_module_text("NR.Hint.Sr");
-    labels.hintCas=obs_module_text("NR.Hint.Cas");
     labels.groupStatus=obs_module_text("NR.Group.Status");
     labels.quickPreset=obs_module_text("NR.QuickPreset");
     labels.quickPresetCustom=obs_module_text("NR.QuickPreset.Custom");
@@ -789,7 +756,7 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
     const nr::lifecycle::Observation observation{tick,f.sourceToken,f.deviceToken,validity,descriptor,
         {configured->revision,nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)),
          !control->reason.empty()?std::string{}:configured->runtimePath,configured->strength,configured->tuning,
-         configured->passes,configured->workScale,configured->pass2Tuning,configured->stabilize,configured->upscale}};
+         configured->passes,configured->workScale,configured->pass2Tuning,configured->stabilize}};
     const bool cut=f.cut.exchange(false);
     const bool signalled=f.callback->cut.exchange(false,std::memory_order_acq_rel);
     const auto prepared=f.native->prepare(observation,device,cut || signalled);
@@ -910,8 +877,7 @@ void render(void *opaque, gs_effect_t *)
         if(f.native && f.admission==Admission::Ready && !f.placeholder && !f.nativeFailed) {
             try {
                 const bool hdr=space==GS_CS_709_SCRGB;
-                const auto outExt=f.deterministicQa?nr::Extent{f.width,f.height}:
-                    nr::upscale_extent({f.width,f.height},configured->upscale.mode);
+                const nr::Extent outExt{f.width,f.height};
                 if(f.output && (gs_texture_get_width(f.output)!=outExt.width || gs_texture_get_height(f.output)!=outExt.height)) {
                     gs_texture_destroy(f.output);f.output=nullptr;
                 }
@@ -954,11 +920,8 @@ void render(void *opaque, gs_effect_t *)
         bypass(f);
         return;
     }
-    const auto outExt=f.deterministicQa?nr::Extent{f.width,f.height}:
-        nr::upscale_extent({f.width,f.height},configured->upscale.mode);
-    const bool outScaled=outExt.width!=f.width || outExt.height!=f.height;
-    const bool useOutput=!outScaled || latched->kind==nr::OutputKind::DelayedNr || (f.native && f.native->holding_output());
-    auto *texture = (f.native && !f.nativeFailed && useOutput)?f.output:gs_texrender_get_texture(f.capture);
+    const nr::Extent outExt{f.width,f.height};
+    auto *texture = (f.native && !f.nativeFailed)?f.output:gs_texrender_get_texture(f.capture);
     auto *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(false);
@@ -1010,27 +973,11 @@ std::pair<uint32_t,uint32_t> target_base_extent(const Filter& f)
 }
 uint32_t filter_width(void* opaque)
 {
-    auto& f=*static_cast<Filter*>(opaque);
-    const auto [w,h]=target_base_extent(f);
-    if(!w || !h)return w;
-    const auto control=f.configuration.load(std::memory_order_acquire);
-    const auto configured=control?control->settings:nullptr;
-    if(!configured || f.nativeFailed || (control && !control->reason.empty()) ||
-        !nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)) || f.deterministicQa)
-        return w;
-    return nr::upscale_extent({w,h},configured->upscale.mode).width;
+    return target_base_extent(*static_cast<Filter*>(opaque)).first;
 }
 uint32_t filter_height(void* opaque)
 {
-    auto& f=*static_cast<Filter*>(opaque);
-    const auto [w,h]=target_base_extent(f);
-    if(!w || !h)return h;
-    const auto control=f.configuration.load(std::memory_order_acquire);
-    const auto configured=control?control->settings:nullptr;
-    if(!configured || f.nativeFailed || (control && !control->reason.empty()) ||
-        !nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)) || f.deterministicQa)
-        return h;
-    return nr::upscale_extent({w,h},configured->upscale.mode).height;
+    return target_base_extent(*static_cast<Filter*>(opaque)).second;
 }
 gs_color_space color_space(void* opaque,size_t count,const gs_color_space* preferred)
 {

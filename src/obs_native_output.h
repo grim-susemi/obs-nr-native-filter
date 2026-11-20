@@ -68,7 +68,6 @@ public:
     model::PassStatus pass_status() const; // Graphics-owned snapshot; properties use Filter's atomic copy.
     std::string diag() const; // N22 cumulative admission/capture diagnostics
     std::shared_ptr<model::Job> selected_job() const;
-    bool holding_output() const;
     std::shared_ptr<const Capture> selected_raw() const;
     std::shared_ptr<const Capture> current_raw() const;
     std::shared_ptr<interop::Context> context() const;

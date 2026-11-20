@@ -21,16 +21,15 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 > [!NOTE]
 > Community project, not affiliated with NVIDIA or the OBS Project. NVIDIA runtime DLLs are **not redistributed** inside this repository or release zip. `install.bat` guides you through placing `nvngx_dlssnr.dll` and can automatically download & verify the official NVIDIA-signed DLSS 4.5 SR and NVIDIA VFG runtimes from NVIDIA's servers.
 
-## What's new in 0.2.3
+## What's new in 0.2.4
 
-- **Standalone Upscale & Sharpen (CAS)**: Add it to any SDR source to upscale 1080p to 1440p or 4K, or sharpen at the original size. It needs no NVIDIA runtime DLLs. See the [filter guide](docs/standalone-upscale.md) for using it with Native NR or VFG.
-- **Installer payload validation**: Rejects incomplete or damaged packages before modifying OBS.
+- **Native NR is now denoising only.** Existing scenes are not modified. Reapply any old Native NR upscaling or sharpening settings in the standalone filter.
+- **Standalone Upscale & Sharpen (CAS)**: Resize SDR sources to 1440p or 4K, or sharpen at the original size. Bilinear scaling and CAS need no NVIDIA runtime. This filter also owns optional DLSS 4.5 SR and DLAA. See the [filter guide](docs/standalone-upscale.md) for upgrading scenes and combining filters.
 
 ## What's new in 0.2.0
 
 - **2-Pass NR Combo & Working Scale**: Run 1 or 2 NR passes with independent styles (e.g. Pass 1 Standard + Pass 2 Cinematic) and adjustable working resolution (50–100%).
 - **Veyra-style Anti-Flicker & Refined Optical Flow**: Motion-compensated temporal stabilizer, static pixel hold (zero ghosting), and cost-gated 5-cell refined NVOF (`nr_guides`) to eliminate edge wobble.
-- **DLSS 4.5 Super Resolution + AMD FidelityFX CAS**: Built-in 1080p→1440p/4K/DLAA upscaler with Preset K / M (DLSS 4.5) / L + linear-space CAS sharpening (falls back cleanly to bilinear+CAS if `nvngx_dlss.dll` is absent).
 - **NVIDIA VFG Preview Window (2× / 3× / 4×)**: Right-click an OBS source/scene projector preview or open via filter/VFG controller for low-latency 120/180/240 fps frame generation (RTX 40/50) with NVIDIA Reflex markers and Pre/Post FPS HUD.
 - **One-Click Official Runtime Setup**: `install.bat` optionally downloads and signature-verifies `nvngx_dlss.dll` (from NVIDIA/DLSS GitHub) and the 5 official NVIDIA VFG DLLs (from `pypi.nvidia.com`).
 
@@ -58,7 +57,7 @@ The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (1
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.2.3-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
+1. Download `obs-nr-native-filter-0.2.4-windows-x64.zip` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
 2. Close OBS completely (including tray icon).
 3. Extract the entire zip and double-click **`install.bat`**.
 4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
@@ -75,7 +74,6 @@ Step-by-step guide, manual install and uninstall: [docs/INSTALL.md](docs/INSTALL
 | **Basic / Preset** | Quick preset, Composition strength, NR passes (1–2), Working scale (50–100%) | 1 pass, 100% | Use 75% working scale or 1 pass on 1440p/4K when running VFG simultaneously. |
 | **1st / 2nd Pass** | Preset (0–3), Style (Standard/Natural/Cinematic), Intensity, Local structure, Local tone, Skin structure, Auto mask | Local tone **0** | Independent 2nd pass styles supported when passes = 2 and Custom 2nd pass is checked. |
 | **Anti-flicker** | Temporal stability (0–1), Static stabilizer, Tolerance, Motion mode | 0.80, Static ON, Refined | Refined NVOF eliminates 4×4 block wobble; Static hold locks stationary UI/backgrounds with zero ghosting. |
-| **DLSS 4.5 & CAS** | Output upscale (Off / 1440p / 4K / DLAA), DLSS SR model (K / M / L), CAS sharpening (0–1) | Off, Model M, CAS 0 | Automatically uses `bin/64bit/dlss/nvngx_dlss.dll`; falls back to bilinear+CAS if absent. |
 | **FPS HUD / Status** | Pre/Post FPS overlay (Off / Top-Left / Top-Right), Status & Reason | Off | Shows live `IN -> NR FPS` on output. |
 
 ## Uninstall
@@ -110,9 +108,11 @@ Related: [OptiScaler-Susemi](https://github.com/grim-susemi/OptiScaler-Susemi) �
 
 OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안티플리커, DLSS 4.5 업스케일(1440p/4K/DLAA) + CAS 선명도, 그리고 RTX 40/50용 NVIDIA VFG(2배~4배 미리보기 프레임 생성)를 한 번에 제공하는 OBS 플러그인입니다.
 
+**Native NR**은 노이즈 제거를 담당합니다. 이전에 Native NR에서 확대 또는 선명화를 사용했다면 해당 값을 **업스케일 및 선명화 (CAS)** 효과에서 다시 설정하세요. 기존 장면은 자동으로 변환되지 않습니다.
+
 **설치 방법 (원클릭)**
 
-1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.2.3-windows-x64.zip`을 내려받아 압축을 풉니다.
+1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.2.4-windows-x64.zip`을 내려받아 압축을 풉니다.
 2. OBS를 완전히 끕니다.
 3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
 4. `nvngx_dlssnr.dll`(310.8.0.0 호환판, SHA-256 `e67dee20…c989a`)이 OBS에 없으면 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)

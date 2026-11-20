@@ -5,13 +5,11 @@
 #include <obs.h>
 namespace nr::properties {
 inline constexpr char default_runtime[]="C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll";
-inline constexpr char default_sr_runtime[]="C:/Program Files/obs-studio/bin/64bit/dlss/nvngx_dlss.dll";
 inline constexpr char runtime_sha256[]="e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a";
 // tuning is decoded from the seven nr_* model controls; ranges follow OptiScaler [DlssNr]
 // (preset 0..3, style 0..2, intensity/localStructure/localTone 0..2, skinStructure -1..2).
 struct Values { bool enabled;std::string runtimePath;CompositionStrength strength;std::string reason;ModelTuning tuning;
-    uint32_t passes=1,workScale=100;std::optional<ModelTuning> pass2Tuning{};StabilizeSettings stabilize{};
-    UpscaleSettings upscale{}; };
+    uint32_t passes=1,workScale=100;std::optional<ModelTuning> pass2Tuning{};StabilizeSettings stabilize{}; };
 struct StatusSnapshot {std::string state,reason;};
 std::optional<unsigned> deadline_warning(uint32_t total,uint32_t late);
 struct DeadlineSnapshot {const uint64_t packed;const std::optional<unsigned> warning;const bool changed;};
@@ -60,20 +58,6 @@ struct Labels {
     const char* groupPass1="1st Pass NR Picture Control";
     const char* groupPass2="2nd Pass Combo (2-pass only)";
     const char* groupStabilize="Anti-flicker / Stabilizer (Veyra)";
-    const char* groupUpscale="DLSS 4.5 Upscale & CAS Sharpening";
-    const char* srMode="Output upscale (DLSS SR)";
-    const char* srModeOff="Off (keep source size)";
-    const char* srMode1440="1440p (2560x1440)";
-    const char* srMode4k="4K (3840x2160)";
-    const char* srModeDlaa="DLAA (1:1 anti-aliasing)";
-    const char* srModel="DLSS SR model";
-    const char* srModelK="DLSS 4 Transformer (Preset K)";
-    const char* srModelM="DLSS 4.5 Transformer (Preset M, recommended)";
-    const char* srModelL="DLSS 4.5 Ultra Perf (Preset L)";
-    const char* casSharpness="CAS sharpening (0-1)";
-    const char* srRuntime="DLSS SR runtime (nvngx_dlss.dll)";
-    const char* hintSr="Upscales post-NR output via nvngx_dlss.dll (falls back to bilinear+CAS if DLL absent).";
-    const char* hintCas="AMD FidelityFX Contrast Adaptive Sharpening in linear color space.";
     const char* groupStatus="FPS HUD / Status";
     const char* quickPreset="Quick preset";
     const char* quickPresetCustom="Custom (keep current values)";

@@ -5,14 +5,14 @@ enum class SessionState { Initializing, Ready, Retiring, Retired };
 struct SessionKey {
     ComPtr<IUnknown> device;
     runtime::RuntimeIdentity core,model;
-    std::filesystem::path data, srDir;
+    std::filesystem::path data;
     runtime::Route route=runtime::Route::DriverFallback;
     uint64_t application=0x24480451ull;
     uint32_t coreApi=static_cast<uint32_t>(NVSDK_NGX_Version_API),modelApi=0x15;
     bool compatible(const SessionKey& other) const {
         return device.Get()==other.device.Get() && core.canonicalPath==other.core.canonicalPath &&
             core.sha256==other.core.sha256 && model.canonicalPath==other.model.canonicalPath &&
-            model.sha256==other.model.sha256 && data==other.data && srDir==other.srDir && route==other.route &&
+            model.sha256==other.model.sha256 && data==other.data && route==other.route &&
             application==other.application && coreApi==other.coreApi && modelApi==other.modelApi;
     }
 };
@@ -97,8 +97,6 @@ SessionKey session_key(ID3D12Device* device,const Config& config,const runtime::
     require(runtime::inspect(config.runtime).accepted,"verified session NR key");
     key.core=binding.identity;key.model=config.runtime;
     key.data=std::filesystem::canonical(config.data);
-    if(!config.srDir.empty() && std::filesystem::is_directory(config.srDir))
-        key.srDir=std::filesystem::canonical(config.srDir);
     require(std::filesystem::is_directory(key.data),"canonical SDK session data directory");
     return key;
 }
