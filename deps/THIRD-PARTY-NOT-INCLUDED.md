@@ -21,10 +21,15 @@ The filter needs them to build. Download them from NVIDIA and place them at the 
 | `deps/ngx/nvsdk_ngx.h` | `dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848` | 40289 |
 | `deps/nvofa/LicenseAgreement.pdf` | `b8981c69975513d5671661be2f8dc1852d6f5e0715cf5b682e75409065635b5e` | 143682 |
 | `deps/nvofa/nvOpticalFlowCommon.h` | `fb96fc6061c01ec2c5970ecebebacac7535c033717ff39810cada1f197c8ec9f` | 33648 |
+| `deps/nvofa/nvOpticalFlowD3D11.h` | `fdb83ba0ef18c7ddd03e8cdb3eb14660795415c84d9f0f40d83881bbdd60900e` | 8405 |
 | `deps/nvofa/nvOpticalFlowD3D12.h` | `d1952d0946a26f1b77e76c320b4dfe9077d946fdc1a6195e01f0460362026305` | 19086 |
 | `deps/nvofa/Release_Notes.pdf` | `65d26d91490063e1efa7756327327752168f7b5b2439c62a9884565667f9c1e5` | 169260 |
 
 Sources: NVIDIA DLSS/NGX SDK (`deps/ngx`: headers and `nvsdk_ngx_d.lib`) and NVIDIA Optical Flow SDK (`deps/nvofa`: headers and license PDFs). The pinned SDK versions are recorded in `provenance/sdk-lock.json`.
+
+For the D3D11 DLSS motion path, extract `NvOFInterface/nvOpticalFlowD3D11.h`
+from the same official Optical Flow SDK 5.0.7 archive as the D3D12 header.
+The header is a build input only; the installed NVIDIA driver supplies the runtime.
 
 The `nvsdk_ngx_d.lib` entry above is historical. The current OBS plugin does
 not link an NVIDIA NGX SDK library. It uses the installed NVIDIA driver

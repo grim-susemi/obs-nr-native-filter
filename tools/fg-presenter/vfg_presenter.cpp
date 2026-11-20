@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "native_vfg.h"
-#include "nr_fps_hud.h"
+#include "vfg_hud.h"
 #include "vfg_reflex.h"
 #include <mmsystem.h>
 #include <algorithm>
@@ -69,6 +69,7 @@ struct Feed {
     FILE* log;
     const wchar_t* runtime;
     uint32_t cliMultiplier;
+    uint32_t hudScale;
     std::atomic_uint64_t heartbeat{clock_ns()};
     std::atomic_int result{-1};
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
@@ -140,39 +141,31 @@ void frames(Feed& f)
     uint64_t lastOriginal = 0;
     uint64_t hudWindowStart = clock_ns();
     uint64_t hudOrigFrames = 0, hudPresentedFrames = 0;
-    double hudInFps = 0.0, hudOutFps = 0.0;
     uint32_t lastHudPos = UINT32_MAX;
-    std::string lastHudKey;
+    std::string hudText = "-- FPS", lastHudText;
     auto refresh_hud = [&](bool isOriginal) {
         ++hudPresentedFrames;
         if (isOriginal) ++hudOrigFrames;
         const uint64_t now = clock_ns();
         const uint64_t dt = now - hudWindowStart;
         const uint32_t pos = static_cast<uint32_t>(std::clamp<LONG>(InterlockedCompareExchange(&f.view.fpsOverlay, 0, 0), 0, 2));
-        if (dt >= 250 * ms) {
+        if (dt >= 1000 * ms) {
             const double sec = static_cast<double>(dt) / 1e9;
-            hudInFps = static_cast<double>(hudOrigFrames) / sec;
-            hudOutFps = static_cast<double>(hudPresentedFrames) / sec;
+            hudText = hud::label(static_cast<uint32_t>(hudOrigFrames / sec + 0.5),
+                static_cast<uint32_t>(hudPresentedFrames / sec + 0.5));
             hudOrigFrames = 0;
             hudPresentedFrames = 0;
             hudWindowStart = now;
         }
         if (pos == 0) {
-            if (lastHudPos != 0) { gpu.set_hud(0, 0, 0, nullptr); lastHudPos = 0; lastHudKey.clear(); }
+            if (lastHudPos != 0) { gpu.set_hud(0, 0, 0, 0, nullptr); lastHudPos = 0; }
             return;
         }
-        char left[32]{}, right[48]{};
-        std::snprintf(left, sizeof(left), "ORIG %5.1f", hudInFps);
-        if (mult > 1) std::snprintf(right, sizeof(right), "VFG %5.1f FPS (%uX)", hudOutFps, mult);
-        else std::snprintf(right, sizeof(right), "OFF %5.1f FPS", hudOutFps);
-        const std::string key = std::string(left) + "|" + right + "|" + std::to_string(pos);
-        if (key != lastHudKey) {
-            const uint32_t scale = f.view.height >= 1440 ? 3u : 2u;
-            const auto accent = mult > 1 ? nr::hud::rgba(0x3D, 0xDC, 0x84, 0xFF) : nr::hud::rgba(0xFF, 0xB8, 0x4D, 0xFF);
-            const auto img = nr::hud::render_fps_pill(left, " -> ", right, scale, 255, accent);
-            gpu.set_hud(pos, img.width, img.height, img.pixels.data());
+        if (pos != lastHudPos || hudText != lastHudText) {
+            const auto img = hud::raster(hudText, f.hudScale);
+            gpu.set_hud(pos, hud::inset * f.hudScale, img.width, img.height, img.pixels.data());
             lastHudPos = pos;
-            lastHudKey = key;
+            lastHudText = hudText;
         }
     };
     uint64_t reflexFrameId = 0;
@@ -388,7 +381,10 @@ int wmain(int argc, wchar_t** argv)
     if (!SetWindowDisplayAffinity(window, 0x11)) { DestroyWindow(window); return 2; }
     SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(view));
 
-    Feed feed{*view, parent.h, window, file, argv[3], cliMult};
+    const auto hudScale = hud::scale_for(view->width, view->height,
+        static_cast<uint32_t>(bounds.right - bounds.left), static_cast<uint32_t>(bounds.bottom - bounds.top),
+        GetDpiForWindow(window));
+    Feed feed{*view, parent.h, window, file, argv[3], cliMult, hudScale};
     std::thread worker([&] {
         try { frames(feed); feed.result.store(0); }
         catch (const std::exception& e) {

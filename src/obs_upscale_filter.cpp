@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-#include "nr_contract.h"
+#include "obs_upscale_filter.h"
 #include "obs_upscale_dlss.h"
 
 #include <obs-module.h>
@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 
+namespace nr::obs_upscale {
 namespace {
 constexpr char modeKey[] = "output_mode";
 constexpr char sharpnessKey[] = "cas_strength";
@@ -77,12 +78,16 @@ technique Draw {
 )effect";
 
 struct Settings {
+    bool enabled;
+    bool keepSize;
     uint32_t mode;
     uint32_t strength;
     bool dlss;
     uint32_t model;
     std::string runtime;
+    bool operator==(const Settings&) const = default;
 };
+}
 
 struct Filter {
     explicit Filter(obs_source_t* source_) : source(source_) {}
@@ -93,8 +98,11 @@ struct Filter {
     gs_eparam_t* multiplier = nullptr;
     gs_eparam_t* image = nullptr;
     ObsUpscaleDlss* dlss = nullptr;
-    gs_texrender_t* capture = nullptr;
+    gs_texrender_t* capture[2]{};
     gs_color_format captureFormat = GS_UNKNOWN;
+    uint32_t captureWidth = 0, captureHeight = 0;
+    uint64_t ticks[2]{};
+    unsigned current = 0;
     obs_source_t* lastTarget = nullptr; // Compare identity only; never dereference after the draw.
     std::shared_ptr<const Settings> lastSettings;
     bool dlssAttempted = false;
@@ -103,6 +111,7 @@ struct Filter {
     std::atomic<std::shared_ptr<const Settings>> settings;
 };
 
+namespace {
 constexpr gs_color_space spaces[] = {
     GS_CS_SRGB, GS_CS_SRGB_16F, GS_CS_709_EXTENDED, GS_CS_709_SCRGB,
 };
@@ -125,26 +134,35 @@ nr::Extent output_extent(nr::Extent in, uint32_t mode)
     return (out.width > 16384 || out.height > 16384) ? in : out;
 }
 
-nr::Extent dimensions(const Filter& f)
+}
+
+Extent dimensions(const Filter& f)
 {
     auto* target = obs_filter_get_target(f.source);
     const auto in = input_extent(target);
-    if (!target || !f.effect || !sdr(obs_source_get_color_space(target, OBS_COUNTOF(spaces), spaces)))
+    const auto settings = f.settings.load();
+    if (!target || !f.effect || !(settings->enabled || settings->keepSize) ||
+        !sdr(obs_source_get_color_space(target, OBS_COUNTOF(spaces), spaces)))
         return in;
-    return output_extent(in, f.settings.load()->mode);
+    return output_extent(in, settings->mode);
 }
 
-void update(void* data, obs_data_t* settings)
+bool update(Filter* f, obs_data_t* settings, bool enabled, bool keepSize)
 {
-    auto& f = *static_cast<Filter*>(data);
+    if (!f)
+        return false;
     const auto rawMode = obs_data_get_int(settings, modeKey);
     const auto mode = rawMode >= 0 && rawMode <= native ? static_cast<uint32_t>(rawMode) : 0u;
     const auto strength = static_cast<uint32_t>(std::clamp(obs_data_get_int(settings, sharpnessKey), 0LL, 100LL));
     const bool dlss = obs_data_get_int(settings, backendKey) == 1;
     const auto rawModel = obs_data_get_int(settings, modelKey);
     const auto model = rawModel >= 0 && rawModel <= 2 ? static_cast<uint32_t>(rawModel) : 1u;
-    f.settings.store(std::make_shared<const Settings>(Settings{
-        mode, strength, dlss, model, obs_data_get_string(settings, runtimeKey)}));
+    Settings next{enabled, keepSize, mode, strength, dlss, model, obs_data_get_string(settings, runtimeKey)};
+    const auto current = f->settings.load();
+    if (current && *current == next)
+        return false;
+    f->settings.store(std::make_shared<const Settings>(std::move(next)));
+    return true;
 }
 
 void enabled_changed(void* data, calldata_t*)
@@ -152,12 +170,12 @@ void enabled_changed(void* data, calldata_t*)
     static_cast<Filter*>(data)->reset.store(true);
 }
 
-void* create(obs_data_t* settings, obs_source_t* source)
+Filter* create(obs_data_t* settings, obs_source_t* source)
 {
     auto* f = new (std::nothrow) Filter(source);
     if (!f)
         return nullptr;
-    update(f, settings);
+    update(f, settings, true);
     char* error = nullptr;
     obs_enter_graphics();
     f->effect = gs_effect_create(effectCode, "obs-nr-upscale.effect", &error);
@@ -175,13 +193,15 @@ void* create(obs_data_t* settings, obs_source_t* source)
     return f;
 }
 
-void destroy(void* data)
+void destroy(Filter* f)
 {
-    auto* f = static_cast<Filter*>(data);
+    if (!f)
+        return;
     signal_handler_disconnect(obs_source_get_signal_handler(f->source), "enable", enabled_changed, f);
     obs_upscale_dlss_destroy(f->dlss);
     obs_enter_graphics();
-    gs_texrender_destroy(f->capture);
+    for (auto* capture : f->capture)
+        gs_texrender_destroy(capture);
     if (f->effect)
         gs_effect_destroy(f->effect);
     obs_leave_graphics();
@@ -190,7 +210,7 @@ void destroy(void* data)
 
 // The libobs filter helper owns its render target privately. Capture explicitly
 // for DLSS so the fallback can reuse this exact frame without a second source draw.
-bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Extent out, gs_color_space space)
+static bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Extent out, gs_color_space space)
 {
     if (!f.dlssAttempted) {
         f.dlss = obs_upscale_dlss_create();
@@ -199,39 +219,69 @@ bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Extent ou
     if (!f.dlss)
         return false;
     const auto format = gs_get_format_from_space(space);
-    if (f.captureFormat != format) {
-        gs_texrender_destroy(f.capture);
-        f.capture = gs_texrender_create(format, GS_ZS_NONE);
+    if (f.captureFormat != format || f.captureWidth != in.width || f.captureHeight != in.height) {
+        for (auto*& capture : f.capture) {
+            gs_texrender_destroy(capture);
+            capture = nullptr;
+        }
         f.captureFormat = format;
+        f.captureWidth = in.width;
+        f.captureHeight = in.height;
+        f.ticks[0] = f.ticks[1] = 0;
     }
-    if (!f.capture)
+    const auto now = obs_get_video_frame_time();
+    const auto interval = obs_get_frame_interval_ns();
+    if (!now || !interval)
         return false;
-    gs_texrender_reset(f.capture);
-    if (!gs_texrender_begin_with_color_space(f.capture, in.width, in.height, space)) {
-        obs_upscale_dlss_reset(f.dlss);
-        return false;
+    if (f.ticks[f.current] != now) {
+        const auto next = f.current ^ 1u;
+        if (!f.capture[next])
+            f.capture[next] = gs_texrender_create(format, GS_ZS_NONE);
+        f.ticks[next] = 0;
+        auto* capture = f.capture[next];
+        if (!capture)
+            return false;
+        gs_texrender_reset(capture);
+        if (!gs_texrender_begin_with_color_space(capture, in.width, in.height, space)) {
+            obs_upscale_dlss_reset(f.dlss);
+            f.ticks[0] = f.ticks[1] = 0;
+            return false;
+        }
+        gs_blend_state_push();
+        gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+        vec4 clear{};
+        gs_clear(GS_CLEAR_COLOR, &clear, 0, 0);
+        gs_ortho(0, static_cast<float>(in.width), 0, static_cast<float>(in.height), -100, 100);
+        obs_source_skip_video_filter(f.source);
+        gs_blend_state_pop();
+        gs_texrender_end(capture);
+        f.current = next;
+        f.ticks[next] = now;
     }
-    gs_blend_state_push();
-    gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-    vec4 clear{};
-    gs_clear(GS_CLEAR_COLOR, &clear, 0, 0);
-    gs_ortho(0, static_cast<float>(in.width), 0, static_cast<float>(in.height), -100, 100);
-    obs_source_skip_video_filter(f.source);
-    gs_blend_state_pop();
-    gs_texrender_end(f.capture);
-    auto* input = gs_texrender_get_texture(f.capture);
-    auto* output = obs_upscale_dlss_render(f.dlss, input, out.width, out.height, settings.model, settings.runtime.c_str());
+    const auto previous = f.current ^ 1u;
+    const auto prior = f.ticks[previous];
+    // Spatial and temporal output must represent the same OBS tick. A late
+    // DLSS completion is never shown after its spatial twin was presented.
+    const bool adjacent = prior && now > prior && now - prior <= interval + interval / 2;
+    auto* input = gs_texrender_get_texture(f.capture[f.current]);
+    auto* spatial = adjacent ? gs_texrender_get_texture(f.capture[previous]) : input;
+#if defined(_WIN32) && defined(OBS_NR_VFG_QA_ACTION)
+    if (obs_upscale_dlss_qa_legacy_pacing())
+        spatial = input;
+#endif
+    auto* output = obs_upscale_dlss_render(f.dlss, input, adjacent ? prior : 0,
+                                          out.width, out.height, settings.model, settings.runtime.c_str());
     const bool linear = gs_set_linear_srgb(true);
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(true);
     if (output)
         gs_effect_set_texture(f.image, output);
     else
-        gs_effect_set_texture_srgb(f.image, input);
+        gs_effect_set_texture_srgb(f.image, spatial);
     gs_blend_state_push();
     gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
     while (gs_effect_loop(f.effect, "Draw"))
-        gs_draw_sprite(output ? output : input, 0, out.width, out.height);
+        gs_draw_sprite(output ? output : spatial, 0, out.width, out.height);
     gs_blend_state_pop();
     gs_enable_framebuffer_srgb(srgb);
     gs_set_linear_srgb(linear);
@@ -243,24 +293,24 @@ bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Extent ou
     return true;
 }
 
-void render(void* data, gs_effect_t*)
+void render(Filter& f)
 {
-    auto& f = *static_cast<Filter*>(data);
     auto* target = obs_filter_get_target(f.source);
     if (!target || !obs_filter_get_parent(f.source))
         return;
     const auto settings = f.settings.load();
     const uint32_t mode = settings->mode;
-    const uint32_t strength = settings->strength;
+    const uint32_t strength = settings->enabled ? settings->strength : 0u;
     const auto in = input_extent(target);
     const auto out = output_extent(in, mode);
     const auto space = obs_source_get_color_space(target, OBS_COUNTOF(spaces), spaces);
-    const bool usable = f.effect && in.width && in.height && sdr(space) && mode != 0;
-    const bool useDlss = usable && settings->dlss && (mode == native || in != out);
+    const bool usable = (settings->enabled || settings->keepSize) && f.effect && in.width && in.height && sdr(space) && mode != 0;
+    const bool useDlss = usable && settings->enabled && settings->dlss && (mode == native || in != out);
     if (f.reset.exchange(false) || f.lastTarget != target || !useDlss || !f.lastSettings ||
         f.lastSettings->mode != mode || f.lastSettings->dlss != settings->dlss ||
         f.lastSettings->model != settings->model || f.lastSettings->runtime != settings->runtime) {
         obs_upscale_dlss_reset(f.dlss);
+        f.ticks[0] = f.ticks[1] = 0;
         f.publishedDlss = false;
     }
     f.lastTarget = target;
@@ -295,20 +345,19 @@ void defaults(obs_data_t* settings)
     obs_data_set_default_string(settings, runtimeKey, "");
 }
 
-bool sync_controls(obs_properties_t* props, obs_property_t*, obs_data_t* settings)
+static bool sync_controls(obs_properties_t* props, obs_property_t*, obs_data_t* settings)
 {
     const bool enabled = obs_data_get_int(settings, modeKey) != 0;
     const bool dlss = enabled && obs_data_get_int(settings, backendKey) == 1;
     obs_property_set_enabled(obs_properties_get(props, backendKey), enabled);
     obs_property_set_enabled(obs_properties_get(props, sharpnessKey), enabled);
-    for (const auto* key : {modelKey, runtimeKey, dlssHintKey})
+    for (const auto* key : {modelKey, dlssHintKey})
         obs_property_set_visible(obs_properties_get(props, key), dlss);
     return true;
 }
 
-obs_properties_t* properties(void*)
+void add_properties(obs_properties_t* props)
 {
-    auto* props = obs_properties_create();
     auto* modes = obs_properties_add_list(props, modeKey, obs_module_text("Upscale.Output"),
                                          OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(modes, obs_module_text("Upscale.Off"), 0);
@@ -326,33 +375,35 @@ obs_properties_t* properties(void*)
     obs_property_list_add_int(model, obs_module_text("Upscale.DlssModelK"), 0);
     obs_property_list_add_int(model, obs_module_text("Upscale.DlssModelM"), 1);
     obs_property_list_add_int(model, obs_module_text("Upscale.DlssModelL"), 2);
-    obs_properties_add_path(props, runtimeKey, obs_module_text("Upscale.DlssRuntime"), OBS_PATH_FILE,
-                            "NVIDIA DLSS (nvngx_dlss.dll)", nullptr);
     obs_properties_add_text(props, dlssHintKey, obs_module_text("Upscale.DlssHint"), OBS_TEXT_INFO);
     obs_properties_add_int_slider(props, sharpnessKey, obs_module_text("Upscale.Strength"), 0, 100, 1);
     obs_properties_add_text(props, "upscale_info", obs_module_text("Upscale.Hint"), OBS_TEXT_INFO);
-    return props;
 }
 }
 
 extern "C" void nr_register_upscale_filter(void)
 {
+    using namespace nr::obs_upscale;
     obs_source_info info{};
     info.id = "susemi_upscale_filter";
     info.type = OBS_SOURCE_TYPE_FILTER;
-    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB;
+    info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB | OBS_SOURCE_DEPRECATED;
     info.get_name = [](void*) { return obs_module_text("Upscale.Name"); };
-    info.create = create;
-    info.destroy = destroy;
-    info.update = update;
+    info.create = [](obs_data_t* settings, obs_source_t* source) -> void* { return create(settings, source); };
+    info.destroy = [](void* data) { destroy(static_cast<Filter*>(data)); };
+    info.update = [](void* data, obs_data_t* settings) { update(static_cast<Filter*>(data), settings, true); };
     info.get_defaults = defaults;
-    info.get_properties = properties;
+    info.get_properties = [](void*) {
+        auto* props = obs_properties_create();
+        add_properties(props);
+        return props;
+    };
     info.get_width = [](void* data) { return dimensions(*static_cast<Filter*>(data)).width; };
     info.get_height = [](void* data) { return dimensions(*static_cast<Filter*>(data)).height; };
     info.video_get_color_space = [](void* data, size_t count, const gs_color_space* preferred) {
         auto* target = obs_filter_get_target(static_cast<Filter*>(data)->source);
         return target ? obs_source_get_color_space(target, count, preferred) : GS_CS_SRGB;
     };
-    info.video_render = render;
+    info.video_render = [](void* data, gs_effect_t*) { render(*static_cast<Filter*>(data)); };
     obs_register_source(&info);
 }

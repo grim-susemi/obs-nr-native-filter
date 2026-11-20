@@ -213,7 +213,7 @@ Status Producer::status()const{
  }
  return Status::ProtocolError;
 }
-Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival){
+Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity){
  if(GetCurrentThreadId()!=config_->thread)return Status::ProtocolError;
  const auto state=status();if(state!=Status::Ok)return state;if(!source)return Status::InvalidFrame;
  D3D11_TEXTURE2D_DESC d{};source->GetDesc(&d);Ptr<ID3D11Device> owner;source->GetDevice(&owner);
@@ -226,8 +226,9 @@ Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arr
   if(complete(write,slot.target)&&complete(returned,slot.target))break;
  }
  if(index==p.slots.size())return Status::Dropped;
- if(p.serial==max_serial)return Status::SequenceExhausted;
- auto& slot=p.slots[index];slot.target=++p.serial;p.uncertain=true;
+ const uint64_t step=discontinuity && p.serial ? 2 : 1;
+ if(p.serial>max_serial-step)return Status::SequenceExhausted;
+ auto& slot=p.slots[index];p.serial+=step;slot.target=p.serial;p.uncertain=true;
  p.graphics->CopyResource(slot.texture.Get(),source);
  if(FAILED(p.graphics->Signal(slot.write.Get(),slot.target)))return Status::ProtocolError;
  p.graphics->Flush();p.uncertain=false;

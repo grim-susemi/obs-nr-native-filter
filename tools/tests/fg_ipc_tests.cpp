@@ -111,6 +111,7 @@ Shape shape(){
  std::copy_n(L"IPC_TEST",9,s.sourceMonitor.begin());return s;
 }
 uint32_t pixel(uint64_t serial,uint32_t x,uint32_t y){return static_cast<uint32_t>(serial)*0x010101u+x*257u+y*65537u;}
+constexpr uint64_t continuous_frames=1000, first_frame_after_switch=5;
 struct Renderer {
  Ptr<ID3D11Device> device;Ptr<ID3D11DeviceContext> context;Ptr<ID3D11Texture2D> source;LUID adapter{};
  Renderer(){
@@ -121,10 +122,10 @@ struct Renderer {
   D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=16;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;d.Format=shape().format;
   d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;check(device->CreateTexture2D(&d,nullptr,&source),"test source");
  }
- void send(Producer& producer,uint64_t serial){
+ void send(Producer& producer,uint64_t serial,bool discontinuity=false){
   std::array<uint32_t,256> data{};for(uint32_t y=0;y<16;++y)for(uint32_t x=0;x<16;++x)data[y*16+x]=pixel(serial,x,y);
   context->UpdateSubresource(source.Get(),0,nullptr,data.data(),16*sizeof(uint32_t),0);
-  expect(producer.publish(source.Get(),serial*1000,serial*1000+7)==Status::Ok,"published test frame without loss");
+  expect(producer.publish(source.Get(),serial*1000,serial*1000+7,discontinuity)==Status::Ok,"published test frame without loss");
  }
 };
 struct Reader {
@@ -166,7 +167,8 @@ int child(HANDLE control){
    std::optional<Frame> next;size_t index=0;
    for(size_t i=0;i<slot_count;++i){const auto f=consumer.frame(i);if(f&&(!next||f->serial<next->serial)){next=f;index=i;}}
    if(!next){await(consumer.frame_event(),b.parent);continue;}
-   expect(next->serial==expected&&next->generation==b.generation&&next->timestampNs==expected*1000&&next->arrivalNs==expected*1000+7,"no torn frame identity/timestamps");
+   const auto wireSerial=expected+(b.frames==continuous_frames&&expected>=first_frame_after_switch?1:0);
+   expect(next->serial==wireSerial&&next->generation==b.generation&&next->timestampNs==expected*1000&&next->arrivalNs==expected*1000+7,"wire serial skips once after an effect switch, keeping frame identity and timestamps");
    expect(next->shape.width==16&&next->shape.height==16&&next->shape.format==shape().format&&next->shape.colorSpace==shape().colorSpace&&
     next->shape.displayCapture&&next->shape.sourceMonitor==shape().sourceMonitor,"no torn shape/provenance");
    expect(consumer.arm_return(index,done.value)==Status::Ok,"subscribe exact return before GPU submission");
@@ -256,12 +258,12 @@ void reject(Renderer& renderer,Producer& producer,Mode mode){
 void frames(Renderer& renderer,Producer& producer){
  // Given a ready child deliberately held before acquisition, When four frames
  // fill the ring, Then a fifth is dropped and all four original pixels survive.
- Child process(Mode::Frames,1000);const auto offer=producer.connect(process.owned);process.offer(offer,renderer.adapter);
+ Child process(Mode::Frames,continuous_frames);const auto offer=producer.connect(process.owned);process.offer(offer,renderer.adapter);
  await(producer.control_event(),process.process.value);expect(producer.status()==Status::Ok,"import handshake ready");
  for(uint64_t n=1;n<=4;++n)renderer.send(producer,n);
  expect(producer.publish(renderer.source.Get(),5000,5007)==Status::Dropped,"held four slots refuse overwrite");
  signal(process.go.value);for(unsigned n=0;n<4;++n)await(process.step.value,process.process.value);
- for(uint64_t n=5;n<=1000;++n){renderer.send(producer,n);await(process.step.value,process.process.value);}
+ for(uint64_t n=first_frame_after_switch;n<=continuous_frames;++n){renderer.send(producer,n,n==first_frame_after_switch);await(process.step.value,process.process.value);}
  finish(process.process.value);expect(producer.retire()==Status::Ok,"1000-frame clean retirement");
  std::puts("PASS fg_ipc_gpu frames=1000 checksum_mismatch=0 held_slot_overwrite=0 torn_header=0");
 }

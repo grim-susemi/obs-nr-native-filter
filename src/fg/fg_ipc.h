@@ -86,7 +86,8 @@ public:
  Producer& operator=(const Producer&)=delete;
  Offer connect(const Peer&); // Throws Error on rejection/capacity; old generation is retained.
  Status status()const;
- Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs);
+ // A discontinuity starts a new frame pair without retiring the transport.
+ Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs,bool discontinuity=false);
  Status retire(); // Alive importer must close first; dead is NOT a completion.
  HANDLE peer_process()const;
  HANDLE control_event()const;

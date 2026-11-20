@@ -11,11 +11,14 @@
 #include <wintrust.h>
 #include <wrl/client.h>
 #include <wincrypt.h>
+#include <nvOpticalFlowD3D11.h>
 #include <obs-module.h>
 #include <util/bmem.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <limits>
@@ -30,89 +33,20 @@ namespace {
 using Microsoft::WRL::ComPtr;
 constexpr UINT64 invalidFence = std::numeric_limits<UINT64>::max();
 constexpr DWORD drainMs = 1500;
-constexpr ULONGLONG maxOutputAgeMs = 80;
-constexpr ULONGLONG maxHistoryGapMs = 100;
+constexpr UINT64 maxHistoryGapNs = 100'000'000;
 constexpr char projectId[] = "f890e249-34d1-4c7f-9069-37d8c312a61e";
 
-// The OBS image is already rasterized, so there is no projection jitter,
-// geometric depth, or engine velocity. Use flat depth and estimate
-// current->previous motion on the incoming frames, in render pixels.
-constexpr char shader[] = R"hlsl(
-Texture2D<float4> first : register(t0);
-Texture2D<float4> second : register(t1);
-RWTexture2D<float4> dest : register(u0);
-SamplerState linearClamp : register(s0);
+#ifdef OBS_NR_VFG_QA_ACTION
+// Fault injection only: 110 ms after every 24th completed evaluation.
+bool qa_pacing_stall() noexcept
+{
+    static const bool enabled = GetEnvironmentVariableW(L"OBS_NR_QA_DLSS_STALL", nullptr, 0) > 0;
+    return enabled;
+}
 
-float lin(float x) { return x <= 0.04045 ? x / 12.92 : pow(max(x + 0.055, 0.0) / 1.055, 2.4); }
-void prepare(uint2 p, bool srgb) {
-    uint w, h;
-    dest.GetDimensions(w, h);
-    if (any(p >= uint2(w, h))) return;
-    float4 c = first.Load(int3(p, 0));
-    if (srgb) c.rgb = float3(lin(c.r), lin(c.g), lin(c.b));
-    c.a = saturate(c.a);
-    dest[p] = float4(c.a > 0.0001 ? saturate(c.rgb / c.a) : 0.0, c.a);
-}
-[numthreads(8, 8, 1)]
-void prepare_srgb(uint3 p : SV_DispatchThreadID) { prepare(p.xy, true); }
-[numthreads(8, 8, 1)]
-void prepare_linear(uint3 p : SV_DispatchThreadID) { prepare(p.xy, false); }
+#endif
 
-float luma(float4 c) { return dot(c.rgb, float3(0.213, 0.715, 0.072)) * c.a; }
-float patch(int2 p, int2 d, int2 hi) {
-    float error = 0.00015 * dot(float2(d), float2(d));
-    [unroll] for (int y = -3; y <= 3; y += 3) {
-        [unroll] for (int x = -3; x <= 3; x += 3) {
-            int2 q = p + int2(x, y);
-            error += abs(luma(first.Load(int3(clamp(q, int2(0, 0), hi), 0))) -
-                         luma(second.Load(int3(clamp(q + d, int2(0, 0), hi), 0))));
-        }
-    }
-    return error;
-}
-[numthreads(8, 8, 1)]
-void estimate(uint3 p : SV_DispatchThreadID) {
-    uint w, h, gw, gh;
-    first.GetDimensions(w, h);
-    dest.GetDimensions(gw, gh);
-    if (any(p.xy >= uint2(gw, gh))) return;
-    int2 hi = int2(w, h) - 1;
-    int2 center = min(int2(p.xy) * 16 + 8, hi);
-    int2 best = 0;
-    float error = patch(center, best, hi);
-    [loop] for (uint step = 8; step > 0; step >>= 1) {
-        int2 base = best;
-        [unroll] for (int y = -1; y <= 1; ++y) {
-            [unroll] for (int x = -1; x <= 1; ++x) {
-                if (x != 0 || y != 0) {
-                    int2 d = base + int2(x, y) * int(step);
-                    float test = patch(center, d, hi);
-                    if (test < error) { error = test; best = d; }
-                }
-            }
-        }
-    }
-    dest[p.xy] = float4(float2(best), 0, 0);
-}
-[numthreads(8, 8, 1)]
-void densify(uint3 p : SV_DispatchThreadID) {
-    uint w, h, gw, gh;
-    dest.GetDimensions(w, h);
-    first.GetDimensions(gw, gh);
-    if (any(p.xy >= uint2(w, h))) return;
-    float2 uv = (float2(p.xy) + 0.5) / (16.0 * float2(gw, gh));
-    dest[p.xy] = float4(first.SampleLevel(linearClamp, uv, 0).xy, 0, 0);
-}
-[numthreads(8, 8, 1)]
-void compose(uint3 p : SV_DispatchThreadID) {
-    uint w, h;
-    dest.GetDimensions(w, h);
-    if (any(p.xy >= uint2(w, h))) return;
-    float a = saturate(second.SampleLevel(linearClamp, (float2(p.xy) + 0.5) / float2(w, h), 0).a);
-    float3 rgb = saturate(first.Load(int3(p.xy, 0)).rgb);
-    dest[p.xy] = float4(rgb * a, a);
-}
-)hlsl";
+#include "obs_upscale_dlss_shader.h"
 
 void check(HRESULT hr, const char* where)
 {
@@ -165,7 +99,7 @@ struct NgxD3d11 {
         MEMORY_BASIC_INFORMATION info{};
         if (!address || !VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) ||
             info.AllocationBase != module)
-            throw std::runtime_error(std::string("NGX SR CORE export unavailable: ") + name);
+            throw std::runtime_error(std::string("NVIDIA export unavailable: ") + name);
         return reinterpret_cast<Fn>(address);
     }
 
@@ -214,7 +148,7 @@ struct Config {
 
 struct Capture {
     UINT64 epoch = 0, fence = 0;
-    ULONGLONG time = 0;
+    UINT64 time = 0, interval = 0;
 };
 
 struct Image {
@@ -251,15 +185,23 @@ Image make_image(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT form
     return image;
 }
 
-ComPtr<ID3D11ComputeShader> program(ID3D11Device* device, const char* entry)
+ComPtr<ID3DBlob> shader_code(const char* entry, const char* target)
 {
     ComPtr<ID3DBlob> code, error;
-    const auto hr = D3DCompile(shader, sizeof(shader) - 1, "obs_upscale_dlss", nullptr, nullptr, entry,
-                               "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
+    const D3D_SHADER_MACRO compute[]{{"COMPUTE", "1"}, {nullptr, nullptr}};
+    const auto hr = D3DCompile(shader, sizeof(shader) - 1, "obs_upscale_dlss",
+                               target[0] == 'c' ? compute : nullptr, nullptr, entry,
+                               target, D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
                                0, &code, &error);
     if (error)
         blog(FAILED(hr) ? LOG_WARNING : LOG_INFO, "obs-nr-upscale: %s", static_cast<const char*>(error->GetBufferPointer()));
     check(hr, "SR shader compile");
+    return code;
+}
+
+ComPtr<ID3D11ComputeShader> program(ID3D11Device* device, const char* entry)
+{
+    const auto code = shader_code(entry, "cs_5_0");
     ComPtr<ID3D11ComputeShader> result;
     check(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &result),
           "SR compute shader");
@@ -278,9 +220,10 @@ std::filesystem::path runtime_path(const std::string& overridePath)
             throw std::runtime_error("NGX SR runtime must be an absolute nvngx_dlss.dll path");
         std::error_code error;
         const auto resolved = std::filesystem::canonical(path, error);
-        if (error)
+        if (!error)
+            return resolved;
+        if (error != std::errc::no_such_file_or_directory)
             throw std::runtime_error("NVIDIA SR runtime is missing or inaccessible");
-        return resolved;
     }
     std::array<wchar_t, 32768> exe{};
     const auto length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
@@ -294,12 +237,12 @@ void admit_runtime(const std::filesystem::path& path, Handle& pinned)
     const auto file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (file == INVALID_HANDLE_VALUE)
-        throw std::runtime_error("NVIDIA SR runtime is missing or inaccessible");
+        throw std::runtime_error("NVIDIA library is missing or inaccessible");
     pinned.value = file; // Keep the admitted file immutable while NGX can use it.
     BY_HANDLE_FILE_INFORMATION identity{};
     if (!GetFileInformationByHandle(file, &identity) ||
         (identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
-        throw std::runtime_error("NVIDIA SR runtime is not a regular file");
+        throw std::runtime_error("NVIDIA library is not a regular file");
     WINTRUST_FILE_INFO info{};
     info.cbStruct = sizeof(info);
     info.pcwszFilePath = path.c_str();
@@ -324,7 +267,7 @@ void admit_runtime(const std::filesystem::path& path, Handle& pinned)
     trust.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(nullptr, &action, &trust);
     if (status != ERROR_SUCCESS || std::wstring_view(subject.data()) != L"NVIDIA Corporation")
-        throw std::runtime_error("NVIDIA SR runtime signature rejected");
+        throw std::runtime_error("NVIDIA library signature rejected");
 }
 
 bool image_matches(HMODULE module, const std::filesystem::path& path)
@@ -334,6 +277,8 @@ bool image_matches(HMODULE module, const std::filesystem::path& path)
     std::error_code error;
     return length && length < image.size() && std::filesystem::equivalent(path, image.data(), error) && !error;
 }
+
+#include "obs_upscale_dlss_flow.h"
 
 struct RenderSize {
     UINT width = 0, height = 0;
@@ -457,10 +402,14 @@ struct Session {
     ComPtr<ID3D11DeviceContext4> commands;
     ComPtr<ID3D11Fence> transfer, worker;
     Handle inputHandle, outputHandle, transferHandle, event;
-    Image input, output, evaluated, motion, grid, depth;
+    Image input, output, evaluated, motion, depth, cutFlag;
+    OpticalFlow flow;
     std::array<Image, 2> colors;
-    ComPtr<ID3D11ComputeShader> prepare, estimate, densify, compose;
+    ComPtr<ID3D11ComputeShader> prepare, densify, detectCut, compose;
+    ComPtr<ID3D11Texture2D> cutReadback;
+    ComPtr<ID3D11Buffer> motionUnits;
     ComPtr<ID3D11SamplerState> sampler;
+    float inputPerOutputX = 1.0f, inputPerOutputY = 1.0f;
     NVSDK_NGX_Parameter* caps = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
@@ -468,6 +417,7 @@ struct Session {
     UINT64 submitted = 0;
     Capture previous{};
     size_t nextColor = 0;
+    bool resetFlowHints = true;
 
     explicit Session(const Config& c) : config(c) {}
 
@@ -543,12 +493,28 @@ struct Session {
         for (auto& color : colors)
             color = make_image(device.Get(), w, h, fp, true);
         motion = make_image(device.Get(), w, h, DXGI_FORMAT_R16G16_FLOAT, true);
-        grid = make_image(device.Get(), (w + 15) / 16, (h + 15) / 16, DXGI_FORMAT_R16G16_FLOAT, true);
         depth = make_image(device.Get(), w, h, DXGI_FORMAT_R32_FLOAT, true);
+        cutFlag = make_image(device.Get(), 1, 1, DXGI_FORMAT_R32_UINT, true);
         prepare = program(device.Get(), config.format == fp ? "prepare_linear" : "prepare_srgb");
-        estimate = program(device.Get(), "estimate");
         densify = program(device.Get(), "densify");
+        detectCut = program(device.Get(), "detect_cut");
         compose = program(device.Get(), "compose");
+        D3D11_TEXTURE2D_DESC cutDesc{};
+        cutFlag.texture->GetDesc(&cutDesc);
+        cutDesc.BindFlags = 0;
+        cutDesc.Usage = D3D11_USAGE_STAGING;
+        cutDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        check(device->CreateTexture2D(&cutDesc, nullptr, &cutReadback), "SR cut readback");
+        const float scale[]{static_cast<float>(ow) / static_cast<float>(w),
+                            static_cast<float>(oh) / static_cast<float>(h), 0.0f, 0.0f};
+        inputPerOutputX = 1.0f / scale[0];
+        inputPerOutputY = 1.0f / scale[1];
+        D3D11_BUFFER_DESC constants{};
+        constants.ByteWidth = sizeof(scale);
+        constants.Usage = D3D11_USAGE_IMMUTABLE;
+        constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        const D3D11_SUBRESOURCE_DATA data{scale, 0, 0};
+        check(device->CreateBuffer(&constants, &data, &motionUnits), "SR motion units");
         D3D11_SAMPLER_DESC sd{};
         sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -557,7 +523,19 @@ struct Session {
         sd.MaxLOD = D3D11_FLOAT32_MAX;
         check(device->CreateSamplerState(&sd, &sampler), "SR sampler");
 
+        // Admission failures select spatial for the entire configuration.
+        // Do not alternate hardware and software vectors inside NGX history.
+        unresolved = true;
+        try {
+            flow.open(device.Get(), commands.Get(), w, h);
+        } catch (...) {
+            unresolved = !finish_worker() || flow.uncertain;
+            throw;
+        }
         {
+            if (!finish_worker())
+                throw std::runtime_error("SR NVOF initialization did not complete");
+            unresolved = false;
             const auto getCaps = ngx_call(core->ngx.capabilities, &caps);
             unresolved = getCaps == NVSDK_NGX_Result_FAIL_PlatformError;
             check_ngx(getCaps, "NGX SR capability map");
@@ -617,7 +595,7 @@ struct Session {
         return s->core->ngx.create(s->commands.Get(), NVSDK_NGX_Feature_SuperSampling, s->params, &s->feature);
     }
 
-    static NVSDK_NGX_Result evaluate_feature(Session* s, ID3D11Resource* color, bool reset, float frameTime)
+    static NVSDK_NGX_Result evaluate_feature(Session* s, ID3D11Resource* color, bool reset)
     {
         auto& p = *s->params;
         p.Set(NVSDK_NGX_Parameter_Color, color);
@@ -630,28 +608,61 @@ struct Session {
         for (const auto* key : {NVSDK_NGX_Parameter_Jitter_Offset_X, NVSDK_NGX_Parameter_Jitter_Offset_Y,
                                 NVSDK_NGX_Parameter_Sharpness})
             p.Set(key, 0.0f);
-        for (const auto* key : {NVSDK_NGX_Parameter_MV_Scale_X, NVSDK_NGX_Parameter_MV_Scale_Y,
-                                NVSDK_NGX_Parameter_DLSS_Pre_Exposure, NVSDK_NGX_Parameter_DLSS_Exposure_Scale})
+        // Motion is stored in output pixels; normalize to render pixels for
+        // NGX's input-sized, low-resolution motion vector contract.
+        p.Set(NVSDK_NGX_Parameter_MV_Scale_X, s->inputPerOutputX);
+        p.Set(NVSDK_NGX_Parameter_MV_Scale_Y, s->inputPerOutputY);
+        for (const auto* key : {NVSDK_NGX_Parameter_DLSS_Pre_Exposure, NVSDK_NGX_Parameter_DLSS_Exposure_Scale})
             p.Set(key, 1.0f);
-        p.Set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, frameTime);
         return s->core->ngx.evaluate(s->commands.Get(), s->feature, s->params, nullptr);
     }
 
     void dispatch(ID3D11ComputeShader* shaderObject, const Image& a, const Image* b, const Image& out,
-                  UINT w, UINT h)
+                  UINT w, UINT h, bool flowInputs = false, bool cutOutput = false)
     {
-        ID3D11ShaderResourceView* srvs[]{a.srv.Get(), b ? b->srv.Get() : nullptr};
-        ID3D11UnorderedAccessView* uavs[]{out.uav.Get()};
+        ID3D11ShaderResourceView* srvs[]{a.srv.Get(), b ? b->srv.Get() : nullptr,
+                                       flowInputs ? flow.vectors.srv.Get() : nullptr,
+                                       flowInputs ? flow.cost.srv.Get() : nullptr};
+        ID3D11UnorderedAccessView* uavs[]{cutOutput ? nullptr : out.uav.Get(), cutOutput ? out.uav.Get() : nullptr};
         ID3D11SamplerState* samplers[]{sampler.Get()};
+        ID3D11Buffer* cb = flowInputs ? motionUnits.Get() : nullptr;
         commands->CSSetShader(shaderObject, nullptr, 0);
-        commands->CSSetShaderResources(0, 2, srvs);
-        commands->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        commands->CSSetShaderResources(0, 4, srvs);
+        commands->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
         commands->CSSetSamplers(0, 1, samplers);
+        commands->CSSetConstantBuffers(0, 1, &cb);
         commands->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-        srvs[0] = srvs[1] = nullptr;
-        uavs[0] = nullptr;
-        commands->CSSetShaderResources(0, 2, srvs);
-        commands->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        ID3D11ShaderResourceView* noSRVs[4]{};
+        ID3D11UnorderedAccessView* noUAVs[2]{};
+        commands->CSSetShaderResources(0, 4, noSRVs);
+        commands->CSSetUnorderedAccessViews(0, 2, noUAVs, nullptr);
+    }
+
+    bool read_cut(const Image& color, const Image& prior, bool& reset)
+    {
+        dispatch(detectCut.Get(), color, &prior, cutFlag, 1, 1, false, true);
+        commands->CopyResource(cutReadback.Get(), cutFlag.texture.Get());
+        // The NGX reset flag lives on the CPU. Only the worker waits for
+        // these four bytes, using the same bounded completion fence.
+        if (!finish_worker())
+            return false;
+        D3D11_MAPPED_SUBRESOURCE map{};
+        const auto hr = commands->Map(cutReadback.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+            // The driver may still be preparing CPU access to the staging
+            // resource. Do not trust history for this frame, but keep the
+            // feature alive. The next job is ordered after this job's fence.
+            reset = true;
+            return true;
+        }
+        if (FAILED(hr)) {
+            blog(LOG_WARNING, "obs-nr-upscale: SR cut readback failed (0x%08lx)", static_cast<unsigned long>(hr));
+            unresolved = FAILED(device->GetDeviceRemovedReason());
+            return false;
+        }
+        reset = *static_cast<const UINT*>(map.pData) != 0;
+        commands->Unmap(cutReadback.Get(), 0);
+        return true;
     }
 
     bool run(const Capture& frame)
@@ -666,20 +677,32 @@ struct Session {
             return false;
         }
         const auto w = config.width, h = config.height;
-        const bool reset = frame.epoch != previous.epoch || frame.time > previous.time + maxHistoryGapMs;
+        const UINT64 cadenceLimit = std::min(maxHistoryGapNs, frame.interval + frame.interval / 2);
+        bool reset = frame.epoch != previous.epoch || frame.time <= previous.time ||
+                     frame.interval != previous.interval || frame.time - previous.time > cadenceLimit;
         auto& color = colors[nextColor];
+        auto& prior = colors[nextColor ^ 1u];
         unresolved = true;
         dispatch(prepare.Get(), input, nullptr, color, w, h);
+        flow.prepare(commands.Get(), nextColor, color, w, h);
+        if (!reset && !read_cut(color, prior, reset))
+            return false;
         if (reset) {
             constexpr float zero[]{0, 0, 0, 0};
             commands->ClearUnorderedAccessViewFloat(motion.uav.Get(), zero);
+            resetFlowHints = true;
         } else {
-            dispatch(estimate.Get(), color, &colors[nextColor ^ 1u], grid, (w + 15) / 16, (h + 15) / 16);
-            dispatch(densify.Get(), grid, nullptr, motion, w, h);
+            try {
+                flow.execute(nextColor, resetFlowHints);
+            } catch (...) {
+                unresolved = !finish_worker() || flow.uncertain;
+                throw;
+            }
+            dispatch(densify.Get(), color, &prior, motion, w, h, true);
+            resetFlowHints = false;
         }
-        const float frameTime = reset ? 0.0f : static_cast<float>(frame.time - previous.time);
         const auto result = ngx_call(&Session::evaluate_feature, this, static_cast<ID3D11Resource*>(color.texture.Get()),
-                                     reset, frameTime);
+                                     reset);
         if (NVSDK_NGX_SUCCEED(result))
             dispatch(compose.Get(), evaluated, &color, output, config.outWidth, config.outHeight);
         const bool complete = finish_worker();
@@ -707,7 +730,7 @@ struct Session {
         if (!s.core)
             return true;
         auto& core = *s.core;
-        if (s.unresolved || core.unsafe ||
+        if (s.unresolved || core.unsafe || !s.flow.close() ||
             (s.feature && !retired(ngx_call(core.ngx.release, s.feature), "feature release")) ||
             (s.params && !retired(ngx_call(core.ngx.destroy, s.params), "parameter destruction")) ||
             (s.caps && !retired(ngx_call(core.ngx.destroy, s.caps), "capability destruction"))) {
@@ -767,6 +790,14 @@ std::string obs_path(char* path)
 }
 }
 
+#ifdef OBS_NR_VFG_QA_ACTION
+bool obs_upscale_dlss_qa_legacy_pacing() noexcept
+{
+    static const bool enabled = GetEnvironmentVariableW(L"OBS_NR_QA_DLSS_LEGACY_PACING", nullptr, 0) > 0;
+    return enabled;
+}
+#endif
+
 struct ObsUpscaleDlss {
     // Graphics-owned. The worker never reads these or calls OBS graphics APIs.
     gs_texture_t* presentation = nullptr;
@@ -777,6 +808,9 @@ struct ObsUpscaleDlss {
     UINT64 boundSession = 0;
     std::atomic<UINT64> epoch{1};
     Capture displayed{};
+    std::optional<Config> graphicsConfig;
+    UINT64 renderTick = 0, renderInterval = 0, acceptedTick = 0;
+    bool renderTemporal = false;
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -790,11 +824,41 @@ struct ObsUpscaleDlss {
     Phase phase = Phase::Empty;
     Capture job{};
 
-    void invalidate() noexcept { epoch.fetch_add(1, std::memory_order_relaxed); displayed = {}; }
+#ifdef OBS_NR_VFG_QA_ACTION
+    bool qa_fresh(const Capture& frame, UINT64 now) const noexcept
+    {
+        return frame.epoch == epoch.load(std::memory_order_relaxed) &&
+               now >= frame.time && now - frame.time <= 80'000'000;
+    }
+    void qa_expire(UINT64 now) noexcept
+    {
+        if (displayed.epoch && !qa_fresh(displayed, now)) {
+            epoch.fetch_add(1, std::memory_order_relaxed);
+            displayed = {};
+        }
+    }
+#endif
+
+    void invalidate() noexcept
+    {
+        epoch.fetch_add(1, std::memory_order_relaxed);
+        displayed = {};
+        renderTick = renderInterval = 0;
+        renderTemporal = false;
+    }
+
+    bool matches(const Capture& frame, UINT64 requested) const noexcept
+    {
+        return requested && frame.time == requested &&
+               frame.epoch == epoch.load(std::memory_order_relaxed);
+    }
 
     void worker_main()
     {
         std::unique_ptr<Session> session;
+#ifdef OBS_NR_VFG_QA_ACTION
+        unsigned qaEvaluations = 0;
+#endif
         std::unique_lock lock(mutex);
         for (;;) {
             wake.wait(lock, [&] {
@@ -861,6 +925,12 @@ struct ObsUpscaleDlss {
                 } catch (...) {
                     blog(LOG_WARNING, "obs-nr-upscale: unexpected NGX SR evaluation failure");
                 }
+#ifdef OBS_NR_VFG_QA_ACTION
+                if (done && qa_pacing_stall() && ++qaEvaluations % 24u == 0) {
+                    blog(LOG_INFO, "obs-nr-upscale [qa]: delaying SR completion for 110 ms");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+                }
+#endif
                 lock.lock();
                 if (done) {
                     phase = Phase::Complete;
@@ -939,6 +1009,7 @@ void obs_upscale_dlss_reset(ObsUpscaleDlss* backend) noexcept
 }
 
 gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr_source,
+                                    uint64_t present_tick,
                                     uint32_t output_width, uint32_t output_height,
                                     uint32_t model, const char* runtime_path) noexcept
 {
@@ -987,19 +1058,49 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
         const Config config{reinterpret_cast<uintptr_t>(renderer), adapterDesc.AdapterLuid,
                             desc.Width, desc.Height, output_width, output_height, format,
                             model <= 2 ? model : 1, runtime_path ? runtime_path : ""};
+        const auto now = obs_get_video_frame_time();
+        const auto interval = obs_get_frame_interval_ns();
+        if (!now || !interval) {
+            b.invalidate();
+            return nullptr;
+        }
+        if (now < b.acceptedTick)
+            b.acceptedTick = 0;
+        if (b.graphicsConfig != config || now < b.renderTick ||
+            (b.renderInterval && b.renderInterval != interval)) {
+            b.invalidate();
+            b.graphicsConfig = config;
+        }
+        // Scene, preview, and VFG draws can render the source more than
+        // once per video tick. They must see the same backend and output.
+        if (now == b.renderTick)
+            return b.renderTemporal ? b.presentation : nullptr;
+        b.renderTick = now;
+        b.renderInterval = interval;
+        b.renderTemporal = false;
+
         // Never block the graphics thread behind the worker (including its
         // resource creation, driver calls, GPU waits and retirement).
         std::unique_lock lock(b.mutex, std::try_to_lock);
-        if (!lock)
+        if (!lock) {
+#ifdef OBS_NR_VFG_QA_ACTION
+            if (obs_upscale_dlss_qa_legacy_pacing()) {
+                b.qa_expire(now);
+                b.renderTemporal = b.qa_fresh(b.displayed, now);
+                return b.renderTemporal ? b.presentation : nullptr;
+            }
+#endif
             return nullptr;
+        }
         if (b.wanted != config) {
-            b.invalidate();
             b.wanted = config;
             b.failed.reset();
             b.wake.notify_one();
         }
-        if (!b.active || b.active->config != config || b.stop || b.phase == Phase::Poisoned)
+        if (!b.active || b.active->config != config || b.stop || b.phase == Phase::Poisoned) {
+            b.displayed = {};
             return nullptr;
+        }
         if (b.boundSession != b.sessionId) {
             try {
                 b.bind(*b.active);
@@ -1009,10 +1110,16 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
                 throw;
             }
         }
-        const auto now = GetTickCount64();
-        const auto epoch = b.epoch.load(std::memory_order_relaxed);
-        if (b.phase == Phase::Complete || b.phase == Phase::Ready) {
-            const bool use = b.phase == Phase::Complete && b.job.epoch == epoch && now - b.job.time <= maxOutputAgeMs;
+        const bool ready = b.phase == Phase::Complete || b.phase == Phase::Ready;
+        bool use = b.phase == Phase::Complete && b.matches(b.job, present_tick);
+#ifdef OBS_NR_VFG_QA_ACTION
+        if (obs_upscale_dlss_qa_legacy_pacing()) {
+            use = b.phase == Phase::Complete && b.qa_fresh(b.job, now);
+            if (!use)
+                b.qa_expire(now);
+        }
+#endif
+        if (ready && b.acceptedTick != now) {
             if (b.access >= invalidFence - 1 || b.transfer11->GetCompletedValue() == invalidFence) {
                 b.phase = Phase::Poisoned;
                 b.wake.notify_one();
@@ -1037,11 +1144,17 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
                 return nullptr;
             }
             b.graphics->Flush();
-            b.job = {epoch, b.access, now};
+            b.acceptedTick = now;
+            b.job = {b.epoch.load(std::memory_order_relaxed), b.access, now, interval};
             b.phase = Phase::Captured;
             b.wake.notify_one();
         }
-        return b.displayed.epoch == epoch && now - b.displayed.time <= maxOutputAgeMs ? b.presentation : nullptr;
+        b.renderTemporal = b.matches(b.displayed, present_tick);
+#ifdef OBS_NR_VFG_QA_ACTION
+        if (obs_upscale_dlss_qa_legacy_pacing())
+            b.renderTemporal = b.qa_fresh(b.displayed, now);
+#endif
+        return b.renderTemporal ? b.presentation : nullptr;
     } catch (...) {
         b.invalidate();
         return nullptr;
@@ -1052,6 +1165,6 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
 ObsUpscaleDlss* obs_upscale_dlss_create() noexcept { return nullptr; }
 void obs_upscale_dlss_destroy(ObsUpscaleDlss*) noexcept {}
 void obs_upscale_dlss_reset(ObsUpscaleDlss*) noexcept {}
-gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss*, gs_texture_t*, uint32_t, uint32_t,
+gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss*, gs_texture_t*, uint64_t, uint32_t, uint32_t,
                                     uint32_t, const char*) noexcept { return nullptr; }
 #endif

@@ -38,7 +38,7 @@ class Gpu final {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint_{};
     ComPtr<ID3D12Resource> hudUpload_;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT hudFp_{};
-    uint32_t hudW_{}, hudH_{}, hudPos_{};
+    uint32_t hudW_{}, hudH_{}, hudPos_{}, hudInset_{};
     ID3D12GraphicsCommandList* begin();
     void finish(bool sync);
     void move(ID3D12Resource*, ID3D12Resource*, bool toBuffer);
@@ -54,7 +54,7 @@ public:
     ID3D12Device* d3d_device() const noexcept { return device_.Get(); }
     Gpu(const Session&, HWND, uint32_t multiplier);
     void stage(unsigned previous, unsigned current);
-    void set_hud(uint32_t pos, uint32_t w, uint32_t h, const uint32_t* pixels);
+    void set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels);
     UINT present(ID3D12Resource*, bool synthetic);
 };
 } // namespace nr::fg::vfg

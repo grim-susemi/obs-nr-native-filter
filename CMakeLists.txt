@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-project(obs-nr-filter VERSION 0.2.4 LANGUAGES C CXX)
+project(obs-nr-filter VERSION 0.2.5 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # D2: the closure gate reads CodeView/COFF sections of every object, so whole-program
 # optimization (/GL IL objects) and /LTCG are forbidden in every configuration, for both
@@ -14,6 +14,7 @@ include(cmake/nr/Libobs.cmake)
 add_library(obs-nr-filter MODULE src/plugin-main.c src/obs_filter.cpp src/obs_upscale_filter.cpp
   src/obs_upscale_dlss.cpp src/capture_exclusion.cpp)
 target_compile_features(obs-nr-filter PRIVATE cxx_std_20)
+target_include_directories(obs-nr-filter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/nvofa")
 target_link_libraries(obs-nr-filter PRIVATE OBS::libobs d3d11 d3dcompiler dxgi crypt32 wintrust)
 set_target_properties(obs-nr-filter PROPERTIES PREFIX "" OUTPUT_NAME "obs-nr-filter")
 add_executable(nr-qa-host tools/host/main.cpp)

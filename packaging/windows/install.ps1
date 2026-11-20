@@ -18,7 +18,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.4'
+$Version = '0.2.5'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'
@@ -88,9 +88,9 @@ $Text = @{
         rolledBack = '설치를 되돌렸습니다.'
         done       = '설치 완료'
         next1      = '1. OBS를 실행합니다.'
-         next2      = '2. 소스 우클릭 > 필터 > 효과 필터 [+] > 업스케일 및 선명화 (CAS). 이중선형과 CAS는 NVIDIA 런타임 없이 작동합니다.'
+          next2      = '2. 소스 우클릭 > 필터 > 효과 필터 [+] > 영상 업스케일 및 프레임 생성. 속성에서 업스케일 및 선명화를 켜세요.'
          next3      = '3. 모델을 설치했다면 Native NR도 사용할 수 있습니다. NVIDIA VFG는 해당 효과에서 엽니다.'
-         pathNote   = '기본 위치가 아닌 OBS에서 Native NR을 쓸 경우에만, 필터를 새로 추가하고 "NR 런타임 파일"에 아래 경로를 지정하세요:'
+         pathNote   = '효과가 모델과 선택 런타임을 자동으로 찾습니다. OBS 효과에서 경로를 설정할 필요가 없습니다.'
         uninstHint = '제거하려면 이 폴더의 uninstall.bat을 실행하세요.'
         uNoState   = '설치 기록이 없어 파일을 변경하지 않습니다.'
         uRemoved   = '삭제: {0}'
@@ -155,9 +155,9 @@ $Text = @{
         rolledBack = 'The install was rolled back.'
         done       = 'Install complete'
         next1      = '1. Start OBS.'
-         next2      = '2. Right-click a source > Filters > Effect Filters [+] > Upscale & Sharpen (CAS). Bilinear scaling and CAS do not need the NVIDIA runtime.'
+          next2      = '2. Right-click a source > Filters > Effect Filters [+] > Video Upscale & Frame Generation. Turn on Upscale & Sharpen in its settings.'
          next3      = '3. If you installed the model, you can also use Native NR. Open NVIDIA VFG from its own filter.'
-         pathNote   = 'For Native NR only: on a non-default OBS installation, add a new Native NR filter and set its "NR runtime file" to this path:'
+         pathNote   = 'Filters find the installed model and optional runtimes automatically. No path setup in OBS is required.'
         uninstHint = 'To uninstall, run uninstall.bat in this folder.'
         uNoState   = 'No install record; leaving files unchanged.'
         uRemoved   = 'Removed: {0}'
@@ -723,11 +723,7 @@ function Invoke-Install {
     Say 'next1' @() 'White'
     Say 'next2' @() 'White'
     Say 'next3' @() 'White'
-    if (-not (Test-SamePath $dir $DefaultObs)) {
-        Write-Host ''
-        Say 'pathNote' @() 'Yellow'
-        Write-Host ('  ' + (Join-Path $dir $RuntimeRel)) -ForegroundColor White
-    }
+    Say 'pathNote' @() 'Gray'
     Write-Host ''
     Say 'uninstHint' @() 'DarkGray'
     return 0

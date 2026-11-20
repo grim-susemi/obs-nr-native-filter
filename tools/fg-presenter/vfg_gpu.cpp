@@ -159,10 +159,11 @@ void Gpu::stage(unsigned previous, unsigned current)
     move(input[current].Get(), exchange[1].Get(), true);
     finish(true);
 }
-void Gpu::set_hud(uint32_t pos, uint32_t w, uint32_t h, const uint32_t* pixels)
+void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels)
 {
     hudPos_ = pos;
-    if (!pos || !pixels || !w || !h || w > 512 || h > 96 || w > desc_.Width || h > desc_.Height) {
+    hudInset_ = inset;
+    if (!pos || !pixels || !w || !h || w > 512 || h > 96 || w + 2 * inset > desc_.Width || h + 2 * inset > desc_.Height) {
         hudW_ = hudH_ = 0;
         return;
     }
@@ -203,19 +204,22 @@ UINT Gpu::present(ID3D12Resource* source, bool synthetic)
     ComPtr<ID3D12Resource> dst;
     check(swap_->GetBuffer(swap_->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&dst)), "back buffer");
     auto* cmd = begin();
+    const auto drawHud = [&] {
+        const UINT dstX = hudPos_ == 2 ? static_cast<UINT>(desc_.Width) - hudW_ - hudInset_ : hudInset_;
+        D3D12_TEXTURE_COPY_LOCATION dloc{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION sloc{hudUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, hudFp_};
+        D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
+        cmd->CopyTextureRegion(&dloc, dstX, hudInset_, 0, &sloc, &box);
+    };
     if (synthetic) {
         move(dst.Get(), source, false);
-        if (hudPos_ && hudUpload_ && hudW_ && hudH_ && hudW_ + 36 <= desc_.Width && hudH_ + 36 <= desc_.Height) {
+        if (hudW_ && hudH_) {
             D3D12_RESOURCE_BARRIER hb{};
             hb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             hb.Transition = {dst.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST};
             cmd->ResourceBarrier(1, &hb);
-            const UINT dstX = (hudPos_ == 2) ? (static_cast<UINT>(desc_.Width) - hudW_ - 18u) : 18u;
-            D3D12_TEXTURE_COPY_LOCATION dloc{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-            D3D12_TEXTURE_COPY_LOCATION sloc{hudUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, hudFp_};
-            D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
-            cmd->CopyTextureRegion(&dloc, dstX, 18u, 0, &sloc, &box);
+            drawHud();
             std::swap(hb.Transition.StateBefore, hb.Transition.StateAfter);
             cmd->ResourceBarrier(1, &hb);
         }
@@ -227,13 +231,7 @@ UINT Gpu::present(ID3D12Resource* source, bool synthetic)
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
         cmd->ResourceBarrier(2, b);
         cmd->CopyResource(dst.Get(), source);
-        if (hudPos_ && hudUpload_ && hudW_ && hudH_ && hudW_ + 36 <= desc_.Width && hudH_ + 36 <= desc_.Height) {
-            const UINT dstX = (hudPos_ == 2) ? (static_cast<UINT>(desc_.Width) - hudW_ - 18u) : 18u;
-            D3D12_TEXTURE_COPY_LOCATION dloc{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-            D3D12_TEXTURE_COPY_LOCATION sloc{hudUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, hudFp_};
-            D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
-            cmd->CopyTextureRegion(&dloc, dstX, 18u, 0, &sloc, &box);
-        }
+        if (hudW_ && hudH_) drawHud();
         for (auto& barrier : b) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         cmd->ResourceBarrier(2, b);
     }

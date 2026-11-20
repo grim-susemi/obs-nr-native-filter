@@ -125,17 +125,24 @@ Values decode(obs_data_t* data,const std::string& admittedText,const std::string
     else if(v.reason.empty())v.reason="runtimeChangeRequiresRecreate";
     return v;
 }
-Values admit(obs_data_t* data,RuntimeInspector inspector)
+Values admit(obs_data_t* data,RuntimeInspector inspector,const std::filesystem::path& installedRuntime)
 {
     auto v=read(data);
     try {
-        const auto path=utf8_path(v.runtimePath);
-        if(!path.is_absolute()) {if(v.reason.empty())v.reason="runtimePathNotAbsolute";return v;}
-        if(!std::filesystem::is_regular_file(path)) {if(v.reason.empty())v.reason="runtimeMissing";return v;}
+        auto path=utf8_path(v.runtimePath);
+        if(!path.empty() && !path.is_absolute()) {if(v.reason.empty())v.reason="runtimePathNotAbsolute";return v;}
+        // Only a missing override may recover automatically. Existing files
+        // must still pass admission; a directory or denied path is not a hint.
+        if(path.empty() || !std::filesystem::exists(path))path=installedRuntime;
+        if(!path.is_absolute() || !std::filesystem::is_regular_file(path)) {
+            if(v.reason.empty())v.reason="runtimeMissing";
+            return v;
+        }
         const auto canonical=std::filesystem::canonical(path);
         const auto inspection=inspector({canonical,runtime_sha256});
         if(!inspection.accepted) {if(v.reason.empty())v.reason=inspection.reason;return v;}
-        v.runtimePath=canonical.generic_string();
+        const auto text=canonical.generic_u8string();
+        v.runtimePath.assign(reinterpret_cast<const char*>(text.data()),text.size());
     } catch(const std::exception&) {if(v.reason.empty())v.reason="runtimePathUnsupported";}
     return v;
 }
@@ -271,7 +278,6 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     auto* pScale=obs_properties_add_int_slider(grpBasic,"nr_work_scale",labels.workScale,50,100,5);
     obs_property_int_set_suffix(pScale,"%");
     obs_property_set_long_description(pScale,labels.hintWorkScale);
-    obs_properties_add_path(grpBasic,"nr_runtime_path",labels.runtime,OBS_PATH_FILE,"Runtime (*.dll)",nullptr);
     obs_properties_add_group(props,"nr_grp_basic",labels.groupBasic,OBS_GROUP_NORMAL,grpBasic);
 
     auto* grpPass1=obs_properties_create();

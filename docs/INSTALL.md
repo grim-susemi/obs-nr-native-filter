@@ -1,6 +1,6 @@
 # Install guide
 
-How to install OBS Native NR 0.2.4 into OBS Studio on Windows.
+How to install OBS Native NR 0.2.5 into OBS Studio on Windows. Start with the [illustrated quick guide](INSTALL-ONECLICK.md). The filters automatically find installed runtimes.
 
 [한국어 설치 안내는 아래에 있습니다](#한국어-설치-안내)
 
@@ -15,7 +15,7 @@ How to install OBS Native NR 0.2.4 into OBS Studio on Windows.
 
 ## One-click install
 
-1. Download `obs-nr-native-filter-0.2.4-windows-x64.zip` and `SHA256SUMS.txt` from the [latest release](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest).
+1. Download `obs-nr-native-filter-0.2.5-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.5 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.5) and verify the checksum.
 2. Close OBS completely, including the tray icon.
 3. Extract the whole zip into a folder and double-click `install.bat`.
    - **Language**: Enter for Korean, `2` for English.
@@ -24,7 +24,7 @@ How to install OBS Native NR 0.2.4 into OBS Studio on Windows.
    - **DLSS 4.5 SR (~56 MB)**: press Enter (Y) to download & signature-verify official `nvngx_dlss.dll` into `bin\64bit\dlss\nvngx_dlss.dll`.
    - **NVIDIA VFG (~415 MB wheel -> 5 DLLs)**: press Enter (Y) to download, verify SHA-256, and extract the 5 signed NVIDIA VFG DLLs into `bin\64bit\nvidia-vfg\` (reused locally if Veyra is already installed).
    - **Admin prompt**: choose **Yes**.
-4. Start OBS > right-click a source > **Filters** > **Effect Filters [+]**. Choose **Upscale & Sharpen (CAS)** for SDR scaling and sharpening, or **Native NR** for denoising. Bilinear scaling and CAS need no NVIDIA runtime; the optional DLSS method uses `nvngx_dlss.dll`. For older scene settings, see the [filter guide](standalone-upscale.md).
+4. Start OBS > right-click a source > **Filters** > **Effect Filters [+]**. Choose **Video Upscale & Frame Generation**, then turn on **Upscale & Sharpen**, or choose **Native NR** for denoising. Bilinear scaling and CAS need no NVIDIA runtime; the optional DLSS method uses `nvngx_dlss.dll`. For older scene settings, see the [filter guide](standalone-upscale.md).
 
 Logs are saved under `%LOCALAPPDATA%\obs-nr-native-filter`.
 
@@ -48,7 +48,7 @@ Close OBS and double-click `uninstall.bat`. It restores any backed-up files and 
 
 ## 한국어 설치 안내
 
-OBS Native NR 0.2.4를 Windows의 OBS Studio에 설치하는 방법입니다.
+OBS Native NR 0.2.5를 Windows OBS Studio에 설치하는 방법입니다. [화면이 포함된 원클릭 안내](INSTALL-ONECLICK.md)부터 보세요. 설치된 런타임은 효과가 자동으로 찾습니다.
 
 ### 준비
 
@@ -59,7 +59,7 @@ OBS Native NR 0.2.4를 Windows의 OBS Studio에 설치하는 방법입니다.
 
 ### 원클릭 설치 순서
 
-1. [최신 릴리즈](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)에서 `obs-nr-native-filter-0.2.4-windows-x64.zip`을 내려받아 압축을 전부 풉니다.
+1. [v0.2.5 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.5)에서 `obs-nr-native-filter-0.2.5-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
 2. OBS를 완전히 끕니다(트레이 아이콘 포함).
 3. 압축 푼 폴더의 `install.bat`을 더블클릭합니다.
    - **언어**: 그냥 Enter를 누르면 한국어입니다.
@@ -68,8 +68,8 @@ OBS Native NR 0.2.4를 Windows의 OBS Studio에 설치하는 방법입니다.
    - **DLSS 4.5 SR / NVIDIA VFG**: 자동 설치 여부를 묻는 곳에서 그냥 Enter(Y)를 누르면 공식 NVIDIA 파일이 자동 설치됩니다.
    - **관리자 권한 창**: **예**를 누릅니다.
 4. OBS를 실행해 소스 우클릭 > **필터** > **효과 필터 [+]**에서 필요한 효과를 선택합니다.
-   - **업스케일 및 선명화 (CAS)**는 SDR 전용입니다. 이중선형 확대와 CAS는 NVIDIA 런타임 없이 작동하고, 선택 기능인 DLSS는 `nvngx_dlss.dll`을 사용합니다.
-   - 이전에 **Native NR**에서 사용한 확대·선명화는 독립 효과에서 다시 설정해야 합니다. [전환 안내](standalone-upscale.md)를 참고하세요.
+   - **영상 업스케일 및 프레임 생성**의 **업스케일 및 선명화**는 SDR 전용입니다. 이중선형 확대와 CAS는 NVIDIA 런타임 없이 작동하고, 선택 기능인 DLSS는 `nvngx_dlss.dll`을 사용합니다.
+   - 이전에 **Native NR**에서 사용한 확대·선명화는 **영상 업스케일 및 프레임 생성**에서 다시 설정하세요. 저장된 독립 효과는 계속 작동합니다. [전환 안내](standalone-upscale.md)를 참고하세요.
    - **Native NR**은 노이즈 제거만 합니다. 두 효과를 함께 쓸 때는 [필터 순서 안내](standalone-upscale.md)를 확인하세요.
    - VFG와 NR을 동시에 켜고 GPU 프레임 시간이 빡빡하면 **NR 작업 해상도**를 `75%`로 두거나 **NR 반복 횟수**를 `1`로 두세요.
 

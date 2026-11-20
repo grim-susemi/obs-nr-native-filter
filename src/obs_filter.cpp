@@ -334,7 +334,9 @@ void update(void* opaque,obs_data_t* values)
 {
     auto& f=*static_cast<Filter*>(opaque);
     f.fpsOverlay.store(static_cast<uint32_t>(std::clamp<long long>(obs_data_get_int(values,"nr_fps_overlay"),0,2)),std::memory_order_release);
-    auto decoded=nr::properties::decode(values,f.admittedRuntimeText,f.config.runtime.canonicalPath.generic_string());
+    const auto text=f.config.runtime.canonicalPath.generic_u8string();
+    auto decoded=nr::properties::decode(values,f.admittedRuntimeText,
+        std::string(reinterpret_cast<const char*>(text.data()),text.size()));
     const auto before=f.configuration.load(std::memory_order_acquire);
     const auto old=before?before->settings:nullptr;
     if(!old && !f.initialAdmissionReason.empty())decoded.reason=f.initialAdmissionReason;
@@ -391,7 +393,8 @@ void *create(obs_data_t *settings, obs_source_t *source)
     const auto shaderOverride=obs_data_get_string(settings,"nr_shader_root");
     const auto dataOverride=obs_data_get_string(settings,"nr_data_root");
     f->admittedRuntimeText=obs_data_get_string(settings,"nr_runtime_path");
-    const auto decoded=nr::properties::admit(settings);
+    const auto bin=executable_dir();
+    const auto decoded=nr::properties::admit(settings,nr::runtime::inspect,bin.empty()?bin:bin/L"nvngx_dlssnr.dll");
     f->initialAdmissionReason=decoded.reason;
     if(decoded.reason.empty()) {
         try {
@@ -401,7 +404,7 @@ void *create(obs_data_t *settings, obs_source_t *source)
             f->deterministicQa=obs_data_get_bool(settings,"nr_qa_deterministic");
             f->capacityEvidence=(f->deterministicQa || obs_data_get_bool(settings,"nr_qa_observe")) &&
                 obs_data_get_bool(settings,"nr_qa_capacity_evidence");
-            f->config.runtime={std::filesystem::path(decoded.runtimePath),nr::properties::runtime_sha256};
+            f->config.runtime={nr::properties::utf8_path(decoded.runtimePath),nr::properties::runtime_sha256};
             f->config.driver=nr::runtime::resolve_driver().identity.canonicalPath;
             const auto dataRoot=*dataOverride?nr::properties::utf8_path(dataOverride):module_path(true,"runtime");
             if(dataRoot.empty())throw std::runtime_error("module configuration directory unavailable");
@@ -477,7 +480,7 @@ obs_properties_t *properties(void *opaque)
     const auto value=opaque?static_cast<Filter*>(opaque)->publicStatus.load(std::memory_order_acquire):
         std::make_shared<const nr::properties::StatusSnapshot>(nr::properties::StatusSnapshot{"priming","awaitingObservation"});
     nr::properties::Labels labels;
-    labels.enabled=obs_module_text("NR.Enabled");labels.runtime=obs_module_text("NR.Runtime");
+    labels.enabled=obs_module_text("NR.Enabled");
     labels.strength=obs_module_text("NR.Strength");labels.preset=obs_module_text("NR.Preset");
     labels.passes=obs_module_text("NR.Passes");labels.workScale=obs_module_text("NR.WorkScale");
     labels.style=obs_module_text("NR.Style");labels.styleStandard=obs_module_text("NR.Style.Standard");

@@ -13,6 +13,12 @@ nr::runtime::Inspection count_inspection(const nr::runtime::RuntimeIdentity& ide
 {
     ++inspections;return nr::runtime::inspect(identity);
 }
+nr::runtime::Inspection accept_path(const nr::runtime::RuntimeIdentity&)
+{
+    nr::runtime::Inspection result{};
+    result.accepted=true;
+    return result;
+}
 struct CpuProcessor final:nr::pipeline::Processor {
     nr::pipeline::Processed process(const nr::pipeline::Work& w,std::stop_token)override {return {w.job,false,{}};}
 };
@@ -279,8 +285,7 @@ int main(int argc,char** argv)
         defaults(data);
         auto* props=controls({"priming","awaitingSample"});
         expect(obs_property_get_type(obs_properties_get(props,"nr_enabled"))==OBS_PROPERTY_BOOL,"boolean property");
-        expect(obs_property_get_type(obs_properties_get(props,"nr_runtime_path"))==OBS_PROPERTY_PATH &&
-            obs_property_path_type(obs_properties_get(props,"nr_runtime_path"))==OBS_PATH_FILE,"file property");
+        expect(!obs_properties_get(props,"nr_runtime_path"),"saved runtime path is not exposed as an editable property");
         auto* slider=obs_properties_get(props,"nr_strength");
         expect(obs_property_get_type(slider)==OBS_PROPERTY_FLOAT && obs_property_float_type(slider)==OBS_NUMBER_SLIDER &&
             obs_property_float_min(slider)==0 && obs_property_float_max(slider)==1 && obs_property_float_step(slider)==.01,"slider bounds");
@@ -298,8 +303,10 @@ int main(int argc,char** argv)
             obs_properties_destroy(rawProps);
         }
         obs_properties_destroy(props);
-        const auto first=admit(data,count_inspection);
-        expect(first.enabled && first.strength.value==1 && first.runtimePath==default_runtime,"defaults");
+        const auto installed=std::filesystem::canonical(argv[0]);
+        const auto first=admit(data,accept_path,installed);
+        expect(first.enabled && first.strength.value==1 && first.reason.empty() &&
+            std::filesystem::equivalent(utf8_path(first.runtimePath),installed),"defaults resolve the installed runtime");
         expect(effective_enabled(true,true) && !effective_enabled(true,false) &&
                !effective_enabled(false,true) && !effective_enabled(false,false),"enable truth table");
         auto a=updated({},first);
@@ -358,9 +365,23 @@ int main(int argc,char** argv)
         expect(admit(data,count_inspection).reason=="hashMismatch","wrong runtime hash refused");
         const auto refused=nr::runtime::inspect({std::filesystem::canonical("C:/Windows/System32/kernel32.dll"),runtime_sha256});
         expect(!refused.accepted && !refused.loaded,"admission never loads DLL");
+        // This executable is a fixture for path selection only. The actual
+        // proprietary admission and evaluation are checked in isolated OBS.
+        const auto fixture=installed.generic_string();
         obs_data_set_string(data,"nr_runtime_path",default_runtime);
-        const auto valid=admit(data,count_inspection);
-        expect(valid.reason.empty() && decode(data,default_runtime,valid.runtimePath).runtimePath==valid.runtimePath,"canonical runtime identity");
+        const auto valid=admit(data,accept_path,installed);
+        expect(valid.reason.empty() && !valid.runtimePath.empty() &&
+            std::filesystem::equivalent(utf8_path(valid.runtimePath),installed) &&
+            decode(data,default_runtime,valid.runtimePath).runtimePath==valid.runtimePath,"automatic installed runtime identity");
+        obs_data_set_string(data,"nr_runtime_path","C:/nr-properties-contract-missing.dll");
+        const auto stale=admit(data,accept_path,installed);
+        expect(stale.reason.empty() && stale.runtimePath==valid.runtimePath,"missing old path recovers with installed runtime");
+        obs_data_set_string(data,"nr_runtime_path",fixture.c_str());
+        const auto manual=admit(data,accept_path,installed.parent_path()/L"unavailable.dll");
+        expect(manual.reason.empty() && manual.runtimePath==valid.runtimePath,"valid existing path wins over automatic location");
+        obs_data_set_string(data,"nr_runtime_path","C:/Windows/System32/kernel32.dll");
+        expect(admit(data,count_inspection,installed).reason=="hashMismatch","wrong existing runtime never falls through");
+        obs_data_set_string(data,"nr_runtime_path",default_runtime);
         expect(decode(data,"C:/immutable-other-runtime.dll","C:/immutable-other-runtime.dll").reason=="runtimeChangeRequiresRecreate","runtime replacement refused");
         expect(status(nr::Status::Applied,nr::Reason::None).state=="ready","applied status");
         expect(status(nr::Status::Priming,nr::Reason::None).state=="priming","priming status");

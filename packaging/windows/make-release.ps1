@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.4',
+    [string]$Version = '0.2.5',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
@@ -44,6 +44,9 @@ $extra = [ordered]@{
     'uninstall.bat'        = Join-Path $PSScriptRoot 'uninstall.bat'
     'scripts\install.ps1'  = Join-Path $PSScriptRoot 'install.ps1'
     'INSTALL.md'           = Join-Path $repo 'docs\INSTALL.md'
+    'INSTALL-ONECLICK.md'  = Join-Path $repo 'docs\INSTALL-ONECLICK.md'
+    'oneclick\installer.png' = Join-Path $repo 'docs\oneclick\installer.png'
+    'oneclick\obs-filters.png' = Join-Path $repo 'docs\oneclick\obs-filters.png'
     'standalone-upscale.md' = Join-Path $repo 'docs\standalone-upscale.md'
     'LICENSE.txt'          = Join-Path $repo 'LICENSE'
     'notices\CREDITS.md'   = Join-Path $repo 'provenance\source-notices\CREDITS.md'
