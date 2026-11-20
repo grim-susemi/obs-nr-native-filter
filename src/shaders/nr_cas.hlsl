@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // AMD FidelityFX CAS (Contrast Adaptive Sharpening) + linear/transfer bridge for DLSS SR.
+// Copyright (c) 2020 Advanced Micro Devices, Inc. for the CAS algorithm.
+// See provenance/source-notices/AMD-FidelityFX-CAS-MIT.txt.
 // mode 0: prepare/resize (t0 -> u0 FP16, optional bilinear upscale + optional sRGB->Linear)
 // mode 1: CAS + encode (t0 linear FP16 + t1 original -> u0 output texture)
 // mode 2: CAS-only 1:1 (t0 FP16 -> u0 FP16, optional sRGB->Linear->CAS->Linear->sRGB)

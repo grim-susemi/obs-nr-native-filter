@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-project(obs-nr-filter VERSION 0.2.1 LANGUAGES C CXX)
+project(obs-nr-filter VERSION 0.2.2 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # D2: the closure gate reads CodeView/COFF sections of every object, so whole-program
 # optimization (/GL IL objects) and /LTCG are forbidden in every configuration, for both
@@ -20,6 +20,9 @@ target_compile_features(nr-qa-host PRIVATE cxx_std_20)
 target_link_libraries(nr-qa-host PRIVATE OBS::libobs)
 target_compile_definitions(nr-qa-host PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 enable_testing()
+add_test(NAME release_installer COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+  -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/release_installer_tests.ps1")
+set_tests_properties(release_installer PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 include(cmake/nr/Runtime.cmake)
 include(cmake/nr/Core.cmake)
 include(cmake/nr/Interop.cmake)
@@ -208,6 +211,7 @@ set_tests_properties(qa_signal_module_retirement PROPERTIES TIMEOUT 30)
 add_test(NAME host_runner COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/host_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME host_runner_flow COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/host_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}" -Task8Only)
 add_test(NAME host_runner_color COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/host_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}" -Task9Only)
+set_tests_properties(host_runner host_runner_flow host_runner_color PROPERTIES RESOURCE_LOCK nr_host_runner_fixtures)
 add_test(NAME host_runner_model COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/model_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME host_retained_notification COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/nr_retained_notification_tests.ps1"
@@ -217,6 +221,7 @@ add_test(NAME host_runner_bootstrap COMMAND powershell.exe -NoProfile -Execution
 add_test(NAME host_runner_lifecycle COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/bootstrap_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}" -Task13Only)
 add_test(NAME host_runner_instances COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/bootstrap_runner_tests.ps1" -Work "${CMAKE_CURRENT_SOURCE_DIR}" -Task14Only -Task14TestRoot "${CMAKE_CURRENT_BINARY_DIR}/task14-runner-cpu")
 install(TARGETS obs-nr-filter LIBRARY DESTINATION obs-plugins/64bit RUNTIME DESTINATION obs-plugins/64bit)
+install(TARGETS obs-nr-fg-presenter RUNTIME DESTINATION bin/64bit)
 install(DIRECTORY data/ DESTINATION data/obs-plugins/obs-nr-filter)
 target_sources(obs-nr-filter PRIVATE src/nr_properties.cpp)
 # Driver-reset naming (H2/M1): typed HRESULTs and a removed device read as gpuDeviceReset. Needs a hardware D3D12 adapter.
@@ -236,24 +241,18 @@ set_tests_properties(properties_contract PROPERTIES
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nr_codec.dxil" "${CMAKE_CURRENT_BINARY_DIR}/nr_color.dxil"
   "${CMAKE_CURRENT_BINARY_DIR}/nr_guides.cso" "${CMAKE_CURRENT_BINARY_DIR}/nr_interop_vertex.cso"
   "${CMAKE_CURRENT_BINARY_DIR}/nr_interop_pixel.cso" "${CMAKE_CURRENT_BINARY_DIR}/nr_obs_analysis.cso"
-  DESTINATION data/obs-plugins/obs-nr-filter/shaders)
+  "${NR_STABILIZE_DXIL}" "${NR_CAS_DXIL}" DESTINATION bin/64bit)
 
 # D2: test executables that link OBS::libobs import obs.dll (e.g. ghost_production_tests via obs_data_*).
 # Give every registered test the same PATH entry the OBS-linked tests above already use.
 get_property(NR_ALL_TESTS DIRECTORY PROPERTY TESTS)
 set_tests_properties(${NR_ALL_TESTS} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")
 
-# ---- package target skeleton (D2) -------------------------------------------------------
-# PLACEHOLDER-D10: the member list below is NOT the Task21 package spec. D10 (Inspect-Package
-# and the member spec) replaces NR_PACKAGE_MEMBERS_PLACEHOLDER and adds the deterministic ZIP,
-# SHA256SUMS and manifest steps. The target never recompiles or relinks: it only depends on the
-# already-built plugin and shader outputs and stages copies of them.
-set(NR_PACKAGE_STAGE "${CMAKE_CURRENT_BINARY_DIR}/package-stage")
-set(NR_PACKAGE_MEMBERS_PLACEHOLDER "$<TARGET_FILE:obs-nr-filter>")
 add_custom_target(package
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${NR_PACKAGE_STAGE}/obs-plugins/64bit"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NR_PACKAGE_MEMBERS_PLACEHOLDER} "${NR_PACKAGE_STAGE}/obs-plugins/64bit"
-  COMMAND ${CMAKE_COMMAND} -E echo "package: PLACEHOLDER-D10 member list staged; no ZIP produced"
+  COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+    -File "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/make-release.ps1"
+    -BuildDir "${CMAKE_CURRENT_BINARY_DIR}" -OutDir "${CMAKE_CURRENT_BINARY_DIR}/package"
+    -Version "${PROJECT_VERSION}" -Configuration "$<CONFIG>"
   DEPENDS obs-nr-filter
   VERBATIM)
 

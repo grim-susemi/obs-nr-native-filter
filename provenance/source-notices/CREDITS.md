@@ -34,4 +34,4 @@ Support upstream: [cdozdil](https://github.com/sponsors/cdozdil?frequency=one-ti
 ## OBS Native NR 0.2.0 additions
 
 - Anti-flicker (`nr_stabilize.hlsl`), refined NVOF optical flow (`nr_guides.hlsl`), NVIDIA VFG low-latency presenter architecture, and NGX DLSS Super Resolution integration adapted from [Likely7/Veyra-NRVideo](https://github.com/Likely7/Veyra-NRVideo) (GPL-3.0-only).
-- Contrast Adaptive Sharpening (`nr_cas.hlsl`) derived from AMD FidelityFX CAS (MIT).
+- Contrast Adaptive Sharpening (`nr_cas.hlsl`) derived from [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS). See the [MIT notice](AMD-FidelityFX-CAS-MIT.txt).

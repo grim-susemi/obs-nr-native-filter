@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-only
 # OBS Native NR installer and uninstaller (Windows PowerShell 5.1 or later).
 # install.bat and uninstall.bat in the release zip run this script.
 [CmdletBinding()]
@@ -18,11 +18,12 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.1'
+$Version = '0.2.2'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'
-$SrUrl = 'https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/rel/nvngx_dlss.dll'
+$SrUrl = 'https://raw.githubusercontent.com/NVIDIA/DLSS/374959484e79a640feaba44c93ac8cfb0a03f5b5/lib/Windows_x86_64/rel/nvngx_dlss.dll'
+$SrSha = '3975567b8943c53acce397f2b72380092f84f162d00b0d2c7d08a1025c563983'
 $VfgDirRel = 'bin\64bit\nvidia-vfg'
 $VfgDlls = @('cudart64_12.dll', 'NVCVImage.dll', 'nvngxruntime.dll', 'NVVideoEffects.dll', 'nvVFXVideoFrameGeneration.dll')
 $VfgWhlUrl = 'https://pypi.nvidia.com/nvidia-vfx/nvidia_vfx-0.2.0.0-cp311-cp311-win_amd64.whl'
@@ -91,7 +92,7 @@ $Text = @{
         next3      = '3. 필터 속성에 "상태: NR 적용 중"이 보이면 성공입니다.'
         pathNote   = 'OBS가 기본 위치가 아니라서 한 가지가 더 필요합니다. 필터 속성의 "NR 런타임 파일" 칸에 아래 경로를 넣고, 필터를 지웠다 다시 추가하세요:'
         uninstHint = '제거하려면 이 폴더의 uninstall.bat을 실행하세요.'
-        uNoState   = '설치 기록이 없어 Native NR 파일만 찾아 지웁니다.'
+        uNoState   = '설치 기록이 없어 파일을 변경하지 않습니다.'
         uRemoved   = '삭제: {0}'
         uChanged   = '남겨 둠 (설치 뒤 바뀐 파일): {0}'
         uRestored  = '복원: {0}'
@@ -158,7 +159,7 @@ $Text = @{
         next3      = '3. When the filter properties show "Status: NR is being applied", it works.'
         pathNote   = 'OBS is not in the default folder, so one more step: put this path into "NR runtime file" in the filter properties, then remove the filter and add it again:'
         uninstHint = 'To uninstall, run uninstall.bat in this folder.'
-        uNoState   = 'No install record, removing only Native NR files.'
+        uNoState   = 'No install record; leaving files unchanged.'
         uRemoved   = 'Removed: {0}'
         uChanged   = 'Left in place (changed after install): {0}'
         uRestored  = 'Restored: {0}'
@@ -192,6 +193,25 @@ function Get-Sha([string]$Path) {
 }
 function Get-FullPath([string]$Path) {
     return [IO.Path]::GetFullPath(($Path.Trim().Trim('"') -replace '/', '\')).TrimEnd('\')
+}
+function Test-PackagePath([string]$Relative) {
+    return $Relative -in @('obs-plugins\64bit\obs-nr-filter.dll', 'bin\64bit\obs-nr-fg-presenter.exe',
+        'data\obs-plugins\obs-nr-filter\locale\en-US.ini', 'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini',
+        'bin\64bit\nr_codec.dxil', 'bin\64bit\nr_color.dxil', 'bin\64bit\nr_guides.cso',
+        'bin\64bit\nr_stabilize.dxil', 'bin\64bit\nr_cas.dxil', 'bin\64bit\nr_obs_analysis.cso',
+        'bin\64bit\nr_interop_vertex.cso', 'bin\64bit\nr_interop_pixel.cso')
+}
+function Assert-ReceiptFile([string]$Relative, [string]$Backup) {
+    $allowed = (Test-PackagePath $Relative) -or $Relative -in @($RuntimeRel, $SrRel) -or
+        $Relative -in @($VfgDlls | ForEach-Object { "$VfgDirRel\$_" })
+    if (-not $allowed) { throw 'Invalid installer receipt path' }
+    if ($Backup) {
+        $root = [regex]::Escape((Get-FullPath $StateDir))
+        $suffix = [regex]::Escape($Relative)
+        if ((Get-FullPath $Backup) -notmatch "^$root\\backup-(?:[0-9a-f]{32}|\d{8}-\d{6})\\$suffix$") {
+            throw 'Invalid installer backup path'
+        }
+    }
 }
 function Test-ObsDir([string]$Dir) {
     return [bool]($Dir -and (Test-Path -LiteralPath (Join-Path $Dir 'bin\64bit\obs64.exe') -PathType Leaf))
@@ -232,6 +252,7 @@ function Get-Manifest {
     }
     if ($m.Count -eq 0) { throw (T 'payloadBad' @('files\manifest.sha256')) }
     foreach ($rel in @($m.Keys)) {
+        if (-not (Test-PackagePath $rel)) { throw (T 'payloadBad' @($rel)) }
         $src = Join-Path $Payload $rel
         if (-not (Test-Path -LiteralPath $src -PathType Leaf) -or (Get-Sha $src) -ne $m[$rel]) { throw (T 'payloadBad' @($rel)) }
     }
@@ -415,6 +436,7 @@ function Resolve-OptionalRuntimes([string]$Dir, [string]$StageDir) {
                     Say 'srDown' @() 'Cyan'
                     $dl = Join-Path $StageDir 'nvngx_dlss.dll'
                     Get-HttpFile $SrUrl $dl
+                    if ((Get-Sha $dl) -ne $SrSha) { throw 'DLSS SR SHA-256 check failed' }
                     if (-not (Test-NvidiaSigned $dl)) { throw 'Authenticode signature check failed' }
                     Say 'srSigOk' @() 'Green'
                     $out.sr = $dl
@@ -481,78 +503,99 @@ function Copy-WithDir([string]$From, [string]$To) {
 }
 
 function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, $Manifest) {
-    $backupDir = Join-Path $StateDir ('backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $backupDir = Join-Path $StateDir ('backup-' + [guid]::NewGuid().ToString('N'))
+    $rollbackDir = Join-Path $StateDir ('rollback-' + [guid]::NewGuid().ToString('N'))
     $rels = @($Manifest.Keys)
-    $backedUp = @(); $created = @(); $runtimeBackedUp = $false; $runtimeCopied = $false
-    $srCopied = $false; $vfgCopied = @()
-    $runtimeTarget = Join-Path $Dir $RuntimeRel
-    $srTarget = Join-Path $Dir $SrRel
-    $vfgTargetDir = Join-Path $Dir $VfgDirRel
+    $previous = Read-State
+    if ($previous -and -not (Test-SamePath ([string]$previous.obsDir) $Dir)) { $previous = $null }
+    $owned = @{}
+    $legacyFiles = @{}
+    if ($previous -and $previous.PSObject.Properties['ownedFiles']) {
+        foreach ($entry in @($previous.ownedFiles)) {
+            Assert-ReceiptFile $entry.relative $entry.backup
+            $owned[$entry.relative] = $entry
+        }
+    } elseif ($previous) {
+        foreach ($rel in @($previous.files)) {
+            if (-not $rel) { continue }
+            $backup = ''
+            if (@($previous.backedUp) -contains $rel) { $backup = Join-Path $previous.backupDir $rel }
+            Assert-ReceiptFile $rel $backup
+            # A legacy receipt cannot distinguish modified bytes from an older version.
+            $legacyFiles[$rel] = $backup
+        }
+        if ($previous.runtimeCopied) {
+            $backup = ''
+            if ($previous.runtimeBackedUp) { $backup = Join-Path $previous.backupDir $RuntimeRel }
+            Assert-ReceiptFile $RuntimeRel $backup
+            $owned[$RuntimeRel] = @{ relative = $RuntimeRel; hash = $RuntimeSha; backup = $backup }
+        }
+    }
+    $sources = [ordered]@{}
+    foreach ($rel in $rels) { $sources[$rel] = Join-Path $Payload $rel }
+    if ($RuntimeSource) { $sources[$RuntimeRel] = $RuntimeSource }
+    if ($SrSource) { $sources[$SrRel] = $SrSource }
+    if ($VfgSourceDir) {
+        foreach ($dll in $VfgDlls) { $sources["$VfgDirRel\$dll"] = Join-Path $VfgSourceDir $dll }
+    }
+    $touched = @()
+    $rollbackSafe = $true
     try {
-        foreach ($rel in $rels) {
+        foreach ($rel in @($sources.Keys)) {
             $dst = Join-Path $Dir $rel
+            $sourceHash = if ($Manifest.Contains($rel)) { $Manifest[$rel] }
+                elseif ($rel -eq $RuntimeRel) { $RuntimeSha } else { Get-Sha $sources[$rel] }
+            $backup = ''
+            if ($owned.ContainsKey($rel)) { $backup = [string]$owned[$rel].backup }
+            elseif ($legacyFiles.ContainsKey($rel)) { $backup = [string]$legacyFiles[$rel] }
             if (Test-Path -LiteralPath $dst -PathType Leaf) {
-                if ((Get-Sha $dst) -ne $Manifest[$rel]) {
-                    Copy-WithDir $dst (Join-Path $backupDir $rel)
-                    $backedUp += $rel
+                $currentHash = Get-Sha $dst
+                if ($owned.ContainsKey($rel) -and $currentHash -ne $owned[$rel].hash) {
+                    Say 'uChanged' @($rel) 'Yellow'
+                    continue
+                }
+                if (-not $owned.ContainsKey($rel) -and $currentHash -eq $sourceHash) { continue }
+                Copy-WithDir $dst (Join-Path $rollbackDir $rel)
+                if (-not $owned.ContainsKey($rel) -and $currentHash -ne $sourceHash) {
+                    $saved = Join-Path $backupDir $rel
+                    Copy-WithDir $dst $saved
+                    if (-not $backup) { $backup = $saved }
                     Say 'backup' @($rel) 'DarkGray'
                 }
-            } else {
-                $created += $rel
             }
-        }
-        if ($RuntimeSource -and (Test-Path -LiteralPath $runtimeTarget -PathType Leaf)) {
-            Copy-WithDir $runtimeTarget (Join-Path $backupDir $RuntimeRel)
-            $runtimeBackedUp = $true
-            Say 'backup' @($RuntimeRel) 'DarkGray'
-        }
-        foreach ($rel in $rels) {
-            $dst = Join-Path $Dir $rel
-            Copy-WithDir (Join-Path $Payload $rel) $dst
-            if ((Get-Sha $dst) -ne $Manifest[$rel]) { throw (T 'verifyFail' @($rel)) }
+            $touched += $rel
+            Copy-WithDir $sources[$rel] $dst
+            if ((Get-Sha $dst) -ne $sourceHash) { throw (T 'verifyFail' @($rel)) }
+            $owned[$rel] = @{ relative = $rel; hash = $sourceHash; backup = $backup }
             Say 'copy' @($rel) 'Gray'
         }
-        if ($RuntimeSource) {
-            Copy-WithDir $RuntimeSource $runtimeTarget
-            if ((Get-Sha $runtimeTarget) -ne $RuntimeSha) { throw (T 'verifyFail' @($RuntimeRel)) }
-            $runtimeCopied = $true
-            Say 'rtCopied' @($runtimeTarget) 'Green'
+        $state = [ordered]@{ version = $Version; obsDir = $Dir; installedAt = (Get-Date).ToString('s'); ownedFiles = @($owned.Values) }
+        New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+        $stateFile = Join-Path $StateDir 'install-state.json'
+        $stateTemp = Join-Path $StateDir ('state-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        ($state | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $stateTemp -Encoding UTF8
+        if (Test-Path -LiteralPath $stateFile) {
+            $stateBackup = $stateTemp + '.bak'
+            [IO.File]::Replace($stateTemp, $stateFile, $stateBackup)
         }
-        if ($SrSource) {
-            $srHash = Get-Sha $SrSource
-            Copy-WithDir $SrSource $srTarget
-            if ((Get-Sha $srTarget) -ne $srHash) { throw (T 'verifyFail' @($SrRel)) }
-            $srCopied = $true
-            Say 'srCopied' @($srTarget) 'Green'
-        }
-        if ($VfgSourceDir) {
-            foreach ($dll in $VfgDlls) {
-                $src = Join-Path $VfgSourceDir $dll
-                $dst = Join-Path $vfgTargetDir $dll
-                $h = Get-Sha $src
-                Copy-WithDir $src $dst
-                if ((Get-Sha $dst) -ne $h) { throw (T 'verifyFail' @("$VfgDirRel\$dll")) }
-                $vfgCopied += $dll
-            }
-            Say 'vfgCopied' @($vfgTargetDir) 'Green'
-        }
+        else { [IO.File]::Move($stateTemp, $stateFile) }
     } catch {
-        foreach ($rel in $backedUp) { try { Copy-WithDir (Join-Path $backupDir $rel) (Join-Path $Dir $rel) } catch {} }
-        foreach ($rel in $created) { Remove-Item -LiteralPath (Join-Path $Dir $rel) -Force -ErrorAction SilentlyContinue }
-        if ($runtimeBackedUp) { try { Copy-WithDir (Join-Path $backupDir $RuntimeRel) $runtimeTarget } catch {} }
-        elseif ($RuntimeSource) { Remove-Item -LiteralPath $runtimeTarget -Force -ErrorAction SilentlyContinue }
-        if ($srCopied) { Remove-Item -LiteralPath $srTarget -Force -ErrorAction SilentlyContinue }
-        foreach ($dll in $vfgCopied) { Remove-Item -LiteralPath (Join-Path $vfgTargetDir $dll) -Force -ErrorAction SilentlyContinue }
+        $failure = $_
+        $rollbackSafe = $false
+        foreach ($rel in $touched) {
+            $saved = Join-Path $rollbackDir $rel
+            if (Test-Path -LiteralPath $saved -PathType Leaf) { Copy-WithDir $saved (Join-Path $Dir $rel) }
+            else { Remove-Item -LiteralPath (Join-Path $Dir $rel) -Force -ErrorAction SilentlyContinue }
+        }
+        $rollbackSafe = $true
+        if (Test-Path -LiteralPath $backupDir) { Remove-Item -LiteralPath $backupDir -Recurse -Force }
         Say 'rolledBack' @() 'Yellow'
-        throw
+        throw $failure
+    } finally {
+        if ($stateTemp -and (Test-Path -LiteralPath $stateTemp)) { Remove-Item -LiteralPath $stateTemp -Force }
+        if ($stateBackup -and (Test-Path -LiteralPath $stateBackup)) { Remove-Item -LiteralPath $stateBackup -Force }
+        if ($rollbackSafe -and (Test-Path -LiteralPath $rollbackDir)) { Remove-Item -LiteralPath $rollbackDir -Recurse -Force }
     }
-    $state = [ordered]@{
-        version = $Version; obsDir = $Dir; installedAt = (Get-Date).ToString('s'); backupDir = $backupDir
-        files = $rels; backedUp = $backedUp; runtimeCopied = $runtimeCopied; runtimeBackedUp = $runtimeBackedUp
-        srCopied = $srCopied; vfgCopied = $vfgCopied
-    }
-    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-    ($state | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath (Join-Path $StateDir 'install-state.json') -Encoding UTF8
 }
 
 function Read-State {
@@ -563,8 +606,36 @@ function Read-State {
 
 function Remove-Files([string]$Dir, $Manifest, $State) {
     $useState = [bool]($State -and $State.obsDir -and (Test-SamePath ([string]$State.obsDir) $Dir))
-    if (-not $useState) { Say 'uNoState' @() 'Yellow' }
-    foreach ($rel in @($Manifest.Keys)) {
+    if ($useState -and $State.PSObject.Properties['ownedFiles']) {
+        foreach ($entry in @($State.ownedFiles)) { Assert-ReceiptFile $entry.relative $entry.backup }
+        foreach ($entry in @($State.ownedFiles)) {
+            $rel = [string]$entry.relative
+            $dst = Join-Path $Dir $rel
+            if (Test-Path -LiteralPath $dst -PathType Leaf) {
+                if ((Get-Sha $dst) -eq $entry.hash) {
+                    Remove-Item -LiteralPath $dst -Force
+                    Say 'uRemoved' @($rel) 'Gray'
+                } else {
+                    Say 'uChanged' @($rel) 'Yellow'
+                }
+            }
+            if ($entry.backup -and (Test-Path -LiteralPath $entry.backup -PathType Leaf) -and -not (Test-Path -LiteralPath $dst)) {
+                Copy-WithDir $entry.backup $dst
+                Say 'uRestored' @($rel) 'Green'
+            }
+        }
+        Remove-Item -LiteralPath (Join-Path $StateDir 'install-state.json') -Force
+        return
+    }
+    if ($useState) {
+        foreach ($rel in @($State.backedUp)) {
+            if ($rel) { Assert-ReceiptFile $rel (Join-Path $State.backupDir $rel) }
+        }
+        if ($State.runtimeBackedUp) { Assert-ReceiptFile $RuntimeRel (Join-Path $State.backupDir $RuntimeRel) }
+    }
+    if (-not $useState) { Say 'uNoState' @() 'Yellow'; return }
+    foreach ($rel in @($State.files)) {
+        if (-not $rel -or -not $Manifest.Contains($rel)) { continue }
         $dst = Join-Path $Dir $rel
         if (Test-Path -LiteralPath $dst -PathType Leaf) {
             if ((Get-Sha $dst) -eq $Manifest[$rel]) { Remove-Item -LiteralPath $dst -Force; Say 'uRemoved' @($rel) 'Gray' }
@@ -593,22 +664,7 @@ function Remove-Files([string]$Dir, $Manifest, $State) {
                 Say 'uRestored' @($RuntimeRel) 'Green'
             }
         }
-        if ($State.PSObject.Properties['srCopied'] -and $State.srCopied) {
-            $sr = Join-Path $Dir $SrRel
-            if (Test-Path -LiteralPath $sr -PathType Leaf) {
-                Remove-Item -LiteralPath $sr -Force
-                Say 'uRemoved' @($SrRel) 'Gray'
-            }
-        }
-        if ($State.PSObject.Properties['vfgCopied'] -and $State.vfgCopied) {
-            foreach ($dll in @($State.vfgCopied)) {
-                $p = Join-Path (Join-Path $Dir $VfgDirRel) $dll
-                if (Test-Path -LiteralPath $p -PathType Leaf) {
-                    Remove-Item -LiteralPath $p -Force
-                    Say 'uRemoved' @("$VfgDirRel\$dll") 'Gray'
-                }
-            }
-        }
+        # Legacy optional-runtime receipts have no hashes; ownership cannot be verified.
         Remove-Item -LiteralPath (Join-Path $StateDir 'install-state.json') -Force
     }
     foreach ($sub in 'data\obs-plugins\obs-nr-filter\locale', 'data\obs-plugins\obs-nr-filter', $VfgDirRel, 'bin\64bit\dlss') {
@@ -632,10 +688,10 @@ function Invoke-Install {
     $runtimeSource = Resolve-Runtime $dir
     Write-Step 4 5 (T 'sOpt')
     $stageDir = Join-Path $env:TEMP ('obs-nr-stage-' + [guid]::NewGuid().ToString('N'))
-    $opt = Resolve-OptionalRuntimes $dir $stageDir
-    if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir $runtimeSource $opt.sr $opt.vfg $stageDir) }
-    Write-Step 5 5 (T 'sCopy')
     try {
+        $opt = Resolve-OptionalRuntimes $dir $stageDir
+        if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir $runtimeSource $opt.sr $opt.vfg $stageDir) }
+        Write-Step 5 5 (T 'sCopy')
         Install-Files $dir $runtimeSource $opt.sr $opt.vfg $manifest
     } finally {
         if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue }

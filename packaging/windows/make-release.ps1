@@ -5,7 +5,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.1'
+    [string]$Version = '0.2.2',
+    [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -21,8 +22,8 @@ if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 
 # Release payload, laid out exactly as inside the OBS install folder.
 $payload = [ordered]@{
-    'obs-plugins\64bit\obs-nr-filter.dll'             = Join-Path $BuildDir 'Release\obs-nr-filter.dll'
-    'bin\64bit\obs-nr-fg-presenter.exe'                = Join-Path $BuildDir 'Release\obs-nr-fg-presenter.exe'
+    'obs-plugins\64bit\obs-nr-filter.dll'             = Join-Path $BuildDir "$Configuration\obs-nr-filter.dll"
+    'bin\64bit\obs-nr-fg-presenter.exe'                = Join-Path $BuildDir "$Configuration\obs-nr-fg-presenter.exe"
     'data\obs-plugins\obs-nr-filter\locale\en-US.ini' = Join-Path $repo 'data\locale\en-US.ini'
     'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini' = Join-Path $repo 'data\locale\ko-KR.ini'
 }
@@ -46,6 +47,7 @@ $extra = [ordered]@{
     'LICENSE.txt'          = Join-Path $repo 'LICENSE'
     'notices\CREDITS.md'   = Join-Path $repo 'provenance\source-notices\CREDITS.md'
     'notices\RenoDX-MIT.txt' = Join-Path $repo 'provenance\source-notices\RenoDX-MIT.txt'
+    'notices\AMD-FidelityFX-CAS-MIT.txt' = Join-Path $repo 'provenance\source-notices\AMD-FidelityFX-CAS-MIT.txt'
 }
 foreach ($rel in $extra.Keys) {
     $dst = Join-Path $stage $rel
