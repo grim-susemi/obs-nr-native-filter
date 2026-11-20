@@ -72,6 +72,14 @@ try {
     Remove-Files $dir $m (Read-State)
     Assert-Equal ([IO.File]::ReadAllText($target)) 'pre-legacy' 'legacy update must retain original backup'
 
+    Put $target 'modern-version'
+    Put (Join-Path $StateDir 'install-state.json') (@{
+        obsDir = $dir; files = @($rel); backedUp = @($rel); backupDir = $legacyBackup
+    } | ConvertTo-Json)
+    Install-Files $dir '' '' '' $m
+    Remove-Files $dir $m (Read-State)
+    Assert-Equal ([IO.File]::ReadAllText($target)) 'pre-legacy' 'legacy backup must survive an identical upgrade'
+
     $unmanaged = 'bin\64bit\obs64.exe'
     $unmanagedFile = Join-Path $dir $unmanaged
     Put $unmanagedFile 'OBS'
@@ -123,7 +131,7 @@ try {
     if (Get-ChildItem -LiteralPath $StateDir -Filter 'rollback-*') { throw 'rollback staging was left behind' }
 
     $package = Join-Path $root 'package'
-    $packageScript = Join-Path $package 'windows\install.ps1'
+    $packageScript = Join-Path $package 'scripts\install.ps1'
     $packagePayload = Join-Path $package 'files'
     $realObs = Join-Path $root 'entry-obs'
     $realState = Join-Path $root 'entry-state'
@@ -132,6 +140,7 @@ try {
     Put (Join-Path $packagePayload $rel) 'entry-v1'
     New-Item -ItemType Directory -Force (Split-Path -Parent $packageScript) | Out-Null
     Copy-Item -LiteralPath $installer -Destination $packageScript
+    Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $installer) 'uninstall.bat') -Destination $package
     function Write-Manifest {
         $file = Join-Path $packagePayload $rel
         [IO.File]::WriteAllText((Join-Path $packagePayload 'manifest.sha256'), ((Get-Sha $file) + '  ' + $rel))
@@ -149,6 +158,13 @@ try {
     Put (Join-Path $packagePayload $rel) 'entry-v3'
     Write-Manifest; Run-Installer $true
     Assert-Equal ([IO.File]::ReadAllText((Join-Path $realObs $rel))) 'entry-foreign' 'real entry point must restore original across upgrades'
+    Put (Join-Path $realObs $rel) 'entry-v3'
+    Run-Installer $false
+    foreach ($attempt in 1..2) {
+        $output = & (Join-Path $package 'uninstall.bat') -ObsDir $realObs -StateDir $realState -Lang en -Yes -NoPause | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "uninstall wrapper failed: $LASTEXITCODE`n$output" }
+        Assert-Equal ([IO.File]::ReadAllText((Join-Path $realObs $rel))) 'entry-v3' "unmanaged identical bytes must survive uninstall $attempt"
+    }
     Write-Host 'PASS release installer ownership'
 } finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

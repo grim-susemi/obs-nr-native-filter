@@ -554,7 +554,12 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
                     Say 'uChanged' @($rel) 'Yellow'
                     continue
                 }
-                if (-not $owned.ContainsKey($rel) -and $currentHash -eq $sourceHash) { continue }
+                if (-not $owned.ContainsKey($rel) -and $currentHash -eq $sourceHash) {
+                    if ($legacyFiles.ContainsKey($rel)) {
+                        $owned[$rel] = @{ relative = $rel; hash = $sourceHash; backup = $backup }
+                    }
+                    continue
+                }
                 Copy-WithDir $dst (Join-Path $rollbackDir $rel)
                 if (-not $owned.ContainsKey($rel) -and $currentHash -ne $sourceHash) {
                     $saved = Join-Path $backupDir $rel
