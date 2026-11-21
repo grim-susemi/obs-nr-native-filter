@@ -40,6 +40,7 @@ struct Shape {
 struct Frame {
  uint64_t generation=0, serial=0, timestampNs=0, arrivalNs=0;
  Shape shape{};
+ uint64_t obsTick=0; // OBS output tick in ns; zero when the source cannot supply it.
 };
 struct CopyTicket {
  size_t slot;
@@ -87,7 +88,7 @@ public:
  Offer connect(const Peer&); // Throws Error on rejection/capacity; old generation is retained.
  Status status()const;
  // A discontinuity starts a new frame pair without retiring the transport.
- Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs,bool discontinuity=false);
+ Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs,bool discontinuity=false,uint64_t obsTick=0);
  Status retire(); // Alive importer must close first; dead is NOT a completion.
  HANDLE peer_process()const;
  HANDLE control_event()const;
@@ -117,6 +118,7 @@ public:
  // Subscribe before copy. The caller owns an unsignaled event and keeps it live
  // through completion. No helper CPU wait is inserted by either method.
  Status arm_return(size_t slot,HANDLE);
+ Status arm_return(const CopyTicket&,HANDLE);
  // Copies into a same-shape COMMON texture or a sufficiently large readback
  // buffer. Keeps destination, allocator and list alive through the return fence.
  // Queue is dedicated to this endpoint; rendering uses the destination only.
@@ -128,6 +130,8 @@ public:
  [[nodiscard]] CopyStep copy_next(ID3D12Resource* destination);
  // Poll a ticket issued by this Consumer on its graphics-owner thread.
  [[nodiscard]] Status copy_status(const CopyTicket&)const;
+ // Add the exact copy completion dependency to a different consumer queue.
+ [[nodiscard]] Status order_copy(const CopyTicket&,ID3D12CommandQueue*)const;
  Status close(); // Pending preserves all imports; destructor uses bounded quarantine.
 #ifdef NR_FG_IPC_TEST_PROBE
  // Compiled only into the separate test transport, never fg_ipc. The child

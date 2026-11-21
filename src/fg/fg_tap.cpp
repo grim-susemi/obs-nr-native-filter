@@ -2,6 +2,7 @@
 #include "fg_controller.h"
 #include "fg_monitor_text.h"
 #include "../obs_upscale_filter.h"
+#include "../obs_quality_trace.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
 #include <wrl/client.h>
@@ -49,7 +50,6 @@ struct Tap {
     std::unique_ptr<ipc::Producer> producer;
     obs_upscale::Filter* upscale{};
     gs_texrender_t* capture{};
-    gs_texrender_t* previewScale{};
     obs_source_t* target{};
     uint32_t previousWidth{}, previousHeight{};
     uint32_t activeWidth{}, activeHeight{};
@@ -62,6 +62,7 @@ struct Tap {
     uint64_t lastTick{};
     uint64_t retiredGeneration{};
     bool breakPair{};
+    bool resizing{};
     bool stopping{true};
     std::atomic_bool detached{false};
 };
@@ -115,6 +116,7 @@ void disconnect(Tap& tap, const char* cause) noexcept
     }
     tap.activeWidth = 0;
     tap.activeHeight = 0;
+    tap.resizing = false;
     tap.stopping = true;
 }
 
@@ -149,8 +151,7 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
     tap.lastTick = tick;
     auto* kind = obs_source_get_unversioned_id(parent);
     const gs_color_space wanted[]{GS_CS_SRGB};
-    const uint32_t w = tap.producer ? tap.activeWidth : output.width;
-    const uint32_t h = tap.producer ? tap.activeHeight : output.height;
+    const uint32_t w = output.width, h = output.height;
     if (!kind || strcmp(kind, "monitor_capture") == 0 ||
         gs_get_device_type() != GS_DEVICE_DIRECT3D_11 || obs_source_get_color_space(target, 1, wanted) != GS_CS_SRGB ||
         !output.width || !output.height ||
@@ -159,6 +160,27 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
         return nullptr;
     }
     try {
+        if (tap.producer && !tap.resizing && (tap.activeWidth != w || tap.activeHeight != h)) {
+            if (!tap.controller->request_resize()) {
+                disconnect(tap, "resize_request");
+                return nullptr;
+            }
+            tap.resizing = true;
+            blog(LOG_INFO, "[vfg] resize requested old=%ux%u new=%ux%u generation=%llu",
+                tap.activeWidth, tap.activeHeight, w, h, nr::quality::id(tap.producer->generation()));
+        }
+        if (tap.resizing) {
+            if (!tap.controller->resize_drained()) return nullptr;
+            const auto retired = tap.producer->retire();
+            if (retired == ipc::Status::PeerBusy) return nullptr;
+            if (retired != ipc::Status::Ok) {
+                disconnect(tap, "resize_retire");
+                return nullptr;
+            }
+            tap.producer.reset();
+            tap.resizing = false;
+            tap.breakPair = true;
+        }
         const ipc::Shape shape{w, h, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
         if (!tap.producer) {
             auto* device = static_cast<ID3D11Device*>(gs_get_device_obj());
@@ -211,24 +233,13 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             else obs_source_skip_video_filter(tap.source);
         }
         auto* texture = gs_texrender_get_texture(tap.capture);
-        auto* preview = texture;
-        if (texture && output != Extent{w, h}) {
-            // Keep the presenter allocation stable, without a second DLSS run
-            // or a resize of the frame returned to the OBS recording path.
-            if (!tap.previewScale) tap.previewScale = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-            if (!tap.previewScale) { disconnect(tap, "preview_resize_allocation"); return texture; }
-            gs_texrender_reset(tap.previewScale);
-            {
-                CaptureScope scope(tap.previewScale);
-                scope.begun = gs_texrender_begin_with_color_space(tap.previewScale, w, h, GS_CS_SRGB);
-                if (!scope.begun) { disconnect(tap, "preview_resize_begin"); return texture; }
-                gs_ortho(0, float(w), 0, float(h), -100, 100);
-                draw_sdr(texture, {w, h}, GS_BLEND_ZERO);
-            }
-            preview = gs_texrender_get_texture(tap.previewScale);
-        }
-        const auto result = tap.producer->publish(preview ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(preview)) : nullptr,
-            captureQpc, clock_ns(), tap.breakPair);
+        const auto arrival = clock_ns();
+        const auto result = tap.producer->publish(texture ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(texture)) : nullptr,
+            captureQpc, arrival, tap.breakPair, tick);
+        if (nr::quality::trace_frames())
+            blog(LOG_INFO, "[quality] stage=vfg_tap obs_tick_ns=%llu source=%s generation=%llu capture_qpc_ns=%llu arrival_qpc_ns=%llu status=%d",
+                nr::quality::id(tick), obs_source_get_uuid(parent), nr::quality::id(tap.producer->generation()),
+                nr::quality::id(captureQpc), nr::quality::id(arrival), static_cast<int>(result));
         if (result == ipc::Status::Ok)
             tap.breakPair = false;
         if (result != ipc::Status::Ok && result != ipc::Status::Dropped) disconnect(tap, "publish_fault");
@@ -556,7 +567,6 @@ extern "C" void nr_register_vfg_tap()
         auto* tap = static_cast<Tap*>(data);
         obs_enter_graphics();
         if (tap->controller) disconnect(*tap, "filter_destroyed");
-        gs_texrender_destroy(tap->previewScale);
         gs_texrender_destroy(tap->capture);
         obs_leave_graphics();
         obs_upscale::destroy(tap->upscale);

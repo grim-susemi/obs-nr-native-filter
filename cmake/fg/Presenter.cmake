@@ -10,13 +10,20 @@ add_executable(obs-nr-fg-presenter
   tools/fg-presenter/vfg_presenter.cpp
   tools/fg-presenter/vfg_gpu.cpp
   tools/fg-presenter/native_vfg.cpp)
+set(VFG_CONTENT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_content_compare.hlsl")
+set(VFG_CONTENT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_content_compare_shader.h")
+add_custom_command(OUTPUT "${VFG_CONTENT_HEADER}"
+  COMMAND "${NR_FXC}" /nologo /WX /Ges /T cs_5_0 /E main /Fh "${VFG_CONTENT_HEADER}"
+    /Vn vfg_content_shader "${VFG_CONTENT_SHADER}"
+  DEPENDS "${VFG_CONTENT_SHADER}" VERBATIM)
+target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}")
 target_compile_features(obs-nr-fg-presenter PRIVATE cxx_std_20)
 target_compile_definitions(obs-nr-fg-presenter PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(obs-nr-fg-presenter PRIVATE /W4 /WX /permissive-)
 if(OBS_NR_VFG_QA_ACTION)
   target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_VFG_QA_ACTION=1)
 endif()
-target_include_directories(obs-nr-fg-presenter PRIVATE src src/fg)
+target_include_directories(obs-nr-fg-presenter PRIVATE src src/fg "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(obs-nr-fg-presenter PRIVATE fg_ipc d3d12 dxgi user32 winmm)
 add_dependencies(obs-nr-filter obs-nr-fg-presenter)
 

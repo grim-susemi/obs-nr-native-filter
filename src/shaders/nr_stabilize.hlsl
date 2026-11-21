@@ -41,6 +41,12 @@ float Luma(float3 c) {
     return dot(max(c, 0.0), kLuma);
 }
 
+float PhotoError(float3 a, float3 b) {
+    float3 d = abs(a - b);
+    return max(abs(Luma(a) - Luma(b)), 0.85 * max(d.r, max(d.g, d.b))) /
+        max(max(Luma(a), Luma(b)), 0.025);
+}
+
 float3 BilinearLoad(Texture2D<float4> tex, float2 centerCoord, int2 maxIdx) {
     float2 sc = clamp(centerCoord - 0.5, float2(0.0, 0.0), float2(maxIdx));
     int2 p00 = clamp(int2(floor(sc)), int2(0, 0), maxIdx);
@@ -72,72 +78,103 @@ void main(uint3 id : SV_DispatchThreadID) {
     float curAlpha = isfinite(curNr4.a) ? saturate(curNr4.a) : 1.0;
 
     float3 temporalOut = curNr;
+    float2 mv = float2(0.0, 0.0);
+    float motionConfidence = 0.0;
+    float staticError = 1.0;
+    float historyWeight = 0.0;
+    float staticMeanChange = 1.0;
+    if (hasHistory != 0 && (temporalStrength > 0.0 || holdStrength > 0.0)) {
+        mv = motionTex.Load(int3(p, 0)).xy;
+        if (IsFinite2(mv)) {
+            float divergence = 0.0;
+            bool neighborsFinite = true;
+            const int2 offsets[4] = {int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)};
+            [unroll] for (int i = 0; i < 4; ++i) {
+                int2 q = clamp(p + offsets[i], int2(0, 0), maxIdx);
+                float2 neighbor = motionTex.Load(int3(q, 0)).xy;
+                if (!IsFinite2(neighbor)) neighborsFinite = false;
+                else divergence = max(divergence, length(neighbor - mv));
+            }
+            if (neighborsFinite) motionConfidence = 1.0 - smoothstep(0.5, 2.0, divergence);
+        }
+    }
 
-    if (hasHistory != 0 && temporalStrength > 0.0) {
-        float2 mv = motionTex.Load(int3(p, 0)).xy;
+    if (hasHistory != 0 && motionConfidence > 0.0) {
         float2 prevPos = float2(p) + 0.5 + mv;
         bool inBounds = IsFinite2(mv) &&
             prevPos.x >= 0.5 && prevPos.y >= 0.5 &&
             prevPos.x <= float(width) - 0.5 && prevPos.y <= float(height) - 0.5;
 
-        if (inBounds) {
-            float3 prevOrig = BilinearLoad(prevOrigTex, prevPos, maxIdx);
-            float3 prevTemp = BilinearLoad(prevTemporalTex, prevPos, maxIdx);
+        float staticSum = 0.0;
+        float warpedSum = 0.0;
+        float sumCur = 0.0;
+        float sumPrev = 0.0;
+        [unroll] for (int dy = -1; dy <= 1; ++dy) {
+            [unroll] for (int dx = -1; dx <= 1; ++dx) {
+                int2 q = clamp(p + int2(dx, dy), int2(0, 0), maxIdx);
+                float3 current = curOrigTex.Load(int3(q, 0)).rgb;
+                float3 stationary = prevOrigTex.Load(int3(q, 0)).rgb;
+                float3 warped = inBounds ? BilinearLoad(prevOrigTex, float2(q) + 0.5 + mv, maxIdx) : stationary;
+                staticSum += IsFinite3(current) && IsFinite3(stationary) ? PhotoError(current, stationary) : 1.0;
+                warpedSum += inBounds && IsFinite3(current) && IsFinite3(warped) ? PhotoError(current, warped) : 1.0;
+                sumCur += Luma(IsFinite3(current) ? current : curOrig);
+                sumPrev += Luma(IsFinite3(stationary) ? stationary : curOrig);
+            }
+        }
+        staticError = staticSum / 9.0;
+        staticMeanChange = abs(sumCur - sumPrev) / max(max(sumCur, sumPrev), 9e-4);
+        float warpedError = warpedSum / 9.0;
+        // Only suppress subpixel flow: larger vectors must still release the unwarped hold.
+        if (length(mv) < 1.0 && staticError <= warpedError) {
+            mv = float2(0.0, 0.0);
+            prevPos = float2(p) + 0.5;
+            inBounds = true;
+            warpedError = staticError;
+        }
+        historyWeight = 1.0 - smoothstep(0.025, 0.11, warpedError);
 
-            if (IsFinite3(prevOrig) && IsFinite3(prevTemp)) {
-                float3 minNr = curNr;
-                float3 maxNr = curNr;
+        if (inBounds && historyWeight > 0.0 && temporalStrength > 0.0) {
+            float3 prevResidual = BilinearLoad(prevTemporalTex, prevPos, maxIdx);
+            if (IsFinite3(prevResidual)) {
+                float3 minResidual = curNr - curOrig;
+                float3 maxResidual = minResidual;
                 [unroll] for (int dy = -1; dy <= 1; ++dy) {
                     [unroll] for (int dx = -1; dx <= 1; ++dx) {
                         int2 q = clamp(p + int2(dx, dy), int2(0, 0), maxIdx);
-                        float3 s = curNrTex.Load(int3(q, 0)).rgb;
-                        if (IsFinite3(s)) {
-                            minNr = min(minNr, s);
-                            maxNr = max(maxNr, s);
+                        float3 nr = curNrTex.Load(int3(q, 0)).rgb;
+                        float3 source = curOrigTex.Load(int3(q, 0)).rgb;
+                        if (IsFinite3(nr) && IsFinite3(source)) {
+                            float3 residual = nr - source;
+                            minResidual = min(minResidual, residual);
+                            maxResidual = max(maxResidual, residual);
                         }
                     }
                 }
-                float3 clampedPrev = clamp(prevTemp, minNr, maxNr);
-
-                float lCur = Luma(curOrig);
-                float lPrev = Luma(prevOrig);
-                float3 rgbDiff = abs(curOrig - prevOrig);
-                float maxCh = max(rgbDiff.r, max(rgbDiff.g, rgbDiff.b));
-                float relErr = max(abs(lCur - lPrev), maxCh * 0.85) / max(max(lCur, lPrev), 0.025);
+                float3 clampedPrev = clamp(prevResidual, minResidual, maxResidual);
                 float velFade = 1.0 - 0.55 * smoothstep(10.0, 36.0, length(mv));
-                float occWeight = (1.0 - smoothstep(0.025, 0.11, relErr)) * velFade;
-                float alpha = saturate(temporalStrength * 0.85 * occWeight);
-                temporalOut = lerp(curNr, clampedPrev, alpha);
+                float alpha = saturate(temporalStrength * 0.85 * historyWeight * velFade * motionConfidence);
+                temporalOut = curOrig + lerp(curNr - curOrig, clampedPrev, alpha);
             }
         }
     }
 
     float3 holdOut = temporalOut;
 
-    if (hasHistory != 0 && holdStrength > 0.0) {
+    if (hasHistory != 0 && holdStrength > 0.0 && historyWeight > 0.0 && staticMeanChange <= holdTolerance) {
         float4 prevHold4 = prevHoldTex.Load(int3(p, 0));
-        if (IsFinite3(prevHold4.rgb)) {
-            float sumCur = 0.0;
-            float sumPrev = 0.0;
-            [unroll] for (int dy = -1; dy <= 1; ++dy) {
-                [unroll] for (int dx = -1; dx <= 1; ++dx) {
-                    int2 q = clamp(p + int2(dx, dy), int2(0, 0), maxIdx);
-                    float3 sc = curOrigTex.Load(int3(q, 0)).rgb;
-                    float3 sp = prevOrigTex.Load(int3(q, 0)).rgb;
-                    sumCur += Luma(IsFinite3(sc) ? sc : curOrig);
-                    sumPrev += Luma(IsFinite3(sp) ? sp : curOrig);
-                }
-            }
-            float meanCur = sumCur * (1.0 / 9.0);
-            float meanPrev = sumPrev * (1.0 / 9.0);
-            float relDiff = abs(meanCur - meanPrev) / max(max(meanCur, meanPrev), 1e-4);
-            if (relDiff <= holdTolerance) {
-                holdOut = lerp(temporalOut, prevHold4.rgb, saturate(holdStrength));
-            }
+        float3 prevOrig = prevOrigTex.Load(int3(p, 0)).rgb;
+        if (IsFinite3(prevHold4.rgb) && IsFinite3(prevOrig)) {
+            // Unwarped hold also carries only the correction, never the old source.
+            float staticMotion = 1.0 - smoothstep(0.25, 1.0, length(mv));
+            float holdWeight = saturate(holdStrength * motionConfidence * staticMotion * historyWeight *
+                (1.0 - smoothstep(0.025, 0.11, staticError)));
+            holdOut = curOrig + lerp(temporalOut - curOrig, prevHold4.rgb - prevOrig, holdWeight);
         }
     }
 
-    outHoldTex[p] = float4(IsFinite3(holdOut) ? holdOut : curNr, curAlpha);
-    outTemporalTex[p] = float4(IsFinite3(temporalOut) ? temporalOut : curNr, curAlpha);
+    float3 published = clamp(IsFinite3(holdOut) ? holdOut : curNr, -65504.0, 65504.0);
+    outHoldTex[p] = float4(published, curAlpha);
+    // History represents exactly the published correction, including hold.
+    outTemporalTex[p] = float4(clamp(published - curOrig, -65504.0, 65504.0), curAlpha);
     outOrigTex[p] = float4(curOrig, 1.0);
 }

@@ -96,15 +96,20 @@ bool completed(NV_OF_FENCE_POINT p) {
     if(!p.fence || !p.value || p.value==UINT64_MAX) return false;
     const auto actual=p.fence->GetCompletedValue(); return actual!=UINT64_MAX && actual>=p.value;
 }
+int64_t flow_qpc() {
+    LARGE_INTEGER counter{};
+    QueryPerformanceCounter(&counter);
+    return counter.QuadPart;
+}
 
 struct DriverModule {
     HMODULE module=nullptr;
     FlowModuleIdentity identity;
     NV_OF_D3D12_API_FUNCTION_LIST api{};
     ~DriverModule() { if(module) FreeLibrary(module); }
-    void load();
+    void load(FlowInitTiming*);
 };
-void DriverModule::load() {
+void DriverModule::load(FlowInitTiming* timing) {
     std::array<wchar_t,32768> directory{};
     const UINT length=GetSystemDirectoryW(directory.data(),static_cast<UINT>(directory.size()));
     if(!length || length>=directory.size()) throw std::runtime_error("System32 unavailable");
@@ -142,6 +147,7 @@ void DriverModule::load() {
         data.dwStateAction=WTD_STATEACTION_CLOSE; WinVerifyTrust(nullptr,&action,&data);
         if(trust!=ERROR_SUCCESS || identity.signer!=L"NVIDIA Corporation")
             throw std::runtime_error("OFA module NVIDIA signature rejected");
+        if(timing)timing->verifiedModule=flow_qpc();
         module=LoadLibraryExW(identity.path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
         if(!module) throw std::runtime_error("OFA signed module load");
         std::array<wchar_t,32768> loaded{};
@@ -159,6 +165,7 @@ void DriverModule::load() {
            !api.nvOFGetSurfaceFormatCountD3D12 || !api.nvOFGetSurfaceFormatD3D12 ||
            !api.nvOFRegisterResourceD3D12 || !api.nvOFUnregisterResourceD3D12 || !api.nvOFExecuteD3D12 || !api.nvOFDestroy)
             throw std::runtime_error("OFA incomplete API table");
+        if(timing)timing->apiBound=flow_qpc();
     } catch(...) { CloseHandle(file); throw; }
     CloseHandle(file);
 }
@@ -221,13 +228,13 @@ struct D3D12Guides::Impl {
         if(count>allocated) throw std::runtime_error("OFA predictor count changed");
         values.resize(count); return values;
     }
-    void initialize(std::span<const std::byte> shader) {
+    void initialize(std::span<const std::byte> shader,FlowInitTiming* timing) {
         if(!device || !queue || !size.width || !size.height || shader.empty() ||
            queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT) throw std::runtime_error("owned guide device/queue admission");
         ComPtr<ID3D12Device> queueDevice; checked(queue->GetDevice(IID_PPV_ARGS(&queueDevice)),"guide queue device");
         ComPtr<IUnknown> a,b; checked(device.As(&a),"guide device identity"); checked(queueDevice.As(&b),"guide queue identity");
         if(a.Get()!=b.Get()) throw std::runtime_error("guide queue is not on owned device");
-        driver.load(); of_checked(driver.api.nvCreateOpticalFlowD3D12(device.Get(),&session),"OFA create");
+        driver.load(timing); of_checked(driver.api.nvCreateOpticalFlowD3D12(device.Get(),&session),"OFA create");
         uint32_t count=0;
         of_checked(driver.api.nvOFGetCaps(session,NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES,nullptr,&count),"OFA grid count");
         if(!count || count>256) throw std::runtime_error("OFA empty/malformed grid capabilities");
@@ -261,10 +268,12 @@ struct D3D12Guides::Impl {
         D3D12_FEATURE_DATA_FORMAT_SUPPORT hintSupport{DXGI_FORMAT_R16G16_SINT};
         checked(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&hintSupport,sizeof(hintSupport)),"predictor typed UAV query");
         if(!(hintSupport.Support2&D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) throw std::runtime_error("predictor typed UAV store unsupported");
+        if(timing)timing->capabilities=flow_qpc();
         const auto init=flow_bootstrap_params(size,grid,policy.perf); of_checked(driver.api.nvOFInit(session,&init),"OFA bootstrap initialize");
         of_checked(driver.api.nvCreateOpticalFlowD3D12(device.Get(),&refinement),"OFA refinement create");
         const auto refineInit=flow_refinement_params(size,grid,hintGrid,policy.perf);
         of_checked(driver.api.nvOFInit(refinement,&refineInit),"OFA refinement initialize");
+        if(timing)timing->sessions=flow_qpc();
         const Extent cells{(size.width+grid-1)/grid,(size.height+grid-1)/grid};
         hardware=texture(device.Get(),cells,DXGI_FORMAT_R16G16_SINT,false);
         cost=texture(device.Get(),cells,costFormat,false);
@@ -287,7 +296,9 @@ struct D3D12Guides::Impl {
         checked(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&inputAllocator)),"bootstrap input allocator");
         checked(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,inputAllocator.Get(),nullptr,IID_PPV_ARGS(&inputList)),"bootstrap input list");
         checked(inputList->Close(),"bootstrap input initial close");
+        if(timing)timing->resources=flow_qpc();
         create_pipeline(shader);
+        if(timing)timing->pipeline=flow_qpc();
     }
     void create_pipeline(std::span<const std::byte>);
     bool image_valid(const FlowImage&) const;
@@ -501,9 +512,10 @@ FlowProblem D3D12Guides::Impl::submit(const FlowInput& in) {
         OutputDebugStringA(error.what()); uncertain=true; return FlowProblem::ApiFailure;
     }
 }
-D3D12Guides::D3D12Guides(ID3D12Device* device,ID3D12CommandQueue* queue,Extent size,std::span<const std::byte> shader,uint64_t frameIntervalNs)
+D3D12Guides::D3D12Guides(ID3D12Device* device,ID3D12CommandQueue* queue,Extent size,std::span<const std::byte> shader,
+    uint64_t frameIntervalNs,FlowInitTiming* timing)
     :impl_(std::make_unique<Impl>(device,queue,size,frameIntervalNs)) {
-    try { impl_->initialize(shader); }
+    try { impl_->initialize(shader,timing); }
     catch(...) { if(!impl_->close()) { OutputDebugStringA("OFA initialization ownership retained"); (void)impl_.release(); } throw; }
 }
 D3D12Guides::~D3D12Guides() {

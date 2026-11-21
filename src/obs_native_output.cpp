@@ -15,7 +15,40 @@ struct Record {
     std::optional<interop::Consumer> pin;
     std::shared_ptr<model::Job> job;
     std::shared_ptr<interop::Bridge> bridge;
+    bool timelineLogged=false;
+    bool warmupObserved=false;
 };
+unsigned long long u64(uint64_t x) { return static_cast<unsigned long long>(x); }
+long long qpc(int64_t x) { return static_cast<long long>(x); }
+void log_job_timeline(const model::Job& job,const interop::Ownership& physical)
+{
+    const auto& t=*job.timeline;
+    const auto& key=job.contract.key;
+    const auto& c=job.chronology;
+    const auto instance=u64(key.frame.instanceId),generation=u64(key.resourceGeneration),serial=u64(key.submissionSerial);
+    const auto observed=model::qpc_now();
+    blog(LOG_INFO,"[obs-nr-timeline] job instance=%llu gen=%llu serial=%llu ingress=%llu content=%llu history=%llu tick=%llu deadline=%llu code=0x%x create=%u warmup=%d submitted=%d eligible=%d "
+        "tickQ=%lld obsCapture=%lld/%lld begin=%lld admitted=%lld snapshot=%lld/%lld bridgeCapture=%lld/%lld queue=%lld/%lld settleEnd=%lld deadlineQ=%lld",
+        instance,generation,serial,u64(key.frame.ingressSequence),u64(key.frame.contentEpoch),u64(key.historyEpoch),
+        u64(job.contract.input.canonicalTick),u64(job.contract.deadlineTick),job.code,job.creationPass,job.warmup,job.submitted,job.eligible,
+        qpc(t.tick),qpc(t.obsCaptureStart),qpc(t.obsCaptureEnd),qpc(t.begin),qpc(job.admittedQpc),
+        qpc(t.snapshotStart),qpc(t.snapshotEnd),qpc(t.captureStart),qpc(t.captureEnd),
+        qpc(job.enqueuedQpc),qpc(job.dequeuedQpc),qpc(t.settleEnd),qpc(job.deadlineQpc.load()));
+    blog(LOG_INFO,"[obs-nr-timeline] stages instance=%llu gen=%llu serial=%llu producer=%lld/%lld producerFence=%llu/%llu sdk=%lld/%lld "
+        "guide=%lld/%lld/%lld guideTarget=%llu alloc=%lld/%lld record=%lld/%lld eval1=%lld/%lld eval2=%lld/%lld "
+        "execute=%lld submit=%lld signal=%lld/%lld signalHr=0x%08x callback=%lld claim=%lld ready=%lld graphics=%lld worker=%llu/%llu modelTarget=%llu",
+        instance,generation,serial,qpc(t.producerBegin),qpc(t.producerEnd),u64(t.producerTarget),u64(t.producerAtWait),qpc(t.sdkBegin),qpc(t.sdkEnd),
+        qpc(t.guideInit),qpc(t.guideSubmit),qpc(t.guideDone),u64(t.guideTarget),qpc(t.allocBegin),qpc(t.allocEnd),
+        qpc(t.recordBegin),qpc(t.recordEnd),qpc(t.evaluationBegin[0]),qpc(t.evaluationEnd[0]),qpc(t.evaluationBegin[1]),qpc(t.evaluationEnd[1]),
+        qpc(c[4]),qpc(c[5]),qpc(t.signalBegin),qpc(t.signalEnd),static_cast<unsigned>(job.originalSignalResult.load()),
+        qpc(t.callback),qpc(c[6]),qpc(c[7]),qpc(observed),u64(t.workerTarget),u64(physical.workerDone),u64(job.completion().value));
+    if(job.code==0xe002 || job.code==0xefff) {
+        blog(LOG_INFO,"[obs-nr-timeline] blocked instance=%llu gen=%llu serial=%llu stopped=%d settle=%u pending=%llu exactFence=%d/%llu "
+             "pendingReady=%d pendingCallback=%d pendingGuide=%d guideState=%u",
+             instance,generation,serial,t.stop,t.settle,u64(t.pendingSerial),t.pendingHasFence,u64(t.pendingFence),
+             t.pendingReady,t.pendingCallback,t.pendingGuide,t.guideState);
+    }
+}
 // Explicit QA transport processor, never a model success. Uses the SAME production
 // scheduler, Bridge, capture pin and output consumer as real model processing.
 struct CopyProcessor final:pipeline::Processor {
@@ -71,10 +104,13 @@ struct NativeOutput::Impl {
     std::shared_ptr<interop::Bridge> bridge;
     std::shared_ptr<pipeline::Processor> processor;
     std::shared_ptr<model::Processor> model;
+    std::shared_ptr<const model::PrewarmRequest> prewarmOffer; // Graphics publishes; model worker consumes.
+    uint64_t nextPrewarmService=0;
     std::shared_ptr<CopyProcessor> copy;
     ComPtr<ID3D11Fence> graphicsFence;
     ComPtr<ID3D11Texture2D> targetLease;
     uint64_t graphicsSerial=0;
+    unsigned timelineTicks=0;
     std::atomic<bool> closeRequested{false},closed{false};
     lifecycle::SnapshotRetirement cutoffRaw;
     Generation(uint64_t generation,ID3D11Device* device,const FrameDescriptor& frame,
@@ -114,6 +150,35 @@ struct NativeOutput::Impl {
         closed.store(model?model->closed():copy->closed.load(std::memory_order_acquire),std::memory_order_release);
     }
     void worker_service() noexcept override { processor->worker_service(); }
+    bool offer_prewarm(const lifecycle::Observation& observation,const Epochs& epochs,
+        const std::string& runtimeSha,bool inactive)
+    {
+        if(!model || (!prewarmOffer && !inactive))return false;
+        if(prewarmOffer && prewarmOffer->history==epochs.historyEpoch &&
+           prewarmOffer->inactive==inactive && prewarmOffer->key.source==observation.sourceIdentity &&
+           prewarmOffer->key.device==observation.deviceIdentity &&
+           prewarmOffer->key.frame==observation.descriptor &&
+           prewarmOffer->key.settings==observation.settings) {
+            if(!inactive || observation.canonicalTick<nextPrewarmService)return false;
+            nextPrewarmService=observation.canonicalTick+6;
+            return true;
+        }
+        const auto luid=context->luid();
+        const auto& frame=observation.descriptor;
+        const model::PrewarmKey key{luid.LowPart,luid.HighPart,runtimeSha,observation.sourceIdentity,
+            observation.deviceIdentity,id,frame,work_extent(frame.active,observation.settings.workScale),
+            {frame.active.width,frame.active.height},observation.settings};
+        prewarmOffer=std::make_shared<const model::PrewarmRequest>(model::PrewarmRequest{key,epochs.historyEpoch,inactive});
+        nextPrewarmService=observation.canonicalTick+6;
+        model->request_prewarm(prewarmOffer);
+        return true;
+    }
+    void cancel_prewarm()
+    {
+        if(!prewarmOffer)return;
+        prewarmOffer.reset();
+        model->request_prewarm({});
+    }
     bool graphics_complete() const
     {
         return interop::completion(graphicsSerial,graphicsFence->GetCompletedValue())==interop::Completion::Complete;
@@ -133,9 +198,13 @@ struct NativeOutput::Impl {
         void worker_service() noexcept override
         {
             for(auto& cell:generations)if(auto g=cell.load(std::memory_order_acquire)) {
-                g->worker_service(); // Live unready owners need release before closeRequested.
-                if(g->closeRequested.load(std::memory_order_acquire) && !g->closed.load(std::memory_order_acquire))
-                    g->worker_stopping();
+                if(g->closeRequested.load(std::memory_order_acquire)) {
+                    if(!g->closed.load(std::memory_order_acquire)) {
+                        if(g->model)g->model->request_prewarm({});
+                        g->worker_service(); // Service any retained original completion marker.
+                        g->worker_stopping();
+                    }
+                } else g->worker_service();
             }
         }
         void worker_stopping() noexcept override { worker_service(); }
@@ -261,11 +330,38 @@ struct NativeOutput::Impl {
             }
             const auto physical=r.bridge->ownership(r.ticket.slot);
             if(!physical.key || *physical.key!=r.ticket.key) continue;
+            if(model::trace_job_timeline() && r.job->timeline && !r.timelineLogged) {
+                r.timelineLogged=true;
+                log_job_timeline(*r.job,physical);
+            }
             if(r.job->composed && r.job->submitted && !r.job->eligible) {
                 require(pipeline->cancel(r.ticket.key) && r.bridge->cancel(r.ticket),"native invalid completion cancellation");
             }
             require(model::observe_publication(*pipeline,r.ticket,r.bridge->ownership(r.ticket.slot),
                 observer.get(),stopping),"native exact ownership observation");
+            if(r.job->warmup && !r.warmupObserved) {
+                const auto& job=*r.job;
+                const auto& t=*job.timeline;
+                const auto& c=job.chronology;
+                const bool complete=job.eligible && interop::publishable(physical,r.ticket.key);
+                require(pipeline->finish_warmup(r.ticket.key,complete),"native exact terminal warmup receipt");
+                r.warmupObserved=true;
+                const auto ms=[](int64_t a,int64_t b) {return a>0&&b>=a?model::qpc_ms(b-a):-1.0;};
+                blog(LOG_INFO,"[obs-nr-filter] warmup instance=%llu gen=%llu serial=%llu ingress=%llu pass=%u code=0x%x eligible=%d prewarm=%d "
+                     "admit-to-ready=%.1f dequeue-to-submit=%.1f sdk=%.1f create=%.1f guide-init=%.1f guide-submit=%.1f record=%.1f submit-to-callback=%.1f ms (-1 not reached)",
+                     u64(instance),u64(r.ticket.key.resourceGeneration),u64(r.ticket.key.submissionSerial),u64(r.ticket.key.frame.ingressSequence),
+                     job.creationPass,job.code,complete,job.prewarmAdopted,ms(job.admittedQpc,c[7]),ms(job.dequeuedQpc,c[5]),ms(t.sdkBegin,t.sdkEnd),
+                     job.creationPass?ms(t.recordBegin,t.recordEnd):-1.0,ms(t.guideInit,t.guideSubmit),ms(t.guideSubmit,t.guideDone),
+                     job.creationPass?-1.0:ms(t.recordBegin,t.recordEnd),ms(c[5],t.callback));
+                if(t.guideInit) {
+                    const auto& g=t.flowInit;
+                    blog(LOG_INFO,"[obs-nr-filter] guide-init instance=%llu gen=%llu serial=%llu "
+                        "verify=%.1f api=%.1f caps=%.1f sessions=%.1f resources=%.1f pipeline=%.1f ms (-1 not reached)",
+                        u64(instance),u64(r.ticket.key.resourceGeneration),u64(r.ticket.key.submissionSerial),
+                        ms(t.flowInitBegin,g.verifiedModule),ms(g.verifiedModule,g.apiBound),ms(g.apiBound,g.capabilities),
+                        ms(g.capabilities,g.sessions),ms(g.sessions,g.resources),ms(g.resources,g.pipeline));
+                }
+            }
         }
     }
     void end_pins()
@@ -348,14 +444,14 @@ NativeOutput::~NativeOutput()
 {
     if(!impl_->closed) (void)impl_.release(); // Unresolved physical owners are never freed.
 }
-lifecycle::Decision NativeOutput::prepare(const lifecycle::Observation& observation,ID3D11Device* renderer,bool cut)
+lifecycle::Decision NativeOutput::prepare(const lifecycle::Observation& observation,ID3D11Device* renderer,bool cut,bool inactive)
 {
     auto& p=*impl_;require(!p.stopping,"native lifecycle detached");
     // OBS creates filters on its UI/control thread. Bind the accepting pipeline
     // only at the first graphics-owned observation, before any capture or job.
     if(!p.pipeline) {
         p.graphicsOwner=GetCurrentThreadId();
-        p.pipeline=std::make_unique<pipeline::FramePipeline>(Epochs{p.instance,1,1,1},p.maintenance);
+        p.pipeline=std::make_unique<pipeline::FramePipeline>(Epochs{p.instance,1,1,1},p.maintenance,!p.deterministicQa);
         p.lifecycle=std::make_unique<nr::lifecycle::Observer>(*p.pipeline);
     }
     require(p.graphicsOwner==GetCurrentThreadId(),"native prepare requires its graphics owner");
@@ -374,12 +470,25 @@ lifecycle::Decision NativeOutput::prepare(const lifecycle::Observation& observat
         *decision.cause!=ResetCause::EvaluationFailure) {
         p.clear_views();p.end_pins();p.collect();
     }
-    if(decision.placeholder)return decision;
+    if(decision.placeholder) {
+        if(p.active && p.active->prewarmOffer) {p.active->cancel_prewarm();p.pipeline->service();}
+        return decision;
+    }
     if(!p.active || p.active->id!=decision.epochs.resourceGeneration) {
+        if(p.active && p.active->prewarmOffer) {p.active->cancel_prewarm();p.pipeline->service();}
         size_t index=0;for(;index<p.generations.size() && p.generations[index];++index) {}
         require(index<p.generations.size(),"native bounded physical generation budget");
+        const bool trace=model::trace_job_timeline();
+        const auto constructing=trace?model::qpc_now():0;
         auto replacement=std::make_shared<Impl::Generation>(decision.epochs.resourceGeneration,renderer,
             observation.descriptor,p.config,p.instance,p.deterministicQa,p.vertexBytes,p.pixelBytes,p.analysisBytes);
+        if(trace) {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            blog(LOG_INFO,"[obs-nr-timeline] generation instance=%llu gen=%llu tick=%llu qpcHz=%lld construct=%lld/%lld",
+                u64(p.instance),u64(replacement->id),u64(observation.canonicalTick),qpc(frequency.QuadPart),
+                qpc(constructing),qpc(model::qpc_now()));
+        }
         require(p.pipeline->hold_generation(replacement->id,replacement),"native exact feature/upload generation hold");
         p.generations[index]=replacement;
         p.maintenance->generations[index].store(replacement,std::memory_order_release);
@@ -396,9 +505,15 @@ lifecycle::Decision NativeOutput::prepare(const lifecycle::Observation& observat
         return g && g!=p.active;
     }))return {decision.epochs,decision.cause,decision.resetTemporal,
         Selection{observation.canonicalTick,OutputKind::CurrentSource,Status::Bypassed,Reason::RetirementBudget,{},{},false}};
+    if(!p.deterministicQa && !p.config.qaObservations && !p.config.qaPreparation &&
+       observation.settings.passes==2 && !p.config.runtime.sha256.empty()) {
+        if(p.active->offer_prewarm(observation,decision.epochs,p.config.runtime.sha256,inactive))p.pipeline->service();
+    } else if(p.active->prewarmOffer) {
+        p.active->cancel_prewarm();p.pipeline->service();
+    }
     return decision;
 }
-Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowed,ID3D11Texture2D* target)
+Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowed,ID3D11Texture2D* target,RenderTiming renderTiming)
 {
     auto& p=*impl_;require(!p.stopping,"native output is stopping");
     require(p.active && p.active->id==input.resourceGeneration && p.active->descriptor==input.descriptor,
@@ -406,19 +521,44 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     auto& g=*p.active;
     require(g.cutoffRaw.capture_allowed(),"native capture forbidden while snapshot cutoff is pending");
     const auto& bridge=g.bridge;
+    const bool trace=model::trace_job_timeline() && g.timelineTicks<360;
+    if(trace)++g.timelineTicks;
+    const auto begin=model::qpc_now();
+    for(auto& r:p.records) {
+        if(r.job->contract.deadlineTick==input.canonicalTick && r.ticket.key.resourceGeneration==g.id)
+            r.job->deadlineQpc.store(begin,std::memory_order_relaxed);
+    }
     p.lastInput.emplace(input);
     p.observe();
     const auto plan=p.pipeline->begin(input,input.canonicalTick+1);
+    const auto admitted=plan.admission?model::qpc_now():0;
     require(plan.action==TickAction::CaptureOnce,"native immutable capture once per canonical tick");
     p.tickWitness.emplace(TickWitness{input.canonicalTick,plan.admissionReason,{},p.pipeline->counters()});
     if(plan.admission)++p.diagAdmit;else{++p.diagNoAdmit;const auto rr=static_cast<size_t>(plan.admissionReason);if(rr<32)++p.diagReason[rr];}
+    if(trace && plan.admissionReason==Reason::SlotsFull) {
+        for(const auto& r:p.records) if(r.ticket.key.resourceGeneration==g.id) {
+            const auto state=p.pipeline->state(r.ticket.key);
+            if(!state)continue;
+            const auto o=r.bridge->ownership(r.ticket.slot);
+            if(!o.key || *o.key!=r.ticket.key)continue;
+            blog(LOG_INFO,"[obs-nr-timeline] full instance=%llu gen=%llu tick=%llu begin=%lld held=%llu slot=%zu pub=%d phase=%d "
+                 "returned=%d ready=%d producer=%llu/%llu worker=%llu/%llu consumer=%llu/%llu open=%d cancelled=%d failed=%d",
+                 u64(p.instance),u64(g.id),u64(input.canonicalTick),qpc(begin),u64(r.ticket.key.submissionSerial),r.ticket.slot,
+                 static_cast<int>(state->publication),static_cast<int>(o.phase),state->dispatchReturned,r.job->ready.load(),
+                 u64(o.producer),u64(o.producerDone),u64(o.worker),u64(o.workerDone),u64(o.consumer),u64(o.consumerDone),
+                 o.consumerOpen,o.cancelled,o.failed);
+        }
+    }
     if(plan.selection.kind==OutputKind::CurrentSource && plan.admissionReason!=Reason::SlotsFull) {
         p.clear_views();p.end_pins();p.nrTarget=nullptr;
         require(p.pipeline->finish({}),"native capture-free scheduler placeholder");
         p.collect();p.tickWitness->counters=p.pipeline->counters();
         return p.pipeline->view(input.canonicalTick)->selection;
     }
+    const bool timeJob=trace || (plan.warmup && plan.admission);
+    const auto snapshotStart=timeJob?model::qpc_now():0;
     const auto immutable=p.capture(borrowed,input);
+    const auto snapshotEnd=timeJob?model::qpc_now():0;
     const auto selected=adapter_selection(plan);
     p.observation=p.observer?p.observer->reserve(input,plan):nullptr;
     if(p.observation) {
@@ -427,8 +567,10 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
         else p.observation->returned->bind({});
     }
     p.selectedJob.reset();
+    const auto captureStart=timeJob?model::qpc_now():0;
     const auto ticket=plan.admission?
         bridge->capture_at(plan.admission->slot,plan.admission->job.key,borrowed):std::nullopt;
+    const auto captureEnd=timeJob?model::qpc_now():0;
     if(plan.admission&&!ticket){++p.diagRefused;if(p.diagLogged<6){++p.diagLogged;const auto o=bridge->ownership(plan.admission->slot);
         blog(LOG_INFO,"[obs-nr-filter] diag capture refused instance %llu tick %llu slot %zu serial %llu sel %d/%d | slot serial %llu phase %d prod %llu/%llu work %llu/%llu cons %llu/%llu open %d cancel %d fail %d",
             (unsigned long long)p.instance,(unsigned long long)input.canonicalTick,plan.admission->slot,(unsigned long long)plan.admission->job.key.submissionSerial,
@@ -467,7 +609,15 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
         const auto fault=p.observer?p.observer->qa_fault(plan.admission->job.key):model::Fault::None;
         auto job=std::make_shared<model::Job>(frame,plan.admission->job,ColorExposure{1,1},fault);
         job->observation=p.observation;
-        const pipeline::WorkBinding binding{*ticket,physical,bridge,job,pin,p.active};
+        job->admittedQpc=admitted;
+        job->warmup=plan.warmup;
+        if(timeJob) {
+            auto& t=job->timeline.emplace();
+            t.tick=renderTiming.tick;t.obsCaptureStart=renderTiming.captureStart;t.obsCaptureEnd=renderTiming.captureEnd;
+            t.begin=begin;t.snapshotStart=snapshotStart;t.snapshotEnd=snapshotEnd;
+            t.captureStart=captureStart;t.captureEnd=captureEnd;
+        }
+        const pipeline::WorkBinding binding{*ticket,physical,bridge,job,pin,p.active,model::qpc_now};
         require(p.pipeline->finish(raw,&binding),"native exact model dispatch");
         p.tickWitness->admitted.emplace(ticket->key);
         p.records.push_back({*ticket,pin,std::move(job),bridge});
@@ -538,6 +688,7 @@ bool NativeOutput::try_close()
     if(const auto block=lifecycle::close_entry_steps(proof,false,0,0,[&] {p.observe();});
         block!=lifecycle::CloseBlock::None){proof.block=block;return false;}
     if(!p.stopSent) {
+        for(const auto& generation:p.generations) if(generation)generation->cancel_prewarm();
         for(const auto& r:p.records) {
             const auto state=p.pipeline->state(r.ticket.key);
             const auto owner=std::find_if(p.generations.begin(),p.generations.end(),[&](const auto& g) {

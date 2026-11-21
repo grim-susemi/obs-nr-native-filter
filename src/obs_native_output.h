@@ -42,6 +42,7 @@ struct Diagnostics {
     std::optional<JobWitness> latest,firstCompleted,firstOrdinary;
     std::shared_ptr<const model::GuidePreparation> preparation;
 };
+struct RenderTiming { int64_t tick=0,captureStart=0,captureEnd=0; };
 class NativeOutput final {
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -50,8 +51,8 @@ public:
     ~NativeOutput();
     NativeOutput(const NativeOutput&)=delete;
     NativeOutput& operator=(const NativeOutput&)=delete;
-    lifecycle::Decision prepare(const lifecycle::Observation&,ID3D11Device*,bool cut=false);
-    Selection tick(const IngressSample&,ID3D11Texture2D*,ID3D11Texture2D*);
+    lifecycle::Decision prepare(const lifecycle::Observation&,ID3D11Device*,bool cut=false,bool inactive=false);
+    Selection tick(const IngressSample&,ID3D11Texture2D*,ID3D11Texture2D*,RenderTiming={});
     void request_stop();
     uint32_t latch_qa_failure(); // Graphics-owned; coupled history cut once.
     bool release_original_marker(const JobKey&); // Exact graphics request; worker signals.

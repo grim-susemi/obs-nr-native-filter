@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "fg/fg_ipc_sequence.h"
+#include "../fg-presenter/vfg_cadence.h"
+#include "../fg-presenter/vfg_content.h"
 #include <cstdio>
 
 using namespace nr::fg::ipc;
 using nr::fg::ipc::detail::CopySequence;
 using nr::fg::ipc::detail::copy_completion;
+using namespace nr::fg::vfg;
 
 namespace {
 Frame original(uint64_t serial,uint64_t timestamp,uint64_t generation=7){
@@ -85,6 +88,120 @@ void fence_values(){
  expect(copy_completion(55,42)==Status::Ok,"later value on same fence preserves prior completion");
  expect(copy_completion(UINT64_MAX,42)==Status::DeviceLost,"removed-device sentinel is not completion");
 }
+
+void retained_unique(){
+ ContentHistory history;
+ CopySequence source;
+ std::array<char,content_input_count> textures{};
+ const auto admit=[&](const Frame& frame,char pixels){
+  const auto index=history.input_index();
+  const auto old=history.anchor();
+  expect(!old||index!=old->index,"the next copy cannot overwrite the retained unique original");
+  textures[index]=pixels;
+  const auto step=source.record({0,frame},Status::Ok);
+  return history.observe(index,frame,step.previous.has_value());
+ };
+ const auto a=original(1,1'000'000'000);
+ const auto anchorIndex=history.input_index();
+ expect(!admit(a,'A').continuous&&!history.can_compare(),"first original reseeds");
+ history.retain(anchorIndex,a);
+ const auto dupIndex=history.input_index();
+ expect(admit(original(2,a.timestampNs+period_60hz),'A').continuous,"duplicate can continue the transport");
+ expect(history.can_compare()&&textures[dupIndex]==textures[anchorIndex],"compare to original pixels");
+ expect(history.anchor()->frame.serial==1,"dedup keeps last unique metadata");
+ const auto nextIndex=history.input_index();
+ expect(nextIndex!=dupIndex,"the next copy cannot overwrite CopySequence's predecessor either");
+ const auto b=original(3,a.timestampNs+period_30hz);
+ expect(admit(b,'B').continuous&&textures[anchorIndex]=='A'&&textures[nextIndex]=='B',
+  "A,A,B forms a real A-B pair across transport serials 1 and 3");
+ history.retain(nextIndex,b);
+ const auto stale=admit(original(2,a.timestampNs+period_60hz),'Z');
+ expect(stale.stale&&history.anchor()->frame.serial==3,"stale input cannot replace the last unique original");
+ expect(admit(original(4,b.timestampNs+period_60hz),'B').continuous,"stale input cannot rewind transport history");
+}
+
+void content_boundaries(){
+ const auto a=original(10,1'000'000'000);
+ auto shapeChanged=original(11,a.timestampNs+period_60hz);
+ shapeChanged.shape.colorSpace=DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+ const std::array boundaries{
+  original(12,a.timestampNs+period_60hz),  // shot change or missing serial
+  original(11,a.timestampNs+period_60hz,8), // new generation
+  original(11,a.timestampNs),              // nonmonotonic clock
+  shapeChanged
+ };
+ for(const auto& b:boundaries){
+  ContentHistory history;
+  const auto index=history.input_index();
+  (void)history.observe(index,a,false);
+  history.retain(index,a);
+  const auto next=history.input_index();
+  expect(!history.observe(next,b,true).continuous&&!history.can_compare(),
+   "no comparison across a serial, clock, shape or generation discontinuity");
+  expect(history.input_index()!=next,"discontinuity still reserves the last IPC destination");
+ }
+ ContentHistory history;
+ const auto index=history.input_index();
+ (void)history.observe(index,a,false);
+ history.retain(index,a);
+ const auto next=history.input_index();
+ expect(!history.observe(next,original(11,a.timestampNs+period_60hz),false).continuous&&!history.can_compare(),
+  "transport must certify adjacency even when the serial is consecutive");
+ history.retain(next,original(11,a.timestampNs+period_60hz));
+ history.invalidate();
+ expect(!history.can_compare()&&history.input_index()!=next,"late unique invalidates pair without releasing IPC reservation");
+}
+
+void cadence_rates(){
+ for(const auto expected:{period_30hz,period_40hz,period_60hz}){
+  UniqueCadence cadence;
+  uint64_t now=1'000'000'000;
+  expect(cadence.observe(now)==0,"one original does not establish cadence");
+  for(unsigned i=0;i<12;++i){
+   // At 40 Hz sampled by OBS at 60 Hz, one and two ticks alternate.
+   now+=expected==period_40hz?(i%2==0?period_60hz:period_30hz):expected;
+   expect(cadence.observe(now)==(i<3?0:expected),"30, 40 and 60 Hz acquisition");
+  }
+  expect(cadence.observe(now+100'000'000)==0,"a stall reseeds without pairing stale content");
+  cadence.reset();
+  expect(cadence.observe(now)==0,"session boundary clears cadence");
+ }
+ UniqueCadence unsupported;
+ uint64_t now=1'000'000'000;
+ for(unsigned i=0;i<10;++i,now+=20'500'000)
+  expect(unsupported.observe(now)==0,"unsupported cadence is not folded into a target");
+ expect(provisional_60hz(now,now+period_60hz,false),
+  "confirmed 60 Hz content can interpolate before the estimator locks");
+ expect(!provisional_60hz(now,now+period_60hz,true) &&
+  !provisional_60hz(now,now+period_30hz,false),
+  "a repeated input or a slow pair must acquire cadence normally");
+}
+
+void cadence_schedule(){
+ for(const auto period:{period_30hz,period_40hz,period_60hz}){
+  for(uint32_t mult=2;mult<=4;++mult){
+   for(unsigned phase=0;phase<2;++phase){
+    uint64_t arrival=1'000'000'000;
+    uint64_t previous=0;
+    for(unsigned i=0;i<12;++i){
+     const auto plan=plan_cadence(arrival,previous,period,mult);
+     expect(plan.target(1)>=arrival&&plan.target(mult)==plan.originalNs,
+      "synthetics start at or after arrival and the last slot is the original");
+     if(previous) expect(plan.originalNs-previous==period,"pacing phase survives both sampled 40 Hz rhythms");
+     for(uint32_t slot=2;slot<=mult;++slot){
+      const auto spacing=plan.target(slot)-plan.target(slot-1);
+      expect(spacing==period/mult||spacing==period/mult+1,"even synthetic spacing");
+     }
+     previous=plan.originalNs;
+     arrival+=period==period_40hz?((i+phase)%2==0?period_60hz:period_30hz):period;
+    }
+    expect(plan_cadence(arrival+90'000'000,previous,period,mult).target(1)>arrival,
+     "after a stall the schedule moves forward");
+   }
+  }
+ }
+ expect(!plan_cadence(1'000'000'000,0,0,4).target(1),"unacquired cadence creates no synthetic slot");
+}
 }
 
 int main(){
@@ -93,6 +210,10 @@ int main(){
   discontinuities();std::puts("PASS discontinuities serial_gap generation timestamp shape");
   rejected_and_stale();std::puts("PASS rejected_and_stale pending invalid protocol peer_dead");
   fence_values();std::puts("PASS fence_values prior exact later device_lost");
+  retained_unique();std::puts("PASS retained_unique duplicate transport gap and stale copy");
+  content_boundaries();std::puts("PASS content_boundaries cuts generations clocks shape and invalidation");
+  cadence_rates();std::puts("PASS cadence_rates 30/40/60 acquisition, stall and unsupported rate");
+  cadence_schedule();std::puts("PASS cadence_schedule 2x/3x/4x intervals and both 40 Hz phases");
   return 0;
  }catch(const std::exception& error){std::fprintf(stderr,"FAIL fg_ipc_sequence: %s\n",error.what());return 1;}
 }

@@ -7,7 +7,9 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <array>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -58,43 +60,40 @@ struct TimingAgg {
     std::atomic<int64_t> sumProd{0},maxProd{0},sumPrep{0},sumRec{0},sumGpu{0},sumQueue{0},maxQueue{0};
 };
 TimingAgg timingAgg;
-struct JobTraceEntry {std::atomic<uint64_t> deadline{0};std::atomic<int64_t> queue{0},run{0},total{0};std::atomic<int> late{0};};
+struct JobTraceEntry {std::atomic<uint64_t> serial{0};std::atomic<int64_t> queue{0},run{0},total{0};std::atomic<int> late{0};};
 JobTraceEntry jobTrace[16];
 std::atomic<unsigned> jobTraceHead{0};
-struct EligEntry {std::atomic<uint64_t> deadline{0};std::atomic<uint32_t> invalid{0},code{0},flags{0};}; // diagnostic: publication eligibility
+struct EligEntry {std::atomic<uint64_t> serial{0};std::atomic<uint32_t> invalid{0},code{0},flags{0};}; // diagnostic: publication eligibility
 EligEntry eligTrace[16];
 std::atomic<unsigned> eligHead{0};
 struct EligAgg {std::atomic<unsigned> n{0},bad{0},badHist{0},badReset{0},orMask{0},noEval{0},noSubmit{0},incomplete{0},qa{0};};
 EligAgg eligAgg;
 std::atomic<uint32_t> appliedPerf{0},appliedGrid{0},appliedHint{0}; // diagnostic: estimator settings actually in use
-struct TickRing {std::atomic<uint64_t> tick[256];std::atomic<int64_t> qpc[256];};
-TickRing tickRing;
-int64_t admit_stamp(uint64_t tick) {
-    if(!tick) return 0;
-    const auto i=tick&255;
-    if(tickRing.tick[i].load(std::memory_order_acquire)!=tick) return 0;
-    return tickRing.qpc[i].load(std::memory_order_relaxed);
-}
 void raise_max(std::atomic<int64_t>& slot,int64_t value) {
     auto seen=slot.load(std::memory_order_relaxed);
     while(value>seen && !slot.compare_exchange_weak(seen,value,std::memory_order_relaxed)) {}
 }
-void record_timing(const std::array<int64_t,8>& c,uint64_t deadline,const std::array<int64_t,5>& q) { // diagnostic only: evaluation jobs carry an encode stamp
+void record_timing(const Job& job) { // diagnostic only: evaluation jobs carry an encode stamp
+    const auto& c=job.chronology;
+    const auto& q=job.qaTiming;
     if(c[1]<=0 && c[0]>0 && c[5]>0 && c[6]>=c[0]) {
         timingAgg.creationJobs.fetch_add(1,std::memory_order_relaxed);const auto cd=c[6]-c[0];
         timingAgg.sumCreation.fetch_add(cd,std::memory_order_relaxed);raise_max(timingAgg.maxCreation,cd);return;
     }
-    if(c[1]<=0 || c[5]<=0 || c[6]<c[5] || c[5]<c[1]) return;
+    if(job.warmup || c[1]<=0 || c[5]<=0 || c[6]<c[5] || c[5]<c[1]) return;
     const auto submit=c[6]-c[5],encode=c[6]-c[1];
     timingAgg.jobs.fetch_add(1,std::memory_order_relaxed);
     timingAgg.sumSubmit.fetch_add(submit,std::memory_order_relaxed);timingAgg.sumEncode.fetch_add(encode,std::memory_order_relaxed);
     raise_max(timingAgg.maxSubmit,submit);raise_max(timingAgg.maxEncode,encode);
-    if(const auto admit=admit_stamp(deadline-1); admit>0 && c[6]>=admit) {
+    const auto admit=job.admittedQpc;
+    if(admit>0 && c[6]>=admit) {
         const auto total=c[6]-admit;
         timingAgg.admitJobs.fetch_add(1,std::memory_order_relaxed);timingAgg.sumAdmit.fetch_add(total,std::memory_order_relaxed);
         raise_max(timingAgg.maxAdmit,total);
     }
-    if(const auto check=admit_stamp(deadline); check>0 && c[6]>check) timingAgg.late.fetch_add(1,std::memory_order_relaxed);
+    const auto check=job.deadlineQpc.load(std::memory_order_relaxed);
+    const bool late=check>0 && c[6]>check;
+    if(late) timingAgg.late.fetch_add(1,std::memory_order_relaxed);
     if(c[0]>0 && q[1]>=c[0] && c[1]>=q[1] && c[5]>=c[1]) {
         timingAgg.stageJobs.fetch_add(1,std::memory_order_relaxed);
         const auto prod=q[1]-c[0];
@@ -103,13 +102,14 @@ void record_timing(const std::array<int64_t,8>& c,uint64_t deadline,const std::a
         timingAgg.sumRec.fetch_add(c[5]-c[1],std::memory_order_relaxed);
         timingAgg.sumGpu.fetch_add(c[6]-c[5],std::memory_order_relaxed);
         {
-            const auto ad=admit_stamp(deadline-1);const auto chk=admit_stamp(deadline);
             auto& e=jobTrace[jobTraceHead.fetch_add(1,std::memory_order_relaxed)&15];
-            e.deadline.store(deadline);e.queue.store(ad>0&&c[0]>=ad?c[0]-ad:0);e.run.store(c[6]-c[0]);
-            e.total.store(ad>0&&c[6]>=ad?c[6]-ad:0);e.late.store(chk>0&&c[6]>chk?1:0);
+            e.serial.store(job.contract.key.submissionSerial);
+            e.queue.store(job.enqueuedQpc>0&&job.dequeuedQpc>=job.enqueuedQpc?job.dequeuedQpc-job.enqueuedQpc:0);
+            e.run.store(c[6]-c[0]);
+            e.total.store(admit>0&&c[6]>=admit?c[6]-admit:0);e.late.store(late?1:0);
         }
-        if(const auto admit2=admit_stamp(deadline-1); admit2>0 && c[0]>=admit2) {
-            const auto qd=c[0]-admit2;
+        if(job.enqueuedQpc>0 && job.dequeuedQpc>=job.enqueuedQpc) {
+            const auto qd=job.dequeuedQpc-job.enqueuedQpc;
             timingAgg.queueJobs.fetch_add(1,std::memory_order_relaxed);timingAgg.sumQueue.fetch_add(qd,std::memory_order_relaxed);raise_max(timingAgg.maxQueue,qd);
         }
     }
@@ -376,7 +376,7 @@ struct Job::Resources {
     std::array<ComPtr<ID3D12Resource>,4> guideObservations;
     ComPtr<ID3D12Resource> status, statusRead, zero;
     ComPtr<ID3D12DescriptorHeap> codecHeap,prepareHeap,restoreHeap,stabilizeHeap;
-    std::unique_ptr<D3D12ColorPass> color;
+    std::shared_ptr<D3D12ColorPass> color;
     std::unique_ptr<Core> core;
     ComPtr<ID3D12Fence> complete;
     std::shared_ptr<runtime::Submission> submission=std::make_shared<runtime::Submission>();
@@ -455,14 +455,14 @@ void finish_completed(Job& job) {
         const bool complete=r.submission->state()==runtime::Completion::Complete;
         const bool qaOk=qa_publication_allowed(job.qaFailure.load(std::memory_order_acquire));
         auto& e=eligTrace[eligHead.fetch_add(1,std::memory_order_relaxed)&15];
-        e.deadline.store(job.contract.deadlineTick);e.invalid.store(job.invalid);e.code.store(job.code);
+        e.serial.store(job.contract.key.submissionSerial);e.invalid.store(job.invalid);e.code.store(job.code);
         e.flags.store((hist?1u:0u)|(job.eligible?2u:0u)|(job.evaluated?4u:0u)|(job.submitted?8u:0u)|(complete?16u:0u)|(qaOk?32u:0u)|(job.flow.has_value()?64u:0u));
         eligAgg.n.fetch_add(1);
         if(!job.eligible){eligAgg.bad.fetch_add(1);(hist?eligAgg.badHist:eligAgg.badReset).fetch_add(1);eligAgg.orMask.fetch_or(job.invalid);
             if(!job.evaluated)eligAgg.noEval.fetch_add(1);if(!job.submitted)eligAgg.noSubmit.fetch_add(1);
             if(!complete)eligAgg.incomplete.fetch_add(1);if(!qaOk)eligAgg.qa.fetch_add(1);}
     }
-    job.chronology[7]=stamp();record_timing(job.chronology,job.contract.deadlineTick,job.qaTiming);
+    job.chronology[7]=stamp();record_timing(job);
     job.ready.store(true,std::memory_order_release);
     observe_completed(job);
     SetEvent(job.observed);
@@ -470,6 +470,7 @@ void finish_completed(Job& job) {
 void CALLBACK completed(void* opaque,BOOLEAN) {
     std::unique_ptr<std::shared_ptr<Job>> retained(static_cast<std::shared_ptr<Job>*>(opaque));
     auto& job=**retained;
+    if(job.timeline)job.timeline->callback=stamp();
     // Seq-cst handoff with marker state prevents a lost completion when the
     // original fence callback arrives before Signal has returned its HRESULT.
     job.callbackArrived.store(true);
@@ -494,7 +495,9 @@ struct Evaluator final : ModelEvaluator {
             static_cast<ID3D12Resource*>(in.depth.native),static_cast<ID3D12Resource*>(in.motion.native),
             static_cast<ID3D12Resource*>(in.output.native),in.depth.active,in.motion.active,false,
             in.input.history.reset,in.input.mvScaleX,in.input.mvScaleY,true};
+        if(job->timeline)job->timeline->evaluationBegin[in.pass]=stamp();
         const auto result=passes[in.pass]->run(in.input.job,inputs,recording(job,commands));
+        if(job->timeline)job->timeline->evaluationEnd[in.pass]=stamp();
         if(in.pass)barrier(commands,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         job->chronology[2]=stamp();
         return {result==NVSDK_NGX_Result_Success?EvaluationState::Evaluated:EvaluationState::Error,
@@ -502,21 +505,21 @@ struct Evaluator final : ModelEvaluator {
     }
 };
 struct TracedCodec final : Codec {
-    D3D12Codec codec;
+    std::shared_ptr<D3D12Codec> codec;
     Job& job;
-    TracedCodec(ID3D12Device* device,std::span<const std::byte> shader,Job& value):codec(device,shader),job(value) {}
+    TracedCodec(std::shared_ptr<D3D12Codec> shared,Job& value):codec(std::move(shared)),job(value) {}
     bool encode(const CoreInput& input,const CodecConstants& constants) override {
-        const bool result=codec.encode(input,constants); job.chronology[1]=stamp(); return result;
+        const bool result=codec->encode(input,constants); job.chronology[1]=stamp(); return result;
     }
     bool downsample(const CoreInput& input,const CoreTexture& from,const CoreTexture& to) override {
-        return codec.downsample(input,from,to);
+        return codec->downsample(input,from,to);
     }
     bool clamp(const CoreInput& input,const CoreTexture& from,const CoreTexture& to,uint32_t slot) override {
         if(job.fault==Fault::Clamp && slot==0)return false; // Refuse before recording any descriptors/barriers.
-        return codec.clamp(input,from,to,slot);
+        return codec->clamp(input,from,to,slot);
     }
     bool resolve(const CoreInput& input,const CodecConstants& constants,const CoreTexture& source,const CoreTexture& answer) override {
-        const bool result=codec.resolve(input,constants,source,answer); job.chronology[3]=stamp(); return result;
+        const bool result=codec->resolve(input,constants,source,answer); job.chronology[3]=stamp(); return result;
     }
 };
 bool typed(ID3D12Device* device,DXGI_FORMAT format,bool store) {
@@ -527,6 +530,11 @@ bool typed(ID3D12Device* device,DXGI_FORMAT format,bool store) {
 }
 }
 struct Processor::Impl {
+    struct PreparedGuides {
+        std::unique_ptr<D3D12Guides> guides;
+        int64_t begin=0;
+        FlowInitTiming timing;
+    };
     std::atomic<std::shared_ptr<const lifecycle::VendorTrace>> traceView;
     const std::shared_ptr<interop::Context> context;
     const Config config;
@@ -536,15 +544,27 @@ struct Processor::Impl {
     std::shared_ptr<Driver> driver;
     std::shared_ptr<runtime::Module> module;
     std::array<std::unique_ptr<runtime::Pass>,2> passes;
+    std::atomic<std::shared_ptr<const PrewarmRequest>> prewarmRequest;
+    std::shared_ptr<const PrewarmRequest> prewarmStarted,prewarmAttempted,prewarmQueued;
+    std::shared_ptr<std::atomic_bool> prewarmRevoked;
+    std::array<std::unique_ptr<runtime::Pass>,2> prewarmed;
+    bool prewarmAborted=false,prewarmReady=false;
+    bool realWork=false;
+    int64_t prewarmSince=0;
     PassChain chain;
     std::atomic<uint64_t> passStatus{pack_pass_status({})};
     std::unique_ptr<D3D12Guides> guides;
+    std::future<PreparedGuides> guidePreparation;
     std::optional<Settings> settings;
     std::optional<Extent> extent;
     std::optional<JobKey> previousKey;
     std::shared_ptr<const Frame> previousFrame;
     std::shared_ptr<Job> pending;
     std::shared_ptr<ColorSlabPool> pool;
+    // Immutable device-bound pipelines are shared; each job retains its own lease
+    // until its command list and descriptors are retired.
+    std::shared_ptr<D3D12ColorPass> color;
+    std::shared_ptr<D3D12Codec> codec;
     std::unique_ptr<D3D12StabilizePass> stabilizer;
     std::optional<Extent> stabilizeExtent;
     std::array<ComPtr<ID3D12Resource>,2> stabilizeOrig,stabilizeTemporal,stabilizeHold;
@@ -566,13 +586,27 @@ struct Processor::Impl {
     // N23 worker diagnostics (no behavior change).
     std::atomic<uint64_t> diagOk{0},diagFail{0},diagExc{0};std::atomic<uint32_t> diagSettle{0},diagLastCode{0},diagFirstN{0};
     std::array<std::atomic<uint64_t>,8> diagFirst{};std::array<char,160> diagWhat{};std::atomic<bool> diagWhatSet{false};
-    void diag_fail(uint32_t code) {
+    void diag_fail(uint32_t code,Job& job) {
         diagFail.fetch_add(1);diagLastCode.store(code);const auto n=diagFirstN.load();
-        if(n<diagFirst.size()) {
-            uint64_t v=code&0xffff;v|=uint64_t(diagSettle.load()&3)<<16;if(guides)v|=uint64_t(guides->state_bits()&7)<<18;
-            if(pending){v|=1ull<<21;if(pending->ready.load())v|=1ull<<22;if(pending->callbackArrived.load())v|=1ull<<23;
-                if(pending->resources&&pending->resources->complete)v|=uint64_t(std::min<uint64_t>(pending->resources->complete->GetCompletedValue(),3))<<24;}
-            if(pendingGuide)v|=1ull<<26;diagFirst[n].store(v);diagFirstN.store(n+1);
+        if(n<diagFirst.size() || job.timeline) {
+            const auto state=diagSettle.load();
+            const auto guideState=guides?guides->state_bits():0u;
+            const bool ready=pending && pending->ready.load();
+            const bool callback=pending && pending->callbackArrived.load();
+            const bool hasFence=pending && pending->resources && pending->resources->complete;
+            const auto fence=hasFence?pending->resources->complete->GetCompletedValue():0;
+            if(job.timeline) {
+                auto& t=*job.timeline;
+                t.settle=state;t.guideState=guideState;t.pendingGuide=pendingGuide.has_value();
+                t.pendingSerial=pending?pending->contract.key.submissionSerial:0;
+                t.pendingReady=ready;t.pendingCallback=callback;t.pendingHasFence=hasFence;t.pendingFence=fence;
+            }
+            if(n<diagFirst.size()) {
+                uint64_t v=code&0xffff;v|=uint64_t(state&3)<<16;v|=uint64_t(guideState&7)<<18;
+                if(pending)v|=1ull<<21;if(ready)v|=1ull<<22;if(callback)v|=1ull<<23;
+                v|=uint64_t(std::min<uint64_t>(fence,3))<<24;if(pendingGuide)v|=1ull<<26;
+                diagFirst[n].store(v);diagFirstN.store(n+1);
+            }
         }
         diagSettle.store(0);
     }
@@ -581,6 +615,10 @@ struct Processor::Impl {
         require(context && id && !config.codec.empty() && !config.color.empty() && !config.guides.empty(),
             "private context and actual compiled model shaders required");
     }
+    uint32_t open_session(Fault,const std::shared_ptr<std::atomic_bool>& speculative={});
+    void prepare_inactive();
+    bool discard_prewarm();
+    bool adopt_prewarm(const JobContract&);
     bool settle() {
         if(!pending) return true;
         if(!pending->ready.load(std::memory_order_acquire)) {diagSettle.store(1);return false;}
@@ -590,8 +628,7 @@ struct Processor::Impl {
         if(!chain.settle({pending->completedPasses,pending->failedPass,
             pending->passError?pending->passError:pending->code,
             !historyRecorded || completion==runtime::Completion::Complete || completion==runtime::Completion::Discarded,
-            pending->eligible}))
-            return false;
+            pending->eligible})) {diagSettle.store(3);return false;}
         if(pending->failedPass) {reset=true;lastResetSetter="pass-failed";}
         passStatus.store(pack_pass_status(chain.status()),std::memory_order_release);
         pendingGuide.reset(); pending->resources->unsubscribe(); pending.reset(); return true;
@@ -611,7 +648,9 @@ struct Processor::Impl {
     void signal(const std::shared_ptr<Job>& job) {
         pending=job;
         const auto result=completion_signal(job->fault,[&] {
+            if(job->timeline)job->timeline->signalBegin=stamp();
             const auto actual=context->queue()->Signal(job->resources->complete.Get(),1);
+            if(job->timeline)job->timeline->signalEnd=stamp();
             job->originalSignalResult.store(actual);
             return actual;
         });
@@ -630,6 +669,120 @@ struct Processor::Impl {
         checked(result,"model retained completion signal");
     }
 };
+uint32_t Processor::Impl::open_session(Fault fault,const std::shared_ptr<std::atomic_bool>& speculative) {
+    if(session)return session->state.load(std::memory_order_acquire)==SessionState::Ready?0u:0xe020u;
+    auto* device=context->device();
+    const auto binding=runtime::resolve_driver();
+    const auto acquisition=sessions().acquire(session_key(device,config,binding),speculative);
+    if(!acquisition.session)return 0xe020;
+    session=acquisition.session;driver=session->driver;
+    traceView.store(std::shared_ptr<const lifecycle::VendorTrace>(session,&session->trace),std::memory_order_release);
+    if(acquisition.initialize) {
+        try {
+            HMODULE existing=nullptr;
+            require(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                config.runtime.canonicalPath.c_str(),&existing),"pre-existing foreign NR image");
+            driver->open(device,config,binding,session->key.data,session->trace);
+            if(fault==Fault::AfterCoreInit) {
+                sessions().retain(session);return 0xe019;
+            }
+            session->module=runtime::Module::open(config.runtime,driver->dispatch,driver,device,
+                session->key.data,session->key.route,&session->trace);
+            require(session->module!=nullptr,"selected runtime module admission");
+            sessions().publish(session);
+        }catch(...) {sessions().retain(session);throw;}
+    }
+    module=session->module;
+    return 0;
+}
+bool Processor::Impl::discard_prewarm() {
+    if(!prewarmStarted)return true;
+    prewarmAborted=true;
+    if(!release_passes(prewarmed))return false; // Signal failure is not completion.
+    // Leave any speculative SDK lease for normal teardown or a retry below.
+    lifecycle::ModelClose proof;
+    if(session && (!close_session_module(sessions(),session,proof) ||
+        !close_session_core(sessions(),session,proof)))return false;
+    module.reset();driver.reset();session.reset();traceView.store({},std::memory_order_release);
+    prewarmStarted.reset();prewarmRevoked.reset();prewarmReady=false;prewarmAborted=false;
+    return true;
+}
+void Processor::Impl::prepare_inactive() {
+    const auto offered=prewarmRequest.load(std::memory_order_acquire);
+    if(prewarmStarted && (prewarmAborted || prewarmRevoked->load(std::memory_order_acquire) || !offered ||
+        offered->key!=prewarmStarted->key)) {
+        (void)discard_prewarm();
+        return;
+    }
+    if(realWork || !offered || !offered->inactive || prewarmReady)return;
+    if(!prewarmStarted) {
+        if(prewarmAttempted && prewarmAttempted->key==offered->key)return;
+        // Start only for a stable inactive source. Delay acquisition on a busy SDK.
+        if(prewarmQueued!=offered) {
+            prewarmQueued=offered;prewarmSince=stamp();
+            return;
+        }
+        if(qpc_ms(stamp()-prewarmSince)<500.0 || !sessions().idle_for_prewarm(config.runtime.canonicalPath))return;
+        prewarmRevoked=std::make_shared<std::atomic_bool>(false);
+        prewarmStarted=offered;
+        const auto code=open_session(Fault::None,prewarmRevoked);
+        if(code) {
+            prewarmStarted.reset();prewarmRevoked.reset();prewarmSince=stamp();
+            return;
+        }
+        prewarmAttempted=offered;
+    }
+    if(prewarmRevoked->load(std::memory_order_acquire) ||
+        prewarmRequest.load(std::memory_order_acquire)!=offered)return;
+    PassChain two;two.reset(2);
+    const auto gate=two.gate(prewarmed,epoch+1);
+    if(gate.primed()) {prewarmReady=true;return;}
+    if(!gate.create)return; // Scheduler service polls the real creation fence, never waits.
+    const auto index=*gate.create;
+    auto r=std::make_shared<Job::Resources>(nullptr);
+    checked(context->device()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&r->allocator)),
+        "inactive NR creation allocator");
+    checked(context->device()->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,r->allocator.Get(),nullptr,
+        IID_PPV_ARGS(&r->creation)),"inactive NR creation list");
+    prewarmed[index]=std::make_unique<runtime::Pass>(module);
+    const auto& key=offered->key;
+    const auto& s=key.settings;
+    const auto& tune=index && s.pass2Tuning?*s.pass2Tuning:s.tuning;
+    const ModelTuning tuning{tune.preset,tune.style,tune.intensity,tune.localStructure,
+        index && !s.pass2Tuning?0.0f:tune.localTone,tune.skinStructure,tune.autoMask};
+    creationReceipt={};
+    const CreateScope scope(driver.get(),creationReceipt);
+    // A create-only recording owns a list and allocator, never a capture or Bridge slot.
+    NVSDK_NGX_Result result;
+    try {
+        result=prewarmed[index]->prepare(s,tuning,key.work,offered->history,
+            {r->creation.Get(),++epoch,r,[submission=r->submission]{return submission->state();}});
+    } catch(...) {
+        (void)r->submission->discard();throw;
+    }
+    if(FAILED(r->creation->Close())) {
+        (void)r->submission->discard();prewarmAborted=true;return;
+    }
+    ID3D12CommandList* lists[]{r->creation.Get()};
+    context->queue()->ExecuteCommandLists(1,lists);
+    const bool submitted=r->submission->submitted(context->queue());
+    prewarmAborted=!submitted || result!=NVSDK_NGX_Result_Success;
+    creationEpoch=epoch;
+}
+bool Processor::Impl::adopt_prewarm(const JobContract& job) {
+    if(!prewarmStarted || prewarmAborted)return false;
+    const auto luid=context->luid();
+    const auto& f=job.input.descriptor;
+    const PrewarmKey actual{luid.LowPart,luid.HighPart,config.runtime.sha256,job.input.sourceIdentity,job.input.deviceIdentity,
+        job.key.resourceGeneration,f,work_extent(f.active,job.input.settings.workScale),{f.active.width,f.active.height},job.input.settings};
+    const auto offered=prewarmRequest.load(std::memory_order_acquire);
+    PassChain two;two.reset(2);
+    if(!offered || !can_adopt_prewarm(*prewarmStarted,*offered,actual,job.key.historyEpoch,
+        two.gate(prewarmed,epoch+1).primed()) ||
+        !sessions().adopt(session,prewarmRevoked))return false;
+    passes=std::move(prewarmed);prewarmStarted.reset();prewarmRevoked.reset();prewarmReady=false;
+    return true;
+}
 Processor::Processor(std::shared_ptr<interop::Context> context,Config config,uint64_t instance)
     :impl_(std::make_unique<Impl>(std::move(context),std::move(config),instance)) {}
 Processor::~Processor() {
@@ -639,12 +792,26 @@ Processor::~Processor() {
     }
 }
 bool Processor::closed() const { return impl_->closed.load(std::memory_order_acquire); }
+void Processor::request_prewarm(std::shared_ptr<const PrewarmRequest> offer) noexcept {
+    impl_->prewarmRequest.store(std::move(offer),std::memory_order_release);
+}
 bool Processor::request_original_marker(const std::shared_ptr<Job>& job,const JobKey& key) {
     return job && job->fault==Fault::CompletionSignal && key==job->contract.key &&
         key.frame.instanceId==impl_->instance && job->originalMarker.request(key);
 }
 void Processor::worker_service() noexcept {
     auto& p=*impl_;
+    if(p.closed.load(std::memory_order_acquire))return;
+    if(p.worker==std::thread::id{} && p.prewarmRequest.load(std::memory_order_acquire))
+        p.worker=std::this_thread::get_id();
+    if(p.worker==std::this_thread::get_id() && !p.pending) {
+        try { p.prepare_inactive(); }
+        catch(const std::exception& e) {
+            p.prewarmAborted=true;
+            if(p.prewarmStarted)p.prewarmAttempted=p.prewarmStarted;
+            OutputDebugStringA(e.what());
+        }
+    }
     if(p.worker!=std::this_thread::get_id() || !p.pending)return;
     const auto job=p.pending; // Only its existing worker reads pending.
     job->originalMarker.consume(job->contract.key,[&] {
@@ -732,17 +899,24 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     require(job && job->contract==work.job && work.raw && work.job.input==work.raw->input && work.binding.transport &&
         work.binding.ticket.key==work.job.key && work.binding.capturePin &&
         work.binding.capturePin->ticket==work.binding.ticket,"exact captured model binding");
+    job->enqueuedQpc=work.enqueued;job->dequeuedQpc=work.dequeued;
+    auto* t=job->timeline?&*job->timeline:nullptr;
     job->chronology[0]=stamp();if(p.config.qaObservations||job->observation)job->qaTiming[0]=stamp();
     auto fail=[&](uint32_t code) {
         job->code=code; p.reset=true; p.lastResetSetter="presubmit-failure";
-        p.diag_fail(code);
+        p.diag_fail(code,*job);
         if(job->fault!=Fault::None)job->qaFailure.store(code,std::memory_order_release);
         require(work.binding.transport->discard_recording(work.binding.ticket),"model presubmit discard");
+        if(t)job->chronology[7]=stamp();
         job->ready.store(true,std::memory_order_release); observe_completed(*job);SetEvent(job->observed);
         return pipeline::Processed{work.job,false,{}};
     };
     try {
-    if(stop.stop_requested() || !p.settle()) return fail(0xe002);
+    p.realWork=true;
+    const bool stopped=stop.stop_requested();
+    const bool settled=!stopped && p.settle();
+    if(t) { t->stop=stopped;t->settleEnd=stamp(); }
+    if(!settled) return fail(0xe002);
     const auto& d=work.job.input.descriptor;
     const Extent size{d.active.width,d.active.height};
     const auto working=work_extent(d.active,work.job.input.settings.workScale);
@@ -753,7 +927,9 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->epoch=++p.epoch; job->creationEpoch=p.creationEpoch;
     if(job->fault==Fault::Capability) return fail(0xe003); // Owned admission control, no feature/compose.
     const auto producer=job->frame->producer;
+    if(t) { t->producerBegin=stamp();t->producerTarget=producer.value; }
     const auto done=producer.fence->GetCompletedValue();
+    if(t)t->producerAtWait=done;
     const auto producerCode=producer_return(job->fault,producer.value,done,[&] {
         HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr); require(event!=nullptr,"producer event");
         const auto result=producer.fence->SetEventOnCompletion(producer.value,event);
@@ -761,26 +937,42 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         CloseHandle(event);
         return wait==WAIT_OBJECT_0 && producer.fence->GetCompletedValue()!=UINT64_MAX;
     });
+    if(t)t->producerEnd=stamp();
     if(producerCode)return fail(producerCode);
-    job->qaTiming[1]=stamp();
+    job->qaTiming[1]=t?t->producerEnd:stamp();
     auto* device=p.context->device();
     const auto plan=color_plan(d,job->exposure,
         typed(device,interop::source_format(d.format),false) &&
         typed(device,DXGI_FORMAT_R16G16B16A16_FLOAT,true) &&
         typed(device,interop::canonical_format(d.format),true));
     if(!plan) return fail(0xe006);
+    if(p.prewarmStarted) {
+        job->prewarmAdopted=job->fault==Fault::None && p.adopt_prewarm(work.job);
+        if(!job->prewarmAdopted && !p.discard_prewarm()) {
+            // Keep the raw warmup path until a discarded create retires on
+            // its own fence. This is not an NR evaluation/worker failure.
+            require(work.binding.transport->discard_recording(work.binding.ticket),"pending inactive prepare raw discard");
+            job->chronology[7]=stamp();
+            job->ready.store(true,std::memory_order_release);observe_completed(*job);SetEvent(job->observed);
+            return {work.job,false,{}};
+        }
+    }
     const bool adapterChanged=p.settings!=work.job.input.settings || p.extent!=size ||
         p.generation!=work.job.key.resourceGeneration;
     if(adapterChanged || !p.settings) {
-        if(!release_passes(p.passes))return fail(0xe007);
+        if(!job->prewarmAdopted && !release_passes(p.passes))return fail(0xe007);
         p.previousFrame.reset(); p.previousKey.reset();
+        if(p.guidePreparation.valid()) {
+            p.guidePreparation.wait();
+            p.guidePreparation={};
+        }
         if(adapterChanged && p.guides) {
             require(p.guides->close(),"old generation guides close"); p.guides.reset();
         }
         p.settings.emplace(work.job.input.settings);p.extent.emplace(size);p.generation=work.job.key.resourceGeneration;
         p.chain.reset(work.job.input.settings.passes);
         p.passStatus.store(pack_pass_status(p.chain.status()),std::memory_order_release);
-        p.reset=true; p.lastResetSetter="pass-retired";
+        p.reset=true; p.lastResetSetter=job->prewarmAdopted?"inactive-prewarm-adopted":"pass-retired";
     } else if(p.passes[0] && !p.passes[0]->ready(job->epoch)) {
         if(!p.passes[0]->release())return fail(0xe007);
         p.passes[0].reset();p.previousFrame.reset();p.previousKey.reset();
@@ -788,29 +980,10 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     }
     if(p.chain.status().failedPass && !release_passes(p.passes,p.chain.limit()))return fail(0xe007);
     if(!p.session) {
+        if(t)t->sdkBegin=stamp();
         if(p.config.qaObservations||job->observation)job->qaTiming[2]=stamp();
-        const auto binding=runtime::resolve_driver();
-        const auto acquisition=sessions().acquire(session_key(device,p.config,binding));
-        if(!acquisition.session)return fail(0xe020); // Initializing/retiring/conflicting owner; never render waits.
-        p.session=acquisition.session;p.driver=p.session->driver;
-        p.traceView.store(std::shared_ptr<const lifecycle::VendorTrace>(p.session,&p.session->trace),
-            std::memory_order_release); // Observation only, not another SDK lease.
-        if(acquisition.initialize) {
-            try {
-                HMODULE existing=nullptr;
-                require(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    p.config.runtime.canonicalPath.c_str(),&existing),"pre-existing foreign NR image");
-                p.driver->open(device,p.config,binding,p.session->key.data,p.session->trace);
-                if(job->fault==Fault::AfterCoreInit) {
-                    sessions().retain(p.session);return fail(0xe019);
-                }
-                p.session->module=runtime::Module::open(p.config.runtime,p.driver->dispatch,p.driver,device,
-                    p.session->key.data,p.session->key.route,&p.session->trace);
-                require(p.session->module!=nullptr,"selected runtime module admission");
-                sessions().publish(p.session);
-            }catch(...) {sessions().retain(p.session);throw;}
-        }
-        p.module=p.session->module;
+        if(const auto code=p.open_session(job->fault))return fail(code);
+        if(t)t->sdkEnd=stamp();
     }
     if(p.session->state.load(std::memory_order_acquire)!=SessionState::Ready)return fail(0xe020);
     job->resources=std::make_shared<Job::Resources>(work.binding.transport);
@@ -830,6 +1003,21 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
             work.binding.transport->discard_recording(work.binding.ticket);
             job->code=0xe008;job->failedPass=index+1;p.signal(job); return {work.job,false,{}};
         }
+        if(job->warmup && index==0 && job->fault==Fault::None &&
+           !p.config.qaObservations && !p.config.qaPreparation && !p.guides && !p.guidePreparation.valid()) {
+            // NGX has finished opening. Overlap first feature creation with
+            // independent OFA preparation. The future transfers exclusive
+            // session ownership; the helper never submits frame/queue work.
+            p.guidePreparation=std::async(std::launch::async,
+                [context=p.context, allocation=d.allocation, shader=p.config.guides, interval=p.config.frameIntervalNs] {
+                    Impl::PreparedGuides prepared;
+                    prepared.begin=stamp();
+                    prepared.guides=std::make_unique<D3D12Guides>(context->device(),context->queue(),
+                        allocation,shader,interval,&prepared.timing);
+                    return prepared;
+                });
+        }
+        if(t)t->recordBegin=stamp();
         if(p.config.qaObservations||job->observation)job->qaTiming[3]=stamp();
         p.creationReceipt={};
         const CreateScope createScope(p.driver.get(),p.creationReceipt);
@@ -852,6 +1040,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         job->code=static_cast<uint32_t>(code); job->created=code==NVSDK_NGX_Result_Success;
         if(!job->created)job->failedPass=index+1;
         checked(r.creation->Close(),"owned creation close");
+        if(t)t->recordEnd=stamp();
         ID3D12CommandList* lists[]{r.creation.Get()}; p.context->queue()->ExecuteCommandLists(1,lists);
         job->chronology[4]=stamp();
         job->submitted=r.submission->submitted(p.context->queue());
@@ -873,17 +1062,30 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const bool reset=p.reset || !p.previousKey || p.previousKey->historyEpoch!=work.job.key.historyEpoch ||
         p.previousKey->frame.contentEpoch!=work.job.key.frame.contentEpoch ||
         p.previousKey->frame.ingressSequence+1!=work.job.key.frame.ingressSequence;
-    if(!p.guides) p.guides=std::make_unique<D3D12Guides>(device,p.context->queue(),d.allocation,p.config.guides,p.config.frameIntervalNs);
+    if(!p.guides) {
+        if(t)t->guideInit=stamp();
+        if(p.guidePreparation.valid()) {
+            auto prepared=p.guidePreparation.get();
+            p.guides=std::move(prepared.guides);
+            if(t) { t->flowInitBegin=prepared.begin;t->flowInit=prepared.timing; }
+        } else {
+            if(t)t->flowInitBegin=t->guideInit;
+            p.guides=std::make_unique<D3D12Guides>(device,p.context->queue(),d.allocation,p.config.guides,p.config.frameIntervalNs,
+                t?&t->flowInit:nullptr);
+        }
+    }
     if(p.config.qaPreparation && !p.preparation.load(std::memory_order_relaxed))
         p.preparation.store(std::make_shared<const GuidePreparation>(GuidePreparation{
             work.job.key,p.guides->observation_descriptors(),p.guides->grid_size()}),std::memory_order_release);
     const int64_t tGuide0=stamp();
+    if(t)t->guideSubmit=tGuide0;
     const FlowImage current{work.job.key,job->frame->analysis.Get(),producer};
     std::optional<FlowImage> previous;
     if(!reset) previous.emplace(FlowImage{*p.previousKey,p.previousFrame->analysis.Get(),p.previousFrame->producer});
     const auto flow=p.guides->submit({current,previous?&*previous:nullptr,d.allocation,d.active,reset,work.job.input.settings.stabilize.motionMode});
     if(flow!=FlowProblem::None) return fail(0xe100+static_cast<uint32_t>(flow));
     const auto* guide=p.guides->result(); require(guide && guide->key==work.job.key,"exact native guides");
+    if(t)t->guideTarget=guide->complete.value;
     job->flow.emplace(*guide);
     job->guideGrid=p.guides->grid_size();
         appliedPerf.store(static_cast<uint32_t>(p.guides->perf_level()));appliedGrid.store(p.guides->grid_size());appliedHint.store(p.guides->hint_grid_size());
@@ -891,10 +1093,12 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     p.pendingGuide.emplace(work.job.key);
     checked(p.context->queue()->Wait(guide->complete.fence,guide->complete.value),"native guide queue dependency");
     const int64_t tGuide1=stamp();
+    if(t)t->guideDone=tGuide1;
     const auto view=work.binding.transport->begin_worker(work.binding.ticket);
     require(view.has_value(),"actual Bridge worker admission");
     job->output=view->output;
     const int64_t tAlloc0=stamp();
+    if(t) { t->workerTarget=view->completionValue;t->allocBegin=tAlloc0; }
     const ColorLayout layout{size,working,work.job.input.settings.passes>1};
     if(!p.pool || p.pool->layout!=layout)p.pool=std::make_shared<ColorSlabPool>(layout);
     r.pool=p.pool;
@@ -915,6 +1119,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         if(!p.config.stabilize.empty()) r.stabilizeHeap=heap(device,9);
     }
     const int64_t tAlloc1=stamp();
+    if(t) { t->allocEnd=tAlloc1;t->recordBegin=tAlloc1; }
     auto* list=view->commands;
     if(slab) { // A returned slab ended its last submitted job in COMMON, including status.
         for(auto& color:r.colors) if(color)
@@ -932,7 +1137,8 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(list,job->frame->original.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const int64_t tColor0=stamp();
-    r.color=std::make_unique<D3D12ColorPass>(device,p.config.color);
+    if(!p.color) p.color=std::make_shared<D3D12ColorPass>(device,p.config.color);
+    r.color=p.color;
     const int64_t tColor1=stamp();
     barrier(list,r.colors[2].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     require(r.color->record(list,r.prepareHeap.Get(),*plan,job->frame->original.Get(),
@@ -952,12 +1158,13 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         plan->whitePoint,float(working.width)/float(size.width),float(working.height)/float(size.height),
         plan->codecColor,plan->codecAlpha,gate.ready,ct(5),ct(6),ct(7)};
     const int64_t tCore0=stamp();
-    r.core=std::make_unique<Core>(p.instance,std::make_unique<TracedCodec>(device,p.config.codec,*job),
+    if(!p.codec) p.codec=std::make_shared<D3D12Codec>(device,p.config.codec);
+    r.core=std::make_unique<Core>(p.instance,std::make_unique<TracedCodec>(p.codec,*job),
         std::make_unique<Evaluator>(std::array{p.passes[0].get(),p.passes[1].get()},job));
     const int64_t tCore1=stamp();
     p.subscribe(job);
     const auto result=r.core->record(input);
-    if(job->chronology[1]>tCore1) {
+    if(!job->warmup && job->chronology[1]>tCore1) {
         prepPre.fetch_add(tGuide0-job->qaTiming[1],std::memory_order_relaxed);prepGuide.fetch_add(tGuide1-tGuide0,std::memory_order_relaxed);
         prepWorker.fetch_add(tAlloc0-tGuide1,std::memory_order_relaxed);prepAlloc.fetch_add(tAlloc1-tAlloc0,std::memory_order_relaxed);
         prepColor.fetch_add(tColor1-tColor0,std::memory_order_relaxed);prepMid.fetch_add(tCore0-tColor1,std::memory_order_relaxed);
@@ -967,6 +1174,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->evaluated=result.evaluated; job->composed=result.composed; job->code=result.error;
     job->completedPasses=result.passes;job->failedPass=result.failedPass;job->passError=result.passError;
     if(result.state!=CoreState::Recorded || job->fault==Fault::Submission) {
+        if(t)t->recordEnd=stamp();
         require(r.submission->discard(),"unsubmitted evaluation discard");
         require(work.binding.transport->discard_recording(work.binding.ticket),"failed core Bridge discard");
         if(job->fault==Fault::Submission) job->code=0xe010;
@@ -1049,6 +1257,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
             barrier(list,r.guideObservations[i].Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
         }
     }
+    if(t)t->recordEnd=stamp();
     job->submitted=work.binding.transport->submit_worker(work.binding.ticket);
     r.slabExecuted=job->submitted;
     job->chronology[4]=stamp();
@@ -1063,10 +1272,11 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     return {work.job,job->submitted,job};
     } catch(const std::exception& error) {
         job->diagnostic=error.what(); job->code=0xefff; p.reset=true; p.lastResetSetter="process-exception";
-        p.diagExc.fetch_add(1);if(!p.diagWhatSet.load()){{const char* m=error.what();size_t i=0;for(;m[i]&&i+1<p.diagWhat.size();++i)p.diagWhat[i]=m[i];p.diagWhat[i]=0;}p.diagWhatSet.store(true,std::memory_order_release);}p.diag_fail(0xefff);
+        p.diagExc.fetch_add(1);if(!p.diagWhatSet.load()){{const char* m=error.what();size_t i=0;for(;m[i]&&i+1<p.diagWhat.size();++i)p.diagWhat[i]=m[i];p.diagWhat[i]=0;}p.diagWhatSet.store(true,std::memory_order_release);}p.diag_fail(0xefff,*job);
         // No recording/resources means no feature submission occurred. All other
         // failures retain their exact resource owners; never manufacture completion.
         if(!job->resources && work.binding.transport->discard_recording(work.binding.ticket)) {
+            if(t)job->chronology[7]=stamp();
             job->ready.store(true,std::memory_order_release);observe_completed(*job);SetEvent(job->observed);
         }
         return {work.job,false,{}};
@@ -1099,12 +1309,16 @@ void Processor::worker_stopping() noexcept {
                 proof.callbackRetained=proof.guidePending=false;
                 return true;
             case 1:
-                if(!release_passes(p.passes))return false;
+                if(!release_passes(p.prewarmed) || !release_passes(p.passes))return false;
                 p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
                 p.stabilizeOrig={};p.stabilizeTemporal={};p.stabilizeHold={};p.stabilizer.reset();
                 p.stabilizeValid=false;p.stabilizeExtent.reset();
                 return true;
             case 2:
+                if(p.guidePreparation.valid()) {
+                    if(p.guidePreparation.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return false;
+                    p.guidePreparation={};
+                }
                 if(p.guides && !p.guides->close())return false;
                 p.guides.reset();
                 return true;
@@ -1140,11 +1354,13 @@ double qpc_ms(int64_t delta) {
     LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
     return freq.QuadPart>0?1000.0*static_cast<double>(delta)/static_cast<double>(freq.QuadPart):0.0;
 }
-void note_admit(uint64_t tick,int64_t qpc) {
-    const auto i=tick&255;
-    tickRing.tick[i].store(0,std::memory_order_release);
-    tickRing.qpc[i].store(qpc,std::memory_order_relaxed);
-    tickRing.tick[i].store(tick,std::memory_order_release);
+bool trace_job_timeline() noexcept {
+    static const bool enabled=[] {
+        char value[2]{};
+        size_t size=0;
+        return getenv_s(&size,value,sizeof(value),"OBS_NR_JOB_TIMELINE")==0 && size==sizeof(value) && value[0]=='1';
+    }();
+    return enabled;
 }
 std::string take_job_trace_base() {
     const auto head=jobTraceHead.load(std::memory_order_relaxed);
@@ -1153,7 +1369,7 @@ std::string take_job_trace_base() {
     for(unsigned k=n;k>0;--k) {
         const auto& e=jobTrace[(head-k)&15];
         char buf[96];
-        std::snprintf(buf,sizeof buf,"%s%llu:q%.0f/r%.0f/t%.0f%s",out.empty()?"":",",static_cast<unsigned long long>(e.deadline.load()%1000),
+        std::snprintf(buf,sizeof buf,"%s%llu:q%.0f/r%.0f/t%.0f%s",out.empty()?"":",",static_cast<unsigned long long>(e.serial.load()),
             qpc_ms(e.queue.load()),qpc_ms(e.run.load()),qpc_ms(e.total.load()),e.late.load()?"L":"");
         out+=buf;
     }
@@ -1170,7 +1386,7 @@ std::string take_job_trace() {
     const auto head=eligHead.load(std::memory_order_relaxed);const unsigned n=head<8?head:8;
     for(unsigned k=n;k>0;--k) {
         const auto& e=eligTrace[(head-k)&15];
-        std::snprintf(buf,sizeof buf,"%s%llu:i%x/c%x/f%x",k==n?"":",",static_cast<unsigned long long>(e.deadline.load()%1000),e.invalid.load(),e.code.load(),e.flags.load());
+        std::snprintf(buf,sizeof buf,"%s%llu:i%x/c%x/f%x",k==n?"":",",static_cast<unsigned long long>(e.serial.load()),e.invalid.load(),e.code.load(),e.flags.load());
         out+=buf;
     }
     out+=")";

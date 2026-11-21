@@ -13,11 +13,12 @@ public:
     ~NativeVfg();
     NativeVfg(const NativeVfg&) = delete;
     NativeVfg& operator=(const NativeVfg&) = delete;
-    // Binds the current (A, B) input pair once, then runs FrameIndex=sub (1..multiplier-1)
-    // and synchronizes the CUDA stream so gpu.exchange[1 + sub] is ready for D3D12 present.
-    bool generate_subframe(uint32_t subIndex, bool newPair, bool shotChange);
-    bool enqueue_subframes(bool shotChange);
+    // stageFence is the signal already queued by Gpu::try_stage. CUDA waits on
+    // it before reading the pair and records each output's completion in order.
+    bool enqueue_subframes(uint64_t stageFence, bool shotChange);
     void wait_subframe(uint32_t subIndex);
+    bool subframe_ready(uint32_t subIndex);
+    void synchronize();
     unsigned sdk_version() const noexcept;
 };
 } // namespace nr::fg::vfg

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "obs_upscale_filter.h"
 #include "obs_upscale_dlss.h"
+#include "obs_quality_trace.h"
 
 #include <obs-module.h>
 #include <graphics/vec2.h>
@@ -102,6 +103,7 @@ struct Filter {
     gs_color_format captureFormat = GS_UNKNOWN;
     uint32_t captureWidth = 0, captureHeight = 0;
     uint64_t ticks[2]{};
+    uint64_t lastTraceTick{};
     unsigned current = 0;
     obs_source_t* lastTarget = nullptr; // Compare identity only; never dereference after the draw.
     std::shared_ptr<const Settings> lastSettings;
@@ -271,6 +273,14 @@ static bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Ex
 #endif
     auto* output = obs_upscale_dlss_render(f.dlss, input, adjacent ? prior : 0,
                                           out.width, out.height, settings.model, settings.runtime.c_str());
+    if (nr::quality::trace_frames() && f.lastTraceTick != now) {
+        f.lastTraceTick = now;
+        const auto* parent = obs_filter_get_parent(f.source);
+        const auto* uuid = parent ? obs_source_get_uuid(parent) : nullptr;
+        blog(LOG_INFO, "[quality] stage=sr obs_tick_ns=%llu input_tick_ns=%llu source=%s path=%s size=%ux%u",
+             nr::quality::id(now), nr::quality::id(adjacent ? prior : now), uuid ? uuid : "-",
+             output ? "dlss" : "spatial_fallback", out.width, out.height);
+    }
     const bool linear = gs_set_linear_srgb(true);
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(true);

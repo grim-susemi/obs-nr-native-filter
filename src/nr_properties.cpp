@@ -184,6 +184,7 @@ StatusSnapshot status(Status state,Reason reason)
     case Reason::RetirementBudget:result.reason="retirementBudget";break;
     case Reason::PassFailed:result.reason="passFailed";break;
     case Reason::WorkScaleTooSmall:result.reason="workScaleTooSmall";break;
+    case Reason::ModelWarmup:result.reason="modelWarmup";break;
     }
     return result;
 }

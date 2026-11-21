@@ -212,9 +212,10 @@ void snapshot_when_committed(){
  auto h=header_fixture();auto& f=h.frames[0];InterlockedExchange64(&f.words[1],2);
  InterlockedExchange64(&f.words[0],1);InterlockedExchange64(&f.words[2],2000);InterlockedExchange64(&f.words[3],2007);
  InterlockedExchange64(&f.words[4],(LONG64{16}<<32)|16);
+ InterlockedExchange64(&f.words[15],16666667);
  InterlockedExchange64(&f.words[5],static_cast<LONG64>(DXGI_FORMAT_R8G8B8A8_UNORM));InterlockedExchange64(&f.sequence,4);
  const auto result=snapshot(f);
- expect(result&&result->serial==2&&result->timestampNs==2000&&result->shape.width==16,"committed wire value");
+ expect(result&&result->serial==2&&result->timestampNs==2000&&result->shape.width==16&&result->obsTick==16666667,"committed wire value and OBS correlation tick");
 }
 struct CloseSourceFailure {
  std::array<HANDLE,3> sources{};

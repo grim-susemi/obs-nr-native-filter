@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "nr_model_passes.h"
 #include "nr_model_layout.h"
+#include "nr_prewarm.h"
 #include <cstdio>
 #include <stdexcept>
 using namespace nr;
@@ -114,9 +115,44 @@ void layouts() {
             layout!=ColorLayout{{1280,720},work,multi},"pool mixed native/work/multipass keys");
     }
 }
+void inactive_prewarm_adoption() {
+    const FrameDescriptor sdr{{1920,1080},{0,0,1920,1080},PixelFormat::Rgba8,
+        ColorSpace::Rec709Srgb,AlphaMode::Premultiplied,80.0f};
+    const FrameDescriptor hdr{{1920,1080},{0,0,1920,1080},PixelFormat::Rgba16Float,
+        ColorSpace::ScRgbLinear,AlphaMode::Premultiplied,80.0f};
+    const ModelTuning tuning{1,0,2.0f,0.0f,0.0f,-1.0f,false};
+    const ModelTuning otherTuning{1,0,1.0f,0.0f,0.0f,-1.0f,false};
+    const Settings settings{{1},true,"model",{1.0f},tuning,2,75,tuning};
+    const Settings otherSettings{{1},true,"model",{1.0f},tuning,2,75,otherTuning};
+    const PrewarmKey key{2,3,"hash",4,5,6,sdr,{1440,810},{1920,1080},settings};
+    const PrewarmRequest prepared{key,7,true},active{key,8,false};
+    expect(can_adopt_prewarm(prepared,active,key,8,true),"exact completed two-pass preparation may adopt after a logical cut");
+    expect(!can_adopt_prewarm(prepared,active,key,8,false),"cannot adopt before both creation fences");
+    expect(!can_adopt_prewarm(prepared,{key,8,true},key,8,true),"inactive observation cannot authorize adoption");
+    expect(!can_adopt_prewarm(prepared,active,key,9,true),"cannot adopt stale active observation");
+    expect(!can_adopt_prewarm({key,9,true},active,key,8,true),"cannot adopt when the job predates prepared history");
+    const PrewarmKey mismatches[]{
+        {9,3,"hash",4,5,6,sdr,{1440,810},{1920,1080},settings},
+        {2,9,"hash",4,5,6,sdr,{1440,810},{1920,1080},settings},
+        {2,3,"replacement",4,5,6,sdr,{1440,810},{1920,1080},settings},
+        {2,3,"hash",9,5,6,sdr,{1440,810},{1920,1080},settings},
+        {2,3,"hash",4,9,6,sdr,{1440,810},{1920,1080},settings},
+        {2,3,"hash",4,5,9,sdr,{1440,810},{1920,1080},settings},
+        {2,3,"hash",4,5,6,hdr,{1440,810},{1920,1080},settings},
+        {2,3,"hash",4,5,6,sdr,{1280,720},{1920,1080},settings},
+        {2,3,"hash",4,5,6,sdr,{1440,810},{2560,1440},settings},
+        {2,3,"hash",4,5,6,sdr,{1440,810},{1920,1080},otherSettings}
+    };
+    for(const auto& mismatch:mismatches) {
+        expect(!can_adopt_prewarm(prepared,{mismatch,8,false},mismatch,8,true),
+            "preparation from another configuration was reused");
+        expect(!can_adopt_prewarm(prepared,{mismatch,8,false},key,8,true),
+            "stale configured source was reused");
+    }
+}
 }
 int main() try {
-    creation_gate();failures();creation_failure_and_instances();layouts();
+    creation_gate();failures();creation_failure_and_instances();layouts();inactive_prewarm_adoption();
     std::printf("PASS model_contract checks=%u creation/readiness/latches/physical-status/release/instances/layout/states CPU_only=true\n",checks);
     return 0;
 } catch(const std::exception& e) {std::fprintf(stderr,"FAIL %s checks=%u\n",e.what(),checks);return 1;}

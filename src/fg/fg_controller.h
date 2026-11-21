@@ -25,9 +25,17 @@ public:
     bool alive() const { return WaitForSingleObject(child_, 0) == WAIT_TIMEOUT; }
     bool exited() const { return WaitForSingleObject(child_, 0) == WAIT_OBJECT_0; }
     bool offer(const ipc::Offer&, const ipc::Shape&, LUID) noexcept;
+    bool request_resize() noexcept { return InterlockedCompareExchange64(&view_->state, 2, 1) == 1; }
+    bool resize_drained() const noexcept { return InterlockedCompareExchange64(&view_->state, 3, 3) == 3; }
     void stop() noexcept { if (view_) InterlockedExchange64(&view_->state, -1); }
-    void set_fps_overlay(uint32_t pos) noexcept { if (view_) InterlockedExchange(&view_->fpsOverlay, static_cast<LONG>(pos)); }
-    void set_low_latency(uint32_t on) noexcept { if (view_) InterlockedExchange(&view_->lowLatency, static_cast<LONG>(on)); }
+    void set_fps_overlay(uint32_t pos) noexcept {
+        options_.fpsOverlay = pos;
+        if (view_) InterlockedExchange(&view_->fpsOverlay, static_cast<LONG>(pos));
+    }
+    void set_low_latency(uint32_t on) noexcept {
+        options_.lowLatency = on;
+        if (view_) InterlockedExchange(&view_->lowLatency, static_cast<LONG>(on));
+    }
     static std::wstring find_runtime_dir();
 };
 } // namespace nr::fg::vfg

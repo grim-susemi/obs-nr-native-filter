@@ -3,15 +3,26 @@
 #include <algorithm>
 #include <dxgi1_5.h>
 #include <intrin.h>
+#include "vfg_content_compare_shader.h"
 
 namespace nr::fg::vfg {
 namespace {
-D3D12_HEAP_PROPERTIES gpu_heap()
+D3D12_HEAP_PROPERTIES gpu_heap(D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT)
 {
     D3D12_HEAP_PROPERTIES p{};
-    p.Type = D3D12_HEAP_TYPE_DEFAULT;
+    p.Type = type;
     p.CreationNodeMask = p.VisibleNodeMask = 1;
     return p;
+}
+
+constexpr size_t compare_bytes = 64 * sizeof(uint32_t); // Must match the HLSL shard count.
+
+D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+    D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+    return barrier;
 }
 }
 Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
@@ -37,7 +48,8 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
         check(device_->CreateCommandList(0, dq.Type, slot.alloc.Get(), nullptr, IID_PPV_ARGS(&slot.list)), "present list");
         check(slot.list->Close(), "initial list close");
     }
-    check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_)), "present fence");
+    const auto fenceFlags = multiplier > 1 ? D3D12_FENCE_FLAG_SHARED : D3D12_FENCE_FLAG_NONE;
+    check(device_->CreateFence(0, fenceFlags, IID_PPV_ARGS(&done_)), "present fence");
     event_.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event_.h) check(E_FAIL, "present fence event");
 
@@ -81,6 +93,138 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&exchange[i])), "CUDA exchange buffer");
         check(device_->CreateSharedHandle(exchange[i].Get(), nullptr, GENERIC_ALL, nullptr, &exported[i].h), "CUDA NT handle");
     }
+    init_compare();
+}
+
+void Gpu::init_compare()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC views{};
+    views.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    views.NumDescriptors = content_input_count;
+    views.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    check(device_->CreateDescriptorHeap(&views, IID_PPV_ARGS(&compareViews_)), "content compare descriptor heap");
+    compareViewStride_ = device_->GetDescriptorHandleIncrementSize(views.Type);
+    auto handle = compareViews_->GetCPUDescriptorHandleForHeapStart();
+    for (const auto& texture : input) {
+        device_->CreateShaderResourceView(texture.Get(), nullptr, handle);
+        handle.ptr += compareViewStride_;
+    }
+
+    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    D3D12_ROOT_PARAMETER parameters[3]{};
+    for (UINT i = 0; i < 2; ++i) {
+        ranges[i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, i, 0, 0};
+        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[i].DescriptorTable = {1, &ranges[i]};
+    }
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    D3D12_ROOT_SIGNATURE_DESC signature{};
+    signature.NumParameters = 3;
+    signature.pParameters = parameters;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+        "content compare root signature serialize");
+    check(device_->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+        IID_PPV_ARGS(&compareRoot_)), "content compare root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
+    pipeline.pRootSignature = compareRoot_.Get();
+    pipeline.CS = {vfg_content_shader, sizeof(vfg_content_shader)};
+    check(device_->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&comparePipeline_)), "content compare pipeline");
+
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = compare_bytes;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const auto allocate = [&](D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES initial, ComPtr<ID3D12Resource>& out) {
+        const auto heap = gpu_heap(type);
+        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, initial, nullptr,
+            IID_PPV_ARGS(&out)), "content compare buffer");
+    };
+    buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    allocate(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, compareFlags_);
+    buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
+    allocate(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, compareZero_);
+    allocate(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, compareReadback_);
+    void* mapped{};
+    const D3D12_RANGE noRead{0, 0}, written{0, compare_bytes};
+    check(compareZero_->Map(0, &noRead, &mapped), "content compare zero buffer map");
+    memset(mapped, 0, compare_bytes);
+    compareZero_->Unmap(0, &written);
+}
+
+void Gpu::prepare_input(unsigned index)
+{
+    const uint64_t reader = inputReadFence_[index];
+    if (reader <= inputWaitFence_[index]) return;
+    const uint64_t completed = done_->GetCompletedValue();
+    if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "present device removed");
+    if (completed < reader)
+        check(ipcQueue->Wait(done_.Get(), reader), "private input recycle wait");
+    inputWaitFence_[index] = reader;
+}
+
+bool Gpu::commands_ready() const
+{
+    const auto completed = done_->GetCompletedValue();
+    if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "present device removed");
+    return completed != UINT64_MAX && completed >= ring_[ringIdx_].fenceVal;
+}
+
+bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
+{
+    if (compareFence_ || !commands_ready()) return false;
+    auto* cmd = begin();
+    auto flagsToCopy = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmd->ResourceBarrier(1, &flagsToCopy);
+    cmd->CopyBufferRegion(compareFlags_.Get(), 0, compareZero_.Get(), 0, compare_bytes);
+    D3D12_RESOURCE_BARRIER barriers[]{
+        transition(input[previous].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(input[current].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    };
+    cmd->ResourceBarrier(3, barriers);
+    ID3D12DescriptorHeap* heaps[]{compareViews_.Get()};
+    cmd->SetDescriptorHeaps(1, heaps);
+    cmd->SetComputeRootSignature(compareRoot_.Get());
+    cmd->SetPipelineState(comparePipeline_.Get());
+    auto view = compareViews_->GetGPUDescriptorHandleForHeapStart();
+    const auto base = view.ptr;
+    view.ptr = base + UINT64{compareViewStride_} * previous;
+    cmd->SetComputeRootDescriptorTable(0, view);
+    view.ptr = base + UINT64{compareViewStride_} * current;
+    cmd->SetComputeRootDescriptorTable(1, view);
+    cmd->SetComputeRootUnorderedAccessView(2, compareFlags_->GetGPUVirtualAddress());
+    cmd->Dispatch(static_cast<UINT>((desc_.Width + 63) / 64), (desc_.Height + 15) / 16, 1);
+    for (unsigned i = 0; i < 2; ++i)
+        std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+    barriers[2] = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->ResourceBarrier(3, barriers);
+    cmd->CopyBufferRegion(compareReadback_.Get(), 0, compareFlags_.Get(), 0, compare_bytes);
+    flagsToCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    flagsToCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    cmd->ResourceBarrier(1, &flagsToCopy);
+    finish(false);
+    compareFence_ = fence_;
+    inputReadFence_[previous] = inputReadFence_[current] = fence_;
+    check(done_->SetEventOnCompletion(compareFence_, ready), "content compare event");
+    return true;
+}
+
+std::optional<bool> Gpu::compare_result()
+{
+    const auto completed = done_->GetCompletedValue();
+    if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "content compare device removed");
+    if (!compareFence_ || completed == UINT64_MAX || completed < compareFence_) return {};
+    void* mapped{};
+    const D3D12_RANGE readRange{0, compare_bytes}, noWrite{0, 0};
+    check(compareReadback_->Map(0, &readRange, &mapped), "content compare result map");
+    const auto* flags = static_cast<const uint32_t*>(mapped);
+    const bool same = std::all_of(flags, flags + compare_bytes / sizeof(*flags), [](uint32_t x) { return x == 0; });
+    compareReadback_->Unmap(0, &noWrite);
+    compareFence_ = 0;
+    return same;
 }
 
 ID3D12GraphicsCommandList* Gpu::begin()
@@ -152,12 +296,19 @@ void Gpu::move(ID3D12Resource* texture, ID3D12Resource* buffer, bool toBuffer)
     std::swap(t.StateBefore, t.StateAfter);
     cmd->ResourceBarrier(1, &b);
 }
-void Gpu::stage(unsigned previous, unsigned current)
+std::optional<uint64_t> Gpu::try_stage(unsigned previous, unsigned current)
 {
+    // The ring is owned by this thread and the draw fence is monotonic, so
+    // begin() cannot wait for an allocator once this check passes.
+    if (!commands_ready()) return {};
     (void)begin();
     move(input[previous].Get(), exchange[0].Get(), true);
     move(input[current].Get(), exchange[1].Get(), true);
-    finish(true);
+    finish(false);
+    inputReadFence_[previous] = inputReadFence_[current] = fence_;
+    // The same draw queue has also consumed any previously presented CUDA outputs
+    // before this signal, so CUDA can safely reuse all exchange buffers.
+    return fence_;
 }
 void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels)
 {
@@ -200,7 +351,36 @@ void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const ui
 }
 UINT Gpu::present(ID3D12Resource* source, bool synthetic)
 {
-    if (WaitForSingleObject(latency_.h, 240) != WAIT_OBJECT_0) check(E_FAIL, "swapchain latency timeout");
+    if (!latencyReady_ && WaitForSingleObject(latency_.h, 240) != WAIT_OBJECT_0)
+        check(E_FAIL, "swapchain latency timeout");
+    return present_ready(source, synthetic);
+}
+
+std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t deadlineNs)
+{
+    // Don't let begin() enter its normal blocking allocator wait on this path.
+    const auto completed = done_->GetCompletedValue();
+    if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "present device removed");
+    if (completed < ring_[ringIdx_].fenceVal) return {};
+    const auto now = clock_ns();
+    if (now >= deadlineNs) return {};
+    if (!latencyReady_) {
+        const auto budgetMs = static_cast<DWORD>(std::min<uint64_t>((deadlineNs - now) / 1'000'000, 240));
+        const DWORD result = WaitForSingleObject(latency_.h, budgetMs);
+        if (result == WAIT_TIMEOUT) return {};
+        if (result != WAIT_OBJECT_0)
+            check(result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL, "synthetic swapchain wait");
+        latencyReady_ = true;
+        // If the thread woke too late, keep the acquired signal for the next
+        // admitted frame. Waiting again without a Present could miss the signal.
+        if (clock_ns() >= deadlineNs) return {};
+    }
+    return present_ready(source, true);
+}
+
+UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic)
+{
+    latencyReady_ = false;
     ComPtr<ID3D12Resource> dst;
     check(swap_->GetBuffer(swap_->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&dst)), "back buffer");
     auto* cmd = begin();
@@ -236,6 +416,10 @@ UINT Gpu::present(ID3D12Resource* source, bool synthetic)
         cmd->ResourceBarrier(2, b);
     }
     finish(false);
+    if (!synthetic) {
+        for (unsigned i = 0; i < input.size(); ++i)
+            if (source == input[i].Get()) inputReadFence_[i] = fence_;
+    }
     const auto hr = allowTearing_ ? swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING) : swap_->Present(1, 0);
     check(hr == S_OK ? hr : FAILED(hr) ? hr : E_FAIL, "DXGI Present");
     UINT presentId{};

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "native_vfg.h"
+#include "vfg_cadence.h"
 #include "vfg_hud.h"
 #include "vfg_reflex.h"
 #include <mmsystem.h>
@@ -7,6 +8,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cwchar>
+#include <fcntl.h>
+#include <io.h>
+#include <intrin.h>
 #include <thread>
 
 namespace nr::fg::vfg {
@@ -73,25 +77,33 @@ struct Feed {
     std::atomic_uint64_t heartbeat{clock_ns()};
     std::atomic_int result{-1};
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
+    bool active() { return state(view) == 1 && !stopped(); }
     void beat() { heartbeat.store(clock_ns()); }
 };
 
 void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a, UINT id, uint64_t workNs = 0)
 {
     const auto q = [](uint64_t n) { return static_cast<unsigned long long>(n); };
-    fprintf(f.log, "event=%s generation=%llu b=%llu b_qpc_ns=%llu b_arrival_ns=%llu a=%llu a_qpc_ns=%llu present_id=%u qpc_ns=%llu work_ns=%llu\n",
-        kind, q(b.generation), q(b.serial), q(b.timestampNs), q(b.arrivalNs), q(a ? a->serial : 0),
+    fprintf(f.log, "event=%s generation=%llu b=%llu b_qpc_ns=%llu b_arrival_ns=%llu b_obs_tick=%llu a=%llu a_qpc_ns=%llu present_id=%u qpc_ns=%llu work_ns=%llu\n",
+        kind, q(b.generation), q(b.serial), q(b.timestampNs), q(b.arrivalNs), q(b.obsTick), q(a ? a->serial : 0),
         q(a ? a->timestampNs : 0), id, q(clock_ns()), q(workNs));
 }
 
-void pace_until(uint64_t targetNs, Feed& f)
+void pace_until(uint64_t targetNs, Feed& f, HANDLE timer)
 {
     for (;;) {
-        if (f.stopped()) return;
+        if (!f.active()) return;
         const uint64_t now = clock_ns();
         if (now >= targetNs) return;
-        const uint64_t remMs = (targetNs - now) / ms;
-        if (remMs >= 2) Sleep(1);
+        const auto remaining = targetNs - now;
+        if (remaining <= 300000) { YieldProcessor(); continue; }
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>((remaining - 200000) / 100);
+        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            if (WaitForSingleObject(timer, static_cast<DWORD>(remaining / ms + 2)) != WAIT_FAILED)
+                continue;
+        }
+        if (remaining >= ms) Sleep(1);
         else SwitchToThread();
     }
 }
@@ -106,9 +118,12 @@ void frames(Feed& f)
 {
     TimerPeriodGuard timerRes;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    while (state(f.view) == 0 && !f.stopped()) Sleep(1);
-    if (f.stopped()) return;
+    if (!f.active()) return;
     f.beat();
+    Handle compareReady, paceTimer;
+    compareReady.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!compareReady.h) check(HRESULT_FROM_WIN32(GetLastError()), "comparison event");
+    paceTimer.h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (f.view.width < 320 || f.view.height < 180 || f.view.width > 7680 || f.view.height > 4320 ||
         !f.view.generation || !f.view.mapping[0])
         check(E_INVALIDARG, "unsupported session offer");
@@ -136,9 +151,12 @@ void frames(Feed& f)
         vfg ? "nvidia-vfg-native" : "original", vfg ? vfg->sdk_version() : 0u, lastReflex);
     f.beat();
     bool shown = false;
-    unsigned nextInput = 0;
-    uint64_t newestAccepted = 0;
-    uint64_t lastOriginal = 0;
+    ContentHistory history;
+    UniqueCadence cadence;
+    uint64_t lastOriginalTarget{};
+    uint64_t lastPeriod{};
+    bool sawRepeat = false;
+    bool cudaPending = false;
     uint64_t hudWindowStart = clock_ns();
     uint64_t hudOrigFrames = 0, hudPresentedFrames = 0;
     uint32_t lastHudPos = UINT32_MAX;
@@ -168,89 +186,149 @@ void frames(Feed& f)
             lastHudText = hudText;
         }
     };
+    struct Incoming {
+        ipc::Frame frame;
+        unsigned index;
+        bool continuous;
+        uint64_t compareStart{};
+    };
+    std::optional<Incoming> incoming;
     uint64_t reflexFrameId = 0;
-    while (!f.stopped()) {
+    while (f.active()) {
         sync_reflex();
-        const auto index = nextInput;
-        const auto next = consumer.copy_next(gpu.input[index].Get());
-        if (!next.current) {
-            if (next.status != ipc::Status::Pending && next.status != ipc::Status::Dropped)
-                check(E_FAIL, "IPC copy_next");
-            WaitForSingleObject(consumer.frame_event(), 4);
-            continue;
-        }
-        if (next.status != ipc::Status::Ok) check(E_FAIL, "IPC copy submit");
-        const auto& b = next.current->frame;
-        const auto deadline = clock_ns() + 200 * ms;
-        auto ready = [&](const ipc::CopyTicket& t) {
-            for (;;) {
-                const auto status = consumer.copy_status(t);
-                if (status == ipc::Status::Ok) return;
-                if (status != ipc::Status::Pending || clock_ns() >= deadline) check(E_FAIL, "IPC copy completion");
-                Sleep(0);
+        if (!incoming) {
+            const auto index = history.input_index();
+            gpu.prepare_input(index);
+            const auto next = consumer.copy_next(gpu.input[index].Get());
+            if (!next.current) {
+                if (next.status != ipc::Status::Pending && next.status != ipc::Status::Dropped)
+                    check(E_FAIL, "IPC copy_next");
+                f.beat();
+                WaitForSingleObject(consumer.frame_event(), 4);
+                continue;
             }
-        };
-        ready(*next.current);
-        record(f, "input", b, nullptr, 0);
-        if (f.stopped()) break;
-        if (b.serial <= newestAccepted) {
-            record(f, "drop_original_stale", b, nullptr, 0);
-            continue;
+            if (next.status != ipc::Status::Ok || consumer.order_copy(*next.current, gpu.drawQueue.Get()) != ipc::Status::Ok)
+                check(E_FAIL, "IPC copy dependency");
+            const auto& b = next.current->frame;
+            record(f, "input", b, nullptr, 0);
+            const auto step = history.observe(index, b, next.previous.has_value());
+            if (step.stale) {
+                record(f, "drop_original_stale", b, nullptr, 0);
+                continue;
+            }
+            if (!step.continuous) {
+                cadence.reset();
+                lastOriginalTarget = lastPeriod = 0;
+                sawRepeat = false;
+            }
+            incoming = Incoming{b,index,step.continuous};
         }
-        newestAccepted = b.serial;
-        nextInput = index ^ 1;
+        const auto b = incoming->frame;
+        const auto index = incoming->index;
+        const auto continuous = incoming->continuous;
+        const auto anchor = history.anchor();
+        if (vfg && anchor && (incoming->compareStart || clock_ns() - b.arrivalNs <= 50 * ms)) {
+            if (!incoming->compareStart) {
+                if (!gpu.begin_compare(anchor->index, index, compareReady.h)) {
+                    pace_until(clock_ns() + 350000, f, paceTimer.h);
+                    continue;
+                }
+                incoming->compareStart = clock_ns();
+            }
+            const auto compared = gpu.compare_result();
+            if (!compared) {
+                // The completion event wakes the presentation loop. This branch
+                // does not map the comparison buffer or block a submit call.
+                const HANDLE wake[]{f.parent, compareReady.h};
+                WaitForMultipleObjects(ARRAYSIZE(wake), wake, FALSE, 2);
+                continue;
+            }
+            const auto compareNs = clock_ns() - incoming->compareStart;
+            record(f, *compared ? "repeat_input" : "content_changed", b, &anchor->frame, 0, compareNs);
+            if (*compared) {
+                sawRepeat = true;
+                incoming.reset();
+                f.beat();
+                continue;
+            }
+        }
+        incoming.reset();
         if (clock_ns() - b.arrivalNs > 50 * ms) {
             record(f, "drop_original_late", b, nullptr, 0);
+            history.invalidate();
+            cadence.reset();
+            lastOriginalTarget = lastPeriod = 0;
+            sawRepeat = false;
             continue;
         }
+        const auto timestamp = b.obsTick ? b.obsTick : b.timestampNs;
+        auto period = vfg ? cadence.observe(timestamp) : 0;
+        if (!period && vfg && anchor && (b.obsTick != 0) == (anchor->frame.obsTick != 0) &&
+            provisional_60hz(anchor->frame.obsTick ? anchor->frame.obsTick : anchor->frame.timestampNs, timestamp, sawRepeat))
+            period = period_60hz;
+        if (period != lastPeriod) lastOriginalTarget = 0;
+        lastPeriod = period;
+        const auto plan = anchor && period ? plan_cadence(b.arrivalNs, lastOriginalTarget, period, mult) : CadencePlan{};
+        const auto originalDeadline = plan.originalNs ? plan.originalNs + 5 * ms : b.arrivalNs + 50 * ms;
         const uint64_t fid = ++reflexFrameId;
         reflex.sleep(clock_ns(), clock_ns);
         reflex.marker(ReflexMarker::SimulationStart, fid);
         reflex.marker(ReflexMarker::SimulationEnd, fid);
         reflex.marker(ReflexMarker::RenderSubmitStart, fid);
-        if (vfg && next.previous) {
-            const auto& a = next.previous->frame;
-            if (a.serial == lastOriginal && b.timestampNs > a.timestampNs && b.timestampNs - a.timestampNs <= 25 * ms) {
-                ready(*next.previous);
-                const uint64_t pairInterval = b.timestampNs - a.timestampNs;
-                const uint64_t pairStart = clock_ns();
-                gpu.stage(index ^ 1, index);
-                vfg->enqueue_subframes(false);
+        if (vfg && anchor && plan.originalNs) {
+            const auto& a = anchor->frame;
+            if (cudaPending && vfg->subframe_ready(mult - 1)) cudaPending = false;
+            const auto stageStart = clock_ns();
+            const bool pairLate = stageStart > plan.target(1) + 3 * ms;
+            const auto staged = !cudaPending && !pairLate ?
+                gpu.try_stage(anchor->index, index) : std::nullopt;
+            if (staged) {
+                record(f, "stage_queued", b, &a, 0, clock_ns() - stageStart);
+                const auto enqueueStart = clock_ns();
+                vfg->enqueue_subframes(*staged, false);
+                record(f, "cuda_enqueued", b, &a, 0, clock_ns() - enqueueStart);
+                cudaPending = true;
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
                 for (uint32_t sub = 1; sub < mult; ++sub) {
-                    if (f.stopped()) break;
-                    if (WaitForSingleObject(consumer.frame_event(), 0) == WAIT_OBJECT_0 ||
-                        clock_ns() - b.arrivalNs > 28 * ms) {
-                        record(f, "drop_vfg_subframe_late", b, &a, 0, 0);
-                        break;
-                    }
-                    const uint64_t targetNs = pairStart + (pairInterval * sub) / mult;
-                    if (clock_ns() < targetNs) pace_until(targetNs, f);
-                    if (f.stopped()) break;
+                    if (!f.active()) break;
+                    const uint64_t targetNs = plan.target(sub);
+                    if (clock_ns() < targetNs) pace_until(targetNs, f, paceTimer.h);
+                    if (!f.active()) break;
                     const uint64_t waitStart = clock_ns();
-                    vfg->wait_subframe(sub);
+                    const auto cutoff = std::min<uint64_t>(targetNs + 3 * ms, plan.target(sub + 1));
+                    bool generatedReady = false;
+                    while (f.active() && clock_ns() < cutoff) {
+                        if (vfg->subframe_ready(sub)) { generatedReady = true; break; }
+                        pace_until(std::min<uint64_t>(clock_ns() + 350000, cutoff), f, paceTimer.h);
+                    }
                     const uint64_t genElapsed = clock_ns() - waitStart;
-                    if (clock_ns() - b.arrivalNs <= 40 * ms) {
+                    if (!f.active()) break;
+                    if (generatedReady && clock_ns() < cutoff) {
                         refresh_hud(false);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentStart, fid, sub);
-                        const UINT pid = gpu.present(gpu.exchange[1 + sub].Get(), true);
+                        const auto pid = gpu.try_present_synthetic(gpu.exchange[1 + sub].Get(), cutoff);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);
-                        record(f, "present_vfg_subframe", b, &a, pid, genElapsed);
+                        record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
+                            pid.value_or(0), genElapsed);
                     } else {
                         record(f, "drop_vfg_subframe_late", b, &a, 0, genElapsed);
                     }
                 }
             } else {
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
-                record(f, "drop_vfg_discontinuity", b, &a, 0);
+                record(f, cudaPending ? "drop_vfg_gpu_busy" :
+                    pairLate ? "drop_vfg_pair_late" : "drop_vfg_stage_busy", b, &a, 0);
             }
         } else {
             reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
+            if (vfg && !continuous)
+                record(f, "drop_vfg_discontinuity", b, nullptr, 0);
         }
-        if (f.stopped()) break;
-        if (clock_ns() - b.arrivalNs <= 50 * ms) {
+        if (plan.originalNs) pace_until(plan.originalNs, f, paceTimer.h);
+        if (!f.active()) break;
+        if (clock_ns() <= originalDeadline) {
             if (!shown) {
                 PostMessageW(f.window, reveal, 0, 0);
                 shown = true;
@@ -260,13 +338,50 @@ void frames(Feed& f)
             const UINT pid = gpu.present(gpu.input[index].Get(), false);
             reflex.marker(ReflexMarker::PresentEnd, fid);
             record(f, "present_original", b, nullptr, pid);
-            lastOriginal = b.serial;
+            history.retain(index, b);
+            lastOriginalTarget = plan.originalNs;
             f.beat();
         } else {
             record(f, "drop_original_late", b, nullptr, 0);
+            history.invalidate();
+            cadence.reset();
+            lastOriginalTarget = lastPeriod = 0;
+            sawRepeat = false;
         }
     }
-    consumer.close();
+    // Both queues must be idle before releasing their resources or acknowledging
+    // a resize. In particular, a successful Present only submits draw work.
+    const auto drain_failure = [&] {
+        fprintf(f.log, "event=error message=presenter_drain_failed\n");
+        ShowWindowAsync(f.window, SW_HIDE);
+        TerminateProcess(GetCurrentProcess(), 5);
+        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    };
+    ComPtr<ID3D12Fence> drainFence;
+    if (FAILED(gpu.d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&drainFence))))
+        drain_failure();
+    Handle drainEvent;
+    drainEvent.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!drainEvent.h) drain_failure();
+    const auto drain = [&](ID3D12CommandQueue* queue, UINT64 value) {
+        if (FAILED(queue->Signal(drainFence.Get(), value)) ||
+            FAILED(drainFence->SetEventOnCompletion(value, drainEvent.h))) drain_failure();
+        if (WaitForSingleObject(drainEvent.h, 240) != WAIT_OBJECT_0)
+            drain_failure();
+        const auto completed = drainFence->GetCompletedValue();
+        if (completed == UINT64_MAX || completed < value)
+            drain_failure();
+    };
+    drain(gpu.ipcQueue.Get(), 1);
+    drain(gpu.drawQueue.Get(), 2);
+    try {
+        if (vfg) vfg->synchronize(); // Do not acknowledge a failed CUDA drain.
+    } catch (const std::exception& e) {
+        fprintf(f.log, "event=error message=%s\n", e.what());
+        drain_failure();
+    }
+    vfg.reset();
+    if (consumer.close() != ipc::Status::Closed) check(E_FAIL, "IPC drain incomplete");
 }
 } // namespace
 } // namespace nr::fg::vfg
@@ -296,8 +411,13 @@ int wmain(int argc, wchar_t** argv)
     if (!view) return 2;
     struct View { Session* p; ~View() { UnmapViewOfFile(p); } } map{view};
 
-    FILE* file{};
-    if (_wfopen_s(&file, argv[4], L"ab") != 0) return 2;
+    const HANDLE logHandle = CreateFileW(argv[4], FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (logHandle == INVALID_HANDLE_VALUE) return 2;
+    const int logFd = _open_osfhandle(reinterpret_cast<intptr_t>(logHandle), _O_APPEND | _O_BINARY);
+    if (logFd == -1) { CloseHandle(logHandle); return 2; }
+    FILE* file = _fdopen(logFd, "ab");
+    if (!file) { _close(logFd); return 2; }
     std::unique_ptr<FILE, decltype(&fclose)> log(file, &fclose);
     setvbuf(file, nullptr, _IONBF, 0);
 
@@ -386,7 +506,22 @@ int wmain(int argc, wchar_t** argv)
         GetDpiForWindow(window));
     Feed feed{*view, parent.h, window, file, argv[3], cliMult, hudScale};
     std::thread worker([&] {
-        try { frames(feed); feed.result.store(0); }
+        try {
+            while (!feed.stopped()) {
+                const auto current = state(*view);
+                if (current == 1) {
+                    frames(feed);
+                } else if (current == 2) {
+                    if (InterlockedCompareExchange64(&view->state, 3, 2) == 2)
+                        fprintf(file, "event=resize_drained hwnd=%p\n", static_cast<void*>(window));
+                } else if (current != 0 && current != 3) {
+                    check(E_INVALIDARG, "invalid presenter state");
+                }
+                feed.beat();
+                if (state(*view) != 1) WaitForSingleObject(parent.h, 10);
+            }
+            feed.result.store(0);
+        }
         catch (const std::exception& e) {
             fprintf(file, "event=error message=%s\n", e.what());
             InterlockedExchange64(&view->state, -1);

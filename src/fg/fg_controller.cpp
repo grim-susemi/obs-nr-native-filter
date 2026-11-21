@@ -174,6 +174,8 @@ Controller::~Controller()
 bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID adapter) noexcept
 {
     if (offer.mapping.size() >= ARRAYSIZE(view_->mapping)) return false;
+    const auto prior = InterlockedCompareExchange64(&view_->state, 0, 0);
+    if (prior != 0 && prior != 3) return false;
     view_->generation = offer.generation;
     view_->width = shape.width;
     view_->height = shape.height;
@@ -189,6 +191,6 @@ bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID ad
     } else {
         view_->monitorId[0] = L'\0';
     }
-    return InterlockedCompareExchange64(&view_->state, 1, 0) == 0;
+    return InterlockedCompareExchange64(&view_->state, 1, prior) == prior;
 }
 } // namespace nr::fg::vfg

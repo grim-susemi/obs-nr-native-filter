@@ -5,6 +5,7 @@
 #include "nr_color.h"
 #include "nr_core.h"
 #include "nr_guides.h"
+#include "nr_prewarm.h"
 #include "nr_runtime.h"
 #include "nr_model_passes.h"
 #include <string>
@@ -121,6 +122,25 @@ struct Job {
     std::string diagnostic;
     std::array<int64_t,8> chronology{}; // create/encode/evaluate/compose/execute/submitted/complete/status
     std::array<int64_t,5> qaTiming{}; // process/producer-ready/module-start/feature-start/feature-return; ready publishes.
+    int64_t admittedQpc=0, enqueuedQpc=0, dequeuedQpc=0; // Immutable across completion.
+    bool warmup=false; // Graphics assigns once before dispatch; separate from steady timing.
+    bool prewarmAdopted=false; // Worker: both feature recordings completed before first evaluation.
+    std::atomic<int64_t> deadlineQpc{0}; // Graphics observes this exact contract's deadline tick.
+    struct Timeline {
+        int64_t tick=0, obsCaptureStart=0, obsCaptureEnd=0, begin=0;
+        int64_t snapshotStart=0,snapshotEnd=0,captureStart=0,captureEnd=0;
+        int64_t settleEnd=0,producerBegin=0,producerEnd=0,guideInit=0,guideSubmit=0,guideDone=0;
+        int64_t flowInitBegin=0;
+        FlowInitTiming flowInit;
+        int64_t sdkBegin=0,sdkEnd=0,recordBegin=0,recordEnd=0,signalBegin=0,signalEnd=0,callback=0;
+        int64_t allocBegin=0,allocEnd=0;
+        std::array<int64_t,2> evaluationBegin{},evaluationEnd{};
+        uint64_t producerTarget=0,producerAtWait=0,guideTarget=0,workerTarget=0;
+        uint64_t pendingSerial=0,pendingFence=0;
+        uint32_t settle=0,guideState=0;
+        bool pendingReady=false,pendingCallback=false,pendingGuide=false,pendingHasFence=false,stop=false;
+    };
+    std::optional<Timeline> timeline; // Warmup/diagnostic only; read after ready AND dispatch returned.
     std::optional<FlowResult> flow;
     std::optional<JobKey> guideReferenceKey; // Actual SDK reference, absent on cold/reset.
     uint32_t guideGrid=0;
@@ -156,6 +176,7 @@ public:
     ~Processor() override;
     pipeline::Processed process(const pipeline::Work&,std::stop_token) override;
     void worker_service() noexcept override;
+    void request_prewarm(std::shared_ptr<const PrewarmRequest>) noexcept;
     bool request_original_marker(const std::shared_ptr<Job>&,const JobKey&);
     std::string diag() const; // N23 worker diagnostics
     void worker_stopping() noexcept override;
@@ -170,7 +191,7 @@ public:
 struct JobTimingWindow {unsigned jobs=0,late=0;double submitMeanMs=0,submitMaxMs=0,encodeMeanMs=0,encodeMaxMs=0,admitMeanMs=0,admitMaxMs=0,queueMeanMs=0,queueMaxMs=0,prodMeanMs=0,prodMaxMs=0,prepMeanMs=0,recMeanMs=0,gpuMeanMs=0,creationMeanMs=0,creationMaxMs=0;unsigned creationJobs=0;};
 int64_t qpc_now(); // diagnostic clock
 double qpc_ms(int64_t delta);
-void note_admit(uint64_t tick,int64_t qpc); // diagnostic: graphics thread stamps each tick's native tick() start
+bool trace_job_timeline() noexcept;
 JobTimingWindow take_job_timing(); // diagnostic: evaluation-job latency since the last call
 std::string take_job_trace(); // diagnostic: last completed jobs (deadline tick, queue/run/total ms, late flag)
 } // namespace nr::model

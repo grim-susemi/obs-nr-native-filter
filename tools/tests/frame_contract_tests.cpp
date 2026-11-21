@@ -395,9 +395,10 @@ void bad_control(std::string_view control)
 void held_nr_frames()
 {
     const Selection late{101, OutputKind::DelayedRaw, Status::Bypassed, Reason::DeadlineMiss, std::nullopt, std::nullopt, false};
-    expect(hold_previous_nr(late, true, 100, 0) && hold_previous_nr(late, true, 100, kMaxHeldNrFrames - 1),
+    expect(hold_previous_nr(late, true, 100, 0),
            "late job did not re-show the previous NR frame");
-    expect(!hold_previous_nr(late, true, 100, kMaxHeldNrFrames), "NR hold is not bounded");
+    const Selection nextLate{102, OutputKind::DelayedRaw, Status::Bypassed, Reason::DeadlineMiss, std::nullopt, std::nullopt, false};
+    expect(!hold_previous_nr(nextLate, true, 101, 1), "consecutive misses must advance after one NR repeat");
     expect(!hold_previous_nr(late, false, 100, 0), "held a frame the output never showed as NR");
     expect(!hold_previous_nr(late, true, 99, 0), "held an NR frame from a non-adjacent tick");
     const Selection reset{101, OutputKind::DelayedRaw, Status::Bypassed, Reason::DeadlineMiss, std::nullopt, std::nullopt, true};

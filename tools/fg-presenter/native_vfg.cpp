@@ -2,6 +2,7 @@
 #include "native_vfg.h"
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -16,14 +17,17 @@ using CUcontext = void*;
 using CUstream = void*;
 using CUevent = void*;
 using CUexternalMemory = void*;
+using CUexternalSemaphore = void*;
 using CUdeviceptr = unsigned long long;
 
 constexpr CUresult CUDA_SUCCESS = 0;
+constexpr CUresult CUDA_ERROR_NOT_READY = 600;
 constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
 constexpr unsigned int CU_STREAM_NON_BLOCKING = 1;
 constexpr int CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE = 5;
 constexpr unsigned int CU_EXTERNAL_MEMORY_DEDICATED = 1;
+constexpr int CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE = 4;
 
 struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
     int type;
@@ -45,11 +49,48 @@ struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
     unsigned int flags;
     unsigned int reserved[16];
 };
+// Win64 CUDA Driver API v1 layouts, including the unused union alternatives
+// and reserved fields; the presenter resolves CUDA symbols without a toolkit.
+struct CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
+    int type;
+    union {
+        int fd;
+        struct {
+            void* handle;
+            const void* name;
+        } win32;
+        const void* nvSciSyncObj;
+    } handle;
+    unsigned int flags;
+    unsigned int reserved[16];
+};
+struct CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS {
+    struct {
+        struct { unsigned long long value; } fence;
+        union {
+            void* fence;
+            unsigned long long reserved;
+        } nvSciSync;
+        struct {
+            unsigned long long key;
+            unsigned int timeoutMs;
+        } keyedMutex;
+        unsigned int reserved[10];
+    } params;
+    unsigned int flags;
+    unsigned int reserved[16];
+};
 
 static_assert(sizeof(CUDA_EXTERNAL_MEMORY_HANDLE_DESC) == 104);
 static_assert(offsetof(CUDA_EXTERNAL_MEMORY_HANDLE_DESC, handle) == 8);
 static_assert(offsetof(CUDA_EXTERNAL_MEMORY_HANDLE_DESC, size) == 24);
 static_assert(offsetof(CUDA_EXTERNAL_MEMORY_HANDLE_DESC, flags) == 32);
+static_assert(sizeof(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC) == 96);
+static_assert(offsetof(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, handle) == 8);
+static_assert(offsetof(CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC, flags) == 24);
+static_assert(sizeof(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS) == 144);
+static_assert(offsetof(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, params.fence.value) == 0);
+static_assert(offsetof(CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS, flags) == 72);
 
 template<class T> T bind_sym(HMODULE dll, const char* name)
 {
@@ -89,10 +130,14 @@ struct NativeVfg::Impl {
     CUresult (__stdcall* cuEventCreate)(CUevent*, unsigned int){};
     CUresult (__stdcall* cuEventDestroy)(CUevent){};
     CUresult (__stdcall* cuEventRecord)(CUevent, CUstream){};
+    CUresult (__stdcall* cuEventQuery)(CUevent){};
     CUresult (__stdcall* cuEventSynchronize)(CUevent){};
     CUresult (__stdcall* cuImportExternalMemory)(CUexternalMemory*, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC*){};
     CUresult (__stdcall* cuExternalMemoryGetMappedBuffer)(CUdeviceptr*, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC*){};
     CUresult (__stdcall* cuDestroyExternalMemory)(CUexternalMemory){};
+    CUresult (__stdcall* cuImportExternalSemaphore)(CUexternalSemaphore*, const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC*){};
+    CUresult (__stdcall* cuWaitExternalSemaphoresAsync)(const CUexternalSemaphore*, const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS*, unsigned int, CUstream){};
+    CUresult (__stdcall* cuDestroyExternalSemaphore)(CUexternalSemaphore){};
     CUresult (__stdcall* cuMemFree)(CUdeviceptr){};
 
     // NvVFX & NvCVImage symbols (public C API signatures)
@@ -122,6 +167,7 @@ struct NativeVfg::Impl {
     CUdevice device{};
     CUcontext cudaContext{};
     CUstream stream{};
+    CUexternalSemaphore stageSemaphore{};
     std::array<CUevent, max_multiplier> subEvents{};
     bool retained{};
     void* effect{};
@@ -160,6 +206,7 @@ struct NativeVfg::Impl {
             CUcontext prev{};
             if (cuCtxPushCurrent(cudaContext) == CUDA_SUCCESS) {
                 if (stream && cuStreamSynchronize) (void)cuStreamSynchronize(stream);
+                if (stageSemaphore) (void)cuDestroyExternalSemaphore(stageSemaphore);
                 if (effect && destroyEffect) destroyEffect(effect);
                 for (size_t i = 0; i < mappedCount; ++i) {
                     if (mapped[i].image && imageDestroy) imageDestroy(mapped[i].image);
@@ -208,10 +255,14 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
     p.cuEventCreate = bind_sym<decltype(p.cuEventCreate)>(nvcuda, "cuEventCreate");
     p.cuEventDestroy = bind_sym<decltype(p.cuEventDestroy)>(nvcuda, "cuEventDestroy_v2");
     p.cuEventRecord = bind_sym<decltype(p.cuEventRecord)>(nvcuda, "cuEventRecord");
+    p.cuEventQuery = bind_sym<decltype(p.cuEventQuery)>(nvcuda, "cuEventQuery");
     p.cuEventSynchronize = bind_sym<decltype(p.cuEventSynchronize)>(nvcuda, "cuEventSynchronize");
     p.cuImportExternalMemory = bind_sym<decltype(p.cuImportExternalMemory)>(nvcuda, "cuImportExternalMemory");
     p.cuExternalMemoryGetMappedBuffer = bind_sym<decltype(p.cuExternalMemoryGetMappedBuffer)>(nvcuda, "cuExternalMemoryGetMappedBuffer");
     p.cuDestroyExternalMemory = bind_sym<decltype(p.cuDestroyExternalMemory)>(nvcuda, "cuDestroyExternalMemory");
+    p.cuImportExternalSemaphore = bind_sym<decltype(p.cuImportExternalSemaphore)>(nvcuda, "cuImportExternalSemaphore");
+    p.cuWaitExternalSemaphoresAsync = bind_sym<decltype(p.cuWaitExternalSemaphoresAsync)>(nvcuda, "cuWaitExternalSemaphoresAsync");
+    p.cuDestroyExternalSemaphore = bind_sym<decltype(p.cuDestroyExternalSemaphore)>(nvcuda, "cuDestroyExternalSemaphore");
     p.cuMemFree = bind_sym<decltype(p.cuMemFree)>(nvcuda, "cuMemFree_v2");
 
     p.cu_check(p.cuInit(0), "cuInit");
@@ -244,6 +295,15 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
     p.retained = true;
     Impl::CtxGuard ctx(p);
     p.cu_check(p.cuStreamCreate(&p.stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+    {
+        Handle fenceHandle; // A Win32 NT handle remains owned by this process after import.
+        check(gpu.d3d_device()->CreateSharedHandle(gpu.staging_fence(), nullptr, GENERIC_ALL, nullptr, &fenceHandle.h),
+            "CUDA staging fence NT handle");
+        CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC desc{};
+        desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
+        desc.handle.win32.handle = fenceHandle.h;
+        p.cu_check(p.cuImportExternalSemaphore(&p.stageSemaphore, &desc), "cuImportExternalSemaphore");
+    }
     for (uint32_t s = 1; s < p.multiplier; ++s) {
         p.cu_check(p.cuEventCreate(&p.subEvents[s], 2u /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
     }
@@ -316,27 +376,13 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
 
 NativeVfg::~NativeVfg() = default;
 
-bool NativeVfg::generate_subframe(uint32_t subIndex, bool newPair, bool shotChange)
-{
-    auto& p = *impl_;
-    if (!subIndex || subIndex >= p.multiplier) return false;
-    Impl::CtxGuard ctx(p);
-    if (newPair) {
-        p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "SetImage SrcImage0");
-        p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "SetImage SrcImage1");
-        p.cv_check(p.setU32(p.effect, "ShotChange", shotChange ? 1u : 0u), "SetU32 ShotChange");
-    }
-    p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[1 + subIndex].image), "SetImage DstImage0");
-    p.cv_check(p.setU32(p.effect, "FrameIndex", subIndex), "SetU32 FrameIndex");
-    p.cv_check(p.runEffect(p.effect, 1), "NvVFX_Run");
-    p.cu_check(p.cuStreamSynchronize(p.stream), "cuStreamSynchronize");
-    return true;
-}
-
-bool NativeVfg::enqueue_subframes(bool shotChange)
+bool NativeVfg::enqueue_subframes(uint64_t stageFence, bool shotChange)
 {
     auto& p = *impl_;
     Impl::CtxGuard ctx(p);
+    CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};
+    wait.params.fence.value = stageFence;
+    p.cu_check(p.cuWaitExternalSemaphoresAsync(&p.stageSemaphore, &wait, 1, p.stream), "cuWaitExternalSemaphoresAsync");
     p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "SetImage SrcImage0");
     p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "SetImage SrcImage1");
     p.cv_check(p.setU32(p.effect, "ShotChange", shotChange ? 1u : 0u), "SetU32 ShotChange");
@@ -354,6 +400,25 @@ void NativeVfg::wait_subframe(uint32_t subIndex)
     auto& p = *impl_;
     if (!subIndex || subIndex >= p.multiplier || !p.subEvents[subIndex]) return;
     p.cu_check(p.cuEventSynchronize(p.subEvents[subIndex]), "cuEventSynchronize");
+}
+
+bool NativeVfg::subframe_ready(uint32_t subIndex)
+{
+    auto& p = *impl_;
+    if (!subIndex || subIndex >= p.multiplier || !p.subEvents[subIndex])
+        return false;
+    Impl::CtxGuard ctx(p);
+    const auto status = p.cuEventQuery(p.subEvents[subIndex]);
+    if (status == CUDA_ERROR_NOT_READY) return false;
+    p.cu_check(status, "cuEventQuery");
+    return true;
+}
+
+void NativeVfg::synchronize()
+{
+    auto& p = *impl_;
+    Impl::CtxGuard ctx(p);
+    p.cu_check(p.cuStreamSynchronize(p.stream), "cuStreamSynchronize drain");
 }
 
 unsigned NativeVfg::sdk_version() const noexcept

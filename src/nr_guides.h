@@ -33,6 +33,9 @@ struct FlowCapabilities {
     std::vector<uint32_t> hintSupport,hintGrids;
     std::vector<DXGI_FORMAT> hintFormats,globalFormats;
 };
+struct FlowInitTiming {
+    int64_t verifiedModule=0,apiBound=0,capabilities=0,sessions=0,resources=0,pipeline=0;
+};
 struct FlowImage {
     const JobKey key;
     ID3D12Resource* const analysis; // OWNED BGRA8 full working-size, not original HDR/raw.
@@ -70,7 +73,8 @@ class D3D12Guides {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 public:
-    D3D12Guides(ID3D12Device*,ID3D12CommandQueue*,Extent,std::span<const std::byte> shader,uint64_t frameIntervalNs=0);
+    D3D12Guides(ID3D12Device*,ID3D12CommandQueue*,Extent,std::span<const std::byte> shader,uint64_t frameIntervalNs=0,
+        FlowInitTiming* timing=nullptr);
     ~D3D12Guides();
     D3D12Guides(const D3D12Guides&)=delete;
     D3D12Guides& operator=(const D3D12Guides&)=delete;

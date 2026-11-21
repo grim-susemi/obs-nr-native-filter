@@ -80,7 +80,7 @@ std::optional<Frame> snapshot(const WireFrame& wire){
  std::array<uint64_t,16> words{};for(size_t i=0;i<words.size();++i)words[i]=static_cast<uint64_t>(load(wire.words[i]));
  if(load(wire.sequence)!=before||words[1]!=static_cast<uint64_t>(before)/2)return {};
  Frame result{words[0],words[1],words[2],words[3],{static_cast<uint32_t>(words[4]),static_cast<uint32_t>(words[4]>>32),
-  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},words[6]==1}};
+  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},words[6]==1},words[15]};
  if(!result.generation||!result.shape.width||!result.shape.height||!format(result.shape.format)||words[6]>1)return {};
  std::memcpy(result.shape.sourceMonitor.data(),words.data()+7,sizeof(result.shape.sourceMonitor));return result;
 }
@@ -213,7 +213,7 @@ Status Producer::status()const{
  }
  return Status::ProtocolError;
 }
-Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity){
+Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity,uint64_t obsTick){
  if(GetCurrentThreadId()!=config_->thread)return Status::ProtocolError;
  const auto state=status();if(state!=Status::Ok)return state;if(!source)return Status::InvalidFrame;
  D3D11_TEXTURE2D_DESC d{};source->GetDesc(&d);Ptr<ID3D11Device> owner;source->GetDevice(&owner);
@@ -236,6 +236,7 @@ Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arr
  std::array<uint64_t,16> words{generation(),slot.target,timestamp,arrival,(uint64_t{shape.height}<<32)|shape.width,
   (uint64_t{static_cast<uint32_t>(shape.colorSpace)}<<32)|static_cast<uint32_t>(shape.format),shape.displayCapture?uint64_t{1}:uint64_t{0}};
  std::memcpy(words.data()+7,shape.sourceMonitor.data(),sizeof(shape.sourceMonitor));
+ words[15]=obsTick;
  store(wire.sequence,slot.target*2-1);
  for(size_t i=0;i<words.size();++i)store(wire.words[i],words[i]);
  store(wire.sequence,slot.target*2);
@@ -342,6 +343,12 @@ Status Consumer::arm_return(size_t index,HANDLE event){
  const auto f=frame(index);if(!f)return Status::Pending;
  return SUCCEEDED(impl_->slots[index].returned->SetEventOnCompletion(f->serial,event))?Status::Ok:Status::ProtocolError;
 }
+Status Consumer::arm_return(const CopyTicket& ticket,HANDLE event){
+ if(!event)return Status::InvalidFrame;
+ const auto status=copy_status(ticket);
+ if(status!=Status::Pending&&status!=Status::Ok)return status;
+ return SUCCEEDED(impl_->slots[ticket.slot].returned->SetEventOnCompletion(ticket.frame.serial,event))?Status::Ok:Status::ProtocolError;
+}
 Status Consumer::copy(size_t index,ID3D12Resource* destination){
  if(!impl_||GetCurrentThreadId()!=impl_->thread)return Status::ProtocolError;
  impl_->sequence.break_pair();
@@ -373,6 +380,13 @@ Status Consumer::copy_status(const CopyTicket& ticket)const{
  const auto& slot=impl_->slots[ticket.slot];
  if(ticket.frame.serial>slot.submitted)return Status::InvalidFrame;
  return detail::copy_completion(slot.returned->GetCompletedValue(),ticket.frame.serial);
+}
+Status Consumer::order_copy(const CopyTicket& ticket,ID3D12CommandQueue* reader)const{
+ if(!reader)return Status::InvalidFrame;
+ const auto state=copy_status(ticket);
+ if(state!=Status::Pending)return state;
+ const auto& slot=impl_->slots[ticket.slot];
+ return SUCCEEDED(reader->Wait(slot.returned.Get(),ticket.frame.serial))?Status::Ok:Status::ProtocolError;
 }
 Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination,bool guardCrossSlotDestination){
  if(!destination)return Status::InvalidFrame;

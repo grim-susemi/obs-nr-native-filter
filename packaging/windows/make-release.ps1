@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.6',
+    [string]$Version = '0.2.7',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
@@ -51,6 +51,7 @@ $extra = [ordered]@{
     'standalone-upscale.md' = Join-Path $repo 'docs\standalone-upscale.md'
     'LICENSE.txt'          = Join-Path $repo 'LICENSE'
     'notices\CREDITS.md'   = Join-Path $repo 'provenance\source-notices\CREDITS.md'
+    'notices\NR-R3.md'    = Join-Path $repo 'provenance\source-notices\NR-R3.md'
     'notices\RenoDX-MIT.txt' = Join-Path $repo 'provenance\source-notices\RenoDX-MIT.txt'
     'notices\AMD-FidelityFX-CAS-MIT.txt' = Join-Path $repo 'provenance\source-notices\AMD-FidelityFX-CAS-MIT.txt'
 }

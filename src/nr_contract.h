@@ -188,7 +188,7 @@ enum class OutputKind { CurrentSource, PrimingRaw, DelayedRaw, DelayedNr };
 enum class Status { Disabled, Priming, Applied, Bypassed, Error };
 enum class Reason { None, MissingIdentity, InvalidSource, UnknownValidity, InvalidDescriptor,
     InvalidSettings, OldEpoch, KeyMismatch, MissingPrevious, DeadlineMiss, Expired, Cancelled,
-    EvaluationFailure, SlotsFull, RetirementBudget, PassFailed, WorkScaleTooSmall };
+    EvaluationFailure, SlotsFull, RetirementBudget, PassFailed, WorkScaleTooSmall, ModelWarmup };
 struct Selection {
     const uint64_t canonicalTick;
     const OutputKind kind;
@@ -263,8 +263,9 @@ inline Selection select_for_tick(const Epochs& active, Phase phase, const Ingres
 }
 
 // A late NR result keeps the temporal history, so the frame between two NR frames re-shows the NR frame
-// already in the output instead of flashing the raw frame. Bounded so a stalled runtime still falls back to raw.
-inline constexpr unsigned kMaxHeldNrFrames = 6;
+// already in the output instead of flashing the raw frame. After one repeat,
+// advance on matched raw input rather than freezing a moving scene.
+inline constexpr unsigned kMaxHeldNrFrames = 1;
 inline bool hold_previous_nr(const Selection& selected, bool targetHoldsNr, uint64_t targetTick, unsigned held) noexcept
 {
     return selected.kind == OutputKind::DelayedRaw && selected.reason == Reason::DeadlineMiss && !selected.resetTemporal &&

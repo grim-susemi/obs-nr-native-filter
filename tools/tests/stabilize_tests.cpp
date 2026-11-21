@@ -78,7 +78,8 @@ void uploadFp16(ID3D12Device* dev, ID3D12GraphicsCommandList* cmd, ID3D12Resourc
     barrier(cmd, tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-void uploadMv(ID3D12Device* dev, ID3D12GraphicsCommandList* cmd, ID3D12Resource* tex, ID3D12Resource* up, float dx, float dy) {
+void uploadMv(ID3D12Device* dev, ID3D12GraphicsCommandList* cmd, ID3D12Resource* tex, ID3D12Resource* up, float dx, float dy,
+    bool motionEdge) {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; UINT rows = 0; UINT64 rowBytes = 0, total = 0;
     const auto desc = tex->GetDesc();
     dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &rowBytes, &total);
@@ -88,7 +89,7 @@ void uploadMv(ID3D12Device* dev, ID3D12GraphicsCommandList* cmd, ID3D12Resource*
     for (uint32_t y = 0; y < H; ++y) {
         auto* dst = reinterpret_cast<float*>(base + size_t(y) * fp.Footprint.RowPitch);
         for (uint32_t x = 0; x < W; ++x) {
-            dst[x * 2 + 0] = dx;
+            dst[x * 2 + 0] = motionEdge && x == 7 && y == 8 ? dx + 4.0f : dx;
             dst[x * 2 + 1] = dy;
         }
     }
@@ -191,12 +192,13 @@ int main(int argc, char** argv) {
         auto run = [&](const nr::StabilizeSettings& st, bool hasHist,
                        const std::vector<RgbaF>& cO, const std::vector<RgbaF>& cN,
                        float dx, float dy,
-                       const std::vector<RgbaF>& pO, const std::vector<RgbaF>& pT, const std::vector<RgbaF>& pH) {
+                       const std::vector<RgbaF>& pO, const std::vector<RgbaF>& pT, const std::vector<RgbaF>& pH,
+                       bool motionEdge = false, bool readResidual = false) {
             checked(alloc->Reset(), "alloc");
             checked(cmd->Reset(alloc.Get(), nullptr), "list");
             uploadFp16(dev.Get(), cmd.Get(), curOrig.Get(), up0.Get(), cO);
             uploadFp16(dev.Get(), cmd.Get(), curNr.Get(), up1.Get(), cN);
-            uploadMv(dev.Get(), cmd.Get(), motion.Get(), up2.Get(), dx, dy);
+            uploadMv(dev.Get(), cmd.Get(), motion.Get(), up2.Get(), dx, dy, motionEdge);
             uploadFp16(dev.Get(), cmd.Get(), prevOrig.Get(), up3.Get(), pO);
             uploadFp16(dev.Get(), cmd.Get(), prevTemp.Get(), up4.Get(), pT);
             uploadFp16(dev.Get(), cmd.Get(), prevHold.Get(), up5.Get(), pH);
@@ -217,7 +219,8 @@ int main(int argc, char** argv) {
             HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             checked(fence->SetEventOnCompletion(fv, ev), "ev");
             WaitForSingleObject(ev, INFINITE); CloseHandle(ev);
-            return readbackFp16(dev.Get(), q.Get(), alloc.Get(), cmd.Get(), fence.Get(), fv, outHold.Get(), rb.Get());
+            return readbackFp16(dev.Get(), q.Get(), alloc.Get(), cmd.Get(), fence.Get(), fv,
+                readResidual ? outTemp.Get() : outHold.Get(), rb.Get());
         };
 
         const std::vector<RgbaF> half(size_t(W) * H, {0.5f, 0.5f, 0.5f, 1.0f});
@@ -245,7 +248,7 @@ int main(int argc, char** argv) {
         {
             std::vector<RgbaF> cOrig(size_t(W) * H, {0.5f, 0.5f, 0.5f, 1.0f});
             std::vector<RgbaF> pOrig(size_t(W) * H, {0.5f, 0.5f, 0.5f, 1.0f});
-            std::vector<RgbaF> pTemp(size_t(W) * H, {0.5f, 0.5f, 0.5f, 1.0f});
+            std::vector<RgbaF> pTemp(size_t(W) * H, {0.0f, 0.0f, 0.0f, 1.0f});
             std::vector<RgbaF> cNr(size_t(W) * H, {0.58f, 0.58f, 0.58f, 1.0f});
             // Put a 3x3 anchor so minNr includes 0.50 at (8,8) neighbor (7,8)
             cNr[8 * W + 7] = {0.50f, 0.50f, 0.50f, 1.0f};
@@ -253,6 +256,12 @@ int main(int argc, char** argv) {
             const auto out = run({0.8f, 0.0f, 0.02f}, true, cOrig, cNr, -2.f, -1.f, pOrig, pTemp, pTemp);
             const auto v = out[8 * W + 8].r;
             expect(v > 0.515f && v < 0.540f, "temporal warped stabilization");
+            const auto edge = run({0.8f, 0.0f, 0.02f}, true, cOrig, cNr, -2.f, -1.f, pOrig, pTemp, pTemp, true);
+            expect(std::abs(edge[8 * W + 8].r - 0.58f) < 0.002f, "temporal must reject a motion discontinuity");
+        }
+        {
+            const auto out = run({0.0f, 0.8f, 0.02f}, true, half, nrSpike, -2.f, -1.f, half, half, half);
+            expect(std::abs(out[8 * W + 8].r - 0.7f) < 0.002f, "unwarped hold must release coherent motion");
         }
         // 5. NrTemporal rejects disocclusion when source warped luma mismatches curOrig
         {
@@ -262,7 +271,83 @@ int main(int argc, char** argv) {
             expect(std::abs(out[8 * W + 8].r - 0.7f) < 0.002f, "temporal disocclusion rejection");
         }
 
-        std::puts("PASS stabilize_gpu: reset=ok hold_static=ok hold_zero_ghost=ok temporal_mv=ok temporal_disocclusion=ok");
+        // Reset publishes a residual, not the NR color; hold must also be reflected in it.
+        {
+            const auto reset = run({0.8f, 0.8f, 0.02f}, false, half, nrSpike, 0.f, 0.f,
+                zero, zero, zero, false, true);
+            expect(std::abs(reset[8 * W + 8].r - 0.2f) < 0.002f, "reset residual");
+            const auto held = run({0.0f, 0.8f, 0.02f}, true, half, nrSpike, 0.f, 0.f,
+                half, zero, half, false, true);
+            expect(std::abs(held[8 * W + 8].r - 0.04f) < 0.003f, "published hold residual");
+            auto nextNr = nrSpike;
+            nextNr[8 * W + 7] = half[0];
+            const auto next = run({0.8f, 0.0f, 0.02f}, true, half, nextNr, 0.f, 0.f,
+                half, held, half);
+            expect(next[8 * W + 8].r > 0.58f && next[8 * W + 8].r < 0.60f,
+                "next frame reuses published hold residual");
+        }
+        // A slightly brighter current source must not inherit the previous source's color.
+        {
+            const std::vector<RgbaF> shifted(size_t(W) * H, {0.505f, 0.505f, 0.505f, 1.0f});
+            std::vector<RgbaF> current(size_t(W) * H, {0.585f, 0.585f, 0.585f, 1.0f});
+            current[8 * W + 7] = shifted[0]; // admit a zero correction into the residual clamp
+            const auto out = run({0.8f, 0.0f, 0.02f}, true, shifted, current, 0.f, 0.f,
+                half, zero, half);
+            expect(out[8 * W + 8].r > 0.525f && out[8 * W + 8].r < 0.536f,
+                "temporal correction follows current source");
+        }
+        // Coherent subpixel flow is false motion when the stationary patch is a better match.
+        {
+            std::vector<RgbaF> source(size_t(W) * H, {0.2f, 0.2f, 0.2f, 1.0f});
+            for (uint32_t y = 0; y < H; ++y)
+                for (uint32_t x = 8; x < W; ++x)
+                    source[y * W + x] = {0.8f, 0.8f, 0.8f, 1.0f};
+            auto current = source;
+            current[8 * W + 7] = {0.1f, 0.1f, 0.1f, 1.0f};
+            current[8 * W + 9] = {0.9f, 0.9f, 0.9f, 1.0f};
+            std::vector<RgbaF> residual(size_t(W) * H, {-0.1f, -0.1f, -0.1f, 1.0f});
+            residual[8 * W + 9] = {0.1f, 0.1f, 0.1f, 1.0f};
+            const auto out = run({0.8f, 0.0f, 0.02f}, true, source, current, 0.75f, 0.f,
+                source, residual, half);
+            expect(out[8 * W + 8].r > 0.72f && out[8 * W + 8].r < 0.745f,
+                "stationary patch cancels micro flow");
+        }
+        // Equal patch averages must not let hold bypass photometric rejection.
+        {
+            std::vector<RgbaF> current(size_t(W) * H), previous(size_t(W) * H);
+            for (uint32_t y = 0; y < H; ++y) {
+                for (uint32_t x = 0; x < W; ++x) {
+                    float a = ((x + y) & 1) ? 0.2f : 0.8f;
+                    float b = 1.0f - a;
+                    current[y * W + x] = {a, a, a, 1.0f};
+                    previous[y * W + x] = {b, b, b, 1.0f};
+                }
+            }
+            const auto out = run({0.8f, 0.8f, 0.25f}, true, current, nrSpike, 0.f, 0.f,
+                previous, zero, half);
+            expect(std::abs(out[8 * W + 8].r - 0.7f) < 0.002f, "rejection also disables hold");
+        }
+        // A real translation must use the warped hypothesis and clamp old corrections.
+        {
+            std::vector<RgbaF> currentSource(size_t(W) * H), previousSource(size_t(W) * H);
+            for (uint32_t y = 0; y < H; ++y) {
+                for (uint32_t x = 0; x < W; ++x) {
+                    float c = x < 8 ? 0.2f : 0.8f;
+                    float p = x < 9 ? 0.2f : 0.8f;
+                    currentSource[y * W + x] = {c, c, c, 1.0f};
+                    previousSource[y * W + x] = {p, p, p, 1.0f};
+                }
+            }
+            auto currentNr = currentSource;
+            currentNr[8 * W + 8] = {0.9f, 0.9f, 0.9f, 1.0f};
+            std::vector<RgbaF> oldResidual(size_t(W) * H, {-0.5f, -0.5f, -0.5f, 1.0f});
+            const auto out = run({0.8f, 0.0f, 0.02f}, true, currentSource, currentNr, 1.f, 0.f,
+                previousSource, oldResidual, half);
+            expect(out[8 * W + 8].r > 0.825f && out[8 * W + 8].r < 0.84f,
+                "warped match accepts and clamps residual");
+        }
+
+        std::puts("PASS stabilize_gpu: reset=ok hold=ok temporal=ok residual=ok micro_flow=ok rejection=ok");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL %s\n", e.what());

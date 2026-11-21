@@ -3,12 +3,14 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -43,7 +45,8 @@ std::wstring secondary_monitor_id()
     return found;
 }
 
-void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std::wstring& logPath, const std::wstring& monitorId)
+void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std::wstring& logPath,
+    const std::wstring& monitorId, uint32_t cadence = 0)
 {
     std::error_code ec;
     std::filesystem::remove(logPath, ec);
@@ -93,16 +96,43 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     expect(waitHandshake == WAIT_OBJECT_0 && producer.status() == ipc::Status::Ok, "IPC handshake ready");
 
     std::vector<uint32_t> row(shape.width * 64, 0xFF2080FFu);
-    uint64_t ts = clock_ns();
-    for (uint32_t f = 0; f < 45; ++f) {
-        const uint32_t x = (f * 40) % (shape.width - 128);
-        D3D11_BOX box{x, 200, 0, x + 64, 264, 1};
-        ctx->UpdateSubresource(tex.Get(), 0, &box, row.data(), 64 * 4, 0);
+    std::vector<uint32_t> background;
+    if (cadence) {
+        background.resize(static_cast<size_t>(shape.width) * shape.height, 0xFF202020u);
+        ctx->UpdateSubresource(tex.Get(), 0, nullptr, background.data(), shape.width * 4, 0);
+    }
+    const auto start = clock_ns();
+    uint32_t last = UINT32_MAX, accepted = 0, repeated = 0;
+    const uint32_t count = cadence ? 96 : 45;
+    for (uint32_t f = 0; f < count; ++f) {
+        const auto ts = start + uint64_t{f} * 1'000'000'000 / 60;
+        if (cadence) {
+            while (clock_ns() < ts) {
+                if (ts - (std::min)(ts, clock_ns()) > 2'000'000) Sleep(1);
+                else SwitchToThread();
+            }
+        }
+        const uint32_t unique = cadence ? f * cadence / 60 : f;
+        const bool repeat = unique == last;
+        if (!repeat) {
+            if (cadence && last != UINT32_MAX) {
+                const uint32_t oldX = (last * 40) % (shape.width - 128);
+                const D3D11_BOX oldBox{oldX, 200, 0, oldX + 64, 264, 1};
+                ctx->UpdateSubresource(tex.Get(), 0, &oldBox, background.data(), 64 * 4, 0);
+            }
+            const uint32_t x = (unique * 40) % (shape.width - 128);
+            const D3D11_BOX box{x, 200, 0, x + 64, 264, 1};
+            ctx->UpdateSubresource(tex.Get(), 0, &box, row.data(), 64 * 4, 0);
+        }
+        last = unique;
         const auto now = clock_ns();
-        const auto pub = producer.publish(tex.Get(), ts, now);
+        const auto pub = producer.publish(tex.Get(), ts, now, cadence && f == 48, cadence ? ts : 0);
         expect(pub == ipc::Status::Ok || pub == ipc::Status::Dropped, "publish");
-        ts += 16666667ULL;
-        Sleep(16);
+        if (pub == ipc::Status::Ok) {
+            ++accepted;
+            if (repeat) ++repeated;
+        }
+        if (!cadence) Sleep(16);
     }
 
     controller.stop();
@@ -125,6 +155,8 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     }();
     expect(subCount >= (mult - 1) * 5, "insufficient VFG interpolated subframes presented");
     expect(origCount >= 5, "insufficient original frames presented");
+    if (cadence)
+        std::printf("CADENCE hz=%u accepted=%u duplicate_writes=%u\n", cadence, accepted, repeated);
     std::printf("PASS vfg_native_smoke multiplier=%ux subframes=%zu originals=%zu\n", mult, subCount, origCount);
 }
 } // namespace
@@ -132,10 +164,18 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
 int wmain(int argc, wchar_t** argv)
 {
     try {
-        expect(argc == 3, "usage: vfg_native_smoke_tests <presenter.exe> <log_dir>");
+        const bool cadence = argc == 4 && std::wstring_view(argv[3]) == L"--cadence";
+        expect(argc == 3 || cadence, "usage: vfg_native_smoke_tests <presenter.exe> <log_dir> [--cadence]");
         const std::wstring presenter = argv[1];
         const std::filesystem::path logDir = argv[2];
         const auto monId = secondary_monitor_id();
+        expect(!monId.empty(), "no active secondary display");
+        expect(SetEnvironmentVariableW(L"OBS_NR_VFG_QA_MONITOR", monId.c_str()) != FALSE, "set secondary display");
+        if (cadence) {
+            for (const auto hz : {30u, 40u, 60u})
+                run_multiplier(2, presenter, (logDir / (L"cadence-" + std::to_wstring(hz) + L".log")).wstring(), monId, hz);
+            return 0;
+        }
         run_multiplier(2, presenter, (logDir / L"smoke-2x.log").wstring(), monId);
         run_multiplier(3, presenter, (logDir / L"smoke-3x.log").wstring(), monId);
         run_multiplier(4, presenter, (logDir / L"smoke-4x.log").wstring(), monId);

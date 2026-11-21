@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "obs_filter.h"
 #include "obs_native_output.h"
+#include "obs_quality_trace.h"
 #include "interop.h"
 #include "nr_properties.h"
 #include "nr_fps_hud.h"
@@ -623,6 +624,18 @@ void publish_status(Filter& f)
     }
     if(const auto now=obs_get_video_frame_time(); now && now!=f.lastCountTime) {
         f.lastCountTime=now;
+        if(nr::quality::trace_frames()) {
+            const auto tick=nr::sampler::canonical_tick(f.clock,f.interval);
+            const auto* selected=selection(f,tick);
+            const auto* parent=obs_filter_get_parent(f.source);
+            const auto* uuid=parent?obs_source_get_uuid(parent):nullptr;
+            blog(LOG_INFO,"[quality] stage=nr obs_tick_ns=%llu source=%s instance=%llu canonical=%llu frame=%llu history=%llu generation=%llu job=%llu state=%s reason=%s",
+                nr::quality::id(now),uuid?uuid:"-",nr::quality::id(f.instance),nr::quality::id(tick),
+                nr::quality::id(selected&&selected->frame?selected->frame->ingressSequence:0),
+                nr::quality::id(selected&&selected->job?selected->job->historyEpoch:0),
+                nr::quality::id(selected&&selected->job?selected->job->resourceGeneration:0),
+                nr::quality::id(selected&&selected->job?selected->job->submissionSerial:0),value.state.c_str(),value.reason.c_str());
+        }
         if(!f.recentStart)f.recentStart=now;
         ++f.recentFrames;if(value.state=="ready")++f.recentReady;
         if(now-f.recentStart>=5000000000ull) {
@@ -702,7 +715,7 @@ void bypass(Filter &f)
     // OBS skip dereferences the parent; unattached filters draw nothing.
     if (obs_filter_get_target(f.source) && obs_filter_get_parent(f.source)) obs_source_skip_video_filter(f.source);
 }
-std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
+std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick,bool fromTick=false)
 {
     auto* target=obs_filter_get_target(f.source);
     const bool attached=target && obs_filter_get_parent(f.source);
@@ -762,7 +775,9 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick)
          configured->passes,configured->workScale,configured->pass2Tuning,configured->stabilize}};
     const bool cut=f.cut.exchange(false);
     const bool signalled=f.callback->cut.exchange(false,std::memory_order_acq_rel);
-    const auto prepared=f.native->prepare(observation,device,cut || signalled);
+    auto* parent=attached?obs_filter_get_parent(f.source):nullptr;
+    const bool inactive=fromTick && parent && !obs_source_active(parent) && !obs_source_showing(parent);
+    const auto prepared=f.native->prepare(observation,device,cut || signalled,inactive);
     f.placeholder=prepared.placeholder.has_value();
     f.lifecycleReason=prepared.placeholder?prepared.placeholder->reason:nr::Reason::None;
     if(!retiring.empty()) { f.placeholder=true;f.lifecycleReason=nr::Reason::RetirementBudget; }
@@ -796,7 +811,7 @@ void video_tick(void* opaque,float)
         if(f.native->latch_qa_failure()) {
             f.nativeFailed=true;f.placeholder=true;
             f.initializationReason="handledAdapterFailure";blog(LOG_WARNING,"[obs-nr-filter] handled adapter failure latched");
-        } else (void)observe(f,nr::sampler::canonical_tick(obs_get_video_frame_time(),obs_get_frame_interval_ns()));
+        } else (void)observe(f,nr::sampler::canonical_tick(obs_get_video_frame_time(),obs_get_frame_interval_ns()),true);
     }
     catch(const std::exception& e) { f.nativeFailed=true;blog(LOG_WARNING,"[obs-nr-filter] video_tick failed: %s",e.what());note_gpu_reset(f,e); }
     publish_status(f);
@@ -841,7 +856,10 @@ void render(void *opaque, gs_effect_t *)
         const auto control=f.configuration.load(std::memory_order_acquire);
         const auto configured=control?control->settings:nullptr;
         const bool enabled=configured && nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source));
+        nr::obs_adapter::RenderTiming renderTiming{f.tickStartQpc};
+        const bool traceJobs=nr::model::trace_job_timeline();
         if (f.admission == Admission::Ready && !f.nativeFailed && !f.placeholder && enabled && control->reason.empty()) {
+            if(traceJobs)renderTiming.captureStart=nr::model::qpc_now();
             const auto format=space==GS_CS_SRGB?GS_RGBA:GS_RGBA16F;
             if(f.captureFormat!=format) {
                 gs_texrender_destroy(f.capture);f.capture=nullptr;gs_texture_destroy(f.output);f.output=nullptr;
@@ -863,6 +881,7 @@ void render(void *opaque, gs_effect_t *)
             } else f.admission = Admission::CaptureFailed;
             gs_enable_framebuffer_srgb(srgb);
             gs_blend_state_pop();
+            if(traceJobs)renderTiming.captureEnd=nr::model::qpc_now();
             if(f.admission==Admission::CaptureFailed && f.native && observed) {
                 const auto& old=*observed;
                 try {
@@ -890,11 +909,11 @@ void render(void *opaque, gs_effect_t *)
                 const nr::IngressSample input{{f.instance,epochs.contentEpoch,f.ingress},tick,tick-1,
                     observed->sourceIdentity,observed->deviceIdentity,
                     epochs.resourceGeneration,observed->validity,observed->descriptor,observed->settings};
-                {const auto q=nr::model::qpc_now();nr::model::note_admit(tick,q);const double o=nr::model::qpc_ms(q-f.tickStartQpc);
+                {const auto q=nr::model::qpc_now();const double o=nr::model::qpc_ms(q-f.tickStartQpc);
              f.admitSum+=o;f.admitMax=o>f.admitMax?o:f.admitMax;++f.admitN;}
             const auto result=f.native->tick(input,
                     static_cast<ID3D11Texture2D*>(gs_texture_get_obj(gs_texrender_get_texture(f.capture))),
-                    static_cast<ID3D11Texture2D*>(gs_texture_get_obj(f.output)));
+                    static_cast<ID3D11Texture2D*>(gs_texture_get_obj(f.output)),renderTiming);
                 f.appliedRevision=input.settings.revision.value;
                 std::destroy_at(&selected);std::construct_at(&selected,result);
             } catch(const std::exception& e) { f.nativeFailed=true;blog(LOG_WARNING,"[obs-nr-filter] native tick failed: %s",e.what());note_gpu_reset(f,e); }

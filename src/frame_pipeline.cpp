@@ -28,18 +28,22 @@ struct FramePipeline::Impl {
         std::array<std::unique_ptr<Slot>, 3> slots;
         std::shared_ptr<void> featureLease;
         bool featureComplete = true;
-        explicit Generation(uint64_t value) : id(value) {}
+        bool warming;
+        std::optional<JobKey> warmupPending;
+        Generation(uint64_t value,bool cold) : id(value),warming(cold) {}
     };
     const std::thread::id graphics = std::this_thread::get_id();
     std::optional<Epochs> active;
     std::shared_ptr<Processor> processor;
     PerInstanceTick ticks;
+    const bool coldGate;
     std::unique_ptr<Generation> current;
     std::array<std::unique_ptr<Generation>, 2> retired;
     std::optional<IngressSample> ingress;
     std::optional<TickPlan> plan;
     std::optional<Published> published;
     std::shared_ptr<const RawFrame> previous;
+    bool previousWarmup=false;
     Slot* reserved = nullptr;
     Phase phase = Phase::Priming;
     uint64_t serial = 0;
@@ -56,8 +60,9 @@ struct FramePipeline::Impl {
     std::atomic<bool> exited{false};
     std::atomic<bool> servicePending{false};
     std::thread worker;
-    Impl(const Epochs& epochs, std::shared_ptr<Processor> p)
-        : active(epochs), processor(std::move(p)), ticks(epochs.instanceId), current(std::make_unique<Generation>(epochs.resourceGeneration))
+    Impl(const Epochs& epochs, std::shared_ptr<Processor> p,bool cold)
+        : active(epochs), processor(std::move(p)), ticks(epochs.instanceId), coldGate(cold),
+          current(std::make_unique<Generation>(epochs.resourceGeneration,cold))
     {
         if (!epochs.valid() || !processor) throw std::invalid_argument("scheduler requires exact epochs and processor");
         worker = std::thread([this] { run(); }); // All signal/lifetime state exists before start.
@@ -88,6 +93,7 @@ struct FramePipeline::Impl {
             const auto index = read.load(std::memory_order_relaxed);
             if (index != written.load(std::memory_order_acquire)) {
                 Slot* s = queue[index % queue.size()];
+                if(s->work->binding.timingClock) s->work->dequeued=s->work->binding.timingClock();
                 read.store(index + 1, std::memory_order_release);
                 s->stage.store(Stage::Running, std::memory_order_relaxed);
                 auto signal = std::move(s->signal);
@@ -150,18 +156,19 @@ struct FramePipeline::Impl {
             size_t index = 0;
             for (; index < retired.size() && retired[index]; ++index) {}
             if (index == retired.size()) { retirementBlocked = true; cancel_pending(); return false; }
-            auto replacement = std::make_unique<Generation>(next->next.resourceGeneration);
+            auto replacement = std::make_unique<Generation>(next->next.resourceGeneration,coldGate);
             retired[index] = std::move(current);
             current = std::move(replacement);
         }
         active.emplace(next->next);
         cancel_pending();
-        if (next->discardDelayed) { previous.reset(); published.reset(); phase = Phase::Priming; }
+        if (next->discardDelayed) { previous.reset(); previousWarmup=false; published.reset(); phase = Phase::Priming; }
         retirementBlocked = false;
         return true;
     }
 };
-FramePipeline::FramePipeline(const Epochs& e, std::shared_ptr<Processor> p) : impl_(std::make_unique<Impl>(e, std::move(p))) {}
+FramePipeline::FramePipeline(const Epochs& e, std::shared_ptr<Processor> p,bool coldGate)
+    : impl_(std::make_unique<Impl>(e, std::move(p),coldGate)) {}
 FramePipeline::~FramePipeline()
 {
     if (impl_ && !try_close()) (void)impl_.release(); // Retain unresolved thread/code/resources; never force-free.
@@ -175,7 +182,7 @@ TickPlan FramePipeline::begin(const IngressSample& input, uint64_t deadline)
     const auto action = p.ticks.claim(input.canonicalTick);
     if (action == TickAction::Reject) return {action, rejected, Reason::OldEpoch, {}};
     if (action != TickAction::CaptureOnce)
-        return {action, p.plan->selection, p.plan->admissionReason, p.plan->admission};
+        return {action, p.plan->selection, p.plan->admissionReason, p.plan->admission,p.plan->warmup};
     p.abandon_reserved();
     p.published.reset();
     p.collect();
@@ -193,8 +200,14 @@ TickPlan FramePipeline::begin(const IngressSample& input, uint64_t deadline)
             interop::completion(old->physical.worker, old->physical.workerDone) == interop::Completion::Complete,
             receipt.evaluated && static_cast<bool>(receipt.image)});
     }
-    const auto selected = select_for_tick(*p.active, p.phase, input,
+    const auto ordinary = select_for_tick(*p.active, p.phase, input,
         p.previous ? &p.previous->input : nullptr, old ? &old->admission.job : nullptr, ready ? &*ready : nullptr);
+    const bool warming=p.current->warming;
+    const bool rawWarmup=(warming && ordinary.kind==OutputKind::PrimingRaw) ||
+        (p.previousWarmup && ordinary.kind==OutputKind::DelayedRaw && ordinary.reason==Reason::DeadlineMiss);
+    const auto selected=rawWarmup?
+        Selection{ordinary.canonicalTick,ordinary.kind,Status::Priming,Reason::ModelWarmup,ordinary.frame,{},false}:
+        ordinary;
     std::shared_ptr<const void> image;
     std::shared_ptr<const RawFrame> raw;
     if (selected.kind == OutputKind::DelayedNr) {
@@ -218,6 +231,7 @@ TickPlan FramePipeline::begin(const IngressSample& input, uint64_t deadline)
     if (!input.settings.enabled) reason = Reason::Cancelled;
     else if (p.retirementBlocked) reason = Reason::RetirementBudget;
     else if (p.epochExhausted || deadline <= input.canonicalTick || p.serial == std::numeric_limits<uint64_t>::max()) reason = Reason::KeyMismatch;
+    else if (reason==Reason::None && p.current->warmupPending) reason=Reason::ModelWarmup;
     if (reason == Reason::None) {
         size_t index = 0;
         for (; index < p.current->slots.size() && p.current->slots[index]; ++index) {}
@@ -232,7 +246,7 @@ TickPlan FramePipeline::begin(const IngressSample& input, uint64_t deadline)
             p.current->slots[index] = std::move(slot);
         }
     }
-    p.plan.emplace(TickPlan{action, selected, reason, admission});
+    p.plan.emplace(TickPlan{action, selected, reason, admission,warming});
     p.published.emplace(Published{selected, raw, image});
     ++p.counts.selections;
     return *p.plan;
@@ -259,11 +273,13 @@ bool FramePipeline::finish(std::shared_ptr<const RawFrame> raw, const WorkBindin
             !binding->transport->owns_consumer(*binding->capturePin))) return false;
         auto& s = *p.reserved;
         s.work.emplace(Work{s.admission.job, raw, *binding});
+        if(p.plan->warmup)p.current->warmupPending.emplace(s.admission.job.key);
         std::destroy_at(&s.physical); // Ownership contains the frozen nonassignable JobKey.
         std::construct_at(&s.physical, binding->captured);
         s.stage.store(Impl::Stage::Queued, std::memory_order_relaxed);
         const auto index = p.written.load(std::memory_order_relaxed);
         p.queue[index % p.queue.size()] = &s;
+        if(binding->timingClock) s.work->enqueued=binding->timingClock();
         p.written.store(index + 1, std::memory_order_release);
         p.reserved = nullptr;
         ++p.counts.dispatches;
@@ -271,9 +287,21 @@ bool FramePipeline::finish(std::shared_ptr<const RawFrame> raw, const WorkBindin
     } else if (p.reserved) { p.abandon_reserved(); (void)p.reset(ResetCause::EvaluationSkipped); }
     if (p.plan->selection.kind == OutputKind::PrimingRaw)
         p.published.emplace(Published{p.plan->selection, raw, raw ? raw->image : nullptr});
-    if (valid) { p.previous = std::move(raw); p.phase = Phase::Delayed; ++p.counts.captures; }
-    else { p.previous.reset(); p.phase = Phase::Priming; }
+    if (valid) { p.previous = std::move(raw); p.previousWarmup=p.plan->warmup;p.phase = Phase::Delayed; ++p.counts.captures; }
+    else { p.previous.reset(); p.previousWarmup=false;p.phase = Phase::Priming; }
     return p.ticks.latch(p.ingress->canonicalTick, p.published->selection);
+}
+bool FramePipeline::finish_warmup(const JobKey& key,bool publishableEvaluation)
+{
+    auto& p=*impl_;
+    if(!p.on_graphics())return false;
+    auto* g=p.generation(key.resourceGeneration);
+    const auto* slot=p.find(key);
+    if(!g || g->warmupPending!=key || !slot || slot->stage.load(std::memory_order_acquire)!=Impl::Stage::Returned)
+        return false;
+    g->warmupPending.reset();
+    if(publishableEvaluation)g->warming=false;
+    return true;
 }
 const Published* FramePipeline::view(uint64_t tick) const
 {

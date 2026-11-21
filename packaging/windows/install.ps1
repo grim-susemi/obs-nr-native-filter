@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-only
 # OBS Native NR installer and uninstaller (Windows PowerShell 5.1 or later).
 # install.bat and uninstall.bat in the release zip run this script.
 [CmdletBinding()]
@@ -18,7 +18,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.6'
+$Version = '0.2.7'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'

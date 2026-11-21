@@ -25,11 +25,13 @@ struct WorkBinding {
     // not the pin identity. Only final end reserves the pin's completion target.
     const std::optional<interop::Consumer> capturePin = std::nullopt;
     const std::shared_ptr<Processor> workerProcessor = {}; // Exact physical generation owner.
+    int64_t (*const timingClock)() = nullptr; // Optional diagnostic clock; one domain for this work.
 };
 struct Work {
     const JobContract job;
     const std::shared_ptr<const RawFrame> raw;
     const WorkBinding binding;
+    int64_t enqueued=0, dequeued=0;
 };
 struct Processed {
     const JobContract job;
@@ -57,6 +59,7 @@ struct TickPlan {
     const Selection selection;
     const Reason admissionReason;
     const std::optional<Admission> admission;
+    const bool warmup=false;
 };
 struct Published {
     const Selection selection;
@@ -76,7 +79,7 @@ class FramePipeline final {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 public:
-    FramePipeline(const Epochs&, std::shared_ptr<Processor>);
+    FramePipeline(const Epochs&, std::shared_ptr<Processor>, bool coldGate=false);
     ~FramePipeline();
     FramePipeline(const FramePipeline&) = delete;
     FramePipeline& operator=(const FramePipeline&) = delete;
@@ -84,6 +87,8 @@ public:
     // Deadline is the caller's canonical successor, not a synthesized source PTS.
     TickPlan begin(const IngressSample&, uint64_t nextCanonicalTick);
     bool finish(std::shared_ptr<const RawFrame>, const WorkBinding* = nullptr);
+    // Graphics supplies the exact dispatched job's terminal model receipt.
+    bool finish_warmup(const JobKey&,bool publishableEvaluation);
     const Published* view(uint64_t canonicalTick) const;
     bool observe(const interop::Ticket&, const interop::Ownership&);
     bool cancel(const JobKey&);

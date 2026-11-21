@@ -24,6 +24,7 @@ struct SdkSession {
     uint64_t owners=1; // Registry mutex only. Observational shared_ptrs are not owners.
     std::shared_ptr<Driver> driver=std::make_shared<Driver>();
     std::shared_ptr<runtime::Module> module;
+    std::weak_ptr<std::atomic_bool> speculative;
     explicit SdkSession(SessionKey input,uint64_t identity):key(std::move(input)),id(identity) {
         require(trace.bind(id,0,0,reinterpret_cast<uintptr_t>(key.device.Get())),"SDK session trace identity");
         driver->trace=&trace;
@@ -35,9 +36,22 @@ class SessionRegistry {
     uint64_t next_=0;
 public:
     struct Acquisition {std::shared_ptr<SdkSession> session;bool initialize=false;};
-    Acquisition acquire(const SessionKey& key) {
+    bool idle_for_prewarm(const std::filesystem::path& model) {
+        std::lock_guard lock(mutex_);
+        return std::none_of(sessions_.begin(),sessions_.end(),[&](const auto& session){
+            return session->key.model.canonicalPath==model;
+        });
+    }
+    Acquisition acquire(const SessionKey& key,const std::shared_ptr<std::atomic_bool>& speculative={}) {
         std::lock_guard lock(mutex_);
         for(const auto& session:sessions_) {
+            if(session->key.device.Get()==key.device.Get() || session->key.model.canonicalPath==key.model.canonicalPath) {
+                if(speculative)return {}; // Do not contend with any running owner's feature calls.
+                if(const auto token=session->speculative.lock()) {
+                    token->store(true,std::memory_order_release); // Real work outranks an unused preparation.
+                    return {};
+                }
+            }
             if(session->key.device.Get()==key.device.Get()) {
                 if(!session->key.compatible(key) || session->state.load()!=SessionState::Ready)return {};
                 require(session->owners && session->owners!=UINT64_MAX,"bounded SDK owner count");
@@ -48,7 +62,15 @@ public:
         }
         require(next_!=UINT64_MAX,"bounded SDK session identity");
         auto session=std::make_shared<SdkSession>(key,++next_);
+        session->speculative=speculative;
         sessions_.push_back(session);return {std::move(session),true};
+    }
+    bool adopt(const std::shared_ptr<SdkSession>& session,const std::shared_ptr<std::atomic_bool>& token) {
+        std::lock_guard lock(mutex_);
+        if(session->speculative.lock()!=token || token->load(std::memory_order_acquire) ||
+            session->state.load()!=SessionState::Ready)return false;
+        session->speculative.reset();
+        return true;
     }
     void publish(const std::shared_ptr<SdkSession>& session) {
         std::lock_guard lock(mutex_);
