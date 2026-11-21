@@ -1,0 +1,59 @@
+name: Issue Triage
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label and post triage checklist
+        uses: actions/github-script@60a0d83039c74a4aee5435080b382d4079480bf7 # v7.0.1
+        with:
+          script: |
+            const issue = context.payload.issue;
+            if (!issue || issue.pull_request) return;
+
+            const labels = new Set((issue.labels || []).map((l) => l.name));
+            if (!labels.has('untriaged')) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['untriaged'],
+              });
+            }
+
+            if (context.payload.action !== 'opened') return;
+
+            const marker = '<!-- obs-nr-triage-checklist -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              per_page: 100,
+            });
+            if (comments.some((c) => typeof c.body === 'string' && c.body.includes(marker))) return;
+
+            const body = [
+              marker,
+              'Thank you for reporting an issue / 오류를 제보해 주셔서 감사합니다.',
+              '',
+              'To help reproduce and fix this quickly, please make sure your report includes:',
+              '- Plugin version & OBS Studio version (`32.x`, Direct3D 11 renderer)',
+              '- GPU model & NVIDIA driver version',
+              '- OBS log (`%APPDATA%\\obs-studio\\logs`) and installer log (`%LOCALAPPDATA%\\obs-nr-native-filter`) if applicable',
+              '',
+              '빠른 확인을 위해 플러그인/OBS 버전, GPU·드라이버 버전, OBS 로그(`%APPDATA%\\obs-studio\\logs`)와 설치기 로그(`%LOCALAPPDATA%\\obs-nr-native-filter`)를 함께 첨부해 주세요.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body,
+            });
