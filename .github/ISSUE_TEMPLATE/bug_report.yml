@@ -1,0 +1,65 @@
+name: Bug Report / 오류 제보
+description: Report a crash, install error, or filter issue with logs / 설치 오류, 튕김, 필터 이상을 로그와 함께 제보합니다.
+title: "[Bug] "
+labels: ["bug", "untriaged"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please attach the relevant log files so we can diagnose the issue quickly.
+        오류 원인을 빠르게 확인할 수 있도록 아래 로그 파일이나 내용을 함께 첨부해 주세요.
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version / 플러그인 버전
+      placeholder: e.g. v0.2.6
+    validations:
+      required: true
+  - type: input
+    id: obs_version
+    attributes:
+      label: OBS Studio version / OBS 버전
+      placeholder: e.g. 32.2.2 (64-bit, Direct3D 11)
+    validations:
+      required: true
+  - type: input
+    id: gpu_driver
+    attributes:
+      label: GPU & NVIDIA driver version / GPU 및 드라이버 버전
+      placeholder: e.g. RTX 4090, GeForce 617.14, Windows 11
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected area / 발생 위치
+      options:
+        - One-click installer (install.bat / uninstall.bat)
+        - Native NR filter
+        - Video Upscale & Frame Generation (VFG / DLSS SR / CAS)
+        - OBS crash or startup failure
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened? / 증상 및 재현 방법
+      description: Describe what you did, what you expected, and what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / 로그 내용 또는 파일 첨부
+      description: |
+        - OBS log: %APPDATA%\obs-studio\logs (Help > Log Files > Upload/Show Log Files)
+        - Installer log: %LOCALAPPDATA%\obs-nr-native-filter
+        Drag and drop the log file here or paste the relevant lines.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission check / 제보 전 확인
+      options:
+        - label: I tested on Windows 64-bit with OBS Studio 32.x and Direct3D 11 renderer / Windows 64비트 OBS 32.x Direct3D 11 환경에서 확인했습니다.
+        - label: I did not include private credentials or unrelated personal files / 개인 비밀번호나 무관한 개인 파일을 빼고 올렸습니다.

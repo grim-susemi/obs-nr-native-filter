@@ -85,6 +85,12 @@ Illustrated one-click setup: [docs/INSTALL-ONECLICK.md](docs/INSTALL-ONECLICK.md
 
 Close OBS and run **`uninstall.bat`** from the extracted release folder. It removes plugin files, restores any backed-up files, and removes `nvngx_dlssnr.dll`, `dlss/nvngx_dlss.dll`, and `nvidia-vfg/*.dll` only if the installer copied them.
 
+## Troubleshooting
+
+- **Installer failed or rolled back**: check the installer log under `%LOCALAPPDATA%\obs-nr-native-filter`.
+- **Filter missing, black frame, or crash in OBS**: make sure OBS uses the **Direct3D 11** renderer (Settings > Advanced > Video), verify `obs-nr-filter.dll` and runtime DLLs are present (see [docs/INSTALL.md](docs/INSTALL.md)), and inspect the latest OBS log under `%APPDATA%\obs-studio\logs`.
+- **Report an issue**: [open a bug report](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml) and attach your OBS log, installer log, GPU model, and NVIDIA driver version.
+
 ## Build from source
 
 ```powershell
@@ -125,4 +131,4 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 6. 관리자 권한 창에서 **예**를 누르면 설치가 끝납니다.
 7. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터 [+]**에서 **영상 업스케일 및 프레임 생성** 또는 **Native NR**을 선택합니다. 이중선형 확대와 CAS만 쓰려면 모델과 선택 런타임 설치를 건너뛰어도 됩니다.
 
-자세한 안내와 제거(`uninstall.bat`)·문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)를 참고하세요.
+자세한 안내와 제거(`uninstall.bat`)·문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)를 참고하세요. 설치·실행 중 오류가 나면 [GitHub 이슈 제보](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml)에 OBS 로그(`%APPDATA%\obs-studio\logs`)와 설치기 로그(`%LOCALAPPDATA%\obs-nr-native-filter`)를 함께 올려주세요.

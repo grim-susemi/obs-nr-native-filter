@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Install Guide & Troubleshooting / 설치 및 문제 해결 안내
+    url: https://github.com/grim-susemi/obs-nr-native-filter/blob/main/docs/INSTALL.md
+    about: Check requirements, runtime paths, and uninstall steps before filing / 설치 조건·로그 위치·제거 방법 먼저 확인하기

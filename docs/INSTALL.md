@@ -44,6 +44,12 @@ Logs are saved under `%LOCALAPPDATA%\obs-nr-native-filter`.
 
 Close OBS and double-click `uninstall.bat`. It restores any backed-up files and removes only the plugin files and runtimes that the installer copied.
 
+## Troubleshooting & Bug Reports
+
+- **OBS renderer**: confirm OBS Settings > Advanced > Video > Renderer is **Direct3D 11**.
+- **Logs to attach**: OBS log in `%APPDATA%\obs-studio\logs` and installer log in `%LOCALAPPDATA%\obs-nr-native-filter`.
+- **Open an issue**: [Submit a bug report](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml) with your plugin version, OBS version, GPU, driver version, and the logs above.
+
 ---
 
 ## 한국어 설치 안내
@@ -76,3 +82,10 @@ OBS Native NR 0.2.6을 Windows OBS Studio에 설치하는 방법입니다. [화�
 ### 제거
 
 OBS를 끄고 같은 폴더의 `uninstall.bat`을 더블클릭합니다. 설치기가 복사한 파일·런타임만 안전하게 제거하고 기존 파일을 복원합니다.
+
+### 문제 해결 및 오류 제보
+
+- OBS 설정 > 고급 > 비디오 > 렌더러가 **Direct3D 11**인지 확인하세요.
+- 오류가 나면 [GitHub 이슈 제보](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml)에 플러그인 버전, OBS 버전, GPU/드라이버 버전과 함께 아래 로그를 첨부해 주세요.
+  - OBS 로그: `%APPDATA%\obs-studio\logs`
+  - 설치기 로그: `%LOCALAPPDATA%\obs-nr-native-filter`
