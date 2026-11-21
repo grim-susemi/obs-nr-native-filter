@@ -144,6 +144,10 @@ Controller::Controller(const LaunchOptions& options) : options_(options)
     auto* view = static_cast<Session*>(MapViewOfFile(mapping.value, FILE_MAP_WRITE, 0, 0, sizeof(Session)));
     require(view != nullptr, "VFG map session");
     struct View { Session* p; ~View() { if (p) UnmapViewOfFile(p); } } guard{view};
+    InterlockedExchange(&view->fpsOverlay, static_cast<LONG>(std::min<uint32_t>(options.fpsOverlay, 2)));
+    InterlockedExchange(&view->lowLatency, static_cast<LONG>(options.lowLatency ? 1u : 0u));
+    InterlockedExchange(&view->gpuPriority, static_cast<LONG>(options.gpuPriority ? 1u : 0u));
+    InterlockedExchange(&view->hideFromCapture, static_cast<LONG>(options.hideFromCapture ? 1u : 0u));
     require(CreateProcessW(exe.c_str(), args.data(), nullptr, nullptr, TRUE,
         CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, runtime.c_str(),
         &startup.StartupInfo, &child), "VFG start presenter");
@@ -185,6 +189,7 @@ bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID ad
     InterlockedExchange(&view_->fpsOverlay, static_cast<LONG>(std::min<uint32_t>(options_.fpsOverlay, 2)));
     InterlockedExchange(&view_->lowLatency, static_cast<LONG>(options_.lowLatency ? 1u : 0u));
     InterlockedExchange(&view_->gpuPriority, static_cast<LONG>(options_.gpuPriority ? 1u : 0u));
+    InterlockedExchange(&view_->hideFromCapture, static_cast<LONG>(options_.hideFromCapture ? 1u : 0u));
     wcscpy_s(view_->mapping, offer.mapping.c_str());
     if (!options_.monitorId.empty() && options_.monitorId.size() < ARRAYSIZE(view_->monitorId)) {
         wcscpy_s(view_->monitorId, options_.monitorId.c_str());

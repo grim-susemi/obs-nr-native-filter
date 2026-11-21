@@ -18,7 +18,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.7'
+$Version = '0.2.8'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'

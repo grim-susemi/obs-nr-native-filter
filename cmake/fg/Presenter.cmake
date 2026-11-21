@@ -43,3 +43,16 @@ target_compile_definitions(vfg_monitor_text_tests PRIVATE NOMINMAX WIN32_LEAN_AN
 target_compile_options(vfg_monitor_text_tests PRIVATE /W4 /WX /permissive-)
 target_include_directories(vfg_monitor_text_tests PRIVATE src/fg)
 add_test(NAME vfg_monitor_text COMMAND vfg_monitor_text_tests)
+
+add_executable(vfg_capture_visibility_tests
+  tools/tests/vfg_capture_visibility_tests.cpp
+  src/fg/fg_controller.cpp)
+target_compile_features(vfg_capture_visibility_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_capture_visibility_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_capture_visibility_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_capture_visibility_tests PRIVATE src/fg)
+target_link_libraries(vfg_capture_visibility_tests PRIVATE fg_ipc d3d11 dxgi user32)
+add_dependencies(vfg_capture_visibility_tests obs-nr-fg-presenter)
+add_test(NAME vfg_capture_visibility COMMAND vfg_capture_visibility_tests
+  $<TARGET_FILE:obs-nr-fg-presenter> "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vfg_capture_visibility")
+set_tests_properties(vfg_capture_visibility PROPERTIES TIMEOUT 60)

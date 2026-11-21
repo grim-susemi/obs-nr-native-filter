@@ -11,6 +11,7 @@ struct LaunchOptions {
     uint32_t fpsOverlay = 1;  // 0 = off, 1 = top-left, 2 = top-right
     uint32_t lowLatency = 1;  // 0 = off, 1 = NVIDIA Reflex on
     uint32_t gpuPriority = 1; // 0 = normal, 1 = high
+    uint32_t hideFromCapture = 0; // 0 = capturable (WDA_NONE), 1 = hide from capture (0x11)
 };
 class Controller final {
     HANDLE job_{}, child_{}, mapping_{};
@@ -35,6 +36,10 @@ public:
     void set_low_latency(uint32_t on) noexcept {
         options_.lowLatency = on;
         if (view_) InterlockedExchange(&view_->lowLatency, static_cast<LONG>(on));
+    }
+    void set_hide_from_capture(uint32_t hide) noexcept {
+        options_.hideFromCapture = hide ? 1u : 0u;
+        if (view_) InterlockedExchange(&view_->hideFromCapture, static_cast<LONG>(options_.hideFromCapture));
     }
     static std::wstring find_runtime_dir();
 };

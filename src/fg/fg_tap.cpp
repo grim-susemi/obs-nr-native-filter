@@ -58,12 +58,15 @@ struct Tap {
     uint32_t fpsOverlay{1};
     uint32_t lowLatency{1};
     uint32_t gpuPriority{1};
+    bool hideFromCapture{false};
     std::string monitorId;
     uint64_t lastTick{};
     uint64_t retiredGeneration{};
     bool breakPair{};
     bool resizing{};
     bool stopping{true};
+    std::atomic_bool hideSourceCanvas{false};
+    std::atomic_bool vfgActive{false};
     std::atomic_bool detached{false};
 };
 std::atomic_uint64_t nextTap{0};
@@ -118,6 +121,7 @@ void disconnect(Tap& tap, const char* cause) noexcept
     tap.activeHeight = 0;
     tap.resizing = false;
     tap.stopping = true;
+    tap.vfgActive.store(false, std::memory_order_release);
 }
 
 void draw_sdr(gs_texture_t* texture, Extent size, gs_blend_type destBlend)
@@ -261,6 +265,9 @@ void render(void* data, gs_effect_t*)
     const auto size = tap.upscale ? obs_upscale::dimensions(*tap.upscale) :
         Extent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
     auto* texture = publish(tap, target, parent, size);
+    if (should_hide_source_canvas(tap.hideSourceCanvas.load(std::memory_order_acquire),
+            tap.vfgActive.load(std::memory_order_acquire)))
+        return;
     if (!texture || gs_get_color_space() != GS_CS_SRGB) {
         if (tap.upscale) obs_upscale::render(*tap.upscale);
         else obs_source_skip_video_filter(tap.source);
@@ -283,8 +290,10 @@ bool start(Tap& tap, bool off)
         opts.fpsOverlay = std::min<uint32_t>(tap.fpsOverlay, 2);
         opts.lowLatency = tap.lowLatency ? 1u : 0u;
         opts.gpuPriority = tap.gpuPriority ? 1u : 0u;
+        opts.hideFromCapture = tap.hideFromCapture ? 1u : 0u;
         tap.controller = std::make_unique<Controller>(opts);
         tap.stopping = false;
+        tap.vfgActive.store(true, std::memory_order_release);
         blog(LOG_INFO, "[vfg] open request mode=%ux quality=%u qpc_ns=%llu",
             opts.multiplier, opts.quality, static_cast<unsigned long long>(clock_ns()));
         return true;
@@ -303,6 +312,7 @@ void stop(void* data)
         if (tap.controller) tap.controller->stop();
         if (!tap.stopping && tap.producer) queued = obs_source_get_weak_source(tap.source);
         tap.stopping = true;
+        tap.vfgActive.store(false, std::memory_order_release);
     }
     if (queued) obs_queue_task(OBS_TASK_GRAPHICS, [](void* opaque) {
         auto* weak = static_cast<obs_weak_source_t*>(opaque);
@@ -328,6 +338,8 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     const auto hud = static_cast<uint32_t>(std::clamp<long long>(obs_data_get_int(settings, "vfg_fps_overlay"), 0, 2));
     const uint32_t ll = obs_data_get_bool(settings, "vfg_low_latency") ? 1u : 0u;
     const uint32_t gp = obs_data_get_bool(settings, "vfg_gpu_priority") ? 1u : 0u;
+    const bool hideFromCapture = obs_data_get_bool(settings, "vfg_hide_from_capture");
+    const bool hideSourceCanvas = obs_data_get_bool(settings, "vfg_hide_source_canvas");
     const char* mon = obs_data_get_string(settings, "vfg_monitor");
     const bool enabled = obs_data_get_bool(settings, "vfg_upscale");
     const bool compare = obs_data_get_bool(settings, "vfg_upscale_compare");
@@ -339,10 +351,13 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     tap.fpsOverlay = hud;
     tap.lowLatency = ll;
     tap.gpuPriority = gp;
+    tap.hideFromCapture = hideFromCapture;
+    tap.hideSourceCanvas.store(hideSourceCanvas, std::memory_order_release);
     tap.monitorId = mon ? mon : "";
     if (tap.controller) {
         tap.controller->set_fps_overlay(tap.fpsOverlay);
         tap.controller->set_low_latency(tap.lowLatency);
+        tap.controller->set_hide_from_capture(tap.hideFromCapture ? 1u : 0u);
     }
 }
 
@@ -501,6 +516,10 @@ obs_properties_t* properties(void* opaque)
         [](obs_properties_t*, obs_property_t*, void* data) { return data && start(*static_cast<Tap*>(data), true); }, opaque);
     obs_properties_add_button2(ctrlGrp, "vfg_stop", obs_module_text("VFG.Close"),
         [](obs_properties_t*, obs_property_t*, void* data) { if (!data) return false; stop(data); return true; }, opaque);
+    auto* hideCapture = obs_properties_add_bool(ctrlGrp, "vfg_hide_from_capture", obs_module_text("VFG.HideFromCapture"));
+    obs_property_set_long_description(hideCapture, obs_module_text("VFG.Hint.HideFromCapture"));
+    auto* hideCanvas = obs_properties_add_bool(ctrlGrp, "vfg_hide_source_canvas", obs_module_text("VFG.HideSourceCanvas"));
+    obs_property_set_long_description(hideCanvas, obs_module_text("VFG.Hint.HideSourceCanvas"));
     obs_properties_add_group(p, "vfg_grp_control", obs_module_text("VFG.Group.Control"), OBS_GROUP_NORMAL, ctrlGrp);
     auto* upscale = obs_properties_create();
     auto* compare = obs_properties_add_bool(upscale, "vfg_upscale_compare", obs_module_text("VFG.Upscale.Compare"));
@@ -528,6 +547,8 @@ extern "C" void nr_register_vfg_tap()
         obs_data_set_default_int(settings, "vfg_fps_overlay", 1);
         obs_data_set_default_bool(settings, "vfg_low_latency", true);
         obs_data_set_default_bool(settings, "vfg_gpu_priority", true);
+        obs_data_set_default_bool(settings, "vfg_hide_from_capture", false);
+        obs_data_set_default_bool(settings, "vfg_hide_source_canvas", false);
         obs_upscale::defaults(settings);
         obs_data_set_default_bool(settings, "vfg_upscale", false);
         obs_data_set_default_bool(settings, "vfg_upscale_compare", false);

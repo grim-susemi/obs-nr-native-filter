@@ -16,7 +16,16 @@ struct Session {
     alignas(4) volatile LONG fpsOverlay;  // 0 = off, 1 = top-left, 2 = top-right
     alignas(4) volatile LONG lowLatency;  // 0 = off, 1 = NVIDIA Reflex on
     alignas(4) volatile LONG gpuPriority; // 0 = normal, 1 = high
+    alignas(4) volatile LONG hideFromCapture; // 0 = capturable (WDA_NONE), 1 = hidden (WDA_EXCLUDEFROMCAPTURE = 0x11)
 };
+inline constexpr DWORD display_affinity(LONG hideFromCapture) noexcept
+{
+    return hideFromCapture ? 0x11u : 0x0u;
+}
+inline constexpr bool should_hide_source_canvas(bool hideSourceCanvas, bool vfgActive) noexcept
+{
+    return hideSourceCanvas && vfgActive;
+}
 inline uint64_t clock_ns() noexcept
 {
     LARGE_INTEGER tick{}, rate{};

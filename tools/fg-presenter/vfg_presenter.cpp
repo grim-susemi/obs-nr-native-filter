@@ -65,6 +65,10 @@ BOOL CALLBACK enum_monitors(HMONITOR monitor, HDC, LPRECT, LPARAM data)
 
 constexpr uint64_t ms = 1000000;
 constexpr UINT reveal = WM_APP + 1;
+constexpr UINT syncAffinity = WM_APP + 2;
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
 
 struct Feed {
     Session& view;
@@ -144,6 +148,16 @@ void frames(Feed& f)
         }
     };
     sync_reflex();
+    LONG lastHide = InterlockedCompareExchange(&f.view.hideFromCapture, 0, 0) ? 1 : 0;
+    auto sync_affinity = [&]() {
+        const LONG want = InterlockedCompareExchange(&f.view.hideFromCapture, 0, 0) ? 1 : 0;
+        if (want != lastHide) {
+            lastHide = want;
+            const DWORD affinity = display_affinity(want);
+            PostMessageW(f.window, syncAffinity, static_cast<WPARAM>(want), 0);
+            fprintf(f.log, "event=display_affinity affinity=0x%lX\n", affinity);
+        }
+    };
     ipc::Consumer consumer(gpu.ipcQueue.Get(), {f.view.mapping, f.view.generation}, ipc::identity(f.parent));
     std::unique_ptr<NativeVfg> vfg;
     if (mult > 1) vfg = std::make_unique<NativeVfg>(f.runtime, gpu, f.view);
@@ -196,6 +210,7 @@ void frames(Feed& f)
     uint64_t reflexFrameId = 0;
     while (f.active()) {
         sync_reflex();
+        sync_affinity();
         if (!incoming) {
             const auto index = history.input_index();
             gpu.prepare_input(index);
@@ -461,7 +476,18 @@ int wmain(int argc, wchar_t** argv)
     wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
         if (msg == reveal) {
             auto* s = reinterpret_cast<Session*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-            if (s && state(*s) == 1) ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            if (s && state(*s) == 1) {
+                const DWORD affinity = display_affinity(InterlockedCompareExchange(&s->hideFromCapture, 0, 0));
+                SetWindowDisplayAffinity(hwnd, affinity);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            return 0;
+        }
+        if (msg == syncAffinity) {
+            auto* s = reinterpret_cast<Session*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            const DWORD affinity = s ? display_affinity(InterlockedCompareExchange(&s->hideFromCapture, 0, 0))
+                                     : static_cast<DWORD>(wp ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
+            SetWindowDisplayAffinity(hwnd, affinity);
             return 0;
         }
         if (msg == WM_CLOSE || (msg == WM_KEYDOWN && wp == VK_ESCAPE)
@@ -498,8 +524,16 @@ int wmain(int argc, wchar_t** argv)
     fprintf(file, "event=qa_monitor_selected id=%ls device=%ls rect=%ld,%ld,%ld,%ld primary=0\n",
         target.wantedId, target.info.szDevice, bounds.left, bounds.top, bounds.right, bounds.bottom);
 #endif
-    if (!SetWindowDisplayAffinity(window, 0x11)) { DestroyWindow(window); return 2; }
     SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(view));
+    const LONG initialHide = InterlockedCompareExchange(&view->hideFromCapture, 0, 0) ? 1 : 0;
+    const DWORD initialAffinity = display_affinity(initialHide);
+    if (!SetWindowDisplayAffinity(window, initialAffinity)) {
+        fprintf(file, "event=display_affinity_failed affinity=0x%lX err=%lu\n",
+            initialAffinity, GetLastError());
+        if (initialHide) { DestroyWindow(window); return 2; }
+    } else {
+        fprintf(file, "event=display_affinity affinity=0x%lX\n", initialAffinity);
+    }
 
     const auto hudScale = hud::scale_for(view->width, view->height,
         static_cast<uint32_t>(bounds.right - bounds.left), static_cast<uint32_t>(bounds.bottom - bounds.top),
@@ -532,10 +566,18 @@ int wmain(int argc, wchar_t** argv)
     const auto watchdog = SetTimer(window, 1, 200, nullptr);
     MSG msg{};
     while (feed.result.load() < 0 && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_TIMER && (feed.stopped() || clock_ns() - feed.heartbeat.load() > 2000 * ms)) {
-            InterlockedExchange64(&view->state, -1);
-            ShowWindow(window, SW_HIDE);
-            break;
+        if (msg.message == WM_TIMER) {
+            if (feed.stopped() || clock_ns() - feed.heartbeat.load() > 2000 * ms) {
+                InterlockedExchange64(&view->state, -1);
+                ShowWindow(window, SW_HIDE);
+                break;
+            }
+            DWORD currentAffinity = WDA_NONE;
+            const DWORD wantedAffinity = display_affinity(InterlockedCompareExchange(&view->hideFromCapture, 0, 0));
+            if (GetWindowDisplayAffinity(window, &currentAffinity) && currentAffinity != wantedAffinity) {
+                if (SetWindowDisplayAffinity(window, wantedAffinity))
+                    fprintf(file, "event=display_affinity affinity=0x%lX\n", wantedAffinity);
+            }
         }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
