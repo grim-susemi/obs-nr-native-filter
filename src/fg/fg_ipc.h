@@ -43,6 +43,7 @@ struct Frame {
  Shape shape{};
  uint64_t obsTick=0; // OBS output tick in ns; zero when the source cannot supply it.
  uint32_t splitPercent=50;
+ bool splitSwap=false;
 };
 struct CopyTicket {
  size_t slot;
@@ -92,7 +93,7 @@ public:
  // A discontinuity starts a new frame pair without retiring the transport.
  // In split mode before is required and splitPercent must be in [0,100].
  Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs,bool discontinuity=false,uint64_t obsTick=0,
-  ID3D11Texture2D* before=nullptr,uint32_t splitPercent=50);
+  ID3D11Texture2D* before=nullptr,uint32_t splitPercent=50,bool splitSwap=false);
  Status retire(); // Alive importer must close first; dead is NOT a completion.
  HANDLE peer_process()const;
  HANDLE control_event()const;

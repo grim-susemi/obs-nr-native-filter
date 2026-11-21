@@ -11,6 +11,7 @@ namespace nr::split {
 namespace {
 constexpr char enabledKey[] = "split_compare_enabled";
 constexpr char positionKey[] = "split_compare_position";
+constexpr char swapKey[] = "split_compare_swap";
 std::atomic<unsigned> requests{};
 thread_local obs_source_t* suppressedParent{};
 struct OriginalRender {
@@ -25,6 +26,7 @@ uniform texture2d before_image;
 uniform texture2d after_image;
 uniform float split_x;
 uniform float viewport_width;
+uniform float swap_sides;
 sampler_state linear_clamp {
     Filter = Linear;
     AddressU = Clamp;
@@ -43,7 +45,8 @@ float4 PSMain(VertData v) : TARGET {
     float divider_start = clamp(floor(split_x) - 1.0, 0.0, max(viewport_width - 2.0, 0.0));
     if (x >= divider_start && x < divider_start + 2.0)
         return float4(0.0, 1.0, 0.0, 1.0);
-    return x < split_x ? before_image.Sample(linear_clamp, v.uv)
+    bool show_before = swap_sides > 0.5 ? (x >= split_x) : (x < split_x);
+    return show_before ? before_image.Sample(linear_clamp, v.uv)
                        : after_image.Sample(linear_clamp, v.uv);
 }
 technique Draw {
@@ -84,6 +87,7 @@ void defaults(obs_data_t* data)
 {
     obs_data_set_default_bool(data, enabledKey, false);
     obs_data_set_default_int(data, positionKey, 50);
+    obs_data_set_default_bool(data, swapKey, false);
 }
 
 void add_properties(obs_properties_t* props)
@@ -91,6 +95,7 @@ void add_properties(obs_properties_t* props)
     auto* enabled = obs_properties_add_bool(props, enabledKey, obs_module_text("SplitCompare.Enabled"));
     obs_property_set_long_description(enabled, obs_module_text("SplitCompare.Hint"));
     obs_properties_add_int_slider(props, positionKey, obs_module_text("SplitCompare.Position"), 0, 100, 1);
+    obs_properties_add_bool(props, swapKey, obs_module_text("SplitCompare.Swap"));
 }
 
 void Setting::update(obs_data_t* data)
@@ -121,6 +126,7 @@ Plan plan(obs_source_t* filter)
     struct Scan {
         obs_source_t* last{};
         int percent = -1;
+        bool swap = false;
     } scan;
     // libobs enumerates from input to output.
     obs_source_enum_filters(parent, [](obs_source_t*, obs_source_t* candidate, void* data) {
@@ -133,13 +139,15 @@ Plan plan(obs_source_t* filter)
             return;
         s.last = candidate;
         auto* settings = obs_source_get_settings(candidate);
-        if (obs_data_get_bool(settings, enabledKey))
+        if (obs_data_get_bool(settings, enabledKey)) {
             s.percent = static_cast<int>(std::clamp(obs_data_get_int(settings, positionKey), 0LL, 100LL));
+            s.swap = obs_data_get_bool(settings, swapKey);
+        }
         obs_data_release(settings);
     }, &scan);
     if (scan.last != filter || scan.percent < 0)
         return {};
-    return {parent, static_cast<uint32_t>(scan.percent)};
+    return {parent, static_cast<uint32_t>(scan.percent), scan.swap};
 }
 
 bool capturing_original(obs_source_t* filter)
@@ -233,7 +241,7 @@ gs_texture_t* Canvas::original(const Plan& plan, Extent size, gs_color_space spa
     }, &context);
 }
 
-bool Canvas::draw(gs_texture_t* before, gs_texture_t* after, Extent size, uint32_t percent)
+bool Canvas::draw(gs_texture_t* before, gs_texture_t* after, Extent size, uint32_t percent, bool swap)
 {
     if (!before || !after)
         return false;
@@ -253,6 +261,7 @@ bool Canvas::draw(gs_texture_t* before, gs_texture_t* after, Extent size, uint32
     bind(gs_effect_get_param_by_name(effect_, "after_image"), after);
     gs_effect_set_float(gs_effect_get_param_by_name(effect_, "viewport_width"), float(size.width));
     gs_effect_set_float(gs_effect_get_param_by_name(effect_, "split_x"), float(size.width) * float(percent) / 100.0f);
+    gs_effect_set_float(gs_effect_get_param_by_name(effect_, "swap_sides"), swap ? 1.0f : 0.0f);
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(encode);
     gs_blend_state_push();
@@ -277,7 +286,7 @@ bool Canvas::render(const Plan& plan, Extent size, Draw render, void* context)
     }
     if (!after)
         return false;
-    if (!draw(before, after, size, plan.percent)) {
+    if (!draw(before, after, size, plan.percent, plan.swap)) {
         gs_blend_state_push();
         gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
         draw_texture(after, size);

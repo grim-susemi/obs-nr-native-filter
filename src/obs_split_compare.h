@@ -18,6 +18,7 @@ public:
 struct Plan {
     obs_source_t* parent{};
     uint32_t percent{};
+    bool swap{};
     explicit operator bool() const { return parent != nullptr; }
 };
 Plan plan(obs_source_t*);
@@ -47,7 +48,7 @@ class Canvas {
 public:
     void clear();
     gs_texture_t* original(const Plan&, Extent, gs_color_space, bool scale);
-    bool draw(gs_texture_t* before, gs_texture_t* after, Extent, uint32_t percent);
+    bool draw(gs_texture_t* before, gs_texture_t* after, Extent, uint32_t percent, bool swap = false);
     bool render(const Plan&, Extent, Draw, void*);
 };
 }

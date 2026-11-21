@@ -109,9 +109,10 @@ void run(const wchar_t* presenter, const std::filesystem::path& scratch)
         producer.status() == ipc::Status::Ok, "handshake");
     uint64_t tick = 1;
     uint32_t percent = 50;
+    bool swap = false;
     const auto publish = [&] {
         const auto now = clock_ns();
-        const auto status = producer.publish(after.Get(), now, now, false, tick += 16666667, before.Get(), percent);
+        const auto status = producer.publish(after.Get(), now, now, false, tick += 16666667, before.Get(), percent, swap);
         expect(status == ipc::Status::Ok || status == ipc::Status::Dropped, "publish paired frame");
     };
     HWND window{};
@@ -145,6 +146,9 @@ void run(const wchar_t* presenter, const std::filesystem::path& scratch)
     percent = 25;
     await([&] { publish(); return red(pixel(window, 10)) && blue(pixel(window, 60)) && divider(window, 25); },
         "changed OBS position must override drag");
+    swap = true;
+    await([&] { publish(); return blue(pixel(window, 10)) && red(pixel(window, 60)) && divider(window, 25); },
+        "swapped presenter sides must show processed on left and original on right");
     controller.stop();
     await([&] { return !controller.alive(); }, "presenter exit");
     expect(producer.retire() == ipc::Status::Ok, "retire");

@@ -74,11 +74,12 @@ Image render(obs_source_t* input, vec4 background = {})
     gs_stagesurface_unmap(stage.get());
     return result;
 }
-void configure(obs_source_t* filter, bool enabled, int position)
+void configure(obs_source_t* filter, bool enabled, int position, bool swap = false)
 {
     auto values = data();
     obs_data_set_bool(values.get(), "split_compare_enabled", enabled);
     obs_data_set_int(values.get(), "split_compare_position", position);
+    obs_data_set_bool(values.get(), "split_compare_swap", swap);
     auto event = std::unique_ptr<void, decltype(&CloseHandle)>(CreateEventW(nullptr, FALSE, FALSE, nullptr), CloseHandle);
     expect(event != nullptr, "create settings event");
     auto* signals = obs_source_get_signal_handler(filter);
@@ -95,7 +96,7 @@ bool close(Pixel a, Pixel b)
         if (std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i])) > 3) return false;
     return true;
 }
-void compare(const Image& actual, const Image& before, const Image& after, int position)
+void compare(const Image& actual, const Image& before, const Image& after, int position, bool swap = false)
 {
     const int divider = static_cast<int>(width) * position / 100;
     unsigned differing = 0, green = 0;
@@ -106,7 +107,8 @@ void compare(const Image& actual, const Image& before, const Image& after, int p
             if (p[1] > 220 && p[0] < 40 && p[2] < 40) ++green;
             continue;
         }
-        const auto expected = x < divider ? before[index] : after[index];
+        const bool showBefore = swap ? (x >= divider) : (x < divider);
+        const auto expected = showBefore ? before[index] : after[index];
         if (!close(actual[index], expected)) {
             const auto seen = actual[index];
             std::fprintf(stderr, "split=%d x=%d actual=%u,%u,%u,%u expected=%u,%u,%u,%u\n", position, x,
@@ -132,6 +134,7 @@ void check_defaults(obs_source_t* filter)
         obs_source_get_settings(filter), obs_data_release);
     expect(!obs_data_get_bool(saved.get(), "split_compare_enabled"), "split default off");
     expect(obs_data_get_int(saved.get(), "split_compare_position") == 50, "split default position");
+    expect(!obs_data_get_bool(saved.get(), "split_compare_swap"), "split swap default off");
 }
 void run_chain(bool nrFirst)
 {
@@ -155,6 +158,8 @@ void run_chain(bool nrFirst)
     compare(render(input.get()), before, after, 0);
     configure(upscale.get(), true, 100);
     compare(render(input.get()), before, after, 100);
+    configure(upscale.get(), true, 40, true);
+    compare(render(input.get()), before, after, 40, true);
     configure(upscale.get(), false, 50);
     configure(nr.get(), true, 50);
     compare(render(input.get()), before, after, 50);

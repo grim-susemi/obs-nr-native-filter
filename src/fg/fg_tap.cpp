@@ -279,7 +279,7 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
         const auto arrival = clock_ns();
         const auto result = tap.producer->publish(texture ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(texture)) : nullptr,
             captureQpc, arrival, tap.breakPair, tick,
-            before ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(before)) : nullptr, compare.percent);
+            before ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(before)) : nullptr, compare.percent, compare.swap);
         if (nr::quality::trace_frames())
             blog(LOG_INFO, "[quality] stage=vfg_tap obs_tick_ns=%llu source=%s generation=%llu capture_qpc_ns=%llu arrival_qpc_ns=%llu status=%d",
                 nr::quality::id(tick), obs_source_get_uuid(parent), nr::quality::id(tap.producer->generation()),
@@ -319,7 +319,7 @@ void render(void* data, gs_effect_t*)
             render_effects(&tap);
         return;
     }
-    if (compare && tap.splitCanvas.draw(before, texture, size, compare.percent))
+    if (compare && tap.splitCanvas.draw(before, texture, size, compare.percent, compare.swap))
         return;
     draw_sdr(texture, size, GS_BLEND_INVSRCALPHA);
 }

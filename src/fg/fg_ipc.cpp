@@ -79,11 +79,11 @@ std::optional<Frame> snapshot(const WireFrame& wire){
  const auto before=load(wire.sequence);if(before<=0||(before&1))return {};
  std::array<uint64_t,16> words{};for(size_t i=0;i<words.size();++i)words[i]=static_cast<uint64_t>(load(wire.words[i]));
  if(load(wire.sequence)!=before||words[1]!=static_cast<uint64_t>(before)/2)return {};
- const bool split=(words[6]&2)!=0;const auto percent=static_cast<uint32_t>((words[6]>>8)&0xff);
+ const bool split=(words[6]&2)!=0;const bool swap=(words[6]&4)!=0;const auto percent=static_cast<uint32_t>((words[6]>>8)&0xff);
  Frame result{words[0],words[1],words[2],words[3],{static_cast<uint32_t>(words[4]),static_cast<uint32_t>(words[4]>>32),
-  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},(words[6]&1)!=0,split},words[15],split?percent:50};
+  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},(words[6]&1)!=0,split},words[15],split?percent:50,split&&swap};
  if(!result.generation||!result.shape.width||!result.shape.height||!format(result.shape.format)||
-  (words[6]&~uint64_t{0xff03})||(split?percent>100:percent!=0))return {};
+  (words[6]&~uint64_t{0xff07})||(split?percent>100:(percent!=0||swap)))return {};
  std::memcpy(result.shape.sourceMonitor.data(),words.data()+7,sizeof(result.shape.sourceMonitor));return result;
 }
 struct Producer::Config {
@@ -216,7 +216,7 @@ Status Producer::status()const{
  return Status::ProtocolError;
 }
 Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity,uint64_t obsTick,
- ID3D11Texture2D* before,uint32_t splitPercent){
+ ID3D11Texture2D* before,uint32_t splitPercent,bool splitSwap){
  if(GetCurrentThreadId()!=config_->thread)return Status::ProtocolError;
  const auto state=status();if(state!=Status::Ok)return state;if(!source)return Status::InvalidFrame;
  D3D11_TEXTURE2D_DESC d{};source->GetDesc(&d);Ptr<ID3D11Device> owner;source->GetDevice(&owner);
@@ -247,7 +247,7 @@ Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arr
  auto& wire=p.mapping.header->frames[index];const auto& shape=config_->shape;
  std::array<uint64_t,16> words{generation(),slot.target,timestamp,arrival,(uint64_t{shape.height}<<32)|shape.width,
   (uint64_t{static_cast<uint32_t>(shape.colorSpace)}<<32)|static_cast<uint32_t>(shape.format),
-  (shape.displayCapture?uint64_t{1}:uint64_t{0})|(shape.splitCompare?(uint64_t{2}|(uint64_t{splitPercent}<<8)):uint64_t{0})};
+  (shape.displayCapture?uint64_t{1}:uint64_t{0})|(shape.splitCompare?(uint64_t{2}|(splitSwap?uint64_t{4}:uint64_t{0})|(uint64_t{splitPercent}<<8)):uint64_t{0})};
  std::memcpy(words.data()+7,shape.sourceMonitor.data(),sizeof(shape.sourceMonitor));
  words[15]=obsTick;
  store(wire.sequence,slot.target*2-1);

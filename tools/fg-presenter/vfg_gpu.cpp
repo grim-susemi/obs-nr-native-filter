@@ -373,15 +373,15 @@ void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const ui
     hudW_ = w;
     hudH_ = h;
 }
-UINT Gpu::present(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent)
+UINT Gpu::present(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
     if (!latencyReady_ && WaitForSingleObject(latency_.h, 240) != WAIT_OBJECT_0)
         check(E_FAIL, "swapchain latency timeout");
-    return present_ready(source, synthetic, beforeIndex, splitPercent);
+    return present_ready(source, synthetic, beforeIndex, splitPercent, splitSwap);
 }
 
 std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t deadlineNs,
-    int beforeIndex, uint32_t splitPercent)
+    int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
     // Don't let begin() enter its normal blocking allocator wait on this path.
     const auto completed = done_->GetCompletedValue();
@@ -400,10 +400,10 @@ std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t 
         // admitted frame. Waiting again without a Present could miss the signal.
         if (clock_ns() >= deadlineNs) return {};
     }
-    return present_ready(source, true, beforeIndex, splitPercent);
+    return present_ready(source, true, beforeIndex, splitPercent, splitSwap);
 }
 
-UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent)
+UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
     latencyReady_ = false;
     ComPtr<ID3D12Resource> dst;
@@ -423,9 +423,12 @@ UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex,
         cmd->ResourceBarrier(1, &barrier);
         D3D12_TEXTURE_COPY_LOCATION d{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
         D3D12_TEXTURE_COPY_LOCATION s{before[beforeIndex].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-        if (split) {
+        if (!splitSwap && split) {
             D3D12_BOX box{0, 0, 0, split, desc_.Height, 1};
             cmd->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+        } else if (splitSwap && split < width) {
+            D3D12_BOX box{split, 0, 0, width, desc_.Height, 1};
+            cmd->CopyTextureRegion(&d, split, 0, 0, &s, &box);
         }
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         cmd->ResourceBarrier(1, &barrier);

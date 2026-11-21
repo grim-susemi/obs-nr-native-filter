@@ -55,7 +55,7 @@ class Gpu final {
     ID3D12GraphicsCommandList* begin();
     void finish(bool sync);
     void move(ID3D12Resource*, ID3D12Resource*, bool toBuffer);
-    UINT present_ready(ID3D12Resource*, bool synthetic, int beforeIndex, uint32_t splitPercent);
+    UINT present_ready(ID3D12Resource*, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap);
 public:
     static constexpr size_t max_exchange = 2 + (max_multiplier - 1); // 2 inputs + up to 3 outputs (4x)
     ComPtr<ID3D12CommandQueue> ipcQueue, drawQueue;
@@ -81,9 +81,9 @@ public:
     // must be finished. An empty result means no staging commands were queued.
     [[nodiscard]] std::optional<uint64_t> try_stage(unsigned previous, unsigned current);
     void set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels);
-    UINT present(ID3D12Resource*, bool synthetic, int beforeIndex = -1, uint32_t splitPercent = 50);
+    UINT present(ID3D12Resource*, bool synthetic, int beforeIndex = -1, uint32_t splitPercent = 50, bool splitSwap = false);
     // Deadline is on clock_ns(). No GPU work is submitted on a missed admission.
     [[nodiscard]] std::optional<UINT> try_present_synthetic(ID3D12Resource*, uint64_t deadlineNs,
-        int beforeIndex = -1, uint32_t splitPercent = 50);
+        int beforeIndex = -1, uint32_t splitPercent = 50, bool splitSwap = false);
 };
 } // namespace nr::fg::vfg

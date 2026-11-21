@@ -91,16 +91,16 @@ struct Feed {
 struct SplitState {
     std::mutex mutex;
     Session* session{};
-    bool enabled{}, dragging{}, initialized{}, overridden{};
+    bool enabled{}, dragging{}, initialized{}, overridden{}, swap{};
     uint32_t observed{50}, percent{50};
 
     void reset(bool on) {
         std::lock_guard lock(mutex);
         enabled = on;
-        dragging = initialized = overridden = false;
+        dragging = initialized = overridden = swap = false;
         observed = percent = 50;
     }
-    uint32_t update(uint32_t value) {
+    uint32_t update(uint32_t value, bool swapSides) {
         std::lock_guard lock(mutex);
         value = std::min(value, 100u);
         if (!initialized || value != observed) {
@@ -109,7 +109,12 @@ struct SplitState {
             overridden = false;
         }
         if (!overridden) percent = observed;
+        swap = swapSides;
         return percent;
+    }
+    bool swapped() {
+        std::lock_guard lock(mutex);
+        return swap;
     }
     uint32_t current() {
         std::lock_guard lock(mutex);
@@ -259,7 +264,7 @@ void frames(Feed& f)
             if (next.status != ipc::Status::Ok || consumer.order_copy(*next.current, gpu.drawQueue.Get()) != ipc::Status::Ok)
                 check(E_FAIL, "IPC copy dependency");
             const auto& b = next.current->frame;
-            if (split) f.split.update(b.splitPercent);
+            if (split) f.split.update(b.splitPercent, b.splitSwap);
             record(f, "input", b, nullptr, 0);
             const auto step = history.observe(index, b, next.previous.has_value());
             if (step.stale) {
@@ -305,7 +310,7 @@ void frames(Feed& f)
                     }
                     refresh_hud(true);
                     const UINT pid = gpu.present(gpu.input[index].Get(), false,
-                        static_cast<int>(index), f.split.current());
+                        static_cast<int>(index), f.split.current(), f.split.swapped());
                     record(f, "present_repeat_split", b, nullptr, pid);
                 }
                 f.beat();
@@ -370,7 +375,7 @@ void frames(Feed& f)
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentStart, fid, sub);
                         const auto pid = gpu.try_present_synthetic(gpu.exchange[1 + sub].Get(), cutoff,
-                            split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
+                            split ? static_cast<int>(index) : -1, split ? f.split.current() : 50, split && f.split.swapped());
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);
                         record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
                             pid.value_or(0), genElapsed);
@@ -399,7 +404,7 @@ void frames(Feed& f)
             refresh_hud(true);
             reflex.marker(ReflexMarker::PresentStart, fid);
             const UINT pid = gpu.present(gpu.input[index].Get(), false,
-                split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
+                split ? static_cast<int>(index) : -1, split ? f.split.current() : 50, split && f.split.swapped());
             reflex.marker(ReflexMarker::PresentEnd, fid);
             record(f, "present_original", b, nullptr, pid);
             history.retain(index, b);
