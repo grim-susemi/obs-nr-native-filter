@@ -66,6 +66,13 @@ add_test(NAME vfg_capture_visibility COMMAND vfg_capture_visibility_tests
   $<TARGET_FILE:obs-nr-fg-presenter> "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vfg_capture_visibility")
 set_tests_properties(vfg_capture_visibility PROPERTIES TIMEOUT 60)
 
+add_executable(vfg_adaptive_fg_tests tools/tests/vfg_adaptive_fg_tests.cpp)
+target_compile_features(vfg_adaptive_fg_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_adaptive_fg_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_adaptive_fg_tests PRIVATE /W4 /WX /permissive-)
+add_test(NAME vfg_adaptive_fg COMMAND vfg_adaptive_fg_tests)
+set_tests_properties(vfg_adaptive_fg PROPERTIES TIMEOUT 30)
+
 add_executable(vfg_filter_output_tests tools/tests/vfg_filter_output_tests.cpp)
 target_compile_features(vfg_filter_output_tests PRIVATE cxx_std_20)
 target_compile_definitions(vfg_filter_output_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

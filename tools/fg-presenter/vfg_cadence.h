@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include <array>
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -90,5 +92,20 @@ struct CadencePlan {
             return {proposed, periodNs, multiplier};
     }
     return {seed, periodNs, multiplier};
+}
+
+[[nodiscard]] inline CadencePlan plan_cadence_adaptive(uint64_t arrivalNs,
+    uint64_t previousOriginalTargetNs, uint64_t contentPeriodNs, uint32_t effectiveMult) noexcept
+{
+    if (contentPeriodNs < 8'333'333 || contentPeriodNs > 50'000'000 ||
+        effectiveMult < 2 || effectiveMult > 4 || arrivalNs > UINT64_MAX - 2 * contentPeriodNs)
+        return {};
+    if (previousOriginalTargetNs && previousOriginalTargetNs <= UINT64_MAX - contentPeriodNs) {
+        const auto proposed = previousOriginalTargetNs + contentPeriodNs;
+        if (proposed >= contentPeriodNs && proposed >= arrivalNs + 3 * contentPeriodNs / 4 &&
+            proposed <= arrivalNs + 7 * contentPeriodNs / 4)
+            return {proposed, contentPeriodNs, effectiveMult};
+    }
+    return {arrivalNs + contentPeriodNs, contentPeriodNs, effectiveMult};
 }
 } // namespace nr::fg::vfg
