@@ -29,7 +29,8 @@ void defaults(obs_data_t* data)
     const auto tuning=core_default_tuning();
     obs_data_set_default_bool(data,"nr_enabled",true);
     obs_data_set_default_string(data,"nr_runtime_path",default_runtime);
-    obs_data_set_default_double(data,"nr_strength",1);
+    // Composition is a 0..1 blend; model intensity is a separate 0..2 control.
+    obs_data_set_default_double(data,"nr_strength",0.85);
     obs_data_set_default_int(data,"nr_passes",1);
     obs_data_set_default_int(data,"nr_work_scale",100);
     obs_data_set_default_int(data,"nr_preset",tuning.preset);
@@ -49,9 +50,9 @@ void defaults(obs_data_t* data)
     obs_data_set_default_double(data,"nr_pass2_local_tone",0);
     obs_data_set_default_double(data,"nr_pass2_skin_structure",tuning.skinStructure);
     obs_data_set_default_bool(data,"nr_pass2_auto_mask",tuning.autoMask);
-    obs_data_set_default_double(data,"nr_temporal_stability",0.80);
+    obs_data_set_default_double(data,"nr_temporal_stability",0.45);
     obs_data_set_default_bool(data,"nr_hold_enabled",true);
-    obs_data_set_default_double(data,"nr_hold_strength",0.80);
+    obs_data_set_default_double(data,"nr_hold_strength",0.45);
     obs_data_set_default_double(data,"nr_hold_tolerance",0.020);
     obs_data_set_default_int(data,"nr_motion_mode",0);
     obs_data_set_default_int(data,"nr_quick_preset",0);
@@ -209,14 +210,14 @@ static bool on_nr_preset_or_layout_changed(obs_properties_t* props,obs_property_
     if(pname && std::string(pname)=="nr_quick_preset") {
         const auto preset=obs_data_get_int(data,"nr_quick_preset");
         if(preset>=1 && preset<=4) {
-            obs_data_set_double(data,"nr_strength",1.0);
+            obs_data_set_double(data,"nr_strength",0.85);
             obs_data_set_int(data,"nr_preset",2);
             obs_data_set_double(data,"nr_local_tone",0.0);
             obs_data_set_double(data,"nr_skin_structure",-1.0);
             obs_data_set_bool(data,"nr_auto_mask",true);
-            obs_data_set_double(data,"nr_temporal_stability",0.80);
+            obs_data_set_double(data,"nr_temporal_stability",0.45);
             obs_data_set_bool(data,"nr_hold_enabled",true);
-            obs_data_set_double(data,"nr_hold_strength",0.80);
+            obs_data_set_double(data,"nr_hold_strength",0.45);
             obs_data_set_double(data,"nr_hold_tolerance",0.020);
             if(preset==1) {
                 obs_data_set_int(data,"nr_passes",1);

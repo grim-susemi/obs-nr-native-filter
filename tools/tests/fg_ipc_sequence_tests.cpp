@@ -201,6 +201,18 @@ void cadence_schedule(){
   }
  }
  expect(!plan_cadence(1'000'000'000,0,0,4).target(1),"unacquired cadence creates no synthetic slot");
+ const auto tight=plan_cadence(1'000'000'000,0,period_60hz,4);
+ for(uint32_t slot=1;slot<4;++slot){
+  expect(tight.synthetic_cutoff(slot)>tight.target(slot)+3'500'000,
+   "a subframe ready 3.5 ms after its 240 Hz target still fits");
+  expect(tight.synthetic_cutoff(slot)+250'000==tight.target(slot+1),
+   "each 240 Hz cutoff reserves time for the next slot, including the original");
+ }
+ expect(tight.synthetic_cutoff(0)==0&&tight.synthetic_cutoff(4)==0,
+  "only synthetic slots have a readiness cutoff");
+ const auto normal=plan_cadence(1'000'000'000,0,period_60hz,3);
+ expect(normal.synthetic_cutoff(1)==normal.target(1)+3'000'000,
+  "lower presentation rates keep their late tolerance");
 }
 }
 

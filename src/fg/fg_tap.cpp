@@ -20,6 +20,8 @@
 namespace nr::fg::vfg {
 namespace {
 using Microsoft::WRL::ComPtr;
+constexpr char qualityKey[] = "vfg_quality_mode";
+constexpr char legacyQualityKey[] = "vfg_quality";
 
 struct CaptureScope {
     gs_texrender_t* buffer;
@@ -54,7 +56,7 @@ struct Tap {
     uint32_t previousWidth{}, previousHeight{};
     uint32_t activeWidth{}, activeHeight{};
     uint32_t multiplier{2};
-    uint32_t quality{1};
+    Quality quality{Quality::Medium};
     uint32_t fpsOverlay{1};
     uint32_t lowLatency{1};
     uint32_t gpuPriority{1};
@@ -138,6 +140,18 @@ void draw_sdr(gs_texture_t* texture, Extent size, gs_blend_type destBlend)
     gs_blend_state_pop();
     gs_enable_framebuffer_srgb(prevSrgb);
     gs_set_linear_srgb(prevLinear);
+}
+
+void draw_transparent(Extent size)
+{
+    if (!size.width || !size.height) return;
+    auto* effect = obs_get_base_effect(OBS_EFFECT_SOLID);
+    const vec4 transparent{};
+    gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &transparent);
+    // Keep the caller's blend mode: source-only targets can write zero, while
+    // the scene's source-over blend keeps the layers already below this one.
+    while (gs_effect_loop(effect, "Solid"))
+        gs_draw_sprite(nullptr, 0, size.width, size.height);
 }
 
 // Returns a displayable capture, if this draw also supplied the presenter.
@@ -266,8 +280,10 @@ void render(void* data, gs_effect_t*)
         Extent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
     auto* texture = publish(tap, target, parent, size);
     if (should_hide_source_canvas(tap.hideSourceCanvas.load(std::memory_order_acquire),
-            tap.vfgActive.load(std::memory_order_acquire)))
+            tap.vfgActive.load(std::memory_order_acquire))) {
+        draw_transparent(size);
         return;
+    }
     if (!texture || gs_get_color_space() != GS_CS_SRGB) {
         if (tap.upscale) obs_upscale::render(*tap.upscale);
         else obs_source_skip_video_filter(tap.source);
@@ -285,7 +301,7 @@ bool start(Tap& tap, bool off)
     try {
         LaunchOptions opts{};
         opts.multiplier = off ? 1u : std::clamp<uint32_t>(tap.multiplier, 2, max_multiplier);
-        opts.quality = std::min<uint32_t>(tap.quality, 2);
+        opts.quality = tap.quality;
         opts.monitorId = utf8_to_wide(tap.monitorId);
         opts.fpsOverlay = std::min<uint32_t>(tap.fpsOverlay, 2);
         opts.lowLatency = tap.lowLatency ? 1u : 0u;
@@ -295,7 +311,7 @@ bool start(Tap& tap, bool off)
         tap.stopping = false;
         tap.vfgActive.store(true, std::memory_order_release);
         blog(LOG_INFO, "[vfg] open request mode=%ux quality=%u qpc_ns=%llu",
-            opts.multiplier, opts.quality, static_cast<unsigned long long>(clock_ns()));
+            opts.multiplier, static_cast<unsigned>(opts.quality), static_cast<unsigned long long>(clock_ns()));
         return true;
     } catch (const std::exception& e) {
         blog(LOG_WARNING, "[vfg] presenter launch failed: %s", e.what());
@@ -334,7 +350,16 @@ void stop(void* data)
 void apply_settings(Tap& tap, obs_data_t* settings)
 {
     const auto mult = static_cast<uint32_t>(obs_data_get_int(settings, "vfg_multiplier"));
-    const auto qual = static_cast<uint32_t>(obs_data_get_int(settings, "vfg_quality"));
+    // Older scenes saved the opposite numbers for the Fast and Best UI choices.
+    if (obs_data_has_user_value(settings, legacyQualityKey)) {
+        if (!obs_data_has_user_value(settings, qualityKey)) {
+            const auto legacy = obs_data_get_int(settings, legacyQualityKey);
+            const auto migrated = legacy == 0 ? Quality::High : legacy == 2 ? Quality::Low : Quality::Medium;
+            obs_data_set_int(settings, qualityKey, static_cast<long long>(migrated));
+        }
+        obs_data_unset_user_value(settings, legacyQualityKey);
+    }
+    const auto quality = decode_quality(obs_data_get_int(settings, qualityKey));
     const auto hud = static_cast<uint32_t>(std::clamp<long long>(obs_data_get_int(settings, "vfg_fps_overlay"), 0, 2));
     const uint32_t ll = obs_data_get_bool(settings, "vfg_low_latency") ? 1u : 0u;
     const uint32_t gp = obs_data_get_bool(settings, "vfg_gpu_priority") ? 1u : 0u;
@@ -347,7 +372,7 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     if (obs_upscale::update(tap.upscale, settings, enabled && !compare, enabled))
         tap.breakPair = true;
     tap.multiplier = std::clamp<uint32_t>(mult ? mult : 2, 2, max_multiplier);
-    tap.quality = std::min<uint32_t>(qual, 2);
+    tap.quality = quality;
     tap.fpsOverlay = hud;
     tap.lowLatency = ll;
     tap.gpuPriority = gp;
@@ -470,11 +495,11 @@ obs_properties_t* properties(void* opaque)
     obs_property_list_add_int(mult, "4x (240fps)", 4);
     obs_property_set_long_description(mult, obs_module_text("VFG.Hint.Multiplier"));
 
-    auto* qual = obs_properties_add_list(coreGrp, "vfg_quality", obs_module_text("VFG.Quality"),
+    auto* qual = obs_properties_add_list(coreGrp, qualityKey, obs_module_text("VFG.Quality"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Best"), 0);
-    obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Balanced"), 1);
-    obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Fast"), 2);
+    obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Fast"), static_cast<long long>(Quality::Low));
+    obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Balanced"), static_cast<long long>(Quality::Medium));
+    obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Best"), static_cast<long long>(Quality::High));
     obs_property_set_long_description(qual, obs_module_text("VFG.Hint.Reopen"));
 
     auto* mon = obs_properties_add_list(coreGrp, "vfg_monitor", obs_module_text("VFG.Monitor"),
@@ -542,7 +567,7 @@ extern "C" void nr_register_vfg_tap()
     info.get_name = [](void*) -> const char* { return obs_module_text("VFG.Name"); };
     info.get_defaults = [](obs_data_t* settings) {
         obs_data_set_default_int(settings, "vfg_multiplier", 2);
-        obs_data_set_default_int(settings, "vfg_quality", 1);
+        obs_data_set_default_int(settings, qualityKey, static_cast<long long>(Quality::Medium));
         obs_data_set_default_string(settings, "vfg_monitor", "");
         obs_data_set_default_int(settings, "vfg_fps_overlay", 1);
         obs_data_set_default_bool(settings, "vfg_low_latency", true);

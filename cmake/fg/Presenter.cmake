@@ -56,3 +56,17 @@ add_dependencies(vfg_capture_visibility_tests obs-nr-fg-presenter)
 add_test(NAME vfg_capture_visibility COMMAND vfg_capture_visibility_tests
   $<TARGET_FILE:obs-nr-fg-presenter> "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/vfg_capture_visibility")
 set_tests_properties(vfg_capture_visibility PROPERTIES TIMEOUT 60)
+
+add_executable(vfg_filter_output_tests tools/tests/vfg_filter_output_tests.cpp)
+target_compile_features(vfg_filter_output_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_filter_output_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_filter_output_tests PRIVATE /W4 /WX /permissive-)
+target_link_libraries(vfg_filter_output_tests PRIVATE OBS::libobs)
+add_dependencies(vfg_filter_output_tests obs-nr-filter)
+if(NOT OBS_NR_VFG_QA_ACTION)
+  add_test(NAME vfg_filter_output COMMAND vfg_filter_output_tests
+    $<TARGET_FILE:obs-nr-filter> "${CMAKE_CURRENT_SOURCE_DIR}/data" $<TARGET_FILE:obs-nr-fg-presenter>
+    "$<TARGET_FILE_DIR:OBS::libobs>/libobs-d3d11.dll" "${CMAKE_CURRENT_BINARY_DIR}/vfg_filter_output")
+  set_tests_properties(vfg_filter_output PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE
+    WORKING_DIRECTORY "$<TARGET_FILE_DIR:OBS::libobs>")
+endif()

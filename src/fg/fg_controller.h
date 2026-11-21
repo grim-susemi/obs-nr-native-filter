@@ -6,7 +6,7 @@
 namespace nr::fg::vfg {
 struct LaunchOptions {
     uint32_t multiplier = 2; // 1 = off (original), 2..4 = VFG
-    uint32_t quality = 1;    // 0 = Best, 1 = Balanced, 2 = Fast
+    Quality quality = Quality::Medium;
     std::wstring monitorId;  // empty = auto
     uint32_t fpsOverlay = 1;  // 0 = off, 1 = top-left, 2 = top-right
     uint32_t lowLatency = 1;  // 0 = off, 1 = NVIDIA Reflex on

@@ -46,7 +46,7 @@ std::wstring secondary_monitor_id()
 }
 
 void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std::wstring& logPath,
-    const std::wstring& monitorId, uint32_t cadence = 0)
+    const std::wstring& monitorId, uint32_t cadence = 0, Quality quality = Quality::Medium, bool hotfix = false)
 {
     std::error_code ec;
     std::filesystem::remove(logPath, ec);
@@ -68,7 +68,8 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     DXGI_ADAPTER_DESC desc{};
     expect(SUCCEEDED(dev.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)), "adapter");
 
-    const ipc::Shape shape{1920, 1080, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
+    const ipc::Shape shape{hotfix ? 2560u : 1920u, hotfix ? 1440u : 1080u,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
     D3D11_TEXTURE2D_DESC td{};
     td.Width = shape.width;
     td.Height = shape.height;
@@ -85,7 +86,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     ipc::Producer producer(dev.Get(), key, shape);
     LaunchOptions opts{};
     opts.multiplier = mult;
-    opts.quality = 1;
+    opts.quality = quality;
     opts.monitorId = monitorId;
     Controller controller(opts);
 
@@ -103,7 +104,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     }
     const auto start = clock_ns();
     uint32_t last = UINT32_MAX, accepted = 0, repeated = 0;
-    const uint32_t count = cadence ? 96 : 45;
+    const uint32_t count = hotfix ? 360 : cadence ? 96 : 45;
     for (uint32_t f = 0; f < count; ++f) {
         const auto ts = start + uint64_t{f} * 1'000'000'000 / 60;
         if (cadence) {
@@ -126,7 +127,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
         }
         last = unique;
         const auto now = clock_ns();
-        const auto pub = producer.publish(tex.Get(), ts, now, cadence && f == 48, cadence ? ts : 0);
+        const auto pub = producer.publish(tex.Get(), ts, now, !hotfix && cadence && f == 48, cadence ? ts : 0);
         expect(pub == ipc::Status::Ok || pub == ipc::Status::Dropped, "publish");
         if (pub == ipc::Status::Ok) {
             ++accepted;
@@ -143,20 +144,25 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     std::ifstream ifs(logPath);
     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
     expect(content.find("event=initialized backend=nvidia-vfg-native") != std::string::npos, "missing nvidia-vfg-native init");
-    const size_t subCount = [&] {
+    const auto events = [&](std::string_view name) {
         size_t c = 0, pos = 0;
-        while ((pos = content.find("event=present_vfg_subframe", pos)) != std::string::npos) { ++c; pos += 26; }
+        while ((pos = content.find(name, pos)) != std::string::npos) { ++c; pos += name.size(); }
         return c;
-    }();
-    const size_t origCount = [&] {
-        size_t c = 0, pos = 0;
-        while ((pos = content.find("event=present_original", pos)) != std::string::npos) { ++c; pos += 22; }
-        return c;
-    }();
-    expect(subCount >= (mult - 1) * 5, "insufficient VFG interpolated subframes presented");
-    expect(origCount >= 5, "insufficient original frames presented");
+    };
+    const auto subCount = events("event=present_vfg_subframe");
+    const auto origCount = events("event=present_original");
     if (cadence)
         std::printf("CADENCE hz=%u accepted=%u duplicate_writes=%u\n", cadence, accepted, repeated);
+    if (hotfix) {
+        const auto mode = static_cast<unsigned>(quality);
+        expect(content.find("size=2560x1440 quality=" + std::to_string(mode) + " ") != std::string::npos,
+            "wrong resolution or mode in presenter");
+        std::printf("HOTFIX quality=%u late=%zu pair_late=%zu busy=%zu original_late=%zu synthetic=%zu original=%zu\n", mode,
+            events("event=drop_vfg_subframe_late"), events("event=drop_vfg_pair_late"),
+            events("event=drop_vfg_present_busy"), events("event=drop_original_late"), subCount, origCount);
+    }
+    expect(subCount >= (mult - 1) * 5, "insufficient VFG interpolated subframes presented");
+    expect(origCount >= 5, "insufficient original frames presented");
     std::printf("PASS vfg_native_smoke multiplier=%ux subframes=%zu originals=%zu\n", mult, subCount, origCount);
 }
 } // namespace
@@ -165,12 +171,25 @@ int wmain(int argc, wchar_t** argv)
 {
     try {
         const bool cadence = argc == 4 && std::wstring_view(argv[3]) == L"--cadence";
-        expect(argc == 3 || cadence, "usage: vfg_native_smoke_tests <presenter.exe> <log_dir> [--cadence]");
+        const bool hotfix = argc == 4 && std::wstring_view(argv[3]) == L"--1440p-4x";
+        const bool high = argc == 4 && std::wstring_view(argv[3]) == L"--1440p-4x-high";
+        expect(argc == 3 || cadence || hotfix || high,
+            "usage: vfg_native_smoke_tests <presenter.exe> <log_dir> [--cadence|--1440p-4x|--1440p-4x-high]");
         const std::wstring presenter = argv[1];
         const std::filesystem::path logDir = argv[2];
         const auto monId = secondary_monitor_id();
         expect(!monId.empty(), "no active secondary display");
         expect(SetEnvironmentVariableW(L"OBS_NR_VFG_QA_MONITOR", monId.c_str()) != FALSE, "set secondary display");
+        if (high) {
+            run_multiplier(4, presenter, (logDir / L"1440p-4x-mode-2.log").wstring(), monId, 60, Quality::High, true);
+            return 0;
+        }
+        if (hotfix) {
+            for (const auto quality : {Quality::Medium, Quality::Low})
+                run_multiplier(4, presenter, (logDir / (L"1440p-4x-mode-" +
+                    std::to_wstring(static_cast<unsigned>(quality)) + L".log")).wstring(), monId, 60, quality, true);
+            return 0;
+        }
         if (cadence) {
             for (const auto hz : {30u, 40u, 60u})
                 run_multiplier(2, presenter, (logDir / (L"cadence-" + std::to_wstring(hz) + L".log")).wstring(), monId, hz);

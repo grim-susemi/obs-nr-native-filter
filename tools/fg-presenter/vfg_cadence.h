@@ -50,6 +50,18 @@ struct CadencePlan {
     {
         return slot && slot <= multiplier ? originalNs - periodNs + periodNs * slot / multiplier : 0;
     }
+
+    [[nodiscard]] uint64_t synthetic_cutoff(uint32_t slot) const noexcept
+    {
+        if (!slot || slot >= multiplier) return 0;
+        const auto due = target(slot);
+        const auto next = target(slot + 1);
+        // At 60 Hz x4, use the rest of the short slot, but reserve 0.25 ms
+        // before the next frame. Keep the existing tolerance at other rates.
+        if (periodNs == period_60hz && multiplier == 4)
+            return next - 250'000;
+        return due + 3'000'000 < next ? due + 3'000'000 : next;
+    }
 };
 
 // A confirmed unique pair one 60 Hz tick apart does not need to wait four

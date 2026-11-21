@@ -1,6 +1,6 @@
 # Install guide
 
-How to install OBS Native NR 0.2.8 into OBS Studio on Windows. Start with the [illustrated quick guide](INSTALL-ONECLICK.md). The filters automatically find installed runtimes.
+How to install OBS Native NR 0.2.9 into OBS Studio on Windows. Start with the [illustrated quick guide](INSTALL-ONECLICK.md). The filters automatically find installed runtimes.
 
 [한국어 설치 안내는 아래에 있습니다](#한국어-설치-안내)
 
@@ -15,7 +15,7 @@ How to install OBS Native NR 0.2.8 into OBS Studio on Windows. Start with the [i
 
 ## One-click install
 
-1. Download `obs-nr-native-filter-0.2.8-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.8 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.8) and verify the checksum.
+1. Download `obs-nr-native-filter-0.2.9-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.9 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.9) and verify the checksum.
 2. Close OBS completely, including the tray icon.
 3. Extract the whole zip into a folder and double-click `install.bat`. The console replaces each question with the next one.
    - **Language**: Enter for Korean, `2` for English.
@@ -54,7 +54,7 @@ Close OBS and double-click `uninstall.bat`. It restores any backed-up files and 
 
 ## 한국어 설치 안내
 
-OBS Native NR 0.2.8을 Windows OBS Studio에 설치하는 방법입니다. [화면이 포함된 원클릭 안내](INSTALL-ONECLICK.md)부터 보세요. 설치된 런타임은 효과가 자동으로 찾습니다.
+OBS Native NR 0.2.9를 Windows OBS Studio에 설치하는 방법입니다. [화면이 포함된 원클릭 안내](INSTALL-ONECLICK.md)부터 보세요. 설치된 런타임은 효과가 자동으로 찾습니다.
 
 ### 준비
 
@@ -65,7 +65,7 @@ OBS Native NR 0.2.8을 Windows OBS Studio에 설치하는 방법입니다. [화�
 
 ### 원클릭 설치 순서
 
-1. [v0.2.8 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.8)에서 `obs-nr-native-filter-0.2.8-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
+1. [v0.2.9 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.9)에서 `obs-nr-native-filter-0.2.9-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
 2. OBS를 완전히 끕니다(트레이 아이콘 포함).
 3. 압축 푼 폴더의 `install.bat`을 더블클릭합니다.
    - **언어**: 그냥 Enter를 누르면 한국어입니다.

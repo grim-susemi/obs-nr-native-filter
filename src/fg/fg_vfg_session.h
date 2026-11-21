@@ -4,12 +4,18 @@
 
 namespace nr::fg::vfg {
 inline constexpr uint32_t max_multiplier = 4;
+enum class Quality : uint32_t { Low = 0, Medium = 1, High = 2 };
+inline constexpr Quality decode_quality(long long mode) noexcept
+{
+    return mode == 0 ? Quality::Low : mode == 2 ? Quality::High : Quality::Medium;
+}
+
 struct Session {
     alignas(8) volatile LONG64 state; // 0 initializing, 1 offered, 2 drain for resize, 3 drained, -1 stop
     uint64_t generation;
     uint32_t width, height;
     uint32_t multiplier; // 1 = original preview, 2..4 = VFG interpolated preview
-    uint32_t quality;    // 0 = Best, 1 = Balanced, 2 = Fast (NVIDIA VFG Mode)
+    uint32_t quality;    // NVIDIA VFG Mode (Quality)
     LUID adapter;
     wchar_t mapping[112];
     wchar_t monitorId[128]; // Empty = auto display selection

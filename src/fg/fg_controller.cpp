@@ -184,7 +184,7 @@ bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID ad
     view_->width = shape.width;
     view_->height = shape.height;
     view_->multiplier = std::clamp<uint32_t>(options_.multiplier, 1, max_multiplier);
-    view_->quality = std::min<uint32_t>(options_.quality, 2);
+    view_->quality = static_cast<uint32_t>(options_.quality);
     view_->adapter = adapter;
     InterlockedExchange(&view_->fpsOverlay, static_cast<LONG>(std::min<uint32_t>(options_.fpsOverlay, 2)));
     InterlockedExchange(&view_->lowLatency, static_cast<LONG>(options_.lowLatency ? 1u : 0u));

@@ -270,6 +270,26 @@ int main(int argc, char** argv) {
             const auto out = run({0.8f, 0.0f, 0.02f}, true, bright, nrSpike, -2.f, -1.f, dark, dark, dark);
             expect(std::abs(out[8 * W + 8].r - 0.7f) < 0.002f, "temporal disocclusion rejection");
         }
+        // Synthetic strong negative correction: test residual history, not vendor intensity.
+        {
+            const std::vector<RgbaF> bright(size_t(W) * H, {0.9f, 0.9f, 0.9f, 1.0f});
+            const std::vector<RgbaF> dark(size_t(W) * H, {0.1f, 0.1f, 0.1f, 1.0f});
+            const std::vector<RgbaF> strongResidual(size_t(W) * H, {-0.7f, -0.7f, -0.7f, 1.0f});
+            auto currentNr=nrSpike;
+            currentNr[8 * W + 7]=dark[0]; // allow the old correction through the 3x3 clamp
+            const nr::StabilizeSettings settings{0.45f, 0.45f, 0.02f};
+            const auto matched=run(settings, true, bright, currentNr, 0.f, 0.f,
+                bright, strongResidual, dark);
+            expect(matched[8 * W + 8].r < 0.6f, "strong residual influences matched history");
+            const auto revealed=run(settings, true, bright, currentNr, 0.f, 0.f,
+                dark, strongResidual, dark);
+            expect(std::abs(revealed[8 * W + 8].r - 0.7f) < 0.002f,
+                "disocclusion rejects strong temporal and hold history");
+            const auto residual=run(settings, true, bright, currentNr, 0.f, 0.f,
+                dark, strongResidual, dark, false, true);
+            expect(std::abs(residual[8 * W + 8].r + 0.2f) < 0.002f,
+                "disocclusion publishes current correction");
+        }
 
         // Reset publishes a residual, not the NR color; hold must also be reflected in it.
         {

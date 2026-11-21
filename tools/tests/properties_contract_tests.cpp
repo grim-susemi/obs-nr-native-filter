@@ -8,6 +8,7 @@
 using namespace nr::properties;
 void expect(bool value,const char* reason) { if(!value)throw std::runtime_error(reason); }
 #include "passes_properties_tests.inc"
+#include "nr_hotfix_properties_tests.inc"
 unsigned inspections=0;
 nr::runtime::Inspection count_inspection(const nr::runtime::RuntimeIdentity& identity)
 {
@@ -189,8 +190,8 @@ void multipass_controls(const std::shared_ptr<const nr::Settings>& initial)
     {
         auto* sdata=obs_data_create();defaults(sdata);
         const auto def=decode(sdata,default_runtime,initial->runtimePath);
-        expect(def.reason.empty() && def.stabilize.temporalStrength==0.8f &&
-            def.stabilize.holdStrength==0.8f && def.stabilize.holdTolerance==0.02f,
+        expect(def.reason.empty() && def.stabilize.temporalStrength==0.45f &&
+            def.stabilize.holdStrength==0.45f && def.stabilize.holdTolerance==0.02f,
             "anti-flicker defaults");
         obs_data_set_bool(sdata,"nr_hold_enabled",false);
         obs_data_set_double(sdata,"nr_temporal_stability",0.0);
@@ -305,7 +306,7 @@ int main(int argc,char** argv)
         obs_properties_destroy(props);
         const auto installed=std::filesystem::canonical(argv[0]);
         const auto first=admit(data,accept_path,installed);
-        expect(first.enabled && first.strength.value==1 && first.reason.empty() &&
+        expect(first.enabled && first.strength.value==0.85f && first.reason.empty() &&
             std::filesystem::equivalent(utf8_path(first.runtimePath),installed),"defaults resolve the installed runtime");
         expect(effective_enabled(true,true) && !effective_enabled(true,false) &&
                !effective_enabled(false,true) && !effective_enabled(false,false),"enable truth table");
@@ -319,6 +320,7 @@ int main(int argc,char** argv)
         expect(followed->tuning==chosen && followed->revision.value==9,"tuning follows decoded values");
         tuning_controls(a);
         multipass_controls(a);
+        nr_hotfix_properties(a->runtimePath);
         passes_status_controls();
     {
         auto* udata = obs_data_create(); defaults(udata);

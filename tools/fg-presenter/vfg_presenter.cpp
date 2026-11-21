@@ -294,7 +294,7 @@ void frames(Feed& f)
             const auto& a = anchor->frame;
             if (cudaPending && vfg->subframe_ready(mult - 1)) cudaPending = false;
             const auto stageStart = clock_ns();
-            const bool pairLate = stageStart > plan.target(1) + 3 * ms;
+            const bool pairLate = stageStart >= plan.synthetic_cutoff(mult - 1);
             const auto staged = !cudaPending && !pairLate ?
                 gpu.try_stage(anchor->index, index) : std::nullopt;
             if (staged) {
@@ -310,15 +310,16 @@ void frames(Feed& f)
                     if (clock_ns() < targetNs) pace_until(targetNs, f, paceTimer.h);
                     if (!f.active()) break;
                     const uint64_t waitStart = clock_ns();
-                    const auto cutoff = std::min<uint64_t>(targetNs + 3 * ms, plan.target(sub + 1));
+                    const auto cutoff = plan.synthetic_cutoff(sub);
                     bool generatedReady = false;
                     while (f.active() && clock_ns() < cutoff) {
                         if (vfg->subframe_ready(sub)) { generatedReady = true; break; }
                         pace_until(std::min<uint64_t>(clock_ns() + 350000, cutoff), f, paceTimer.h);
                     }
-                    const uint64_t genElapsed = clock_ns() - waitStart;
+                    const auto readyCheck = clock_ns();
+                    const uint64_t genElapsed = readyCheck - waitStart;
                     if (!f.active()) break;
-                    if (generatedReady && clock_ns() < cutoff) {
+                    if (generatedReady && readyCheck < cutoff) {
                         refresh_hud(false);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
@@ -328,7 +329,8 @@ void frames(Feed& f)
                         record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
                             pid.value_or(0), genElapsed);
                     } else {
-                        record(f, "drop_vfg_subframe_late", b, &a, 0, genElapsed);
+                        record(f, "drop_vfg_subframe_late", b, &a, 0,
+                            readyCheck > cutoff ? readyCheck - cutoff : 0);
                     }
                 }
             } else {

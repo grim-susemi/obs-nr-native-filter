@@ -21,6 +21,12 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 > [!NOTE]
 > Community project, not affiliated with NVIDIA or the OBS Project. NVIDIA runtime DLLs are **not redistributed** inside this repository or release zip. `install.bat` guides you through placing `nvngx_dlssnr.dll` and can automatically download & verify the official NVIDIA-signed DLSS 4.5 SR and NVIDIA VFG runtimes from NVIDIA's servers.
 
+## What's new in 0.2.9
+
+- **VFG quality:** Fast/Low is Mode 0, Balanced/Medium is Mode 1 (default), and Best/High is Mode 2. Existing choices keep the meaning of their previous labels.
+- **VFG canvas and pacing:** Canvas hide writes transparent source output while the preview feed continues. At 60 Hz input and 4×, late synthetic frames get more time within their slot without taking the original frame's slot.
+- **Native NR:** New filters and built-in quick presets use composition strength 0.85, temporal stability 0.45, static hold 0.45, and tolerance 0.020. Explicitly saved settings are retained.
+
 ## What's new in 0.2.8
 
 - **VFG preview capture & source canvas visibility:** VFG preview windows are now capturable by OBS Window/Game Capture by default (`WDA_NONE = 0`), with an optional **"Hide VFG window from capture"** checkbox to restore capture exclusion (`0x11`). Added **"Hide source on OBS canvas while VFG active"** (off by default) to keep feeding frames to the VFG window without showing the original source on the OBS canvas.
@@ -72,7 +78,7 @@ The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (1
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.2.8-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.8 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.8).
+1. Download `obs-nr-native-filter-0.2.9-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.9 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.9).
 2. Close OBS completely (including tray icon).
 3. Extract the entire zip and double-click **`install.bat`**.
 4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
@@ -86,9 +92,9 @@ Illustrated one-click setup: [docs/INSTALL-ONECLICK.md](docs/INSTALL-ONECLICK.md
 
 | Group | Key Settings | Default | Notes |
 |---|---|---|---|
-| **Basic / Preset** | Quick preset, Composition strength, NR passes (1–2), Working scale (50–100%) | 1 pass, 100% | Use 75% working scale or 1 pass on 1440p/4K when running VFG simultaneously. |
+| **Basic / Preset** | Quick preset, Composition strength, NR passes (1–2), Working scale (50–100%) | 0.85, 1 pass, 100% | Composition strength is a 0–1 blend; model intensity is a separate 0–2 control. |
 | **1st / 2nd Pass** | Preset (0–3), Style (Standard/Natural/Cinematic), Intensity, Local structure, Local tone, Skin structure, Auto mask | Local tone **0** | Independent 2nd pass styles supported when passes = 2 and Custom 2nd pass is checked. |
-| **Anti-flicker** | Temporal stability (0–1), Static stabilizer, Tolerance, Motion mode | 0.80, Static ON, Refined | Refined NVOF eliminates 4×4 block wobble; Static hold locks stationary UI/backgrounds with zero ghosting. |
+| **Anti-flicker** | Temporal stability (0–1), Static hold strength, Tolerance, Motion mode | 0.45, 0.45 (on), 0.020, Refined | Lower history weights limit trails while holding stable details. |
 | **FPS HUD / Status** | Pre/Post FPS overlay (Off / Top-Left / Top-Right), Status & Reason | Off | Shows live `IN -> NR FPS` on output. |
 
 ## Uninstall
@@ -133,7 +139,7 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 
 **설치 방법 (원클릭)**
 
-1. [v0.2.8 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.8)에서 `obs-nr-native-filter-0.2.8-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
+1. [v0.2.9 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.9)에서 `obs-nr-native-filter-0.2.9-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
 2. OBS를 완전히 끕니다.
 3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
 4. `nvngx_dlssnr.dll`(310.8.0.0 호환판, SHA-256 `e67dee20…c989a`)이 OBS에 없으면 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)

@@ -1,4 +1,4 @@
-# OBS 원클릭 설치 — 0.2.8
+# OBS 원클릭 설치 — 0.2.9
 
 1. `SHA256SUMS.txt`로 ZIP을 확인하고 **모두 압축 해제**합니다. OBS를 종료한 뒤 `install.bat`을 더블클릭합니다. 포터블 OBS가 목록에 없으면 `bin\64bit\obs64.exe`가 들어 있는 OBS 최상위 폴더를 지정합니다.
 2. 설치기는 현재 질문만 표시합니다. DLSS와 VFG는 각각 **Y 또는 Enter**로 설치하고 **N**으로 건너뜁니다. Native NR용 `nvngx_dlssnr.dll`이 있으면 모델 질문에서 지정합니다. 그냥 Enter를 누르면 모델만 건너뜁니다. 자세한 준비 사항은 [설치 안내](INSTALL.md)를 참고하세요.

@@ -360,7 +360,7 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
             reinterpret_cast<void*>(buf.pointer), pixFmt, compType, layout, 1), "NvCVImage_Init");
     }
 
-    const unsigned mode = std::min<uint32_t>(session.quality, 2);
+    const auto mode = static_cast<unsigned>(decode_quality(session.quality));
     p.cv_check(p.createEffect("VideoFrameGeneration", &p.effect), "NvVFX_CreateEffect");
     p.cv_check(p.setStream(p.effect, "CudaStream", p.stream), "NvVFX_SetCudaStream");
     p.cv_check(p.setU32(p.effect, "InputWidth", session.width), "InputWidth");
