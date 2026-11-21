@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
+#include "fg_backend.h"
 #include "vfg_gpu.h"
 #include <filesystem>
 #include <memory>
 
 namespace nr::fg::vfg {
-class NativeVfg final {
+class NativeVfg final : public IFgBackend {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 public:
-    NativeVfg(const std::filesystem::path& runtimeDir, const Gpu& gpu, const Session& session);
-    ~NativeVfg();
+    NativeVfg(const std::filesystem::path& runtimeDir, Gpu& gpu, const Session& session,
+        bool gpuShotChange = false, const std::function<void()>& beat = {});
+    ~NativeVfg() override;
     NativeVfg(const NativeVfg&) = delete;
     NativeVfg& operator=(const NativeVfg&) = delete;
-    // stageFence is the signal already queued by Gpu::try_stage. CUDA waits on
-    // it before reading the pair and records each output's completion in order.
-    bool enqueue_subframes(uint64_t stageFence, bool shotChange);
-    void wait_subframe(uint32_t subIndex);
-    bool subframe_ready(uint32_t subIndex);
-    void synchronize();
-    unsigned sdk_version() const noexcept;
+    const char* name() const noexcept override { return "nvidia-vfg-native"; }
+    unsigned version_tag() const noexcept override;
+    bool faulted() const noexcept override;
+    std::optional<FgPairTicket> submit_pair(const FgPairDesc&, unsigned prevIndex, unsigned currIndex) override;
+    bool subframe_ready(const FgPairTicket&, uint32_t sub) override;
+    void resolve_subframe(ID3D12GraphicsCommandList*, const FgPairTicket&, ID3D12Resource*, uint32_t sub) override;
+    void synchronize() override;
 };
 } // namespace nr::fg::vfg

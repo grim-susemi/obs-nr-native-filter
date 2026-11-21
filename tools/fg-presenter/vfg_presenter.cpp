@@ -83,6 +83,7 @@ struct Feed {
     struct SplitState& split;
     std::atomic_uint64_t heartbeat{clock_ns()};
     std::atomic_int result{-1};
+    std::atomic_bool initializing{true};
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
     bool active() { return state(view) == 1 && !stopped(); }
     void beat() { heartbeat.store(clock_ns()); }
@@ -156,6 +157,7 @@ void frames(Feed& f)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (!f.active()) return;
     f.beat();
+    f.initializing.store(true);
     Handle compareReady, paceTimer;
     compareReady.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!compareReady.h) check(HRESULT_FROM_WIN32(GetLastError()), "comparison event");
@@ -193,18 +195,19 @@ void frames(Feed& f)
         }
     };
     ipc::Consumer consumer(gpu.ipcQueue.Get(), {f.view.mapping, f.view.generation}, ipc::identity(f.parent));
-    std::unique_ptr<NativeVfg> vfg;
-    if (mult > 1) vfg = std::make_unique<NativeVfg>(f.runtime, gpu, f.view);
+    std::unique_ptr<IFgBackend> vfg;
+    if (mult > 1) vfg = std::make_unique<NativeVfg>(f.runtime, gpu, f.view, false, [&] { f.beat(); });
     fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld\n",
-        vfg ? "nvidia-vfg-native" : "original", vfg ? vfg->sdk_version() : 0u, lastReflex);
+        vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, lastReflex);
     f.beat();
+    f.initializing.store(false);
     bool shown = false;
     ContentHistory history;
     UniqueCadence cadence;
     uint64_t lastOriginalTarget{};
     uint64_t lastPeriod{};
     bool sawRepeat = false;
-    bool cudaPending = false;
+    std::optional<FgPairTicket> previousTicket;
     uint64_t hudWindowStart = clock_ns();
     uint64_t hudOrigFrames = 0, hudPresentedFrames = 0;
     uint32_t lastHudPos = UINT32_MAX;
@@ -337,19 +340,18 @@ void frames(Feed& f)
         reflex.marker(ReflexMarker::RenderSubmitStart, fid);
         if (vfg && anchor && plan.originalNs) {
             const auto& a = anchor->frame;
-            if (cudaPending && vfg->subframe_ready(mult - 1)) cudaPending = false;
+            const bool backendBusy = previousTicket &&
+                !vfg->subframe_ready(*previousTicket, previousTicket->lastSubmittedSub);
             const auto stageStart = clock_ns();
             const bool pairLate = stageStart >= plan.synthetic_cutoff(mult - 1);
-            const auto staged = !cudaPending && !pairLate ?
-                gpu.try_stage(anchor->index, index) : std::nullopt;
-            if (staged) {
-                record(f, "stage_queued", b, &a, 0, clock_ns() - stageStart);
-                const auto enqueueStart = clock_ns();
-                vfg->enqueue_subframes(*staged, false);
-                record(f, "cuda_enqueued", b, &a, 0, clock_ns() - enqueueStart);
-                cudaPending = true;
+            const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, mult, false,
+                [&] { record(f, "stage_queued", b, &a, 0, clock_ns() - stageStart); },
+                [&](uint64_t workNs) { record(f, "cuda_enqueued", b, &a, 0, workNs); }};
+            const auto ticket = !backendBusy && !pairLate ? vfg->submit_pair(pair, anchor->index, index) : std::nullopt;
+            if (ticket) {
+                previousTicket.emplace(*ticket);
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
-                for (uint32_t sub = 1; sub < mult; ++sub) {
+                for (uint32_t sub = 1; sub <= ticket->lastSubmittedSub; ++sub) {
                     if (!f.active()) break;
                     const uint64_t targetNs = plan.target(sub);
                     if (clock_ns() < targetNs) pace_until(targetNs, f, paceTimer.h);
@@ -358,7 +360,7 @@ void frames(Feed& f)
                     const auto cutoff = plan.synthetic_cutoff(sub);
                     bool generatedReady = false;
                     while (f.active() && clock_ns() < cutoff) {
-                        if (vfg->subframe_ready(sub)) { generatedReady = true; break; }
+                        if (vfg->subframe_ready(*ticket, sub)) { generatedReady = true; break; }
                         pace_until(std::min<uint64_t>(clock_ns() + 350000, cutoff), f, paceTimer.h);
                     }
                     const auto readyCheck = clock_ns();
@@ -369,7 +371,11 @@ void frames(Feed& f)
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentStart, fid, sub);
-                        const auto pid = gpu.try_present_synthetic(gpu.exchange[1 + sub].Get(), cutoff,
+                        auto* const displayTex = gpu.syntheticTex[sub - 1].Get();
+                        const Gpu::SyntheticFrame synthetic{displayTex, [&](ID3D12GraphicsCommandList* cmd) {
+                            vfg->resolve_subframe(cmd, *ticket, displayTex, sub);
+                        }, ticket->prevIndex, ticket->currIndex};
+                        const auto pid = gpu.try_present_synthetic(synthetic, cutoff,
                             split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);
                         record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
@@ -381,7 +387,7 @@ void frames(Feed& f)
                 }
             } else {
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
-                record(f, cudaPending ? "drop_vfg_gpu_busy" :
+                record(f, backendBusy ? "drop_vfg_gpu_busy" :
                     pairLate ? "drop_vfg_pair_late" : "drop_vfg_stage_busy", b, &a, 0);
             }
         } else {
@@ -403,6 +409,7 @@ void frames(Feed& f)
             reflex.marker(ReflexMarker::PresentEnd, fid);
             record(f, "present_original", b, nullptr, pid);
             history.retain(index, b);
+            gpu.enter_steady_state();
             lastOriginalTarget = plan.originalNs;
             f.beat();
         } else {
@@ -419,6 +426,7 @@ void frames(Feed& f)
     // a resize. In particular, a successful Present only submits draw work.
     const auto drain_failure = [&] {
         fprintf(f.log, "event=error message=presenter_drain_failed\n");
+        fflush(f.log);
         ShowWindowAsync(f.window, SW_HIDE);
         TerminateProcess(GetCurrentProcess(), 5);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
@@ -625,6 +633,19 @@ int wmain(int argc, wchar_t** argv)
         static_cast<uint32_t>(bounds.right - bounds.left), static_cast<uint32_t>(bounds.bottom - bounds.top),
         GetDpiForWindow(window));
     Feed feed{*view, parent.h, window, file, argv[3], cliMult, hudScale, split};
+    Handle workerDone;
+    workerDone.h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!workerDone.h) {
+        fprintf(file, "event=error message=worker_done_event_failed\n");
+        DestroyWindow(window);
+        return 2;
+    }
+    const auto watchdog = SetTimer(window, 1, 200, nullptr);
+    if (!watchdog) {
+        fprintf(file, "event=error message=watchdog_timer_failed\n");
+        DestroyWindow(window);
+        return 2;
+    }
     std::thread worker([&] {
         try {
             while (!feed.stopped()) {
@@ -648,14 +669,23 @@ int wmain(int argc, wchar_t** argv)
             feed.result.store(1);
         }
         PostMessageW(window, WM_CLOSE, 0, 0);
+        SetEvent(workerDone.h);
     });
-    const auto watchdog = SetTimer(window, 1, 200, nullptr);
+    bool watchdogTriggered = false;
     MSG msg{};
     while (feed.result.load() < 0 && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_TIMER) {
-            if (feed.stopped() || clock_ns() - feed.heartbeat.load() > 2000 * ms) {
-                InterlockedExchange64(&view->state, -1);
-                ShowWindow(window, SW_HIDE);
+            const auto initializing = feed.initializing.load();
+            const auto heartbeat = feed.heartbeat.load();
+            const auto elapsed = clock_ns() - heartbeat;
+            const auto timeout = (initializing ? 15000 : 2000) * ms;
+            if (feed.stopped()) {
+                break;
+            } else if (elapsed > timeout) {
+                watchdogTriggered = true;
+                fprintf(file, "event=watchdog_timeout initializing=%d elapsed_ms=%lld\n",
+                    initializing ? 1 : 0, static_cast<long long>(elapsed / ms));
+                fflush(file);
                 break;
             }
             DWORD currentAffinity = WDA_NONE;
@@ -667,11 +697,19 @@ int wmain(int argc, wchar_t** argv)
         }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+        if (feed.stopped()) break;
     }
-    if (watchdog) KillTimer(window, watchdog);
+    KillTimer(window, watchdog);
     InterlockedExchange64(&view->state, -1);
     ShowWindow(window, SW_HIDE);
-    if (worker.joinable()) worker.join();
+    if (WaitForSingleObject(workerDone.h, 1000) != WAIT_OBJECT_0) {
+        fprintf(file, "event=shutdown_force_terminate watchdog=%d\n", watchdogTriggered ? 1 : 0);
+        fflush(file);
+        DestroyWindow(window);
+        TerminateProcess(GetCurrentProcess(), watchdogTriggered ? 2u : 0u);
+        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    }
+    worker.join();
     DestroyWindow(window);
-    return feed.result.load() == 0 ? 0 : 1;
+    return watchdogTriggered ? 2 : feed.result.load() == 0 ? 0 : 1;
 }

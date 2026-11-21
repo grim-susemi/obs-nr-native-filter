@@ -4,6 +4,7 @@
 #include "vfg_content.h"
 #include <wrl/client.h>
 #include <array>
+#include <functional>
 #include <optional>
 
 namespace nr::fg::vfg {
@@ -19,6 +20,14 @@ inline void check(HRESULT hr, const char* operation)
 {
     if (FAILED(hr)) throw ipc::Error(ipc::Status::ProtocolError, hr, operation);
 }
+class DescriptorStager final {
+    ID3D12Device* device_;
+    ComPtr<ID3D12DescriptorHeap> cpu_;
+public:
+    explicit DescriptorStager(ID3D12Device*);
+    void write_srv(ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE dest) const;
+};
+
 class Gpu final {
     HWND window_;
     ComPtr<ID3D12Device> device_;
@@ -37,8 +46,8 @@ class Gpu final {
     bool latencyReady_{};
     uint64_t fence_{};
     bool allowTearing_{};
+    DWORD waitMs_{5000};
     D3D12_RESOURCE_DESC desc_{};
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint_{};
     ComPtr<ID3D12Resource> hudUpload_;
     ComPtr<ID3D12Resource> dividerUpload_;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT dividerFp_{};
@@ -53,22 +62,23 @@ class Gpu final {
     uint64_t compareFence_{};
     void init_compare();
     ID3D12GraphicsCommandList* begin();
-    void finish(bool sync);
-    void move(ID3D12Resource*, ID3D12Resource*, bool toBuffer);
+    ID3D12GraphicsCommandList* begin_available();
+    uint64_t finish(bool sync);
+    using Draw = std::function<void(ID3D12GraphicsCommandList*)>;
     UINT present_ready(ID3D12Resource*, bool synthetic, int beforeIndex, uint32_t splitPercent);
 public:
-    static constexpr size_t max_exchange = 2 + (max_multiplier - 1); // 2 inputs + up to 3 outputs (4x)
+    struct SyntheticFrame {
+        ID3D12Resource* texture;
+        Draw resolve;
+        unsigned prevIndex, currIndex;
+    };
     ComPtr<ID3D12CommandQueue> ipcQueue, drawQueue;
     std::array<ComPtr<ID3D12Resource>, content_input_count> input;
     std::array<ComPtr<ID3D12Resource>, content_input_count> before;
-    std::array<ComPtr<ID3D12Resource>, max_exchange> exchange;
-    std::array<Handle, max_exchange> exported;
-    size_t outputCount{};
-    uint64_t bytes{}, allocated{};
-    UINT pitch() const { return footprint_.Footprint.RowPitch; }
+    std::array<ComPtr<ID3D12Resource>, max_multiplier - 1> syntheticTex;
     ID3D12Device* d3d_device() const noexcept { return device_.Get(); }
-    ID3D12Fence* staging_fence() const noexcept { return done_.Get(); }
     Gpu(const Session&, HWND, uint32_t multiplier);
+    void enter_steady_state() noexcept { waitMs_ = 1000; }
     // Call before submitting a copy to this input on ipcQueue.
     void prepare_input(unsigned index);
     [[nodiscard]] bool commands_ready() const;
@@ -77,13 +87,13 @@ public:
     // occurs on submission, and polling never maps an unfinished readback.
     [[nodiscard]] bool begin_compare(unsigned previous, unsigned current, HANDLE ready);
     [[nodiscard]] std::optional<bool> compare_result();
-    // IPC copies must be ordered before this read, and the previous CUDA pair
-    // must be finished. An empty result means no staging commands were queued.
-    [[nodiscard]] std::optional<uint64_t> try_stage(unsigned previous, unsigned current);
+    // Speculative admission never waits on the ring. Zero means no submission.
+    [[nodiscard]] uint64_t record_draw(const Draw&);
+    void mark_inputs_read(unsigned prevIndex, unsigned currIndex, uint64_t fenceVal);
     void set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels);
     UINT present(ID3D12Resource*, bool synthetic, int beforeIndex = -1, uint32_t splitPercent = 50);
     // Deadline is on clock_ns(). No GPU work is submitted on a missed admission.
-    [[nodiscard]] std::optional<UINT> try_present_synthetic(ID3D12Resource*, uint64_t deadlineNs,
+    [[nodiscard]] std::optional<UINT> try_present_synthetic(const SyntheticFrame&, uint64_t deadlineNs,
         int beforeIndex = -1, uint32_t splitPercent = 50);
 };
 } // namespace nr::fg::vfg

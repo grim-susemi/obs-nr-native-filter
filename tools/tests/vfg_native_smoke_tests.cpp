@@ -139,6 +139,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     controller.stop();
     Sleep(100);
     for (int i = 0; i < 60 && controller.alive(); ++i) Sleep(50);
+    expect(!controller.alive(), "presenter still alive after stop");
     expect(producer.retire() == ipc::Status::Ok, "producer.retire");
 
     std::ifstream ifs(logPath);
@@ -151,6 +152,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     };
     const auto subCount = events("event=present_vfg_subframe");
     const auto origCount = events("event=present_original");
+    expect(events("event=error") == 0, "presenter logged an error");
     if (cadence)
         std::printf("CADENCE hz=%u accepted=%u duplicate_writes=%u\n", cadence, accepted, repeated);
     if (hotfix) {
@@ -173,13 +175,19 @@ int wmain(int argc, wchar_t** argv)
         const bool cadence = argc == 4 && std::wstring_view(argv[3]) == L"--cadence";
         const bool hotfix = argc == 4 && std::wstring_view(argv[3]) == L"--1440p-4x";
         const bool high = argc == 4 && std::wstring_view(argv[3]) == L"--1440p-4x-high";
-        expect(argc == 3 || cadence || hotfix || high,
-            "usage: vfg_native_smoke_tests <presenter.exe> <log_dir> [--cadence|--1440p-4x|--1440p-4x-high]");
+#ifdef OBS_NR_VFG_QA_ACTION
+        constexpr bool allowPrimary = false;
+#else
+        const bool allowPrimary = argc == 4 && std::wstring_view(argv[3]) == L"--allow-primary";
+#endif
+        expect(argc == 3 || cadence || hotfix || high || allowPrimary,
+            "usage: vfg_native_smoke_tests <presenter.exe> <log_dir> [--cadence|--1440p-4x|--1440p-4x-high|--allow-primary (QA action OFF)]");
         const std::wstring presenter = argv[1];
         const std::filesystem::path logDir = argv[2];
         const auto monId = secondary_monitor_id();
-        expect(!monId.empty(), "no active secondary display");
-        expect(SetEnvironmentVariableW(L"OBS_NR_VFG_QA_MONITOR", monId.c_str()) != FALSE, "set secondary display");
+        expect(allowPrimary || !monId.empty(), "no active secondary display");
+        expect(SetEnvironmentVariableW(L"OBS_NR_VFG_QA_MONITOR", monId.empty() ? nullptr : monId.c_str()) != FALSE,
+            "set QA monitor override");
         if (high) {
             run_multiplier(4, presenter, (logDir / L"1440p-4x-mode-2.log").wstring(), monId, 60, Quality::High, true);
             return 0;
