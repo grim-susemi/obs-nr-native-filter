@@ -32,7 +32,7 @@ struct FramePipeline::Impl {
         std::optional<JobKey> warmupPending;
         Generation(uint64_t value,bool cold) : id(value),warming(cold) {}
     };
-    const std::thread::id graphics = std::this_thread::get_id();
+    std::atomic<std::thread::id> graphics{std::this_thread::get_id()};
     std::optional<Epochs> active;
     std::shared_ptr<Processor> processor;
     PerInstanceTick ticks;
@@ -67,7 +67,7 @@ struct FramePipeline::Impl {
         if (!epochs.valid() || !processor) throw std::invalid_argument("scheduler requires exact epochs and processor");
         worker = std::thread([this] { run(); }); // All signal/lifetime state exists before start.
     }
-    bool on_graphics() const { return graphics == std::this_thread::get_id(); }
+    bool on_graphics() const { return graphics.load(std::memory_order_acquire) == std::this_thread::get_id(); }
     template<class F> void each(F&& f) const
     {
         if (current) f(*current);
@@ -398,6 +398,7 @@ size_t FramePipeline::retired_generations() const
 }
 Counters FramePipeline::counters() const { return impl_->counts; }
 void FramePipeline::collect() { if (impl_->on_graphics()) impl_->collect(); }
+void FramePipeline::rebind_graphics() { impl_->graphics.store(std::this_thread::get_id(), std::memory_order_release); }
 void FramePipeline::service()
 {
     if(impl_->on_graphics() && !impl_->exited.load(std::memory_order_acquire) &&

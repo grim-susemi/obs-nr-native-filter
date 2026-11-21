@@ -23,6 +23,7 @@ struct Session {
     alignas(4) volatile LONG lowLatency;  // 0 = off, 1 = NVIDIA Reflex on
     alignas(4) volatile LONG gpuPriority; // 0 = normal, 1 = high
     alignas(4) volatile LONG hideFromCapture; // 0 = capturable (WDA_NONE), 1 = hidden (WDA_EXCLUDEFROMCAPTURE = 0x11)
+    uint32_t splitCompare; // Fixed for the lifetime of each offered generation.
 };
 inline constexpr DWORD display_affinity(LONG hideFromCapture) noexcept
 {

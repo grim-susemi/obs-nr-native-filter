@@ -40,6 +40,19 @@ void leave() {}
 void refresh() {}
 }
 
+// P15's deterministic fake has no graphics or filter-chain fixture.
+namespace nr::split {
+void defaults(obs_data_t*) {}
+void add_properties(obs_properties_t*) {}
+Setting::~Setting() = default;
+void Setting::update(obs_data_t*) {}
+Plan plan(obs_source_t*) { return {}; }
+bool capturing_original(obs_source_t*) { return false; }
+bool capturing_processed(obs_source_t*) { return false; }
+void Canvas::clear() {}
+bool Canvas::render(const Plan&, Extent, Draw, void*) { std::abort(); }
+}
+
 extern "C" {
 void obs_enter_graphics(void)
 {
@@ -53,6 +66,7 @@ void obs_enter_graphics(void)
     fake_obs::graphics.lock();
 }
 void obs_leave_graphics(void) {fake_obs::graphics.unlock();}
+bool obs_in_task_thread(enum obs_task_type) {return true;}
 void obs_add_main_render_callback(void (*draw)(void*,uint32_t,uint32_t),void* param)
 {
     std::lock_guard hold(fake_obs::graphics);fake_obs::renderCallbacks.emplace_back(draw,param);

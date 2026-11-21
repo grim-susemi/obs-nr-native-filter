@@ -102,6 +102,7 @@ public:
     size_t retired_generations() const;
     Counters counters() const;
     void collect();
+    void rebind_graphics(); // Adopt a replacement graphics thread after OBS ResetVideo.
     void service(); // Notify existing worker; never calls vendor cleanup on graphics.
     std::shared_future<void> worker_exit() const; // Subscribe BEFORE request_stop.
     void request_stop();

@@ -12,7 +12,7 @@
 #include <string>
 
 namespace nr::fg::ipc {
-inline constexpr uint64_t protocol_version=1, slot_count=4, generation_limit=2;
+inline constexpr uint64_t protocol_version=2, slot_count=4, generation_limit=2;
 enum class Status {
  Ok, Pending, Dropped, PeerDead, VersionMismatch, AdapterMismatch, WrongPeer,
  Rejected, PeerBusy, RetirementCapacity, DeviceLost, InvalidFrame,
@@ -36,11 +36,13 @@ struct Shape {
  DXGI_COLOR_SPACE_TYPE colorSpace;
  std::array<wchar_t,32> sourceMonitor{};
  bool displayCapture=false;
+ bool splitCompare=false;
 };
 struct Frame {
  uint64_t generation=0, serial=0, timestampNs=0, arrivalNs=0;
  Shape shape{};
  uint64_t obsTick=0; // OBS output tick in ns; zero when the source cannot supply it.
+ uint32_t splitPercent=50;
 };
 struct CopyTicket {
  size_t slot;
@@ -88,7 +90,9 @@ public:
  Offer connect(const Peer&); // Throws Error on rejection/capacity; old generation is retained.
  Status status()const;
  // A discontinuity starts a new frame pair without retiring the transport.
- Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs,bool discontinuity=false,uint64_t obsTick=0);
+ // In split mode before is required and splitPercent must be in [0,100].
+ Status publish(ID3D11Texture2D*,uint64_t timestampNs,uint64_t arrivalNs,bool discontinuity=false,uint64_t obsTick=0,
+  ID3D11Texture2D* before=nullptr,uint32_t splitPercent=50);
  Status retire(); // Alive importer must close first; dead is NOT a completion.
  HANDLE peer_process()const;
  HANDLE control_event()const;
@@ -122,12 +126,14 @@ public:
  // Copies into a same-shape COMMON texture or a sufficiently large readback
  // buffer. Keeps destination, allocator and list alive through the return fence.
  // Queue is dedicated to this endpoint; rendering uses the destination only.
+ // This legacy entry point rejects split frames.
  Status copy(size_t slot,ID3D12Resource* destination);
  // Copy the oldest visible unconsumed IPC frame to a private COMMON texture.
  // Keep each destination alive and unmodified through its last reader. Do not
  // alias input allocations. A ticket means queued, not GPU-ready: check both
- // tickets with copy_status before reading off-queue. Keep original output.
- [[nodiscard]] CopyStep copy_next(ID3D12Resource* destination);
+ // tickets with copy_status before reading off-queue. In split mode before is
+ // required and receives the original under the same ticket and return fence.
+ [[nodiscard]] CopyStep copy_next(ID3D12Resource* destination,ID3D12Resource* before=nullptr);
  // Poll a ticket issued by this Consumer on its graphics-owner thread.
  [[nodiscard]] Status copy_status(const CopyTicket&)const;
  // Add the exact copy completion dependency to a different consumer queue.
@@ -140,6 +146,6 @@ public:
  void test_submit_probe(HANDLE reached,HANDLE resume);
 #endif
 private:
- Status copy_frame(const CopyTicket&,ID3D12Resource*,bool guardCrossSlotDestination);
+ Status copy_frame(const CopyTicket&,ID3D12Resource*,ID3D12Resource*,bool guardCrossSlotDestination);
 };
 } // namespace nr::fg::ipc

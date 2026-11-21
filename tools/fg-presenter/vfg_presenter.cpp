@@ -4,6 +4,7 @@
 #include "vfg_hud.h"
 #include "vfg_reflex.h"
 #include <mmsystem.h>
+#include <windowsx.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <intrin.h>
+#include <mutex>
 #include <thread>
 
 namespace nr::fg::vfg {
@@ -78,11 +80,41 @@ struct Feed {
     const wchar_t* runtime;
     uint32_t cliMultiplier;
     uint32_t hudScale;
+    struct SplitState& split;
     std::atomic_uint64_t heartbeat{clock_ns()};
     std::atomic_int result{-1};
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
     bool active() { return state(view) == 1 && !stopped(); }
     void beat() { heartbeat.store(clock_ns()); }
+};
+
+struct SplitState {
+    std::mutex mutex;
+    Session* session{};
+    bool enabled{}, dragging{}, initialized{}, overridden{};
+    uint32_t observed{50}, percent{50};
+
+    void reset(bool on) {
+        std::lock_guard lock(mutex);
+        enabled = on;
+        dragging = initialized = overridden = false;
+        observed = percent = 50;
+    }
+    uint32_t update(uint32_t value) {
+        std::lock_guard lock(mutex);
+        value = std::min(value, 100u);
+        if (!initialized || value != observed) {
+            observed = value;
+            initialized = true;
+            overridden = false;
+        }
+        if (!overridden) percent = observed;
+        return percent;
+    }
+    uint32_t current() {
+        std::lock_guard lock(mutex);
+        return percent;
+    }
 };
 
 void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a, UINT id, uint64_t workNs = 0)
@@ -137,6 +169,8 @@ void frames(Feed& f)
         static_cast<unsigned long long>(f.view.generation), static_cast<unsigned long>(f.view.adapter.HighPart),
         f.view.adapter.LowPart, static_cast<void*>(f.window), GetCurrentProcessId());
     set_gpu_process_priority(InterlockedCompareExchange(&f.view.gpuPriority, 0, 0) != 0, f.log);
+    const bool split = f.view.splitCompare != 0;
+    f.split.reset(split);
     Gpu gpu(f.view, f.window, mult);
     ReflexContext reflex(gpu.d3d_device(), gpu.drawQueue.Get(), f.log);
     LONG lastReflex = -1;
@@ -214,7 +248,7 @@ void frames(Feed& f)
         if (!incoming) {
             const auto index = history.input_index();
             gpu.prepare_input(index);
-            const auto next = consumer.copy_next(gpu.input[index].Get());
+            const auto next = consumer.copy_next(gpu.input[index].Get(), split ? gpu.before[index].Get() : nullptr);
             if (!next.current) {
                 if (next.status != ipc::Status::Pending && next.status != ipc::Status::Dropped)
                     check(E_FAIL, "IPC copy_next");
@@ -225,6 +259,7 @@ void frames(Feed& f)
             if (next.status != ipc::Status::Ok || consumer.order_copy(*next.current, gpu.drawQueue.Get()) != ipc::Status::Ok)
                 check(E_FAIL, "IPC copy dependency");
             const auto& b = next.current->frame;
+            if (split) f.split.update(b.splitPercent);
             record(f, "input", b, nullptr, 0);
             const auto step = history.observe(index, b, next.previous.has_value());
             if (step.stale) {
@@ -263,6 +298,16 @@ void frames(Feed& f)
             if (*compared) {
                 sawRepeat = true;
                 incoming.reset();
+                if (split) {
+                    if (!shown) {
+                        PostMessageW(f.window, reveal, 0, 0);
+                        shown = true;
+                    }
+                    refresh_hud(true);
+                    const UINT pid = gpu.present(gpu.input[index].Get(), false,
+                        static_cast<int>(index), f.split.current());
+                    record(f, "present_repeat_split", b, nullptr, pid);
+                }
                 f.beat();
                 continue;
             }
@@ -324,7 +369,8 @@ void frames(Feed& f)
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentStart, fid, sub);
-                        const auto pid = gpu.try_present_synthetic(gpu.exchange[1 + sub].Get(), cutoff);
+                        const auto pid = gpu.try_present_synthetic(gpu.exchange[1 + sub].Get(), cutoff,
+                            split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);
                         record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
                             pid.value_or(0), genElapsed);
@@ -352,7 +398,8 @@ void frames(Feed& f)
             }
             refresh_hud(true);
             reflex.marker(ReflexMarker::PresentStart, fid);
-            const UINT pid = gpu.present(gpu.input[index].Get(), false);
+            const UINT pid = gpu.present(gpu.input[index].Get(), false,
+                split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
             reflex.marker(ReflexMarker::PresentEnd, fid);
             record(f, "present_original", b, nullptr, pid);
             history.retain(index, b);
@@ -366,6 +413,8 @@ void frames(Feed& f)
             sawRepeat = false;
         }
     }
+    f.split.reset(false);
+    PostMessageW(f.window, WM_CANCELMODE, 0, 0);
     // Both queues must be idle before releasing their resources or acknowledging
     // a resize. In particular, a successful Present only submits draw work.
     const auto drain_failure = [&] {
@@ -476,8 +525,9 @@ int wmain(int argc, wchar_t** argv)
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"ObsNrVfgPreviewWindow";
     wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+        auto* split = reinterpret_cast<SplitState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (msg == reveal) {
-            auto* s = reinterpret_cast<Session*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            auto* s = split ? split->session : nullptr;
             if (s && state(*s) == 1) {
                 const DWORD affinity = display_affinity(InterlockedCompareExchange(&s->hideFromCapture, 0, 0));
                 SetWindowDisplayAffinity(hwnd, affinity);
@@ -486,10 +536,42 @@ int wmain(int argc, wchar_t** argv)
             return 0;
         }
         if (msg == syncAffinity) {
-            auto* s = reinterpret_cast<Session*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            auto* s = split ? split->session : nullptr;
             const DWORD affinity = s ? display_affinity(InterlockedCompareExchange(&s->hideFromCapture, 0, 0))
                                      : static_cast<DWORD>(wp ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
             SetWindowDisplayAffinity(hwnd, affinity);
+            return 0;
+        }
+        if (split && (msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP ||
+            msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE)) {
+            std::unique_lock lock(split->mutex);
+            if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
+                split->dragging = false;
+                lock.unlock();
+                if (msg == WM_CANCELMODE && GetCapture() == hwnd) ReleaseCapture();
+                return 0;
+            }
+            RECT client{};
+            if (!split->enabled || !GetClientRect(hwnd, &client) || client.right <= 0) {
+                split->dragging = false;
+                return 0;
+            }
+            const int x = std::clamp(GET_X_LPARAM(lp), 0, static_cast<int>(client.right));
+            if (msg == WM_LBUTTONDOWN) {
+                const int divider = static_cast<int>(static_cast<int64_t>(client.right) * split->percent / 100);
+                if (std::abs(x - divider) > 12) return 0;
+                SetCapture(hwnd);
+                split->dragging = GetCapture() == hwnd;
+            }
+            if (split->dragging) {
+                split->percent = static_cast<uint32_t>((static_cast<int64_t>(x) * 100 + client.right / 2) / client.right);
+                split->overridden = true;
+                if (msg == WM_LBUTTONUP) {
+                    split->dragging = false;
+                    lock.unlock();
+                    ReleaseCapture();
+                }
+            }
             return 0;
         }
         if (msg == WM_CLOSE || (msg == WM_KEYDOWN && wp == VK_ESCAPE)
@@ -497,7 +579,7 @@ int wmain(int argc, wchar_t** argv)
             || msg == WM_DISPLAYCHANGE
 #endif
         ) {
-            auto* s = reinterpret_cast<Session*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            auto* s = split ? split->session : nullptr;
             if (s) InterlockedExchange64(&s->state, -1);
             ShowWindow(hwnd, SW_HIDE);
             return 0;
@@ -526,7 +608,9 @@ int wmain(int argc, wchar_t** argv)
     fprintf(file, "event=qa_monitor_selected id=%ls device=%ls rect=%ld,%ld,%ld,%ld primary=0\n",
         target.wantedId, target.info.szDevice, bounds.left, bounds.top, bounds.right, bounds.bottom);
 #endif
-    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(view));
+    SplitState split;
+    split.session = view;
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&split));
     const LONG initialHide = InterlockedCompareExchange(&view->hideFromCapture, 0, 0) ? 1 : 0;
     const DWORD initialAffinity = display_affinity(initialHide);
     if (!SetWindowDisplayAffinity(window, initialAffinity)) {
@@ -540,7 +624,7 @@ int wmain(int argc, wchar_t** argv)
     const auto hudScale = hud::scale_for(view->width, view->height,
         static_cast<uint32_t>(bounds.right - bounds.left), static_cast<uint32_t>(bounds.bottom - bounds.top),
         GetDpiForWindow(window));
-    Feed feed{*view, parent.h, window, file, argv[3], cliMult, hudScale};
+    Feed feed{*view, parent.h, window, file, argv[3], cliMult, hudScale, split};
     std::thread worker([&] {
         try {
             while (!feed.stopped()) {

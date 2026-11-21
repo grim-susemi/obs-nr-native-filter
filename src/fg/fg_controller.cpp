@@ -183,6 +183,7 @@ bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID ad
     view_->generation = offer.generation;
     view_->width = shape.width;
     view_->height = shape.height;
+    view_->splitCompare = shape.splitCompare ? 1u : 0u;
     view_->multiplier = std::clamp<uint32_t>(options_.multiplier, 1, max_multiplier);
     view_->quality = static_cast<uint32_t>(options_.quality);
     view_->adapter = adapter;

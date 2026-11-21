@@ -79,9 +79,11 @@ std::optional<Frame> snapshot(const WireFrame& wire){
  const auto before=load(wire.sequence);if(before<=0||(before&1))return {};
  std::array<uint64_t,16> words{};for(size_t i=0;i<words.size();++i)words[i]=static_cast<uint64_t>(load(wire.words[i]));
  if(load(wire.sequence)!=before||words[1]!=static_cast<uint64_t>(before)/2)return {};
+ const bool split=(words[6]&2)!=0;const auto percent=static_cast<uint32_t>((words[6]>>8)&0xff);
  Frame result{words[0],words[1],words[2],words[3],{static_cast<uint32_t>(words[4]),static_cast<uint32_t>(words[4]>>32),
-  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},words[6]==1},words[15]};
- if(!result.generation||!result.shape.width||!result.shape.height||!format(result.shape.format)||words[6]>1)return {};
+  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},(words[6]&1)!=0,split},words[15],split?percent:50};
+ if(!result.generation||!result.shape.width||!result.shape.height||!format(result.shape.format)||
+  (words[6]&~uint64_t{0xff03})||(split?percent>100:percent!=0))return {};
  std::memcpy(result.shape.sourceMonitor.data(),words.data()+7,sizeof(result.shape.sourceMonitor));return result;
 }
 struct Producer::Config {
@@ -152,7 +154,7 @@ Producer::RevokeProbeResult Producer::test_revoke(std::array<HANDLE,14>& remote,
 }
 #endif
 Producer::Producer(ID3D11Device* device,std::wstring name,const Shape& shape):config_(std::make_unique<Config>()){
- if(!device||name.empty()||!shape.width||!shape.height||shape.width>16384||shape.height>16384||!format(shape.format))
+ if(!device||name.empty()||!shape.width||!shape.height||shape.width>16384||shape.height>(shape.splitCompare?8192u:16384u)||!format(shape.format))
   throw Error(Status::InvalidFrame,E_INVALIDARG,"producer shape/device/name");
  check(device->QueryInterface(IID_PPV_ARGS(&config_->device)),"ID3D11Device5");Ptr<ID3D11DeviceContext> immediate;
  device->GetImmediateContext(&immediate);check(immediate.As(&config_->graphics),"ID3D11DeviceContext4");
@@ -186,7 +188,7 @@ Offer Producer::connect(const Peer& consumer){
   h.handles[index]=static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p->remote[index]));
  };
  for(size_t i=0;i<p->slots.size();++i){
-  auto& slot=p->slots[i];D3D11_TEXTURE2D_DESC d{};d.Width=config_->shape.width;d.Height=config_->shape.height;
+  auto& slot=p->slots[i];D3D11_TEXTURE2D_DESC d{};d.Width=config_->shape.width;d.Height=config_->shape.height*(config_->shape.splitCompare?2u:1u);
   d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;d.Format=config_->shape.format;d.Usage=D3D11_USAGE_DEFAULT;
   d.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;d.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
   check(p->device->CreateTexture2D(&d,nullptr,&slot.texture),"shared texture");Ptr<IDXGIResource1> dxgi;
@@ -213,12 +215,19 @@ Status Producer::status()const{
  }
  return Status::ProtocolError;
 }
-Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity,uint64_t obsTick){
+Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity,uint64_t obsTick,
+ ID3D11Texture2D* before,uint32_t splitPercent){
  if(GetCurrentThreadId()!=config_->thread)return Status::ProtocolError;
  const auto state=status();if(state!=Status::Ok)return state;if(!source)return Status::InvalidFrame;
  D3D11_TEXTURE2D_DESC d{};source->GetDesc(&d);Ptr<ID3D11Device> owner;source->GetDevice(&owner);
  if(owner.Get()!=config_->device.Get()||d.Width!=config_->shape.width||d.Height!=config_->shape.height||
   !compatible(d.Format,config_->shape.format)||d.MipLevels!=1||d.ArraySize!=1||d.SampleDesc.Count!=1)return Status::InvalidFrame;
+ if(config_->shape.splitCompare){
+  if(!before||splitPercent>100)return Status::InvalidFrame;
+  D3D11_TEXTURE2D_DESC original{};before->GetDesc(&original);Ptr<ID3D11Device> originalOwner;before->GetDevice(&originalOwner);
+  if(originalOwner.Get()!=config_->device.Get()||original.Width!=d.Width||original.Height!=d.Height||
+   !compatible(original.Format,config_->shape.format)||original.MipLevels!=1||original.ArraySize!=1||original.SampleDesc.Count!=1)return Status::InvalidFrame;
+ }
  auto& p=*current_;size_t index=0;
  for(;index<p.slots.size();++index){
   const auto& slot=p.slots[index];const auto write=slot.write->GetCompletedValue(),returned=slot.returned->GetCompletedValue();
@@ -229,12 +238,16 @@ Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arr
  const uint64_t step=discontinuity && p.serial ? 2 : 1;
  if(p.serial>max_serial-step)return Status::SequenceExhausted;
  auto& slot=p.slots[index];p.serial+=step;slot.target=p.serial;p.uncertain=true;
- p.graphics->CopyResource(slot.texture.Get(),source);
+ if(config_->shape.splitCompare){
+  p.graphics->CopySubresourceRegion(slot.texture.Get(),0,0,0,0,source,0,nullptr);
+  p.graphics->CopySubresourceRegion(slot.texture.Get(),0,0,config_->shape.height,0,before,0,nullptr);
+ }else p.graphics->CopyResource(slot.texture.Get(),source);
  if(FAILED(p.graphics->Signal(slot.write.Get(),slot.target)))return Status::ProtocolError;
  p.graphics->Flush();p.uncertain=false;
  auto& wire=p.mapping.header->frames[index];const auto& shape=config_->shape;
  std::array<uint64_t,16> words{generation(),slot.target,timestamp,arrival,(uint64_t{shape.height}<<32)|shape.width,
-  (uint64_t{static_cast<uint32_t>(shape.colorSpace)}<<32)|static_cast<uint32_t>(shape.format),shape.displayCapture?uint64_t{1}:uint64_t{0}};
+  (uint64_t{static_cast<uint32_t>(shape.colorSpace)}<<32)|static_cast<uint32_t>(shape.format),
+  (shape.displayCapture?uint64_t{1}:uint64_t{0})|(shape.splitCompare?(uint64_t{2}|(uint64_t{splitPercent}<<8)):uint64_t{0})};
  std::memcpy(words.data()+7,shape.sourceMonitor.data(),sizeof(shape.sourceMonitor));
  words[15]=obsTick;
  store(wire.sequence,slot.target*2-1);
@@ -268,7 +281,7 @@ bool Producer::generation_retained(uint64_t generation){
 
 struct Consumer::Impl {
  struct Slot {
-  Ptr<ID3D12Resource> texture,destination;Ptr<ID3D12Fence> write,returned;
+  Ptr<ID3D12Resource> texture,destination,before;Ptr<ID3D12Fence> write,returned;
   Ptr<ID3D12CommandAllocator> allocator;Ptr<ID3D12GraphicsCommandList> list;
   uint64_t submitted=0;
  };
@@ -284,7 +297,7 @@ struct Consumer::Impl {
  bool drain(){
   if(closed)return true;if(uncertain)return false;
   for(const auto& slot:slots)if(slot.submitted&&!complete(slot.returned->GetCompletedValue(),slot.submitted))return false;
-  for(auto& slot:slots){slot.list.Reset();slot.allocator.Reset();slot.destination.Reset();slot.texture.Reset();slot.write.Reset();slot.returned.Reset();}
+  for(auto& slot:slots){slot.list.Reset();slot.allocator.Reset();slot.destination.Reset();slot.before.Reset();slot.texture.Reset();slot.write.Reset();slot.returned.Reset();}
   store(mapping.header->transfer,static_cast<uint64_t>(Transfer::Closed));SetEvent(controlEvent.value);closed=true;return true;
  }
  static void collect(){for(auto& p:vault())if(p&&p->retired&&p->drain())p.reset();}
@@ -353,9 +366,10 @@ Status Consumer::copy(size_t index,ID3D12Resource* destination){
  if(!impl_||GetCurrentThreadId()!=impl_->thread)return Status::ProtocolError;
  impl_->sequence.break_pair();
  const auto f=frame(index);if(!f)return Status::Pending;
- return copy_frame({index,*f},destination,false);
+ if(f->shape.splitCompare)return Status::InvalidFrame;
+ return copy_frame({index,*f},destination,nullptr,false);
 }
-CopyStep Consumer::copy_next(ID3D12Resource* destination){
+CopyStep Consumer::copy_next(ID3D12Resource* destination,ID3D12Resource* before){
  if(!impl_)return {Status::Closed};
  if(GetCurrentThreadId()!=impl_->thread)return {Status::ProtocolError};
  const auto state=status();auto& sequence=impl_->sequence;
@@ -366,11 +380,15 @@ CopyStep Consumer::copy_next(ID3D12Resource* destination){
  if(!ticket)return {Status::Pending};
  const auto& previous=sequence.previous();
  if(!destination||destination->GetDesc().Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
-    (previous&&impl_->slots[previous->slot].destination.Get()==destination)){
+    (ticket->frame.shape.splitCompare&&(!before||before==destination))||
+    (previous&&(impl_->slots[previous->slot].destination.Get()==destination||
+     impl_->slots[previous->slot].before.Get()==destination||
+     (ticket->frame.shape.splitCompare&&(impl_->slots[previous->slot].destination.Get()==before||
+      impl_->slots[previous->slot].before.Get()==before))))){
   return sequence.record(*ticket,Status::InvalidFrame);
  }
  // This exact serial still owns the source slot until its return fence signals.
- return sequence.record(*ticket,copy_frame(*ticket,destination,true));
+ return sequence.record(*ticket,copy_frame(*ticket,destination,ticket->frame.shape.splitCompare?before:nullptr,true));
 }
 Status Consumer::copy_status(const CopyTicket& ticket)const{
  if(!impl_)return Status::Closed;
@@ -388,31 +406,54 @@ Status Consumer::order_copy(const CopyTicket& ticket,ID3D12CommandQueue* reader)
  const auto& slot=impl_->slots[ticket.slot];
  return SUCCEEDED(reader->Wait(slot.returned.Get(),ticket.frame.serial))?Status::Ok:Status::ProtocolError;
 }
-Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination,bool guardCrossSlotDestination){
+Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination,ID3D12Resource* before,bool guardCrossSlotDestination){
  if(!destination)return Status::InvalidFrame;
  const auto state=status();if(state!=Status::Ok)return state;
  const auto* f=&ticket.frame;
  auto& p=*impl_;auto& slot=p.slots[ticket.slot];
  for(const auto& other:p.slots){
-  if(other.submitted&&(&other==&slot||(guardCrossSlotDestination&&other.destination.Get()==destination))){
+  if(other.submitted&&(&other==&slot||(guardCrossSlotDestination&&
+   (other.destination.Get()==destination||other.before.Get()==destination||
+    (before&&(other.destination.Get()==before||other.before.Get()==before)))))){
    const auto ready=detail::copy_completion(other.returned->GetCompletedValue(),other.submitted);
    if(ready!=Status::Ok)return ready;
   }
  }
  const auto source=slot.texture->GetDesc(),target=destination->GetDesc();Ptr<ID3D12Device> owner;
  if(FAILED(destination->GetDevice(IID_PPV_ARGS(&owner)))||owner.Get()!=p.device.Get())return Status::InvalidFrame;
+ if(source.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||source.Width!=f->shape.width||
+  source.Height!=uint64_t{f->shape.height}*(f->shape.splitCompare?2u:1u)||source.Format!=f->shape.format||
+  source.MipLevels!=1||source.DepthOrArraySize!=1||source.SampleDesc.Count!=1)return Status::InvalidFrame;
  D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};UINT64 bytes=0;p.device->GetCopyableFootprints(&source,0,1,0,&layout,nullptr,nullptr,&bytes);
  const bool readback=target.Dimension==D3D12_RESOURCE_DIMENSION_BUFFER;
  if(readback){D3D12_HEAP_PROPERTIES heap{};D3D12_HEAP_FLAGS flags{};
   if(FAILED(destination->GetHeapProperties(&heap,&flags))||heap.Type!=D3D12_HEAP_TYPE_READBACK||target.Width<bytes)return Status::InvalidFrame;
- }else if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.Width!=source.Width||target.Height!=source.Height||
+ }else if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.Width!=f->shape.width||target.Height!=f->shape.height||
   target.Format!=source.Format||target.MipLevels!=1||target.DepthOrArraySize!=1||target.SampleDesc.Count!=1)return Status::InvalidFrame;
+ if(f->shape.splitCompare){
+  if(readback||!before||before==destination)return Status::InvalidFrame;
+  Ptr<ID3D12Device> beforeOwner;const auto original=before->GetDesc();
+  if(FAILED(before->GetDevice(IID_PPV_ARGS(&beforeOwner)))||beforeOwner.Get()!=p.device.Get()||
+   original.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||original.Width!=target.Width||original.Height!=target.Height||
+   original.Format!=target.Format||original.MipLevels!=1||original.DepthOrArraySize!=1||original.SampleDesc.Count!=1)return Status::InvalidFrame;
+ }
  if(FAILED(slot.allocator->Reset())||FAILED(slot.list->Reset(slot.allocator.Get(),nullptr)))return Status::ProtocolError;
  transition(slot.list.Get(),slot.texture.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
  if(readback){
   D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=slot.texture.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=destination;to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=layout;
   slot.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+ }else if(f->shape.splitCompare){
+  transition(slot.list.Get(),destination,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+  transition(slot.list.Get(),before,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+  D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=slot.texture.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=destination;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_BOX box{0,0,0,f->shape.width,f->shape.height,1};
+  slot.list->CopyTextureRegion(&to,0,0,0,&from,&box);
+  box.top=f->shape.height;box.bottom=f->shape.height*2;to.pResource=before;
+  slot.list->CopyTextureRegion(&to,0,0,0,&from,&box);
+  transition(slot.list.Get(),before,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+  transition(slot.list.Get(),destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
  }else{
   transition(slot.list.Get(),destination,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
   slot.list->CopyResource(destination,slot.texture.Get());transition(slot.list.Get(),destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
@@ -422,7 +463,7 @@ Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination
  if(FAILED(p.queue->Wait(slot.write.Get(),f->serial)))return Status::ProtocolError;
  // Reserve before Execute: a crash or Signal failure must leave a known pending
  // target in both processes. No CPU receipt after submission can prove safety.
- slot.destination=destination;slot.submitted=f->serial;p.uncertain=true;
+ slot.destination=destination;slot.before=before;slot.submitted=f->serial;p.uncertain=true;
  ID3D12CommandList* lists[]{slot.list.Get()};p.queue->ExecuteCommandLists(1,lists);
 #ifdef NR_FG_IPC_TEST_PROBE
  if(p.reached){

@@ -660,6 +660,21 @@ bool NativeOutput::on_graphics_owner() const {
     const auto& p=*impl_;
     return p.pipeline && GetCurrentThreadId()==p.graphicsOwner;
 }
+bool NativeOutput::rebind_graphics_owner() {
+    auto& p=*impl_;
+    if(!p.pipeline || p.stopping)return false;
+    const DWORD current=GetCurrentThreadId();
+    if(p.graphicsOwner==current)return false;
+    p.graphicsOwner=current;
+    p.pipeline->rebind_graphics();
+    for(const auto& g:p.generations)if(g && g->context)g->context->rebind_graphics_thread(current);
+    for(auto& r:p.records)if(r.pin) {
+        const auto old=*r.pin;
+        r.pin.reset();
+        r.pin.emplace(interop::Consumer{old.ticket,old.texture,old.leaseValue,old.raw,old.bridge,old.fence,current});
+    }
+    return true;
+}
 bool NativeOutput::release_original_marker(const JobKey& key) {
     auto& p=*impl_;
     if(!p.pipeline || GetCurrentThreadId()!=p.graphicsOwner)return false;

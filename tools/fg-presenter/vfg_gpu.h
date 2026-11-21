@@ -40,6 +40,8 @@ class Gpu final {
     D3D12_RESOURCE_DESC desc_{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint_{};
     ComPtr<ID3D12Resource> hudUpload_;
+    ComPtr<ID3D12Resource> dividerUpload_;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT dividerFp_{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT hudFp_{};
     uint32_t hudW_{}, hudH_{}, hudPos_{}, hudInset_{};
     std::array<uint64_t, content_input_count> inputReadFence_{}, inputWaitFence_{};
@@ -53,11 +55,12 @@ class Gpu final {
     ID3D12GraphicsCommandList* begin();
     void finish(bool sync);
     void move(ID3D12Resource*, ID3D12Resource*, bool toBuffer);
-    UINT present_ready(ID3D12Resource*, bool synthetic);
+    UINT present_ready(ID3D12Resource*, bool synthetic, int beforeIndex, uint32_t splitPercent);
 public:
     static constexpr size_t max_exchange = 2 + (max_multiplier - 1); // 2 inputs + up to 3 outputs (4x)
     ComPtr<ID3D12CommandQueue> ipcQueue, drawQueue;
     std::array<ComPtr<ID3D12Resource>, content_input_count> input;
+    std::array<ComPtr<ID3D12Resource>, content_input_count> before;
     std::array<ComPtr<ID3D12Resource>, max_exchange> exchange;
     std::array<Handle, max_exchange> exported;
     size_t outputCount{};
@@ -78,8 +81,9 @@ public:
     // must be finished. An empty result means no staging commands were queued.
     [[nodiscard]] std::optional<uint64_t> try_stage(unsigned previous, unsigned current);
     void set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels);
-    UINT present(ID3D12Resource*, bool synthetic);
+    UINT present(ID3D12Resource*, bool synthetic, int beforeIndex = -1, uint32_t splitPercent = 50);
     // Deadline is on clock_ns(). No GPU work is submitted on a missed admission.
-    [[nodiscard]] std::optional<UINT> try_present_synthetic(ID3D12Resource*, uint64_t deadlineNs);
+    [[nodiscard]] std::optional<UINT> try_present_synthetic(ID3D12Resource*, uint64_t deadlineNs,
+        int beforeIndex = -1, uint32_t splitPercent = 50);
 };
 } // namespace nr::fg::vfg

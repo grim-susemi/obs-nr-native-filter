@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "nr_contract.h"
+#include <atomic>
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -87,7 +88,7 @@ class Context final {
  Microsoft::WRL::ComPtr<ID3D11Device5> renderer_;
  Microsoft::WRL::ComPtr<ID3D12Device> device_;
  Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
- DWORD graphicsThread_;
+ std::atomic<DWORD> graphicsThread_;
  LUID luid_;
  explicit Context(ID3D11Device*);
  friend class Bridge;
@@ -96,7 +97,8 @@ public:
  ID3D12Device* device()const{return device_.Get();}
  ID3D12CommandQueue* queue()const{return queue_.Get();}
  LUID luid()const{return luid_;}
- DWORD graphics_thread()const{return graphicsThread_;}
+ DWORD graphics_thread()const{return graphicsThread_.load(std::memory_order_acquire);}
+ void rebind_graphics_thread(DWORD thread){graphicsThread_.store(thread,std::memory_order_release);}
 };
 struct Ticket { JobKey key; size_t slot; bool operator==(const Ticket&)const=default; };
 struct WorkerView {

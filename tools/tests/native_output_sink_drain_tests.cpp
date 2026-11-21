@@ -42,6 +42,20 @@ int main() try {
     bool foreign=true;
     std::thread([&]{foreign=output.on_graphics_owner();}).join();
     expect(!foreign,"foreign thread was recognised as the graphics owner");
+    // Simulate OBS ResetVideo replacing obs_graphics_thread with a new thread.
+    std::thread([&]{
+        expect(!output.on_graphics_owner(),"new thread was prematurely recognised before rebind");
+        bool threw=false;
+        try { (void)output.prepare({2,1,1,nr::SourceValidity::Invalid,frame,settings},nullptr); } catch(...) { threw=true; }
+        expect(threw,"unbound replacement thread prepared without explicit rebind");
+        expect(output.rebind_graphics_owner(),"rebind_graphics_owner failed on replacement thread");
+        expect(output.on_graphics_owner(),"replacement thread was not recognised after rebind");
+        const auto d2=output.prepare({3,1,1,nr::SourceValidity::Invalid,frame,settings},nullptr);
+        expect(d2.placeholder.has_value(),"prepare failed on replacement graphics thread after rebind");
+    }).join();
+    expect(!output.on_graphics_owner(),"previous graphics thread remained owner after rebind");
+    expect(output.rebind_graphics_owner(),"rebind back to test main thread failed");
+    expect(output.on_graphics_owner(),"test main thread was not restored as owner");
     witness.exited=output.worker_exit(); // Subscribe BEFORE stop.
     expect(witness.exited.valid() && !witness.destroyed,"actual worker pipeline and sink owner");
     output.request_stop();

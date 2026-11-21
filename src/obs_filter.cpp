@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "obs_filter.h"
 #include "obs_native_output.h"
+#include "obs_split_compare.h"
 #include "obs_quality_trace.h"
 #include "interop.h"
 #include "nr_properties.h"
@@ -25,6 +26,8 @@ struct Callback {
 };
 struct Filter {
     obs_source_t *source;
+    nr::split::Setting splitSetting;
+    nr::split::Canvas splitCanvas;
     const uint64_t instance;
     nr::PerInstanceTick ticks;
     gs_texrender_t *capture = nullptr;
@@ -157,7 +160,9 @@ std::vector<std::byte> bytes(const std::filesystem::path& path)
 }
 void retire(void*,uint32_t,uint32_t)
 {
-    retiring.erase(std::remove_if(retiring.begin(),retiring.end(),[](const auto& owner) {
+    const bool onGraphics=obs_in_task_thread(OBS_TASK_GRAPHICS);
+    retiring.erase(std::remove_if(retiring.begin(),retiring.end(),[onGraphics](const auto& owner) {
+        if(onGraphics && !owner.output->on_graphics_owner()) (void)owner.output->rebind_graphics_owner();
         return close_owned(*owner.output,true);
     }),retiring.end());
     if(retiring.empty())obs_remove_main_render_callback(retire,nullptr);
@@ -334,6 +339,7 @@ void snapshot(void *opaque, calldata_t *data)
 void update(void* opaque,obs_data_t* values)
 {
     auto& f=*static_cast<Filter*>(opaque);
+    f.splitSetting.update(values);
     f.fpsOverlay.store(static_cast<uint32_t>(std::clamp<long long>(obs_data_get_int(values,"nr_fps_overlay"),0,2)),std::memory_order_release);
     const auto text=f.config.runtime.canonicalPath.generic_u8string();
     auto decoded=nr::properties::decode(values,f.admittedRuntimeText,
@@ -462,6 +468,7 @@ void destroy(void *opaque)
     gs_texture_destroy(f->output);f->output=nullptr;
     gs_texrender_destroy(f->capture);f->capture=nullptr;
     gs_texrender_destroy(f->linearize);f->linearize=nullptr;
+    f->splitCanvas.clear();
     // A video_tick already dispatched on the graphics thread may still be before its
     // graphics entry; it then reads only `destroyed`. Release every owner here, as before,
     // and let only the inert Filter shell wait for that thread's next render pass.
@@ -576,6 +583,7 @@ obs_properties_t *properties(void *opaque)
         reasonText=localized("NR.Reason.","passFailed");labels.reasonText=reasonText.c_str();
     }
     auto* props=nr::properties::controls(*value,labels);
+    nr::split::add_properties(props);
     if(opaque) {
         if(auto* cur=obs_source_get_settings(static_cast<Filter*>(opaque)->source)) {
             nr::properties::sync_visibility(props,cur);
@@ -808,6 +816,11 @@ void video_tick(void* opaque,float)
     if(!f.destroyed) hold_capture_exclusion(f);
     if(f.destroyed || !f.native || f.stopping || f.nativeFailed) { obs_leave_graphics();return; }
     try {
+        if(!f.native->on_graphics_owner() && obs_in_task_thread(OBS_TASK_GRAPHICS) &&
+            f.native->rebind_graphics_owner()) {
+            f.cut.store(true,std::memory_order_release);
+            blog(LOG_INFO,"[obs-nr-filter] adopted new OBS graphics thread (instance %llu)",static_cast<unsigned long long>(f.instance));
+        }
         if(f.native->latch_qa_failure()) {
             f.nativeFailed=true;f.placeholder=true;
             f.initializationReason="handledAdapterFailure";blog(LOG_WARNING,"[obs-nr-filter] handled adapter failure latched");
@@ -829,7 +842,7 @@ void filter_remove(void* opaque,obs_source_t*)
     obs_leave_graphics();
     if(exclusion)nr::capture_exclusion::leave();
 }
-void render(void *opaque, gs_effect_t *)
+void render_native(void *opaque)
 {
     auto &f = *static_cast<Filter *>(opaque);
     struct PublishOnReturn {Filter& filter;~PublishOnReturn(){publish_status(filter);}} publish{f};
@@ -948,10 +961,12 @@ void render(void *opaque, gs_effect_t *)
     const bool srgb = gs_framebuffer_srgb_enabled();
     gs_enable_framebuffer_srgb(false);
     auto *image = gs_effect_get_param_by_name(effect, "image");
-    // A GS_CS_SRGB_16F target (a projector on a >8-bit SDR monitor) stores linear light, but the
-    // sRGB output holds encoded values. Un-premultiply into an sRGB texrender, then sample it
-    // through its sRGB view, as libobs does for its own color-space conversions.
-    if (f.color == GS_CS_SRGB && gs_get_color_space() == GS_CS_SRGB_16F) {
+    // NR's SDR texture is premultiplied in encoded space. For a linear
+    // destination or a split capture, recover straight color before decoding
+    // and blending. The ordinary SDR output keeps its existing path.
+    const auto destination = gs_get_color_space();
+    if (f.color == GS_CS_SRGB && (destination == GS_CS_SRGB_16F ||
+        (destination == GS_CS_SRGB && nr::split::capturing_processed(f.source)))) {
         if (!f.linearize) f.linearize = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
         gs_texrender_reset(f.linearize);
         gs_blend_state_push();
@@ -967,7 +982,11 @@ void render(void *opaque, gs_effect_t *)
         if (texture) {
             gs_enable_framebuffer_srgb(true);
             gs_effect_set_texture_srgb(image, texture);
+            gs_blend_state_push();
+            if (destination == GS_CS_SRGB)
+                gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
             while (gs_effect_loop(effect, "Draw")) gs_draw_sprite(texture, 0, outExt.width, outExt.height);
+            gs_blend_state_pop();
             gs_enable_framebuffer_srgb(false);
             draw_hud_overlay(f,effect,image,outExt.width,outExt.height);
         } else bypass(f);
@@ -979,6 +998,19 @@ void render(void *opaque, gs_effect_t *)
     while (gs_effect_loop(effect, "DrawAlphaDivide")) gs_draw_sprite(texture, 0, outExt.width, outExt.height);
     draw_hud_overlay(f,effect,image,outExt.width,outExt.height);
     gs_enable_framebuffer_srgb(srgb);
+}
+void render(void* opaque, gs_effect_t*)
+{
+    auto& f = *static_cast<Filter*>(opaque);
+    if (nr::split::capturing_original(f.source))
+        return;
+    if (const auto plan = nr::split::plan(f.source)) {
+        auto* target = obs_filter_get_target(f.source);
+        const nr::Extent size{obs_source_get_base_width(target), obs_source_get_base_height(target)};
+        if (f.splitCanvas.render(plan, size, render_native, opaque))
+            return;
+    }
+    render_native(opaque);
 }
 std::pair<uint32_t,uint32_t> target_base_extent(const Filter& f)
 {
@@ -1028,7 +1060,10 @@ extern "C" void nr_register_obs_filter(void)
     info.video_tick = video_tick;
     info.filter_remove = filter_remove;
     info.get_properties = properties;
-    info.get_defaults = nr::properties::defaults;
+    info.get_defaults = [](obs_data_t* data) {
+        nr::properties::defaults(data);
+        nr::split::defaults(data);
+    };
     info.video_render = render;
     info.video_get_color_space = color_space;
     obs_register_source(&info);

@@ -78,6 +78,30 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
     for (auto& t : input)
         check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc_,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t)), "private IPC input");
+    if (s.splitCompare) {
+        for (auto& t : before)
+            check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc_,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t)), "private before input");
+        D3D12_RESOURCE_DESC upload{};
+        upload.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        upload.Width = UINT64{D3D12_TEXTURE_DATA_PITCH_ALIGNMENT} * s.height;
+        upload.Height = upload.DepthOrArraySize = upload.MipLevels = 1;
+        upload.SampleDesc.Count = 1;
+        upload.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto up = gpu_heap(D3D12_HEAP_TYPE_UPLOAD);
+        check(device_->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &upload,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&dividerUpload_)), "divider upload");
+        dividerFp_.Footprint = {desc_.Format, 3, s.height, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+        void* mapped{};
+        const D3D12_RANGE noRead{0, 0};
+        check(dividerUpload_->Map(0, &noRead, &mapped), "divider map");
+        for (uint32_t y = 0; y < s.height; ++y) {
+            auto* row = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(mapped) +
+                size_t{y} * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            row[0] = row[1] = row[2] = 0xff00ff00u;
+        }
+        dividerUpload_->Unmap(0, nullptr);
+    }
     if (multiplier <= 1) return;
     outputCount = std::clamp<uint32_t>(multiplier, 2, max_multiplier) - 1;
     device_->GetCopyableFootprints(&desc_, 0, 1, 0, &footprint_, nullptr, nullptr, &bytes);
@@ -349,14 +373,15 @@ void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const ui
     hudW_ = w;
     hudH_ = h;
 }
-UINT Gpu::present(ID3D12Resource* source, bool synthetic)
+UINT Gpu::present(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent)
 {
     if (!latencyReady_ && WaitForSingleObject(latency_.h, 240) != WAIT_OBJECT_0)
         check(E_FAIL, "swapchain latency timeout");
-    return present_ready(source, synthetic);
+    return present_ready(source, synthetic, beforeIndex, splitPercent);
 }
 
-std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t deadlineNs)
+std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t deadlineNs,
+    int beforeIndex, uint32_t splitPercent)
 {
     // Don't let begin() enter its normal blocking allocator wait on this path.
     const auto completed = done_->GetCompletedValue();
@@ -375,10 +400,10 @@ std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t 
         // admitted frame. Waiting again without a Present could miss the signal.
         if (clock_ns() >= deadlineNs) return {};
     }
-    return present_ready(source, true);
+    return present_ready(source, true, beforeIndex, splitPercent);
 }
 
-UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic)
+UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent)
 {
     latencyReady_ = false;
     ComPtr<ID3D12Resource> dst;
@@ -391,15 +416,33 @@ UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic)
         D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
         cmd->CopyTextureRegion(&dloc, dstX, hudInset_, 0, &sloc, &box);
     };
+    const auto drawSplit = [&] {
+        const UINT width = static_cast<UINT>(desc_.Width);
+        const UINT split = static_cast<UINT>(UINT64{width} * std::min(splitPercent, 100u) / 100);
+        auto barrier = transition(before[beforeIndex].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmd->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION d{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION s{before[beforeIndex].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        if (split) {
+            D3D12_BOX box{0, 0, 0, split, desc_.Height, 1};
+            cmd->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+        }
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd->ResourceBarrier(1, &barrier);
+        if (hudW_ && hudH_) drawHud();
+        D3D12_TEXTURE_COPY_LOCATION green{dividerUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, dividerFp_};
+        cmd->CopyTextureRegion(&d, std::min(split, width - 3), 0, 0, &green, nullptr);
+    };
     if (synthetic) {
         move(dst.Get(), source, false);
-        if (hudW_ && hudH_) {
+        if ((hudW_ && hudH_) || beforeIndex >= 0) {
             D3D12_RESOURCE_BARRIER hb{};
             hb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             hb.Transition = {dst.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST};
             cmd->ResourceBarrier(1, &hb);
-            drawHud();
+            if (beforeIndex >= 0) drawSplit();
+            else if (hudW_ && hudH_) drawHud();
             std::swap(hb.Transition.StateBefore, hb.Transition.StateAfter);
             cmd->ResourceBarrier(1, &hb);
         }
@@ -411,7 +454,8 @@ UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic)
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
         cmd->ResourceBarrier(2, b);
         cmd->CopyResource(dst.Get(), source);
-        if (hudW_ && hudH_) drawHud();
+        if (beforeIndex >= 0) drawSplit();
+        else if (hudW_ && hudH_) drawHud();
         for (auto& barrier : b) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         cmd->ResourceBarrier(2, b);
     }
@@ -420,6 +464,7 @@ UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic)
         for (unsigned i = 0; i < input.size(); ++i)
             if (source == input[i].Get()) inputReadFence_[i] = fence_;
     }
+    if (beforeIndex >= 0) inputReadFence_[beforeIndex] = fence_;
     const auto hr = allowTearing_ ? swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING) : swap_->Present(1, 0);
     check(hr == S_OK ? hr : FAILED(hr) ? hr : E_FAIL, "DXGI Present");
     UINT presentId{};

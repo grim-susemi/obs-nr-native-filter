@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "obs_upscale_filter.h"
 #include "obs_upscale_dlss.h"
+#include "obs_split_compare.h"
 #include "obs_quality_trace.h"
 
 #include <obs-module.h>
@@ -93,6 +94,8 @@ struct Settings {
 struct Filter {
     explicit Filter(obs_source_t* source_) : source(source_) {}
     obs_source_t* source;
+    split::Setting splitSetting;
+    split::Canvas splitCanvas;
     gs_effect_t* effect = nullptr;
     gs_eparam_t* outputStep = nullptr;
     gs_eparam_t* sharpness = nullptr;
@@ -202,6 +205,7 @@ void destroy(Filter* f)
     signal_handler_disconnect(obs_source_get_signal_handler(f->source), "enable", enabled_changed, f);
     obs_upscale_dlss_destroy(f->dlss);
     obs_enter_graphics();
+    f->splitCanvas.clear();
     for (auto* capture : f->capture)
         gs_texrender_destroy(capture);
     if (f->effect)
@@ -399,13 +403,26 @@ extern "C" void nr_register_upscale_filter(void)
     info.type = OBS_SOURCE_TYPE_FILTER;
     info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB | OBS_SOURCE_DEPRECATED;
     info.get_name = [](void*) { return obs_module_text("Upscale.Name"); };
-    info.create = [](obs_data_t* settings, obs_source_t* source) -> void* { return create(settings, source); };
+    info.create = [](obs_data_t* settings, obs_source_t* source) -> void* {
+        auto* filter = create(settings, source);
+        if (filter)
+            filter->splitSetting.update(settings);
+        return filter;
+    };
     info.destroy = [](void* data) { destroy(static_cast<Filter*>(data)); };
-    info.update = [](void* data, obs_data_t* settings) { update(static_cast<Filter*>(data), settings, true); };
-    info.get_defaults = defaults;
+    info.update = [](void* data, obs_data_t* settings) {
+        auto* filter = static_cast<Filter*>(data);
+        filter->splitSetting.update(settings);
+        update(filter, settings, true);
+    };
+    info.get_defaults = [](obs_data_t* settings) {
+        defaults(settings);
+        nr::split::defaults(settings);
+    };
     info.get_properties = [](void*) {
         auto* props = obs_properties_create();
         add_properties(props);
+        nr::split::add_properties(props);
         return props;
     };
     info.get_width = [](void* data) { return dimensions(*static_cast<Filter*>(data)).width; };
@@ -414,6 +431,17 @@ extern "C" void nr_register_upscale_filter(void)
         auto* target = obs_filter_get_target(static_cast<Filter*>(data)->source);
         return target ? obs_source_get_color_space(target, count, preferred) : GS_CS_SRGB;
     };
-    info.video_render = [](void* data, gs_effect_t*) { render(*static_cast<Filter*>(data)); };
+    info.video_render = [](void* data, gs_effect_t*) {
+        auto& filter = *static_cast<Filter*>(data);
+        if (nr::split::capturing_original(filter.source))
+            return;
+        if (const auto plan = nr::split::plan(filter.source)) {
+            if (filter.splitCanvas.render(plan, dimensions(filter), [](void* arg) {
+                    render(*static_cast<Filter*>(arg));
+                }, data))
+                return;
+        }
+        render(filter);
+    };
     obs_register_source(&info);
 }

@@ -2,6 +2,7 @@
 #include "fg_controller.h"
 #include "fg_monitor_text.h"
 #include "../obs_upscale_filter.h"
+#include "../obs_split_compare.h"
 #include "../obs_quality_trace.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
@@ -51,10 +52,13 @@ struct Tap {
     std::unique_ptr<Controller> controller;
     std::unique_ptr<ipc::Producer> producer;
     obs_upscale::Filter* upscale{};
+    split::Setting splitSetting;
+    split::Canvas splitCanvas;
     gs_texrender_t* capture{};
     obs_source_t* target{};
     uint32_t previousWidth{}, previousHeight{};
     uint32_t activeWidth{}, activeHeight{};
+    bool activeSplit{};
     uint32_t multiplier{2};
     Quality quality{Quality::Medium};
     uint32_t fpsOverlay{1};
@@ -142,6 +146,13 @@ void draw_sdr(gs_texture_t* texture, Extent size, gs_blend_type destBlend)
     gs_set_linear_srgb(prevLinear);
 }
 
+void render_effects(void* data)
+{
+    auto& tap = *static_cast<Tap*>(data);
+    if (tap.upscale) obs_upscale::render(*tap.upscale);
+    else obs_source_skip_video_filter(tap.source);
+}
+
 void draw_transparent(Extent size)
 {
     if (!size.width || !size.height) return;
@@ -155,7 +166,8 @@ void draw_transparent(Extent size)
 }
 
 // Returns a displayable capture, if this draw also supplied the presenter.
-gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Extent output)
+gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Extent output,
+                      const split::Plan& compare, gs_texture_t*& before)
 {
     if (!obs_in_task_thread(OBS_TASK_GRAPHICS)) return nullptr;
     std::unique_lock lock(tap.command, std::try_to_lock);
@@ -178,7 +190,8 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
         return nullptr;
     }
     try {
-        if (tap.producer && !tap.resizing && (tap.activeWidth != w || tap.activeHeight != h)) {
+        if (tap.producer && !tap.resizing &&
+            (tap.activeWidth != w || tap.activeHeight != h || tap.activeSplit != bool(compare))) {
             if (!tap.controller->request_resize()) {
                 disconnect(tap, "resize_request");
                 return nullptr;
@@ -199,7 +212,8 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             tap.resizing = false;
             tap.breakPair = true;
         }
-        const ipc::Shape shape{w, h, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
+        ipc::Shape shape{w, h, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
+        shape.splitCompare = bool(compare);
         if (!tap.producer) {
             auto* device = static_cast<ID3D11Device*>(gs_get_device_obj());
             ComPtr<IDXGIDevice> dxgi;
@@ -216,6 +230,7 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             tap.target = target;
             tap.activeWidth = w;
             tap.activeHeight = h;
+            tap.activeSplit = shape.splitCompare;
             if (!tap.controller->offer(offer, shape, desc.AdapterLuid)) {
                 disconnect(tap, "offer_rejected");
                 return nullptr;
@@ -237,6 +252,8 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             tap.capture = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
         if (!tap.capture) { disconnect(tap, "texture_allocation"); return nullptr; }
         const auto captureQpc = clock_ns();
+        if (compare)
+            before = tap.splitCanvas.original(compare, output, GS_CS_SRGB, true);
         gs_texrender_reset(tap.capture);
         {
             CaptureScope scope(tap.capture);
@@ -247,13 +264,22 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             gs_clear(GS_CLEAR_COLOR, &clear, 0, 0);
             gs_ortho(0, float(output.width), 0, float(output.height), -100, 100);
             gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-            if (tap.upscale) obs_upscale::render(*tap.upscale);
-            else obs_source_skip_video_filter(tap.source);
+            if (compare) {
+                const split::Suppress suppress(compare);
+                render_effects(&tap);
+            } else {
+                render_effects(&tap);
+            }
         }
         auto* texture = gs_texrender_get_texture(tap.capture);
+        if (compare && !before) {
+            disconnect(tap, "split_original_capture");
+            return texture;
+        }
         const auto arrival = clock_ns();
         const auto result = tap.producer->publish(texture ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(texture)) : nullptr,
-            captureQpc, arrival, tap.breakPair, tick);
+            captureQpc, arrival, tap.breakPair, tick,
+            before ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(before)) : nullptr, compare.percent);
         if (nr::quality::trace_frames())
             blog(LOG_INFO, "[quality] stage=vfg_tap obs_tick_ns=%llu source=%s generation=%llu capture_qpc_ns=%llu arrival_qpc_ns=%llu status=%d",
                 nr::quality::id(tick), obs_source_get_uuid(parent), nr::quality::id(tap.producer->generation()),
@@ -272,23 +298,29 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
 void render(void* data, gs_effect_t*)
 {
     auto& tap = *static_cast<Tap*>(data);
+    if (split::capturing_original(tap.source))
+        return;
     auto* target = obs_filter_get_target(tap.source);
     auto* parent = obs_filter_get_parent(tap.source);
     if (!target || !parent)
         return;
     const auto size = tap.upscale ? obs_upscale::dimensions(*tap.upscale) :
         Extent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
-    auto* texture = publish(tap, target, parent, size);
+    const auto compare = split::plan(tap.source);
+    gs_texture_t* before{};
+    auto* texture = publish(tap, target, parent, size, compare, before);
     if (should_hide_source_canvas(tap.hideSourceCanvas.load(std::memory_order_acquire),
             tap.vfgActive.load(std::memory_order_acquire))) {
         draw_transparent(size);
         return;
     }
     if (!texture || gs_get_color_space() != GS_CS_SRGB) {
-        if (tap.upscale) obs_upscale::render(*tap.upscale);
-        else obs_source_skip_video_filter(tap.source);
+        if (!compare || !tap.splitCanvas.render(compare, size, render_effects, &tap))
+            render_effects(&tap);
         return;
     }
+    if (compare && tap.splitCanvas.draw(before, texture, size, compare.percent))
+        return;
     draw_sdr(texture, size, GS_BLEND_INVSRCALPHA);
 }
 
@@ -369,6 +401,7 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     const bool enabled = obs_data_get_bool(settings, "vfg_upscale");
     const bool compare = obs_data_get_bool(settings, "vfg_upscale_compare");
     std::lock_guard lock(tap.command);
+    tap.splitSetting.update(settings);
     if (obs_upscale::update(tap.upscale, settings, enabled && !compare, enabled))
         tap.breakPair = true;
     tap.multiplier = std::clamp<uint32_t>(mult ? mult : 2, 2, max_multiplier);
@@ -546,6 +579,7 @@ obs_properties_t* properties(void* opaque)
     auto* hideCanvas = obs_properties_add_bool(ctrlGrp, "vfg_hide_source_canvas", obs_module_text("VFG.HideSourceCanvas"));
     obs_property_set_long_description(hideCanvas, obs_module_text("VFG.Hint.HideSourceCanvas"));
     obs_properties_add_group(p, "vfg_grp_control", obs_module_text("VFG.Group.Control"), OBS_GROUP_NORMAL, ctrlGrp);
+    split::add_properties(p);
     auto* upscale = obs_properties_create();
     auto* compare = obs_properties_add_bool(upscale, "vfg_upscale_compare", obs_module_text("VFG.Upscale.Compare"));
     obs_property_set_long_description(compare, obs_module_text("VFG.Upscale.CompareHint"));
@@ -575,6 +609,7 @@ extern "C" void nr_register_vfg_tap()
         obs_data_set_default_bool(settings, "vfg_hide_from_capture", false);
         obs_data_set_default_bool(settings, "vfg_hide_source_canvas", false);
         obs_upscale::defaults(settings);
+        nr::split::defaults(settings);
         obs_data_set_default_bool(settings, "vfg_upscale", false);
         obs_data_set_default_bool(settings, "vfg_upscale_compare", false);
     };
@@ -614,6 +649,7 @@ extern "C" void nr_register_vfg_tap()
         obs_enter_graphics();
         if (tap->controller) disconnect(*tap, "filter_destroyed");
         gs_texrender_destroy(tap->capture);
+        tap->splitCanvas.clear();
         obs_leave_graphics();
         obs_upscale::destroy(tap->upscale);
         delete tap;

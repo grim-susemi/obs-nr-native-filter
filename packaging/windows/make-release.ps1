@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.9',
+    [string]$Version = '0.2.10',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'

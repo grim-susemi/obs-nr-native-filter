@@ -57,6 +57,7 @@ public:
     uint32_t latch_qa_failure(); // Graphics-owned; coupled history cut once.
     bool release_original_marker(const JobKey&); // Exact graphics request; worker signals.
     bool on_graphics_owner() const; // True only on the bound graphics thread; false while the pipeline is unbound (video_tick binds it).
+    bool rebind_graphics_owner(); // Re-adopt graphics ownership if OBS replaces obs_graphics_thread (ResetVideo).
     bool try_close();
     bool closed() const;
     std::shared_future<void> worker_exit() const;

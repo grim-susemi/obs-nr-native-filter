@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-project(obs-nr-filter VERSION 0.2.9 LANGUAGES C CXX)
+project(obs-nr-filter VERSION 0.2.10 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # D2: the closure gate reads CodeView/COFF sections of every object, so whole-program
 # optimization (/GL IL objects) and /LTCG are forbidden in every configuration, for both
@@ -12,7 +12,7 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 include(cmake/nr/Libobs.cmake)
 add_library(obs-nr-filter MODULE src/plugin-main.c src/obs_filter.cpp src/obs_upscale_filter.cpp
-  src/obs_upscale_dlss.cpp src/capture_exclusion.cpp)
+  src/obs_upscale_dlss.cpp src/obs_split_compare.cpp src/capture_exclusion.cpp)
 target_compile_features(obs-nr-filter PRIVATE cxx_std_20)
 target_include_directories(obs-nr-filter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/nvofa")
 target_link_libraries(obs-nr-filter PRIVATE OBS::libobs d3d11 d3dcompiler dxgi crypt32 wintrust)
@@ -54,6 +54,7 @@ target_sources(obs-nr-filter PRIVATE src/obs_native_output.cpp)
 target_link_libraries(obs-nr-filter PRIVATE nr_model nr_lifecycle)
 include(cmake/fg/Ipc.cmake)
 include(cmake/fg/Presenter.cmake)
+include(cmake/fg/SplitTests.cmake)
 add_executable(native_output_lifetime_tests tools/tests/native_output_lifetime_tests.cpp src/obs_native_output.cpp)
 target_link_libraries(native_output_lifetime_tests PRIVATE OBS::libobs nr_model nr_lifecycle)
 target_compile_features(native_output_lifetime_tests PRIVATE cxx_std_20)
