@@ -47,6 +47,12 @@ target_compile_options(vfg_monitor_text_tests PRIVATE /W4 /WX /permissive-)
 target_include_directories(vfg_monitor_text_tests PRIVATE src/fg)
 add_test(NAME vfg_monitor_text COMMAND vfg_monitor_text_tests)
 
+add_executable(vfg_pacing_repair_tests tools/tests/vfg_pacing_repair_tests.cpp)
+target_compile_features(vfg_pacing_repair_tests PRIVATE cxx_std_20)
+target_compile_options(vfg_pacing_repair_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_pacing_repair_tests PRIVATE tools/fg-presenter)
+add_test(NAME vfg_pacing_repair COMMAND vfg_pacing_repair_tests)
+
 add_executable(vfg_capture_visibility_tests
   tools/tests/vfg_capture_visibility_tests.cpp
   src/fg/fg_controller.cpp)
