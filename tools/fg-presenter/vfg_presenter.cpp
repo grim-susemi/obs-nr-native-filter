@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "native_vfg.h"
+#include "pushflow_backend.h"
 #include "vfg_adaptive_fg.h"
 #include "vfg_cadence.h"
+#include "vfg_generation_scope.h"
 #include "vfg_hud.h"
 #include "vfg_pacing_repair.h"
 #include "vfg_reflex.h"
@@ -92,6 +94,7 @@ struct Feed {
     std::atomic_bool initializing{true};
     std::atomic_bool userClosing{false};
     std::atomic_bool pushflowActive{false};
+    pushflow::PreviewMultiplier previewMultiplier;
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
     bool active() { return state(view) == 1 && !stopped(); }
     void beat() { heartbeat.store(clock_ns()); }
@@ -144,32 +147,14 @@ DWORD fixture_ms(const Session& s, const wchar_t* name)
     return *end ? 0 : std::min(delay, 30'000ul);
 }
 
-std::unique_ptr<IFgBackend> create_backend(Feed& f, Gpu& gpu, uint32_t multiplier)
+void clear_pushflow_starting_on_close(const Feed& f) noexcept
 {
-    if (multiplier == 1) return {};
-    switch (f.view.backend) {
-    case Backend::NativeVfg:
-        return std::make_unique<NativeVfg>(f.runtime, gpu, f.view, f.view.gpuShotChange != 0, [&f] { f.beat(); });
-    case Backend::PushFlow:
-        fprintf(f.log, "%s\n", f.view.pushflowRuntimeDir[0] ? "event=pushflow_backend_unavailable_fallback_1x"
-            : "event=pushflow_runtime_missing_fallback_1x");
-        return {};
-    case Backend::AnrExperimental:
-        fprintf(f.log, "event=anr_runtime_unavailable_fallback_1x\n");
-        return {};
+    try {
+        if (pushflow::clear_starting_on_user_close(pushflow::marker_directory(), f.pushflowActive.load(),
+            read_exit_reason(f.view))) return;
+    } catch (...) {
     }
-    return {};
-}
-
-void clear_pushflow_starting_on_close(const Feed& f, const std::atomic<bool>& userClosing)
-{
-    if (!userClosing.load() || !f.pushflowActive.load()) return;
-    wchar_t local[4096]{};
-    const auto len = GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local));
-    if (len && len < ARRAYSIZE(local)) {
-        std::error_code ec;
-        std::filesystem::remove(std::filesystem::path(local) / L"obs-nr-native-filter" / L"pushflow-starting.txt", ec);
-    }
+    fprintf(f.log, "event=pushflow_marker_cleanup_failed\n");
 }
 
 double window_refresh(HWND window) noexcept
@@ -238,7 +223,9 @@ void frames(Feed& f)
     if (f.view.width < 320 || f.view.height < 180 || f.view.width > 7680 || f.view.height > 4320 ||
         !f.view.generation || !f.view.mapping[0])
         check(E_INVALIDARG, "unsupported session offer");
-    const uint32_t mult = f.cliMultiplier <= 1 ? 1 : std::clamp<uint32_t>(f.view.multiplier ? f.view.multiplier : f.cliMultiplier, 2, max_multiplier);
+    const auto requested = f.cliMultiplier <= 1 ? 1u :
+        std::clamp<uint32_t>(f.view.multiplier ? f.view.multiplier : f.cliMultiplier, 2, max_multiplier);
+    const auto mult = f.previewMultiplier.effective(requested);
     fprintf(f.log, "event=offer mode=%ux size=%ux%u quality=%u generation=%llu luid=%08lx:%08lx hwnd=%p pid=%lu backend=%s epoch=%llu\n",
         mult, f.view.width, f.view.height, f.view.quality,
         static_cast<unsigned long long>(f.view.generation), static_cast<unsigned long>(f.view.adapter.HighPart),
@@ -247,7 +234,7 @@ void frames(Feed& f)
     set_gpu_process_priority(InterlockedCompareExchange(&f.view.gpuPriority, 0, 0) != 0, f.log);
     const bool split = f.view.splitCompare != 0;
     f.split.reset(split);
-    Gpu gpu(f.view, f.window, f.view.backend == Backend::NativeVfg ? mult : 1u);
+    Gpu gpu(f.view, f.window, f.view.backend == Backend::AnrExperimental ? 1u : mult);
     ReflexContext reflex(f.view.backend == Backend::NativeVfg ? gpu.d3d_device() : nullptr,
         f.view.backend == Backend::NativeVfg ? gpu.drawQueue.Get() : nullptr, f.log);
     LONG lastReflex = -1;
@@ -272,8 +259,35 @@ void frames(Feed& f)
     if (!f.active()) return;
     ipc::Consumer consumer(gpu.ipcQueue.Get(), {f.view.mapping, f.view.generation}, ipc::identity(f.parent));
     FaultGuard innerFault{f.view};
-    auto vfg = create_backend(f, gpu, mult);
-    f.pushflowActive.store(vfg && f.view.backend == Backend::PushFlow && mult > 1);
+    std::unique_ptr<IFgBackend> backend;
+    PushFlowBackend* pushflowBackend{};
+    IFgBackend* vfg{};
+    const auto userClosing = [&f] { return read_exit_reason(f.view) == ExitReason::UserClosed; };
+    const auto work = [&] {
+    if (mult > 1) {
+        switch (f.view.backend) {
+        case Backend::NativeVfg:
+            backend = std::make_unique<NativeVfg>(f.runtime, gpu, f.view, f.view.gpuShotChange != 0, [&f] { f.beat(); });
+            vfg = backend.get();
+            break;
+        case Backend::PushFlow: {
+            auto owner = std::make_unique<PushFlowBackend>();
+            pushflowBackend = owner.get();
+            backend = std::move(owner);
+            f.pushflowActive.store(true);
+            if (pushflowBackend->open({f.view, f.log, [&f] { f.beat(); }, userClosing, 0, &f.previewMultiplier}, &gpu))
+                vfg = pushflowBackend;
+            else if (pushflowBackend->runtime_fault())
+                check(E_FAIL, "PushFlow initialization fault");
+            else
+                f.pushflowActive.store(false);
+            break;
+        }
+        case Backend::AnrExperimental:
+            fprintf(f.log, "event=anr_runtime_unavailable_fallback_1x\n");
+            break;
+        }
+    }
     fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld\n",
         vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, lastReflex, f.view.gpuShotChange,
         InterlockedCompareExchange(&f.view.hudLock, 0, 0), InterlockedCompareExchange(&f.view.pacingRepair, 0, 0),
@@ -351,7 +365,7 @@ void frames(Feed& f)
     };
     std::optional<Incoming> incoming;
     uint64_t reflexFrameId = 0;
-    while (f.active()) {
+    while (f.active() && !(pushflowBackend && pushflowBackend->runtime_fault())) {
         if (faultArm.h && WaitForSingleObject(faultArm.h, 0) == WAIT_OBJECT_0)
             throw std::runtime_error("test_live_consumer_fault");
         sync_reflex();
@@ -537,10 +551,13 @@ void frames(Feed& f)
                 !vfg->subframe_ready(*previousTicket, previousTicket->lastSubmittedSub);
             const auto stageStart = clock_ns();
             const bool pairLate = stageStart >= plan.synthetic_cutoff(activeMult - 1);
-            const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult, telemetry.shotCut,
+            const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult,
+                !continuous, telemetry.shotCut,
                 [&] { record(f, "stage_queued", b, &a, 0, telemetry, clock_ns() - stageStart); },
-                [&](uint64_t workNs) { record(f, "cuda_enqueued", b, &a, 0, telemetry, workNs); }};
-            const auto ticket = !backendBusy && !pairLate ? vfg->submit_pair(pair, anchor->index, index) : std::nullopt;
+                [&](uint64_t workNs) { record(f, pushflowBackend ? "pushflow_enqueued" : "cuda_enqueued",
+                    b, &a, 0, telemetry, workNs); }};
+            const auto ticket = !backendBusy && !pairLate ?
+                vfg->try_submit_pair(pair, anchor->index, index) : std::nullopt;
             if (ticket) {
                 previousTicket.emplace(*ticket);
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
@@ -617,16 +634,21 @@ void frames(Feed& f)
         }
     }
     if (incoming) record(f, "input", incoming->frame, nullptr, 0, incoming->telemetry, 0, incoming->receivedNs);
-    f.split.reset(false);
+    };
+    const auto shutdown = [&](bool threw) {
+    if (threw && pushflowBackend) pushflowBackend->generation_fault();
     PostMessageW(f.window, WM_CANCELMODE, 0, 0);
     // Both queues must be idle before releasing their resources or acknowledging
     // a resize. In particular, a successful Present only submits draw work.
     const auto drain_failure = [&] {
         stamp_exit_reason(f.view, ExitReason::Fault);
+        const bool userClosed = f.view.backend == Backend::PushFlow &&
+            read_exit_reason(f.view) == ExitReason::UserClosed;
+        if (userClosed) clear_pushflow_starting_on_close(f);
         fprintf(f.log, "event=error message=presenter_drain_failed\n");
         fflush(f.log);
         ShowWindowAsync(f.window, SW_HIDE);
-        TerminateProcess(GetCurrentProcess(), 5);
+        TerminateProcess(GetCurrentProcess(), userClosed ? 0u : 5u);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     };
     ComPtr<ID3D12Fence> drainFence;
@@ -644,22 +666,42 @@ void frames(Feed& f)
         if (completed == UINT64_MAX || completed < value)
             drain_failure();
     };
-    drain(gpu.ipcQueue.Get(), 1);
-    drain(gpu.drawQueue.Get(), 2);
     try {
-        if (vfg) vfg->synchronize(); // Do not acknowledge a failed CUDA drain.
-    } catch (const std::exception& e) {
-        fprintf(f.log, "event=error message=%s\n", e.what());
+        if (pushflowBackend) pushflowBackend->synchronize();
+        drain(gpu.ipcQueue.Get(), 1);
+        drain(gpu.drawQueue.Get(), 2);
+        if (vfg && !pushflowBackend) vfg->synchronize(); // Do not acknowledge a failed CUDA drain.
+    } catch (const std::exception& error) {
+        if (f.view.backend != Backend::PushFlow)
+            fprintf(f.log, "event=error message=%s\n", error.what());
+        drain_failure();
+    } catch (...) {
         drain_failure();
     }
     if (const auto stall = fixture_ms(f.view, L"OBS_NR_TEST_STALL_TEARDOWN_MS")) {
         fprintf(f.log, "event=test_teardown_stalled delay_ms=%lu\n", stall);
         Sleep(stall);
     }
-    vfg.reset();
-    clear_pushflow_starting_on_close(f, f.userClosing);
+    const bool pushflowFault = pushflowBackend && pushflowBackend->runtime_fault();
+    try {
+        if (pushflowBackend && !pushflowBackend->close()) drain_failure();
+    } catch (...) {
+        drain_failure();
+    }
+    backend.reset();
+    clear_pushflow_starting_on_close(f);
     f.pushflowActive.store(false);
-    if (consumer.close() != ipc::Status::Closed) check(E_FAIL, "IPC drain incomplete");
+    if (consumer.close() != ipc::Status::Closed) {
+        if (f.view.backend == Backend::PushFlow) drain_failure();
+        check(E_FAIL, "IPC drain incomplete");
+    }
+    f.split.reset(false);
+    const bool closed = userClosing();
+    if (pushflowFault && !threw && !closed)
+        check(E_FAIL, "PushFlow inference fault");
+    return closed && f.view.backend == Backend::PushFlow;
+    };
+    run_generation(work, shutdown, f.view.backend == Backend::PushFlow);
 }
 } // namespace
 } // namespace nr::fg::vfg
@@ -929,7 +971,7 @@ int wmain(int argc, wchar_t** argv)
         fprintf(file, "event=shutdown_force_terminate watchdog=%d exit_reason=%ld\n",
             reason == ExitReason::Watchdog, static_cast<LONG>(reason));
         fflush(file);
-        if (reason == ExitReason::UserClosed) clear_pushflow_starting_on_close(feed, feed.userClosing);
+        if (reason == ExitReason::UserClosed) clear_pushflow_starting_on_close(feed);
         TerminateProcess(GetCurrentProcess(), reason == ExitReason::UserClosed ? 0u : 2u);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }

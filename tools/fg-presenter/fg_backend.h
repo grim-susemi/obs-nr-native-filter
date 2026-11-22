@@ -20,6 +20,7 @@ struct FgPairDesc {
     uint64_t prevSerial, currSerial;
     uint32_t effectiveMultiplier;
     bool discontinuity;
+    bool shotCut{};
     // Optional synchronous notifications at staging admission and backend
     // enqueue completion. Enqueue time excludes staging and its notification.
     std::function<void()> onStageQueued{};
@@ -32,6 +33,13 @@ public:
     virtual const char* name() const noexcept = 0;
     virtual unsigned version_tag() const noexcept = 0;
     virtual bool faulted() const noexcept = 0;
+    // A transport break is never a valid interpolation pair. A shot cut is
+    // still submitted so the shared GPU display path can consume its predicate.
+    std::optional<FgPairTicket> try_submit_pair(const FgPairDesc& pair, unsigned prevIndex, unsigned currIndex)
+    {
+        if (pair.discontinuity) return {};
+        return submit_pair(pair, prevIndex, currIndex);
+    }
     // Empty means no commands were admitted. The input copies must already
     // be ordered on the draw queue before submitting the pair.
     virtual std::optional<FgPairTicket> submit_pair(const FgPairDesc&, unsigned prevIndex, unsigned currIndex) = 0;

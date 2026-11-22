@@ -40,7 +40,8 @@ void DescriptorStager::write_srv(ID3D12Resource* resource, const D3D12_SHADER_RE
     device_->CopyDescriptorsSimple(1, dest, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
-Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
+Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier)
+    : window_(window), pushflow_(s.backend == Backend::PushFlow)
 {
     ComPtr<IDXGIFactory5> factory5;
     ComPtr<IDXGIFactory4> factory;
@@ -278,13 +279,15 @@ ID3D12GraphicsCommandList* Gpu::begin()
         if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "present device removed");
         if (completed < slot.fenceVal) {
             check(done_->SetEventOnCompletion(slot.fenceVal, event_.h), "ring slot fence event");
-            if (WaitForSingleObject(event_.h, waitMs_) != WAIT_OBJECT_0) {
+            const auto wait = WaitForSingleObject(event_.h, waitMs_);
+            if (!pushflow_ && wait != WAIT_OBJECT_0) {
                 check(device_->GetDeviceRemovedReason(), "present device removed");
                 ShowWindowAsync(window_, SW_HIDE);
                 TerminateProcess(GetCurrentProcess(), 5);
                 __fastfail(FAST_FAIL_FATAL_APP_EXIT);
             }
-            check(device_->GetDeviceRemovedReason(), "present device removed");
+            // The owner must classify the close and drain without unwinding Gpu.
+            check_ring_wait(wait, device_->GetDeviceRemovedReason());
         }
     }
     return begin_available();
@@ -307,26 +310,33 @@ uint64_t Gpu::finish(bool sync)
     check(drawQueue->Signal(done_.Get(), sigFence), "present queue signal");
     slot.fenceVal = sigFence;
     ringIdx_ = (ringIdx_ + 1) % ring_slots;
-    if (!sync) {
+    if (!pushflow_ && sync) {
+        const char* operation = "present queue fence event";
+        HRESULT hr = done_->SetEventOnCompletion(sigFence, event_.h);
+        if (SUCCEEDED(hr) && WaitForSingleObject(event_.h, waitMs_) != WAIT_OBJECT_0) {
+            operation = "present fence wait";
+            hr = E_FAIL;
+        }
+        const auto completed = done_->GetCompletedValue();
         const auto removed = device_->GetDeviceRemovedReason();
-        if (FAILED(removed)) check(removed, "present device removed");
+        if (SUCCEEDED(removed) && (completed == UINT64_MAX || completed < sigFence)) {
+            ShowWindowAsync(window_, SW_HIDE);
+            TerminateProcess(GetCurrentProcess(), 5);
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        check(removed, "present device removed");
+        check(hr, operation);
         return sigFence;
     }
-    const char* operation = "present queue fence event";
-    HRESULT hr = done_->SetEventOnCompletion(sigFence, event_.h);
-    if (SUCCEEDED(hr) && WaitForSingleObject(event_.h, waitMs_) != WAIT_OBJECT_0) {
-        operation = "present fence wait";
-        hr = E_FAIL;
+    if (sync) {
+        check(done_->SetEventOnCompletion(sigFence, event_.h), "present queue fence event");
+        const auto wait = WaitForSingleObject(event_.h, waitMs_);
+        check_ring_wait(wait, device_->GetDeviceRemovedReason());
+        const auto completed = done_->GetCompletedValue();
+        check(completed == UINT64_MAX || completed < sigFence ? E_FAIL : S_OK, "present fence incomplete");
+    } else {
+        check(device_->GetDeviceRemovedReason(), "present device removed");
     }
-    const auto completed = done_->GetCompletedValue();
-    const auto removed = device_->GetDeviceRemovedReason();
-    if (SUCCEEDED(removed) && (completed == UINT64_MAX || completed < sigFence)) {
-        ShowWindowAsync(window_, SW_HIDE);
-        TerminateProcess(GetCurrentProcess(), 5);
-        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    }
-    check(removed, "present device removed");
-    check(hr, operation);
     return sigFence;
 }
 uint64_t Gpu::record_draw(const Draw& draw)

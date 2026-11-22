@@ -11,6 +11,9 @@ add_executable(obs-nr-fg-presenter
   tools/fg-presenter/vfg_gpu.cpp
   tools/fg-presenter/vfg_shot_change.cpp
   tools/fg-presenter/native_vfg.cpp
+  tools/fg-presenter/pushflow_backend.cpp
+  tools/fg-presenter/pushflow_compute.cpp
+  tools/fg-presenter/pushflow_ort.cpp
   tools/fg-presenter/pushflow_shader_bytecode.cpp)
 set(VFG_SHOT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_shot_change.hlsl")
 set(VFG_SHOT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_shot_change_shader.h")
@@ -142,6 +145,35 @@ target_compile_options(pushflow_motion_tests PRIVATE /W4 /WX /permissive-)
 target_include_directories(pushflow_motion_tests PRIVATE tools/fg-presenter)
 add_test(NAME pushflow_motion COMMAND pushflow_motion_tests)
 set_tests_properties(pushflow_motion PROPERTIES TIMEOUT 30)
+
+add_library(pushflow_loader_fixture MODULE tools/tests/pushflow_loader_fixture.cpp)
+target_compile_options(pushflow_loader_fixture PRIVATE /W4 /WX /permissive-)
+target_link_options(pushflow_loader_fixture PRIVATE /NOENTRY)
+
+add_executable(pushflow_backend_tests
+  tools/tests/pushflow_backend_tests.cpp
+  tools/tests/pushflow_gpu_fixture.cpp
+  tools/fg-presenter/pushflow_backend.cpp
+  tools/fg-presenter/pushflow_compute.cpp
+  tools/fg-presenter/pushflow_ort.cpp
+  tools/fg-presenter/pushflow_shader_bytecode.cpp
+  tools/fg-presenter/vfg_shot_change.cpp
+  tools/fg-presenter/vfg_gpu.cpp)
+add_dependencies(pushflow_backend_tests vfg_presenter_shaders pushflow_loader_fixture)
+target_compile_features(pushflow_backend_tests PRIVATE cxx_std_20)
+target_compile_definitions(pushflow_backend_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(pushflow_backend_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(pushflow_backend_tests PRIVATE src src/fg "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(pushflow_backend_tests SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-1.20.1")
+target_link_libraries(pushflow_backend_tests PRIVATE fg_ipc d3d12 dxgi user32)
+add_test(NAME pushflow_backend COMMAND pushflow_backend_tests)
+set_tests_properties(pushflow_backend PROPERTIES TIMEOUT 90)
+foreach(case IN ITEMS invalid missing)
+  add_test(NAME pushflow_backend_cli_${case}
+    COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:pushflow_backend_tests>" "-DCASE=${case}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/check_pushflow_cli_rejection.cmake")
+  set_tests_properties(pushflow_backend_cli_${case} PROPERTIES TIMEOUT 10)
+endforeach()
 
 add_executable(vfg_filter_output_tests tools/tests/vfg_filter_output_tests.cpp)
 target_compile_features(vfg_filter_output_tests PRIVATE cxx_std_20)

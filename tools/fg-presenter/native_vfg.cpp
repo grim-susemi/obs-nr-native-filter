@@ -460,7 +460,7 @@ std::optional<FgPairTicket> NativeVfg::submit_pair(const FgPairDesc& pair, unsig
             p.cv_check(p.setU32(p.effect, "FrameMultiplier", pair.effectiveMultiplier), "FrameMultiplier");
             p.activeMultiplier = pair.effectiveMultiplier;
         }
-        p.cv_check(p.setU32(p.effect, "ShotChange", pair.discontinuity ? 1u : 0u), "SetU32 ShotChange");
+        p.cv_check(p.setU32(p.effect, "ShotChange", pair.shotCut ? 1u : 0u), "SetU32 ShotChange");
         for (uint32_t sub = 1; sub < p.activeMultiplier; ++sub) {
             p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[1 + sub].image), "SetImage DstImage0");
             p.cv_check(p.setU32(p.effect, "FrameIndex", sub), "SetU32 FrameIndex");

@@ -22,6 +22,12 @@ inline void check(HRESULT hr, const char* operation)
 {
     if (FAILED(hr)) throw ipc::Error(ipc::Status::ProtocolError, hr, operation);
 }
+inline void check_ring_wait(DWORD wait, HRESULT removed)
+{
+    check(removed, "present device removed");
+    if (wait != WAIT_OBJECT_0) check(
+        wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : E_FAIL, "present ring wait");
+}
 struct PushFlowShaderBytecodeSet {
     D3D12_SHADER_BYTECODE pack{}, unpack{}, reconstruct{};
 };
@@ -36,6 +42,7 @@ public:
 
 class Gpu final {
     HWND window_;
+    bool pushflow_;
     const PushFlowShaderBytecodeSet pushflowShaders_{make_pushflow_shader_bytecode()};
     ComPtr<ID3D12Device> device_;
     struct CmdSlot {
@@ -110,6 +117,14 @@ public:
     // Speculative admission never waits on the ring. Zero means no submission.
     [[nodiscard]] uint64_t record_draw(const Draw&);
     void mark_inputs_read(unsigned prevIndex, unsigned currIndex, uint64_t fenceVal);
+    // A backend may own its command allocators but still reads these inputs
+    // on drawQueue. Insert its reader fence into the IPC recycle timeline.
+    void mark_external_inputs_read(unsigned prevIndex, unsigned currIndex)
+    {
+        const auto value = ++fence_;
+        check(drawQueue->Signal(done_.Get(), value), "backend reader fence");
+        mark_inputs_read(prevIndex, currIndex, value);
+    }
     void set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels);
     UINT present(ID3D12Resource*, bool synthetic, int beforeIndex = -1, uint32_t splitPercent = 50);
     // Deadline is on clock_ns(). No GPU work is submitted on a missed admission.
