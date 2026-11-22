@@ -61,16 +61,22 @@ struct Tap {
     bool activeSplit{};
     uint32_t multiplier{2};
     Quality quality{Quality::Medium};
+    Backend backend{};
+    PushFlowTier pushflowTier{};
+    uint32_t gpuShotChange{}, experimentalAnrOptIn{}, hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{};
+    std::wstring anrDllPath;
     uint32_t fpsOverlay{1};
     uint32_t lowLatency{1};
     uint32_t gpuPriority{1};
     bool hideFromCapture{false};
     std::string monitorId;
     uint64_t lastTick{};
+    uint64_t rejectedSinceNs{};
     uint64_t retiredGeneration{};
     bool breakPair{};
     bool resizing{};
     bool stopping{true};
+    std::atomic_bool testCheckpointUsed{};
     std::atomic_bool hideSourceCanvas{false};
     std::atomic_bool vfgActive{false};
     std::atomic_bool detached{false};
@@ -115,7 +121,7 @@ std::vector<MonitorItem> list_monitors()
 
 void disconnect(Tap& tap, const char* cause) noexcept
 {
-    if (tap.controller) tap.controller->stop();
+    if (tap.controller) tap.controller->request_stop();
     if (tap.producer) {
         tap.retiredGeneration = tap.producer->generation();
         blog(LOG_INFO, "[vfg] original selected generation=%llu qpc_ns=%llu reason=%s",
@@ -126,8 +132,57 @@ void disconnect(Tap& tap, const char* cause) noexcept
     tap.activeWidth = 0;
     tap.activeHeight = 0;
     tap.resizing = false;
+    tap.rejectedSinceNs = 0;
     tap.stopping = true;
     tap.vfgActive.store(false, std::memory_order_release);
+}
+
+bool try_recover_peer_exit(Tap& tap, const char* reason, bool forceFaultOnTimeout = false)
+{
+    if (tap.stopping || tap.detached.load()) {
+        disconnect(tap, reason);
+        return false;
+    }
+    // Bracket only the graphics caller's enqueue. Logging, producer teardown
+    // and asynchronous child reap/spawn are outside the measured interval.
+    const auto startedNs = clock_ns();
+    const bool scheduled = tap.controller->begin_async_fallback_relaunch(forceFaultOnTimeout);
+    const auto elapsedNs = clock_ns() - startedNs;
+    if (!scheduled) {
+        disconnect(tap, reason);
+        return false;
+    }
+    blog(LOG_INFO, "[vfg] recovery requested reason=%s enqueue_ns=%llu graphics_thread=%d",
+        reason, nr::quality::id(elapsedNs), obs_in_task_thread(OBS_TASK_GRAPHICS) ? 1 : 0);
+    if (tap.producer) tap.retiredGeneration = tap.producer->generation();
+    tap.producer.reset();
+    tap.resizing = false;
+    tap.rejectedSinceNs = 0;
+    tap.breakPair = true;
+    return true;
+}
+
+// The isolated libobs fixture releases this bounded checkpoint after acting
+// on its own presenter. It is never taken without both fixture events.
+bool test_checkpoint(Tap& tap, const wchar_t* stage)
+{
+    if (tap.testCheckpointUsed) return false;
+    wchar_t selected[24]{}, name[128]{};
+    if (!GetEnvironmentVariableW(L"OBS_NR_TEST_TAP_STAGE", selected, ARRAYSIZE(selected)) ||
+        wcscmp(selected, stage) ||
+        GetEnvironmentVariableW(L"OBS_NR_TEST_TAP_EVENT", name, ARRAYSIZE(name)) >= ARRAYSIZE(name) ||
+        !name[0]) return false;
+    const auto observed = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+    if (!observed) return false;
+    const auto resumed = OpenEventW(SYNCHRONIZE, FALSE, (std::wstring(name) + L".resume").c_str());
+    if (resumed) {
+        tap.testCheckpointUsed = true;
+        SetEvent(observed);
+        WaitForSingleObject(resumed, 250);
+        CloseHandle(resumed);
+    }
+    CloseHandle(observed);
+    return resumed != nullptr;
 }
 
 void draw_sdr(gs_texture_t* texture, Extent size, gs_blend_type destBlend)
@@ -172,10 +227,24 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
     if (!obs_in_task_thread(OBS_TASK_GRAPHICS)) return nullptr;
     std::unique_lock lock(tap.command, std::try_to_lock);
     if (!lock || !tap.controller) return nullptr;
-    if (tap.stopping || tap.detached.load() || !tap.controller->alive()) {
-        disconnect(tap, "stopped_or_peer_exit");
+    if (tap.stopping || tap.detached.load()) {
+        disconnect(tap, "stopped_or_detached");
         return nullptr;
     }
+    switch (tap.controller->poll_async_fallback_relaunch()) {
+    case RelaunchState::InFlight: return nullptr;
+    case RelaunchState::Failed: disconnect(tap, "relaunch_failed"); return nullptr;
+    case RelaunchState::Idle:
+    case RelaunchState::Ready: break;
+    }
+    test_checkpoint(tap, L"before_alive");
+    if (!tap.controller->alive()) {
+        try_recover_peer_exit(tap, "peer_exit");
+        return nullptr;
+    }
+    const auto exit = tap.controller->exit_reason();
+    if (exit == ExitReason::Watchdog || exit == ExitReason::UserClosed) return nullptr;
+    if (tap.producer) test_checkpoint(tap, L"after_alive");
     const auto tick = obs_get_video_frame_time();
     if (tick == tap.lastTick) return nullptr;
     tap.lastTick = tick;
@@ -193,7 +262,9 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
         if (tap.producer && !tap.resizing &&
             (tap.activeWidth != w || tap.activeHeight != h || tap.activeSplit != bool(compare))) {
             if (!tap.controller->request_resize()) {
-                disconnect(tap, "resize_request");
+                if (!tap.controller->alive() || tap.controller->is_fault_or_watchdog_exit())
+                    try_recover_peer_exit(tap, "resize_request_peer_fault");
+                else disconnect(tap, "resize_request");
                 return nullptr;
             }
             tap.resizing = true;
@@ -201,11 +272,17 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
                 tap.activeWidth, tap.activeHeight, w, h, nr::quality::id(tap.producer->generation()));
         }
         if (tap.resizing) {
-            if (!tap.controller->resize_drained()) return nullptr;
+            if (!tap.controller->resize_drained()) {
+                if (tap.controller->is_fault_or_watchdog_exit())
+                    try_recover_peer_exit(tap, "resize_drain_peer_fault");
+                return nullptr;
+            }
             const auto retired = tap.producer->retire();
             if (retired == ipc::Status::PeerBusy) return nullptr;
             if (retired != ipc::Status::Ok) {
-                disconnect(tap, "resize_retire");
+                if (retired == ipc::Status::PeerDead || retired == ipc::Status::Closed)
+                    try_recover_peer_exit(tap, "resize_retire_peer_exit");
+                else disconnect(tap, "resize_retire");
                 return nullptr;
             }
             tap.producer.reset();
@@ -226,13 +303,25 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             }
             const auto key = LR"(Local\obs-nr-vfg.)" + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(++nextTap);
             tap.producer = std::make_unique<ipc::Producer>(device, key, shape);
-            const auto offer = tap.producer->connect(tap.controller->peer());
+            ipc::Offer offer;
+            try {
+                test_checkpoint(tap, L"before_connect");
+                auto peer = tap.controller->peer();
+                if (test_checkpoint(tap, L"bad_peer")) ++peer.creation;
+                offer = tap.producer->connect(peer);
+            } catch (const ipc::Error&) {
+                if (tap.controller->alive() && !tap.controller->is_fault_or_watchdog_exit()) throw;
+                try_recover_peer_exit(tap, "connect_peer_dead");
+                return nullptr;
+            }
             tap.target = target;
             tap.activeWidth = w;
             tap.activeHeight = h;
             tap.activeSplit = shape.splitCompare;
             if (!tap.controller->offer(offer, shape, desc.AdapterLuid)) {
-                disconnect(tap, "offer_rejected");
+                if (!tap.controller->alive() || tap.controller->is_fault_or_watchdog_exit())
+                    try_recover_peer_exit(tap, "offer_peer_fault");
+                else disconnect(tap, "offer_rejected");
                 return nullptr;
             }
             blog(LOG_INFO, "[vfg] offered source_uuid=%s tap_uuid=%s size=%ux%u generation=%llu qpc_ns=%llu",
@@ -241,6 +330,21 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
         }
         const auto status = tap.producer->status();
         if (status == ipc::Status::Pending) return nullptr;
+        if (status == ipc::Status::Rejected) {
+            if (tap.controller->can_recover() && tap.controller->alive() &&
+                tap.controller->exit_reason() == ExitReason::None) {
+                const auto now = clock_ns();
+                if (!tap.rejectedSinceNs) tap.rejectedSinceNs = now;
+                if (now - tap.rejectedSinceNs < 500'000'000) return nullptr;
+                try_recover_peer_exit(tap, "import_rejected_timeout", true);
+            } else try_recover_peer_exit(tap, "import_rejected");
+            return nullptr;
+        }
+        if (status == ipc::Status::PeerDead || status == ipc::Status::Closed) {
+            try_recover_peer_exit(tap, "transport_peer_closed");
+            return nullptr;
+        }
+        tap.rejectedSinceNs = 0;
         if (status != ipc::Status::Ok) { disconnect(tap, "transport_status"); return nullptr; }
         if (tap.target != target || tap.previousWidth != output.width || tap.previousHeight != output.height) {
             tap.breakPair = true;
@@ -286,7 +390,14 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
                 nr::quality::id(captureQpc), nr::quality::id(arrival), static_cast<int>(result));
         if (result == ipc::Status::Ok)
             tap.breakPair = false;
-        if (result != ipc::Status::Ok && result != ipc::Status::Dropped) disconnect(tap, "publish_fault");
+        if (result == ipc::Status::PeerDead || result == ipc::Status::Closed ||
+            (result != ipc::Status::Ok && result != ipc::Status::Dropped &&
+                (!tap.controller->alive() || tap.controller->is_fault_or_watchdog_exit())))
+            try_recover_peer_exit(tap, "publish_peer_closed");
+        else if (result != ipc::Status::Ok && result != ipc::Status::Dropped) {
+            blog(LOG_WARNING, "[vfg] transport publish failed status=%d", static_cast<int>(result));
+            disconnect(tap, "publish_fault");
+        }
         return texture;
     } catch (const std::exception& e) {
         blog(LOG_WARNING, "[vfg] OBS tap fault: %s", e.what());
@@ -304,6 +415,7 @@ void render(void* data, gs_effect_t*)
     auto* parent = obs_filter_get_parent(tap.source);
     if (!target || !parent)
         return;
+    if (obs_in_task_thread(OBS_TASK_GRAPHICS)) test_checkpoint(tap, L"before_extent");
     const auto size = tap.upscale ? obs_upscale::dimensions(*tap.upscale) :
         Extent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
     const auto compare = split::plan(tap.source);
@@ -339,7 +451,17 @@ bool start(Tap& tap, bool off)
         opts.lowLatency = tap.lowLatency ? 1u : 0u;
         opts.gpuPriority = tap.gpuPriority ? 1u : 0u;
         opts.hideFromCapture = tap.hideFromCapture ? 1u : 0u;
+        opts.backend = tap.backend;
+        opts.pushflowTier = tap.pushflowTier;
+        opts.gpuShotChange = tap.gpuShotChange;
+        opts.experimentalAnrOptIn = tap.experimentalAnrOptIn;
+        opts.anrDllPath = tap.anrDllPath;
+        opts.hudLock = tap.hudLock;
+        opts.pacingRepair = tap.pacingRepair;
+        opts.adaptiveFg = tap.adaptiveFg;
+        opts.adaptiveTargetFps = tap.adaptiveTargetFps;
         tap.controller = std::make_unique<Controller>(opts);
+        tap.testCheckpointUsed = false;
         tap.stopping = false;
         tap.vfgActive.store(true, std::memory_order_release);
         blog(LOG_INFO, "[vfg] open request mode=%ux quality=%u qpc_ns=%llu",
@@ -410,12 +532,29 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     tap.lowLatency = ll;
     tap.gpuPriority = gp;
     tap.hideFromCapture = hideFromCapture;
+    switch (obs_data_get_int(settings, "vfg_backend")) {
+    case 1: tap.backend = Backend::PushFlow; break;
+    case 2: tap.backend = Backend::AnrExperimental; break;
+    default: tap.backend = Backend::NativeVfg; break;
+    }
+    tap.pushflowTier = obs_data_get_int(settings, "vfg_pushflow_tier") == 1 ? PushFlowTier::Quality : PushFlowTier::Fast;
+    tap.experimentalAnrOptIn = obs_data_get_bool(settings, "vfg_experimental_anr");
+    tap.anrDllPath = utf8_to_wide(obs_data_get_string(settings, "vfg_anr_dll_path"));
+    tap.gpuShotChange = obs_data_get_bool(settings, "vfg_gpu_shot_change");
+    tap.hudLock = obs_data_get_bool(settings, "vfg_hud_lock");
+    tap.pacingRepair = obs_data_get_bool(settings, "vfg_pacing_repair");
+    tap.adaptiveFg = obs_data_get_bool(settings, "vfg_adaptive_fg");
+    tap.adaptiveTargetFps = static_cast<uint32_t>(std::clamp(obs_data_get_int(settings, "vfg_adaptive_target_fps"), 0LL, static_cast<long long>(LONG_MAX)));
     tap.hideSourceCanvas.store(hideSourceCanvas, std::memory_order_release);
     tap.monitorId = mon ? mon : "";
     if (tap.controller) {
         tap.controller->set_fps_overlay(tap.fpsOverlay);
         tap.controller->set_low_latency(tap.lowLatency);
         tap.controller->set_hide_from_capture(tap.hideFromCapture ? 1u : 0u);
+        tap.controller->set_hud_lock(tap.hudLock);
+        tap.controller->set_pacing_repair(tap.pacingRepair);
+        tap.controller->set_adaptive_fg(tap.adaptiveFg);
+        tap.controller->set_adaptive_target_fps(tap.adaptiveTargetFps);
     }
 }
 

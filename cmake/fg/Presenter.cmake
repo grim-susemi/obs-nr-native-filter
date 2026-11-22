@@ -47,6 +47,22 @@ target_compile_options(vfg_monitor_text_tests PRIVATE /W4 /WX /permissive-)
 target_include_directories(vfg_monitor_text_tests PRIVATE src/fg)
 add_test(NAME vfg_monitor_text COMMAND vfg_monitor_text_tests)
 
+add_executable(vfg_session_controller_tests
+  tools/tests/vfg_session_controller_tests.cpp
+  src/fg/fg_controller.cpp)
+target_compile_features(vfg_session_controller_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_session_controller_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_session_controller_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_session_controller_tests PRIVATE src/fg)
+target_link_libraries(vfg_session_controller_tests PRIVATE fg_ipc user32)
+add_dependencies(vfg_session_controller_tests vfg_native_smoke_tests)
+add_test(NAME vfg_session_controller COMMAND vfg_session_controller_tests
+  $<TARGET_FILE:obs-nr-fg-presenter> "${CMAKE_CURRENT_BINARY_DIR}/vfg_session_controller")
+set_tests_properties(vfg_session_controller PROPERTIES TIMEOUT 20)
+add_test(NAME vfg_session_controller_native COMMAND vfg_native_smoke_tests
+  $<TARGET_FILE:obs-nr-fg-presenter> "${CMAKE_CURRENT_BINARY_DIR}/vfg_session_controller_native" --split-telemetry)
+set_tests_properties(vfg_session_controller_native PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE LABELS gpu)
+
 add_executable(vfg_pacing_repair_tests tools/tests/vfg_pacing_repair_tests.cpp)
 target_compile_features(vfg_pacing_repair_tests PRIVATE cxx_std_20)
 target_compile_options(vfg_pacing_repair_tests PRIVATE /W4 /WX /permissive-)
@@ -83,6 +99,6 @@ if(NOT OBS_NR_VFG_QA_ACTION)
   add_test(NAME vfg_filter_output COMMAND vfg_filter_output_tests
     $<TARGET_FILE:obs-nr-filter> "${CMAKE_CURRENT_SOURCE_DIR}/data" $<TARGET_FILE:obs-nr-fg-presenter>
     "$<TARGET_FILE_DIR:OBS::libobs>/libobs-d3d11.dll" "${CMAKE_CURRENT_BINARY_DIR}/vfg_filter_output")
-  set_tests_properties(vfg_filter_output PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE
+  set_tests_properties(vfg_filter_output PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE
     WORKING_DIRECTORY "$<TARGET_FILE_DIR:OBS::libobs>")
 endif()

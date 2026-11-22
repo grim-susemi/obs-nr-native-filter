@@ -3,16 +3,19 @@
 #include <graphics/vec4.h>
 #include <windows.h>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <string>
 
 namespace {
 constexpr uint32_t width = 320, height = 180;
+std::atomic_uint32_t fixtureWidth{width};
 constexpr char filterId[] = "susemi_fg_tap";
 using Pixels = std::array<uint8_t, 4>;
 constexpr Pixels red{255, 0, 0, 255}, blue{0, 0, 255, 255}, transparent{};
@@ -71,7 +74,7 @@ void render_fixture(void*, gs_effect_t*)
     const vec4 color{1.f, 0.f, 0.f, 1.f};
     gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &color);
     while (gs_effect_loop(effect, "Solid"))
-        gs_draw_sprite(nullptr, 0, width, height);
+        gs_draw_sprite(nullptr, 0, fixtureWidth.load(), height);
 }
 
 Pixels probe(obs_source_t* src, const Pixels& background, bool sourceOver)
@@ -131,21 +134,380 @@ void canvas_contract(const std::filesystem::path& log)
     obs_queue_task(OBS_TASK_GRAPHICS, [](void*) {}, nullptr, true);
     obs_source_filter_remove(input.get(), filter.get());
 }
+
+using Clock = std::chrono::steady_clock;
+namespace fs = std::filesystem;
+
+struct Handle {
+    HANDLE value{};
+    ~Handle() { if (value) CloseHandle(value); }
+};
+
+std::string text_of(const fs::path& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(f), {}};
 }
 
-int wmain(int argc, wchar_t** argv)
+template<class Predicate>
+void await(Predicate test, const char* description, int timeoutMs = 6000)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!test()) {
+        expect(Clock::now() < deadline, description);
+        Sleep(1);
+    }
+}
+
+std::string field(const std::string& line, const char* key)
+{
+    const auto pos = line.find(key);
+    if (pos == std::string::npos) return {};
+    const auto start = pos + strlen(key);
+    return line.substr(start, line.find_first_of(" \r\n", start) - start);
+}
+
+std::string event(const std::string& text, const char* token, const char* epoch = "")
+{
+    for (size_t start = 0; start < text.size();) {
+        const auto end = text.find('\n', start);
+        if (end == std::string::npos) break;
+        const auto line = text.substr(start, end - start);
+        if (line.starts_with(token) && line.find(epoch) != std::string::npos) return line;
+        start = end + 1;
+    }
+    return {};
+}
+
+size_t count_events(const std::string& text, const char* token)
+{
+    size_t count = 0;
+    for (auto pos = text.find(token); pos != std::string::npos; pos = text.find(token, pos + 1)) ++count;
+    return count;
+}
+
+struct RenderStats {
+    std::atomic_uint64_t rawCount{}, gaps{}, maxNs{}, ticks{};
+    uint64_t lastTimestamp{};
+    Clock::time_point tickStarted{};
+    static void tick(void* opaque, float)
+    {
+        static_cast<RenderStats*>(opaque)->tickStarted = Clock::now();
+    }
+    static void rendered(void* opaque)
+    {
+        auto& s = *static_cast<RenderStats*>(opaque);
+        if (s.tickStarted == Clock::time_point{}) return;
+        const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - s.tickStarted).count());
+        auto prior = s.maxNs.load();
+        while (ns > prior && !s.maxNs.compare_exchange_weak(prior, ns)) {}
+        ++s.ticks;
+    }
+    static void raw(void* opaque, video_data* frame)
+    {
+        auto& s = *static_cast<RenderStats*>(opaque);
+        if (s.lastTimestamp && frame->timestamp - s.lastTimestamp > 25'000'000) ++s.gaps;
+        s.lastTimestamp = frame->timestamp;
+        ++s.rawCount;
+    }
+    RenderStats()
+    {
+        obs_add_tick_callback(tick, this);
+        obs_add_main_rendered_callback(rendered, this);
+        obs_add_raw_video_callback(nullptr, raw, this);
+    }
+    ~RenderStats()
+    {
+        obs_remove_raw_video_callback(raw, this);
+        obs_remove_main_rendered_callback(rendered, this);
+        obs_remove_tick_callback(tick, this);
+    }
+};
+
+enum class Action { Escape, Close, ExitZero, Fault, Reject, ResizeFault, Kill, Watchdog, Stop, Detach, BadPeer };
+struct Scenario {
+    const wchar_t* name;
+    Action action;
+    const wchar_t* stall{};
+    const wchar_t* rejectedStall{};
+    const wchar_t* checkpoint{};
+    bool timing{};
+    bool closeRecovered{};
+};
+
+void recovery_case(const fs::path& scratch, const Scenario& s)
+{
+    const auto log = scratch / (std::wstring(s.name) + L".log");
+    fs::remove(log);
+    const auto marks = scratch / L"obs-nr-native-filter";
+    fs::remove_all(marks);
+    const auto quarantine = marks / L"pushflow-crash-quarantine.txt";
+    const auto key = LR"(Local\nr-t2-)" + std::to_wstring(GetCurrentProcessId()) + L"-" + s.name;
+    const Handle reached{CreateEventW(nullptr, TRUE, FALSE, key.c_str())},
+        resume{CreateEventW(nullptr, TRUE, FALSE, (key + L".resume").c_str())},
+        armFault{CreateEventW(nullptr, TRUE, FALSE, (key + L".fault").c_str())};
+    expect(reached.value && resume.value && armFault.value, "create isolated checkpoint events");
+    const bool resize = s.action == Action::ResizeFault;
+    const bool recover = s.action != Action::Escape && s.action != Action::Close &&
+        s.action != Action::Stop && s.action != Action::Detach && s.action != Action::BadPeer;
+    const bool earlyCheckpoint = s.checkpoint && (wcscmp(s.checkpoint, L"before_alive") == 0 ||
+        wcscmp(s.checkpoint, L"before_connect") == 0 || wcscmp(s.checkpoint, L"bad_peer") == 0);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_WORKER_MS", s.stall);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_REJECT_FIRST_IMPORT", s.action == Action::Reject ? L"1" : nullptr);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_REJECT_STALL_MS", s.rejectedStall);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_FAULT_EXIT_DELAY_MS", s.action == Action::Fault || resize ? L"700" : nullptr);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_FAULT_ARM_EVENT", resize ? (key + L".fault").c_str() : nullptr);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", s.closeRecovered ? L"2500" : nullptr);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_TAP_EVENT", key.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_TAP_STAGE", earlyCheckpoint ? s.checkpoint : nullptr);
+    fixtureWidth.store(width);
+    auto input = source("vfg_test_color");
+    auto data = settings();
+    obs_data_set_int(data.get(), "vfg_backend", 1);
+    auto filter = source(filterId, data.get());
+    obs_source_filter_add(input.get(), filter.get());
+    obs_set_output_source(0, input.get());
+    struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+    const auto props = properties(filter.get());
+    RenderStats stats;
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get()), "start PushFlow");
+    std::string initial;
+    await([&] {
+        initial = event(text_of(log), "event=session_started backend=pushflow ", "epoch=1");
+        return !initial.empty();
+    }, "confirm PushFlow before injection");
+    const auto oldPid = std::stoul(field(initial, "pid="));
+    const Handle old{OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, oldPid)};
+    expect(old.value != nullptr, "open owned original presenter");
+    std::string oldOffer;
+    if (!earlyCheckpoint) await([&] {
+        oldOffer = event(text_of(log), "event=offer ", "epoch=1");
+        return !oldOffer.empty();
+    }, "original IPC offer");
+    const auto hwnd = [&] {
+        return reinterpret_cast<HWND>(static_cast<uintptr_t>(std::stoull(field(oldOffer, "hwnd="), nullptr, 16)));
+    };
+    const auto started = Clock::now();
+    const auto beginRaw = stats.rawCount.load();
+    const auto beginGaps = stats.gaps.load();
+    switch (s.action) {
+    case Action::Escape:
+    case Action::Close: {
+        const auto ready = s.stall ? "event=test_worker_stalled" : "event=present_original ";
+        await([&] { return !event(text_of(log), ready).empty(); }, "presenter ready for user close");
+        if (!s.stall) {
+            expect(!event(text_of(log), "event=pushflow_runtime_missing_fallback_1x").empty() &&
+                count_events(text_of(log), "event=present_vfg_subframe ") == 0,
+                "empty PushFlow runtime outputs only originals");
+            for (const auto enabled : {true, false}) {
+                const auto offset = text_of(log).size();
+                auto live = settings();
+                obs_data_set_int(live.get(), "vfg_backend", 1);
+                obs_data_set_bool(live.get(), "vfg_hud_lock", enabled);
+                obs_data_set_bool(live.get(), "vfg_pacing_repair", enabled);
+                obs_data_set_bool(live.get(), "vfg_adaptive_fg", enabled);
+                obs_data_set_int(live.get(), "vfg_adaptive_target_fps", enabled ? 90 : 0);
+                obs_source_update(filter.get(), live.get());
+                const auto wanted = enabled ? "hud_lock=1 shot_cut=0 pacing_repair=1 adaptive_fg=1 adaptive_target_fps=90" :
+                    "hud_lock=0 shot_cut=0 pacing_repair=0 adaptive_fg=0 adaptive_target_fps=0";
+                await([&] { return !event(text_of(log).substr(offset), "event=present_original ", wanted).empty(); },
+                    "live settings reach the presenter without relaunch");
+            }
+        }
+        const auto message = s.action == Action::Escape ? WM_KEYDOWN : WM_CLOSE;
+        const auto closeSent = Clock::now();
+        expect(PostMessageW(hwnd(), message, message == WM_KEYDOWN ? VK_ESCAPE : 0, 0) != FALSE, "user close");
+        if (s.stall) {
+            await([&] { return WaitForSingleObject(old.value, 0) == WAIT_OBJECT_0; }, "bounded stalled user close", 1800);
+            const auto closeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - closeSent).count();
+            expect(closeElapsed < 1800, "stalled user close exited within 1800 ms of message");
+            std::printf("user_close message=%s send_to_exit_ms=%lld\n", message == WM_CLOSE ? "WM_CLOSE" : "Esc",
+                static_cast<long long>(closeElapsed));
+        }
+        break;
+    }
+    case Action::ResizeFault:
+        await([&] { return !event(text_of(log), "event=present_original ").empty(); }, "active connection before resize");
+        SetEnvironmentVariableW(L"OBS_NR_TEST_TAP_STAGE", L"before_extent");
+        expect(WaitForSingleObject(reached.value, 2000) == WAIT_OBJECT_0, "pause before extent");
+        SetEvent(armFault.value);
+        await([&] { return text_of(log).find("test_live_consumer_fault") != std::string::npos; },
+            "fault state before resize", 225);
+        fixtureWidth.store(352);
+        SetEvent(resume.value);
+        break;
+    case Action::Kill:
+    case Action::ExitZero:
+        if (s.checkpoint) {
+            if (!earlyCheckpoint) {
+                await([&] { return !event(text_of(log), "event=present_original ").empty(); }, "active connection before kill");
+                SetEnvironmentVariableW(L"OBS_NR_TEST_TAP_STAGE", s.checkpoint);
+            }
+            expect(WaitForSingleObject(reached.value, 2000) == WAIT_OBJECT_0, "kill checkpoint reached");
+        }
+        expect(TerminateProcess(old.value, s.action == Action::ExitZero ? 0 : 7) != FALSE &&
+            WaitForSingleObject(old.value, s.checkpoint ? 200 : 1500) == WAIT_OBJECT_0, "terminate owned presenter");
+        SetEvent(resume.value);
+        break;
+    case Action::Stop:
+        await([&] { return !event(text_of(log), "event=present_original ").empty(); }, "active connection before stop");
+        expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()), "parent stop");
+        break;
+    case Action::Detach:
+        await([&] { return !event(text_of(log), "event=present_original ").empty(); }, "active connection before detach");
+        obs_source_filter_remove(input.get(), filter.get());
+        break;
+    case Action::BadPeer:
+        expect(WaitForSingleObject(reached.value, 2000) == WAIT_OBJECT_0 &&
+            WaitForSingleObject(old.value, 0) == WAIT_TIMEOUT, "corrupt identity while original child lives");
+        SetEvent(resume.value);
+        break;
+    case Action::Fault:
+    case Action::Reject:
+    case Action::Watchdog: break;
+    }
+    await([&] { return WaitForSingleObject(old.value, 0) == WAIT_OBJECT_0; }, "bounded original child shutdown");
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
+    DWORD oldExit{};
+    expect(GetExitCodeProcess(old.value, &oldExit) != FALSE, "owned original exit code");
+    std::string newOffer, transcript;
+    if (recover) {
+        await([&] {
+            transcript = text_of(log);
+            newOffer = event(transcript, "event=offer ", "epoch=2");
+            if (newOffer.empty()) return false;
+            const auto generation = "generation=" + field(newOffer, "generation=") + " ";
+            return !event(transcript, "event=present_original ", generation.c_str()).empty();
+        }, "new 1x PID resumes original preview");
+        expect(std::stoul(field(newOffer, "pid=")) != oldPid && field(newOffer, "mode=") == "1x" &&
+            (!oldOffer.size() || field(newOffer, "generation=") != field(oldOffer, "generation=")), "fresh PID/generation in 1x mode");
+        expect(!resize || field(newOffer, "size=") == "352x180", "recovered at the resized extent");
+        expect(text_of(quarantine) == "reason=controller_unexpected_exit\n", "parent persisted crash quarantine");
+        if (s.action == Action::Watchdog)
+            expect(oldExit == 2 && !event(transcript, "event=watchdog_timeout ").empty() &&
+                !event(transcript, "event=shutdown_force_terminate watchdog=1 exit_reason=3").empty(), "watchdog chose forced exit");
+        if (s.timing)
+            expect(stats.rawCount.load() > beginRaw && stats.gaps.load() == beginGaps &&
+                stats.ticks.load() > 0 && stats.maxNs.load() < 5'000'000, "render under 5 ms; continuous raw broadcast");
+        const auto newPid = std::stoul(field(newOffer, "pid="));
+        const Handle child{OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, newPid)};
+        expect(child.value != nullptr, "open owned replacement");
+        if (s.closeRecovered) {
+            const auto window = reinterpret_cast<HWND>(static_cast<uintptr_t>(std::stoull(field(newOffer, "hwnd="), nullptr, 16)));
+            expect(PostMessageW(window, WM_KEYDOWN, VK_ESCAPE, 0) != FALSE, "Esc on recovered 1x");
+        } else expect(TerminateProcess(child.value, 8) != FALSE, "second unexpected exit");
+        await([&] { return WaitForSingleObject(child.value, 0) == WAIT_OBJECT_0; }, "replacement closed");
+        if (s.closeRecovered)
+            expect(text_of(quarantine) == "reason=controller_unexpected_exit\n" &&
+                !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty(),
+                "forced Esc in recovered 1x preserves quarantine");
+    } else {
+        if (oldExit != 0)
+            throw std::runtime_error("user/parent close exited " + std::to_string(oldExit));
+        if (s.stall) expect(
+            !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty(), "stalled user close preserves UserClosed");
+        expect(!fs::exists(quarantine), "intentional stop never quarantined");
+    }
+    const auto observed = stats.rawCount.load();
+    await([&] { return stats.rawCount.load() >= observed + 10; }, "broadcast continues after final child exit");
+    transcript = text_of(log);
+    const auto restarts = count_events(transcript, "event=controller_auto_fallback_1x_relaunch");
+    expect(restarts == static_cast<size_t>(recover), "exact relaunch count after the last close");
+    std::printf("PASS %ls old_pid=%lu old_exit=%lu old_generation=%s new_pid=%s new_generation=%s relaunches=%zu "
+        "elapsed_ms=%lld max_render_ns=%llu raw_frames=%llu raw_gaps=%llu\n", s.name, oldPid, oldExit,
+        field(oldOffer, "generation=").c_str(), field(newOffer, "pid=").c_str(), field(newOffer, "generation=").c_str(),
+        restarts, static_cast<long long>(elapsed), static_cast<unsigned long long>(stats.maxNs.load()),
+        static_cast<unsigned long long>(stats.rawCount.load()), static_cast<unsigned long long>(stats.gaps.load()));
+    if (s.action != Action::Detach) obs_source_filter_remove(input.get(), filter.get());
+}
+
+constexpr std::array scenarios{
+        Scenario{L"a-esc", Action::Escape},
+        Scenario{L"wm-close", Action::Close},
+        Scenario{L"b-esc-stalled", Action::Escape, L"7000"},
+        Scenario{L"wm-close-stalled", Action::Close, L"7000"},
+        Scenario{L"c-exit-zero", Action::ExitZero, nullptr, nullptr, nullptr, false, true},
+        Scenario{L"d-live-consumer-fault", Action::Fault, nullptr, nullptr, nullptr, true},
+        Scenario{L"e-import-rejected", Action::Reject},
+        Scenario{L"e-import-rejected-stalled", Action::Reject, nullptr, L"700", nullptr, true},
+        Scenario{L"f-resize-fault", Action::ResizeFault},
+        Scenario{L"g-before-publish", Action::Kill, nullptr, nullptr, L"before_alive"},
+        Scenario{L"h-before-connect", Action::Kill, nullptr, nullptr, L"before_connect"},
+        Scenario{L"i-after-alive", Action::Kill, nullptr, nullptr, L"after_alive"},
+        Scenario{L"j-watchdog", Action::Watchdog, L"7000"},
+        Scenario{L"parent-stop", Action::Stop},
+        Scenario{L"parent-detach", Action::Detach},
+        Scenario{L"bad-live-peer", Action::BadPeer, nullptr, nullptr, L"bad_peer"},
+};
+
+void run_isolated(wchar_t** argv, const Scenario& s)
+{
+    std::printf("START %ls\n", s.name);
+    std::fflush(stdout);
+    std::wstring cmd;
+    for (int i = 0; i < 6; ++i) cmd += L"\"" + std::wstring(argv[i]) + L"\" ";
+    cmd += s.name;
+    const auto output = fs::path(argv[5]) / (std::wstring(s.name) + L".host.log");
+    SECURITY_ATTRIBUTES inheritable{sizeof(inheritable), nullptr, TRUE};
+    Handle log{CreateFileW(output.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inheritable, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr)};
+    expect(log.value != INVALID_HANDLE_VALUE, "capture isolated libobs stdout");
+    STARTUPINFOW startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = startup.hStdError = log.value;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION pi{};
+    expect(CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+        &startup, &pi) != FALSE, "start isolated libobs recovery case");
+    const Handle process{pi.hProcess}, thread{pi.hThread};
+    const auto closed = WaitForSingleObject(process.value, 14'000) == WAIT_OBJECT_0;
+    if (!closed) TerminateProcess(process.value, 11);
+    DWORD code{};
+    const auto transcript = text_of(output);
+    std::fputs(transcript.c_str(), stdout);
+    expect(closed && GetExitCodeProcess(process.value, &code), "isolated libobs recovery case did not exit");
+    if (code) throw std::runtime_error("isolated libobs recovery case exited " + std::to_string(code));
+    constexpr char recovery[] = "[vfg] recovery requested ";
+    const auto start = transcript.find(recovery);
+    if (transcript.find(" relaunches=1 ") != std::string::npos) {
+        expect(count_events(transcript, recovery) == 1, "one graphics enqueue for the single successful relaunch");
+        const auto line = transcript.substr(start, transcript.find('\n', start) - start);
+        const auto elapsed = field(line, "enqueue_ns=");
+        expect(!elapsed.empty() && field(line, "graphics_thread=") == "1" &&
+            std::stoull(elapsed) < 1'000'000, "graphics-thread recovery enqueue under 1 ms");
+        std::printf("PASS enqueue %ls reason=%s enqueue_ns=%s\n", s.name, field(line, "reason=").c_str(), elapsed.c_str());
+    } else expect(start == std::string::npos, "no graphics enqueue for zero-relaunch case");
+}
+}
+
+int run_host(int argc, wchar_t** argv)
 {
     try {
-        expect(argc == 6, "arguments: plugin plugin-data presenter graphics-module scratch");
+        expect(argc == 6 || argc == 7, "arguments: plugin plugin-data presenter graphics-module scratch [case]");
+        fs::create_directories(argv[5]);
+        if (argc == 6) {
+            unsigned failed = 0;
+            for (const auto& s : scenarios) {
+                try { run_isolated(argv, s); }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr, "FAIL %ls: %s\n", s.name, e.what());
+                    ++failed;
+                }
+            }
+            expect(failed == 0, "isolated libobs recovery failures");
+        }
         const auto plugin = std::filesystem::path(argv[1]).string();
         const auto data = std::filesystem::path(argv[2]).string();
         const auto graphics = std::filesystem::path(argv[4]).string();
-        const auto scratch = std::filesystem::path(argv[5]);
+        const auto scratch = std::filesystem::path(argv[5]) / std::to_wstring(GetCurrentProcessId());
         std::filesystem::create_directories(scratch);
         const auto log = scratch / "canvas-presenter.log";
         std::filesystem::remove(log);
         SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", argv[3]);
         SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+        struct Plugin { HMODULE value{}; ~Plugin() { if (value) FreeLibrary(value); } } pluginHandle;
         expect(obs_startup("en-US", scratch.string().c_str(), nullptr), "obs_startup");
         struct Shutdown { ~Shutdown() { obs_shutdown(); } } shutdown;
         obs_video_info video{};
@@ -158,8 +520,8 @@ int wmain(int argc, wchar_t** argv)
         video.range = VIDEO_RANGE_FULL;
         expect(obs_reset_video(&video) == OBS_VIDEO_SUCCESS, "obs_reset_video");
         obs_module_t* module{};
-        const auto pluginHandle = LoadLibraryW(argv[1]);
-        expect(pluginHandle != nullptr, "retain plugin through libobs teardown");
+        pluginHandle.value = LoadLibraryW(argv[1]);
+        expect(pluginHandle.value != nullptr, "retain plugin through libobs teardown");
         expect(obs_open_module(&module, plugin.c_str(), data.c_str()) == MODULE_SUCCESS &&
             obs_init_module(module), "load release plugin");
         obs_source_info info{};
@@ -170,9 +532,18 @@ int wmain(int argc, wchar_t** argv)
         info.create = [](obs_data_t*, obs_source_t* src) -> void* { return src; };
         info.destroy = [](void*) {};
         info.video_render = render_fixture;
-        info.get_width = [](void*) { return width; };
+        info.get_width = [](void*) { return fixtureWidth.load(); };
         info.get_height = [](void*) { return height; };
         obs_register_source(&info);
+        if (argc == 7) {
+            SetEnvironmentVariableW(L"LOCALAPPDATA", scratch.c_str());
+            SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", (scratch / L"missing-runtime").c_str());
+            for (const auto& s : scenarios) if (wcscmp(argv[6], s.name) == 0) {
+                recovery_case(scratch, s);
+                return 0;
+            }
+            throw std::runtime_error("unknown recovery scenario");
+        }
         quality_contract();
         canvas_contract(log);
         std::puts("PASS vfg_filter_output: stored quality, RGBA zero, scene blend, preview feed and restore");
@@ -181,4 +552,18 @@ int wmain(int argc, wchar_t** argv)
         std::fprintf(stderr, "FAIL vfg_filter_output: %s\n", e.what());
         return 1;
     }
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    const auto result = run_host(argc, argv);
+    if (argc == 7) {
+        // This isolated process may deliberately retain two quarantined
+        // GPU generations. Do not unload their driver after libobs shutdown.
+        // Reclaim them with the process, keeping the real scenario exit code.
+        std::fflush(stdout);
+        std::fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(result));
+    }
+    return result;
 }
