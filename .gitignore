@@ -49,6 +49,10 @@
 !/deps/ngx/
 /deps/ngx/*
 !/deps/ngx/README.md
+!/deps/onnxruntime-1.20.1/
+/deps/onnxruntime-1.20.1/*.dll
+/deps/onnxruntime-1.20.1/*.lib
+/deps/onnxruntime-1.20.1/*.onnx
 
 # Exclude macOS legacy resource forks
 .DS_Store

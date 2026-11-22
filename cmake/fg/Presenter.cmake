@@ -9,14 +9,38 @@ endif()
 add_executable(obs-nr-fg-presenter
   tools/fg-presenter/vfg_presenter.cpp
   tools/fg-presenter/vfg_gpu.cpp
-  tools/fg-presenter/native_vfg.cpp)
+  tools/fg-presenter/native_vfg.cpp
+  tools/fg-presenter/pushflow_shader_bytecode.cpp)
 set(VFG_CONTENT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_content_compare.hlsl")
 set(VFG_CONTENT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_content_compare_shader.h")
 add_custom_command(OUTPUT "${VFG_CONTENT_HEADER}"
   COMMAND "${NR_FXC}" /nologo /WX /Ges /T cs_5_0 /E main /Fh "${VFG_CONTENT_HEADER}"
     /Vn vfg_content_shader "${VFG_CONTENT_SHADER}"
   DEPENDS "${VFG_CONTENT_SHADER}" VERBATIM)
-target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}")
+set(PUSHFLOW_PACK_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/pushflow_pack.hlsl")
+set(PUSHFLOW_PACK_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pushflow_pack_shader.h")
+set(PUSHFLOW_UNPACK_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/pushflow_unpack.hlsl")
+set(PUSHFLOW_UNPACK_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pushflow_unpack_shader.h")
+set(PUSHFLOW_RECONSTRUCT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/pushflow_reconstruct.hlsl")
+set(PUSHFLOW_RECONSTRUCT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pushflow_reconstruct_shader.h")
+add_custom_command(OUTPUT "${PUSHFLOW_PACK_HEADER}"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${PUSHFLOW_PACK_HEADER}"
+    -Vn pushflow_pack_shader "${PUSHFLOW_PACK_SHADER}"
+  DEPENDS "${PUSHFLOW_PACK_SHADER}" VERBATIM)
+add_custom_command(OUTPUT "${PUSHFLOW_UNPACK_HEADER}"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${PUSHFLOW_UNPACK_HEADER}"
+    -Vn pushflow_unpack_shader "${PUSHFLOW_UNPACK_SHADER}"
+  DEPENDS "${PUSHFLOW_UNPACK_SHADER}" VERBATIM)
+add_custom_command(OUTPUT "${PUSHFLOW_RECONSTRUCT_HEADER}"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${PUSHFLOW_RECONSTRUCT_HEADER}"
+    -Vn pushflow_reconstruct_shader "${PUSHFLOW_RECONSTRUCT_SHADER}"
+  DEPENDS "${PUSHFLOW_RECONSTRUCT_SHADER}" VERBATIM)
+add_custom_target(vfg_presenter_shaders DEPENDS
+  "${VFG_CONTENT_HEADER}" "${PUSHFLOW_PACK_HEADER}"
+  "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
+target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
+  "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
+add_dependencies(obs-nr-fg-presenter vfg_presenter_shaders)
 target_compile_features(obs-nr-fg-presenter PRIVATE cxx_std_20)
 target_compile_definitions(obs-nr-fg-presenter PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(obs-nr-fg-presenter PRIVATE /W4 /WX /permissive-)
@@ -24,6 +48,8 @@ if(OBS_NR_VFG_QA_ACTION)
   target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_VFG_QA_ACTION=1)
 endif()
 target_include_directories(obs-nr-fg-presenter PRIVATE src src/fg "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(obs-nr-fg-presenter SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-1.20.1")
+target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_HAVE_ONNXRUNTIME=1)
 target_link_libraries(obs-nr-fg-presenter PRIVATE fg_ipc d3d12 dxgi user32 winmm)
 add_dependencies(obs-nr-filter obs-nr-fg-presenter)
 
@@ -88,6 +114,13 @@ target_compile_definitions(vfg_adaptive_fg_tests PRIVATE NOMINMAX WIN32_LEAN_AND
 target_compile_options(vfg_adaptive_fg_tests PRIVATE /W4 /WX /permissive-)
 add_test(NAME vfg_adaptive_fg COMMAND vfg_adaptive_fg_tests)
 set_tests_properties(vfg_adaptive_fg PROPERTIES TIMEOUT 30)
+
+add_executable(pushflow_motion_tests tools/tests/pushflow_motion_tests.cpp)
+target_compile_features(pushflow_motion_tests PRIVATE cxx_std_20)
+target_compile_options(pushflow_motion_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(pushflow_motion_tests PRIVATE tools/fg-presenter)
+add_test(NAME pushflow_motion COMMAND pushflow_motion_tests)
+set_tests_properties(pushflow_motion PROPERTIES TIMEOUT 30)
 
 add_executable(vfg_filter_output_tests tools/tests/vfg_filter_output_tests.cpp)
 target_compile_features(vfg_filter_output_tests PRIVATE cxx_std_20)

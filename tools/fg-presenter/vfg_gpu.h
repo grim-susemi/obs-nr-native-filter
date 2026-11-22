@@ -20,6 +20,10 @@ inline void check(HRESULT hr, const char* operation)
 {
     if (FAILED(hr)) throw ipc::Error(ipc::Status::ProtocolError, hr, operation);
 }
+struct PushFlowShaderBytecodeSet {
+    D3D12_SHADER_BYTECODE pack{}, unpack{}, reconstruct{};
+};
+[[nodiscard]] PushFlowShaderBytecodeSet make_pushflow_shader_bytecode() noexcept;
 class DescriptorStager final {
     ID3D12Device* device_;
     ComPtr<ID3D12DescriptorHeap> cpu_;
@@ -30,6 +34,7 @@ public:
 
 class Gpu final {
     HWND window_;
+    const PushFlowShaderBytecodeSet pushflowShaders_{make_pushflow_shader_bytecode()};
     ComPtr<ID3D12Device> device_;
     struct CmdSlot {
         ComPtr<ID3D12CommandAllocator> alloc;
@@ -77,6 +82,10 @@ public:
     std::array<ComPtr<ID3D12Resource>, content_input_count> before;
     std::array<ComPtr<ID3D12Resource>, max_multiplier - 1> syntheticTex;
     ID3D12Device* d3d_device() const noexcept { return device_.Get(); }
+    [[nodiscard]] const PushFlowShaderBytecodeSet& pushflow_shader_bytecode() const noexcept
+    {
+        return pushflowShaders_;
+    }
     Gpu(const Session&, HWND, uint32_t multiplier);
     void enter_steady_state() noexcept { waitMs_ = 1000; }
     // Call before submitting a copy to this input on ipcQueue.
