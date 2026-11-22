@@ -123,6 +123,7 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
         check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &syntheticDesc,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t)), "synthetic texture");
     init_compare();
+    if (s.gpuShotChange) shotChange_ = std::make_unique<VfgShotChange>(device_.Get());
 }
 
 void Gpu::init_compare()
@@ -176,6 +177,7 @@ void Gpu::init_compare()
     allocate(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, compareFlags_);
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     allocate(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, compareZero_);
+    buffer.Width = compare_bytes + 256;
     allocate(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, compareReadback_);
     void* mapped{};
     const D3D12_RANGE noRead{0, 0}, written{0, compare_bytes};
@@ -205,6 +207,7 @@ bool Gpu::commands_ready() const
 bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
 {
     if (compareFence_ || !commands_ready()) return false;
+    if (shotChange_ && done_->GetCompletedValue() < shotSlotFence_[compareParity_ ^ 1u]) return false;
     auto* cmd = begin_available();
     auto flagsToCopy = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     cmd->ResourceBarrier(1, &flagsToCopy);
@@ -227,6 +230,13 @@ bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
     cmd->SetComputeRootDescriptorTable(1, view);
     cmd->SetComputeRootUnorderedAccessView(2, compareFlags_->GetGPUVirtualAddress());
     cmd->Dispatch(static_cast<UINT>((desc_.Width + 63) / 64), (desc_.Height + 15) / 16, 1);
+    if (shotChange_) {
+        compareParity_ ^= 1u;
+        auto previousView = view;
+        previousView.ptr = base + UINT64{compareViewStride_} * previous;
+        shotChange_->record(cmd, {previousView, view, static_cast<uint32_t>(desc_.Width), desc_.Height,
+            compareParity_, 1}, compareReadback_.Get());
+    }
     for (unsigned i = 0; i < 2; ++i)
         std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
     barriers[2] = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -236,24 +246,28 @@ bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
     flagsToCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     cmd->ResourceBarrier(1, &flagsToCopy);
     compareFence_ = finish(false);
+    if (shotChange_) shotSlotFence_[compareParity_] = compareFence_;
     mark_inputs_read(previous, current, compareFence_);
     check(done_->SetEventOnCompletion(compareFence_, ready), "content compare event");
     return true;
 }
 
-std::optional<bool> Gpu::compare_result()
+std::optional<Gpu::CompareResult> Gpu::compare_result()
 {
     const auto completed = done_->GetCompletedValue();
     if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "content compare device removed");
     if (!compareFence_ || completed == UINT64_MAX || completed < compareFence_) return {};
     void* mapped{};
-    const D3D12_RANGE readRange{0, compare_bytes}, noWrite{0, 0};
+    const D3D12_RANGE readRange{0, compare_bytes + (shotChange_ ? 256 : 0)}, noWrite{0, 0};
     check(compareReadback_->Map(0, &readRange, &mapped), "content compare result map");
     const auto* flags = static_cast<const uint32_t*>(mapped);
     const bool same = std::all_of(flags, flags + compare_bytes / sizeof(*flags), [](uint32_t x) { return x == 0; });
+    const auto* shot = flags + compare_bytes / sizeof(*flags);
+    const CompareResult result{same, shotChange_ && shot[compareParity_ * 2] != 0,
+        shotChange_ && shot[7 + compareParity_ * 4] != 0, compareParity_};
     compareReadback_->Unmap(0, &noWrite);
     compareFence_ = 0;
-    return same;
+    return result;
 }
 
 ID3D12GraphicsCommandList* Gpu::begin()
@@ -389,8 +403,12 @@ std::optional<UINT> Gpu::try_present_synthetic(const SyntheticFrame& frame, uint
     }
     // Keep any acquired latency signal for the next frame if we woke too late.
     if (clock_ns() >= deadlineNs) return {};
-    frame.resolve(begin_available());
+    auto* cmd = begin_available();
+    frame.resolve(cmd);
+    if (shotChange_ && frame.shotCompared)
+        shotChange_->replace_on_cut(cmd, frame.texture, input[frame.currIndex].Get(), frame.shotParity);
     const auto id = present_ready(frame.texture, true, beforeIndex, splitPercent);
+    if (shotChange_ && frame.shotCompared) shotSlotFence_[frame.shotParity] = fence_;
     mark_inputs_read(frame.prevIndex, frame.currIndex, fence_);
     return id;
 }

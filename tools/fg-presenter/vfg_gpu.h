@@ -2,9 +2,11 @@
 #pragma once
 #include "fg_vfg_session.h"
 #include "vfg_content.h"
+#include "vfg_shot_change.h"
 #include <wrl/client.h>
 #include <array>
 #include <functional>
+#include <memory>
 #include <optional>
 
 namespace nr::fg::vfg {
@@ -65,6 +67,9 @@ class Gpu final {
     UINT compareViewStride_{};
     ComPtr<ID3D12Resource> compareFlags_, compareZero_, compareReadback_;
     uint64_t compareFence_{};
+    std::unique_ptr<VfgShotChange> shotChange_;
+    uint32_t compareParity_{};
+    std::array<uint64_t, 2> shotSlotFence_{};
     void init_compare();
     ID3D12GraphicsCommandList* begin();
     ID3D12GraphicsCommandList* begin_available();
@@ -76,6 +81,12 @@ public:
         ID3D12Resource* texture;
         Draw resolve;
         unsigned prevIndex, currIndex;
+        bool shotCompared;
+        uint32_t shotParity;
+    };
+    struct CompareResult {
+        bool same, cut, flash;
+        uint32_t parity;
     };
     ComPtr<ID3D12CommandQueue> ipcQueue, drawQueue;
     std::array<ComPtr<ID3D12Resource>, content_input_count> input;
@@ -95,7 +106,7 @@ public:
     // retains both inputs until the result arrives. No CPU fence wait or Map
     // occurs on submission, and polling never maps an unfinished readback.
     [[nodiscard]] bool begin_compare(unsigned previous, unsigned current, HANDLE ready);
-    [[nodiscard]] std::optional<bool> compare_result();
+    [[nodiscard]] std::optional<CompareResult> compare_result();
     // Speculative admission never waits on the ring. Zero means no submission.
     [[nodiscard]] uint64_t record_draw(const Draw&);
     void mark_inputs_read(unsigned prevIndex, unsigned currIndex, uint64_t fenceVal);

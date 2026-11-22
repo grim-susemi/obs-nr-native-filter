@@ -410,6 +410,8 @@ void frames(Feed& f)
         const bool adaptive = telemetry.adaptiveFg, repairing = telemetry.pacingRepair;
         const bool interpolate = incoming->interpolate;
         uint64_t comparedNs{}, compareWorkNs{};
+        bool shotCompared = false;
+        uint32_t shotParity = 0;
         const auto record_input = [&](const char* comparison = "content_changed") {
             // Publish the ingress timestamp with the decision completed for this
             // frame. A comparison retry must not re-read mutable settings.
@@ -435,7 +437,10 @@ void frames(Feed& f)
             }
             comparedNs = clock_ns();
             compareWorkNs = comparedNs - incoming->compareStart;
-            if (*compared) {
+            shotCompared = f.view.gpuShotChange != 0;
+            shotParity = compared->parity;
+            telemetry.shotCut = compared->cut;
+            if (compared->same) {
                 // A single transport repeat is not a static hold. Once stillness
                 // reaches 500 ms, retain the classification through repeats.
                 if (lastChangedNs && b.timestampNs >= lastChangedNs && b.timestampNs - lastChangedNs >= 500 * ms)
@@ -532,7 +537,7 @@ void frames(Feed& f)
                 !vfg->subframe_ready(*previousTicket, previousTicket->lastSubmittedSub);
             const auto stageStart = clock_ns();
             const bool pairLate = stageStart >= plan.synthetic_cutoff(activeMult - 1);
-            const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult, false,
+            const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult, telemetry.shotCut,
                 [&] { record(f, "stage_queued", b, &a, 0, telemetry, clock_ns() - stageStart); },
                 [&](uint64_t workNs) { record(f, "cuda_enqueued", b, &a, 0, telemetry, workNs); }};
             const auto ticket = !backendBusy && !pairLate ? vfg->submit_pair(pair, anchor->index, index) : std::nullopt;
@@ -562,7 +567,7 @@ void frames(Feed& f)
                         auto* const displayTex = gpu.syntheticTex[sub - 1].Get();
                         const Gpu::SyntheticFrame synthetic{displayTex, [&](ID3D12GraphicsCommandList* cmd) {
                             vfg->resolve_subframe(cmd, *ticket, displayTex, sub);
-                        }, ticket->prevIndex, ticket->currIndex};
+                        }, ticket->prevIndex, ticket->currIndex, shotCompared, shotParity};
                         const auto pid = gpu.try_present_synthetic(synthetic, cutoff,
                             split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);

@@ -9,8 +9,15 @@ endif()
 add_executable(obs-nr-fg-presenter
   tools/fg-presenter/vfg_presenter.cpp
   tools/fg-presenter/vfg_gpu.cpp
+  tools/fg-presenter/vfg_shot_change.cpp
   tools/fg-presenter/native_vfg.cpp
   tools/fg-presenter/pushflow_shader_bytecode.cpp)
+set(VFG_SHOT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_shot_change.hlsl")
+set(VFG_SHOT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_shot_change_shader.h")
+add_custom_command(OUTPUT "${VFG_SHOT_HEADER}"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${VFG_SHOT_HEADER}"
+    -Vn vfg_shot_change_shader "${VFG_SHOT_SHADER}"
+  DEPENDS "${VFG_SHOT_SHADER}" VERBATIM)
 set(VFG_CONTENT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_content_compare.hlsl")
 set(VFG_CONTENT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_content_compare_shader.h")
 add_custom_command(OUTPUT "${VFG_CONTENT_HEADER}"
@@ -36,7 +43,7 @@ add_custom_command(OUTPUT "${PUSHFLOW_RECONSTRUCT_HEADER}"
     -Vn pushflow_reconstruct_shader "${PUSHFLOW_RECONSTRUCT_SHADER}"
   DEPENDS "${PUSHFLOW_RECONSTRUCT_SHADER}" VERBATIM)
 add_custom_target(vfg_presenter_shaders DEPENDS
-  "${VFG_CONTENT_HEADER}" "${PUSHFLOW_PACK_HEADER}"
+  "${VFG_CONTENT_HEADER}" "${VFG_SHOT_HEADER}" "${PUSHFLOW_PACK_HEADER}"
   "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
 target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
   "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
@@ -52,6 +59,20 @@ target_include_directories(obs-nr-fg-presenter SYSTEM PRIVATE "${CMAKE_CURRENT_S
 target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_HAVE_ONNXRUNTIME=1)
 target_link_libraries(obs-nr-fg-presenter PRIVATE fg_ipc d3d12 dxgi user32 winmm)
 add_dependencies(obs-nr-filter obs-nr-fg-presenter)
+
+add_executable(vfg_shot_change_gpu_tests
+  tools/tests/vfg_shot_change_gpu_tests.cpp
+  tools/fg-presenter/vfg_gpu.cpp
+  tools/fg-presenter/vfg_shot_change.cpp
+  tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_features(vfg_shot_change_gpu_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_shot_change_gpu_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_shot_change_gpu_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_shot_change_gpu_tests PRIVATE src src/fg "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(vfg_shot_change_gpu_tests PRIVATE fg_ipc d3d12 dxgi user32 winmm)
+add_dependencies(vfg_shot_change_gpu_tests vfg_presenter_shaders)
+add_test(NAME vfg_shot_change_gpu COMMAND vfg_shot_change_gpu_tests)
+set_tests_properties(vfg_shot_change_gpu PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS gpu)
 
 add_executable(vfg_native_smoke_tests
   tools/tests/vfg_native_smoke_tests.cpp
