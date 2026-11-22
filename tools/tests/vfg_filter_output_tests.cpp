@@ -482,6 +482,8 @@ void run_isolated(wchar_t** argv, const Scenario& s)
 }
 }
 
+void vfg_anr_fallback_case(const fs::path& fixture, const fs::path& log, bool stageCompanions);
+
 int run_host(int argc, wchar_t** argv)
 {
     try {
@@ -537,6 +539,12 @@ int run_host(int argc, wchar_t** argv)
         obs_register_source(&info);
         if (argc == 7) {
             SetEnvironmentVariableW(L"LOCALAPPDATA", scratch.c_str());
+            const std::wstring_view scenario = argv[6];
+            if (scenario == L"anr-missing-companion" || scenario == L"anr-missing-pack") {
+                vfg_anr_fallback_case(fs::path(argv[0]).parent_path() / L"anr_benign_fixture.dll", log,
+                    scenario == L"anr-missing-pack");
+                return 0;
+            }
             SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", (scratch / L"missing-runtime").c_str());
             for (const auto& s : scenarios) if (wcscmp(argv[6], s.name) == 0) {
                 recovery_case(scratch, s);

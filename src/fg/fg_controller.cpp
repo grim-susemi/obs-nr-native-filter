@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "fg_controller.h"
+#include "anr_dll_validator.h"
 #include <algorithm>
 #include <array>
 #include <filesystem>
@@ -155,6 +156,39 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         options.anrDllPath.size() < ARRAYSIZE(header.anrDllPath), "VFG runtime path too long");
     std::copy(options.anrDllPath.begin(), options.anrDllPath.end(), header.anrDllPath);
     require(validate_session_header(header), "VFG invalid session header");
+    std::unique_ptr<anr::PinnedAddon> anrPin;
+    if (options.backend == Backend::AnrExperimental && !fallback) {
+        auto result = anr::validate_addon(options.anrDllPath, options.experimentalAnrOptIn == 1);
+        std::string reason = anr::status_name(result.status);
+        switch (result.status) {
+        case anr::ValidationStatus::Accepted:
+            anrPin = std::move(result.addon);
+            require(anrPin->canonicalPath.size() < ARRAYSIZE(header.anrDllPath), "VFG canonical ANR path too long");
+            std::ranges::fill(header.anrDllPath, L'\0');
+            std::ranges::copy(anrPin->canonicalPath, header.anrDllPath);
+            options_.anrDllPath = anrPin->canonicalPath;
+            write_event((std::string("event=anr_validated sha256=") + anrPin->sha256 +
+                (anrPin->sha256 == anr::b15Sha256 ? "\n" : " warning=b15_sha256_mismatch\n")).c_str());
+            break;
+        case anr::ValidationStatus::IncompleteAddonMissingCompanions:
+            options_.multiplier = 1;
+            write_event(("event=anr_validation_fallback reason=" + reason + " missing=" +
+                std::string(result.relativePath) + "\n").c_str());
+            break;
+        case anr::ValidationStatus::ReparseOrRootEscape:
+        case anr::ValidationStatus::IoFailure:
+            if (!result.relativePath.empty()) reason += " path=" + std::string(result.relativePath);
+            [[fallthrough]];
+        case anr::ValidationStatus::OptInRequired:
+        case anr::ValidationStatus::InvalidPath:
+        case anr::ValidationStatus::InvalidSize:
+        case anr::ValidationStatus::InvalidPe:
+        case anr::ValidationStatus::MissingExport:
+        case anr::ValidationStatus::InvalidExport:
+        case anr::ValidationStatus::HashFailure:
+            throw ipc::Error(ipc::Status::ProtocolError, E_ACCESSDENIED, reason.c_str());
+        }
+    }
     const auto exe = resolve_presenter_exe();
     const auto log = resolve_log_path();
     const auto exeDir = fs::path(exe).parent_path().wstring();
