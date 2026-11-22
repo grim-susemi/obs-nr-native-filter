@@ -263,7 +263,29 @@ void frames(Feed& f)
     PushFlowBackend* pushflowBackend{};
     IFgBackend* vfg{};
     const auto userClosing = [&f] { return read_exit_reason(f.view) == ExitReason::UserClosed; };
+    const auto drain_failure = [&] {
+        stamp_exit_reason(f.view, ExitReason::Fault);
+        const bool userClosed = f.view.backend == Backend::PushFlow &&
+            read_exit_reason(f.view) == ExitReason::UserClosed;
+        if (userClosed) clear_pushflow_starting_on_close(f);
+        fprintf(f.log, "event=error message=presenter_drain_failed\n");
+        fflush(f.log);
+        ShowWindowAsync(f.window, SW_HIDE);
+        TerminateProcess(GetCurrentProcess(), userClosed ? 0u : 5u);
+        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    };
     const auto work = [&] {
+    // PushFlow already preserves its owners through the generation shutdown.
+    // The other paths propagate work exceptions directly to the worker.
+    struct HudUnwindGuard {
+        const Gpu& gpu;
+        const decltype(drain_failure)& fail;
+        bool pushflow;
+        ~HudUnwindGuard()
+        {
+            if (!pushflow && std::uncaught_exceptions() > 0 && !gpu.drain_hud_on_unwind()) fail();
+        }
+    } hudUnwind{gpu, drain_failure, f.view.backend == Backend::PushFlow};
     if (mult > 1) {
         switch (f.view.backend) {
         case Backend::NativeVfg:
@@ -321,6 +343,13 @@ void frames(Feed& f)
     uint64_t previousRepairedPtsNs{}, uniqueOrdinal{}, lastChangedNs{}, previousObsTick{};
     int64_t transportNs = TransportIntervalEstimator::kDefaultNs;
     bool staticHold = false, wasRepairing = false, wasAdaptive = false, backendFault = false;
+    bool hudEnabled = false, hudReset = true;
+    const auto sync_hud_lock = [&] {
+        const bool enabled = InterlockedCompareExchange(&f.view.hudLock, 0, 0) != 0;
+        if (enabled != hudEnabled) hudReset = true;
+        hudEnabled = enabled;
+        gpu.sync_hud_lock(enabled);
+    };
     double contentFps = 0;
     auto displayEpoch = f.split.displayEpoch.load();
     auto monitorHz = window_refresh(f.window);
@@ -370,6 +399,7 @@ void frames(Feed& f)
             throw std::runtime_error("test_live_consumer_fault");
         sync_reflex();
         sync_affinity();
+        sync_hud_lock();
         if (!incoming) {
             const auto index = history.input_index();
             gpu.prepare_input(index);
@@ -391,7 +421,7 @@ void frames(Feed& f)
                 fprintf(f.log, "event=backend_fault_fallback_1x backend=%s\n", vfg->name());
             }
             const bool interpolate = vfg && !backendFault;
-            const PairTelemetry telemetry{1, 0, InterlockedCompareExchange(&f.view.hudLock, 0, 0) != 0,
+            const PairTelemetry telemetry{1, 0, hudEnabled,
                 false, InterlockedCompareExchange(&f.view.pacingRepair, 0, 0) != 0,
                 InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0) != 0,
                 InterlockedCompareExchange(&f.view.adaptiveTargetFps, 0, 0)};
@@ -402,6 +432,7 @@ void frames(Feed& f)
                 continue;
             }
             if (!step.continuous) {
+                hudReset = true;
                 cadence.reset();
                 lastOriginalTarget = lastPeriod = 0;
                 sawRepeat = false;
@@ -421,6 +452,7 @@ void frames(Feed& f)
         const auto continuous = incoming->continuous;
         const auto anchor = history.anchor();
         auto telemetry = incoming->telemetry;
+        telemetry.hudLock &= hudEnabled;
         const bool adaptive = telemetry.adaptiveFg, repairing = telemetry.pacingRepair;
         const bool interpolate = incoming->interpolate;
         uint64_t comparedNs{}, compareWorkNs{};
@@ -433,7 +465,8 @@ void frames(Feed& f)
             if (comparedNs) record(f, comparison, b, &anchor->frame, 0, telemetry, compareWorkNs, comparedNs);
             incoming.reset();
         };
-        if (interpolate && anchor && (incoming->compareStart || clock_ns() - b.arrivalNs <= 50 * ms)) {
+        const bool timely = clock_ns() - b.arrivalNs <= 50 * ms;
+        if ((interpolate || telemetry.hudLock) && anchor && timely) {
             if (!incoming->compareStart) {
                 if (!gpu.begin_compare(anchor->index, index, compareReady.h)) {
                     pace_until(clock_ns() + 350000, f, paceTimer.h);
@@ -462,24 +495,28 @@ void frames(Feed& f)
                 contentFps = rate.observe(b.timestampNs, uniqueOrdinal, staticHold);
                 sawRepeat = true;
                 record_input("repeat_input");
-                if (split) {
+                present_content_repeat(interpolate, split, [&] {
                     if (!shown) {
                         PostMessageW(f.window, reveal, 0, 0);
                         shown = true;
                     }
                     refresh_hud(true);
                     const UINT pid = gpu.present(gpu.input[index].Get(), false,
-                        static_cast<int>(index), f.split.current());
-                    record(f, "present_repeat_split", b, nullptr, pid, telemetry);
-                }
+                        split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
+                    record(f, split ? "present_repeat_split" : "present_repeat_original", b, nullptr, pid, telemetry);
+                });
                 f.beat();
                 continue;
             }
+        } else if (incoming->compareStart) {
+            // OFF may no longer need a HUD-only result; an expired frame never does.
+            gpu.discard_compare();
         }
         if (clock_ns() - b.arrivalNs > 50 * ms) {
             record_input();
             record(f, "drop_original_late", b, nullptr, 0, telemetry);
             history.invalidate();
+            hudReset = true;
             cadence.reset();
             lastOriginalTarget = lastPeriod = 0;
             sawRepeat = false;
@@ -539,6 +576,11 @@ void frames(Feed& f)
             plan_cadence_adaptive(phaseArrivalNs, lastOriginalTarget, period, activeMult) :
             plan_cadence(phaseArrivalNs, lastOriginalTarget, period, activeMult);
         record_input();
+        if (telemetry.hudLock) {
+            const bool reset = hudReset || telemetry.shotCut || !anchor;
+            gpu.update_hud_lock(index, anchor ? anchor->index : index, reset);
+            hudReset = false;
+        }
         const auto originalDeadline = plan.originalNs ? plan.originalNs + 5 * ms : b.arrivalNs + 50 * ms;
         const uint64_t fid = ++reflexFrameId;
         reflex.sleep(clock_ns(), clock_ns);
@@ -561,6 +603,7 @@ void frames(Feed& f)
             if (ticket) {
                 previousTicket.emplace(*ticket);
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
+                bool composeHud = telemetry.hudLock;
                 for (uint32_t sub = 1; sub <= ticket->lastSubmittedSub; ++sub) {
                     if (!f.active()) break;
                     const uint64_t targetNs = plan.target(sub);
@@ -577,6 +620,8 @@ void frames(Feed& f)
                     const uint64_t genElapsed = readyCheck - waitStart;
                     if (!f.active()) break;
                     if (generatedReady && readyCheck < cutoff) {
+                        sync_hud_lock();
+                        composeHud &= hudEnabled;
                         refresh_hud(false);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, fid, sub);
                         reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
@@ -584,7 +629,7 @@ void frames(Feed& f)
                         auto* const displayTex = gpu.syntheticTex[sub - 1].Get();
                         const Gpu::SyntheticFrame synthetic{displayTex, [&](ID3D12GraphicsCommandList* cmd) {
                             vfg->resolve_subframe(cmd, *ticket, displayTex, sub);
-                        }, ticket->prevIndex, ticket->currIndex, shotCompared, shotParity};
+                        }, ticket->prevIndex, ticket->currIndex, shotCompared, shotParity, composeHud, sub - 1};
                         const auto pid = gpu.try_present_synthetic(synthetic, cutoff,
                             split ? static_cast<int>(index) : -1, split ? f.split.current() : 50);
                         reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);
@@ -627,6 +672,7 @@ void frames(Feed& f)
         } else {
             record(f, "drop_original_late", b, nullptr, 0, telemetry);
             history.invalidate();
+            hudReset = true;
             cadence.reset();
             lastOriginalTarget = lastPeriod = 0;
             sawRepeat = false;
@@ -636,21 +682,11 @@ void frames(Feed& f)
     if (incoming) record(f, "input", incoming->frame, nullptr, 0, incoming->telemetry, 0, incoming->receivedNs);
     };
     const auto shutdown = [&](bool threw) {
+    gpu.discard_compare();
     if (threw && pushflowBackend) pushflowBackend->generation_fault();
     PostMessageW(f.window, WM_CANCELMODE, 0, 0);
     // Both queues must be idle before releasing their resources or acknowledging
     // a resize. In particular, a successful Present only submits draw work.
-    const auto drain_failure = [&] {
-        stamp_exit_reason(f.view, ExitReason::Fault);
-        const bool userClosed = f.view.backend == Backend::PushFlow &&
-            read_exit_reason(f.view) == ExitReason::UserClosed;
-        if (userClosed) clear_pushflow_starting_on_close(f);
-        fprintf(f.log, "event=error message=presenter_drain_failed\n");
-        fflush(f.log);
-        ShowWindowAsync(f.window, SW_HIDE);
-        TerminateProcess(GetCurrentProcess(), userClosed ? 0u : 5u);
-        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    };
     ComPtr<ID3D12Fence> drainFence;
     if (FAILED(gpu.d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&drainFence))))
         drain_failure();

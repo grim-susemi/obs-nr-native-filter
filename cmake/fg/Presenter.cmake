@@ -12,6 +12,7 @@ endif()
 add_executable(obs-nr-fg-presenter
   tools/fg-presenter/vfg_presenter.cpp
   tools/fg-presenter/vfg_gpu.cpp
+  tools/fg-presenter/vfg_hud_lock.cpp
   tools/fg-presenter/vfg_shot_change.cpp
   tools/fg-presenter/native_vfg.cpp
   tools/fg-presenter/pushflow_backend.cpp
@@ -21,6 +22,14 @@ add_executable(obs-nr-fg-presenter
   src/fg/anr_dll_validator.cpp)
 set(VFG_SHOT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_shot_change.hlsl")
 set(VFG_SHOT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_shot_change_shader.h")
+foreach(PASS update compose)
+  set(HUD_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_hud_lock_${PASS}.hlsl")
+  set(HUD_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_${PASS}_shader.h")
+  add_custom_command(OUTPUT "${HUD_HEADER}"
+    COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${HUD_HEADER}"
+      -Vn "vfg_hud_lock_${PASS}_shader" "${HUD_SHADER}"
+    DEPENDS "${HUD_SHADER}" VERBATIM)
+endforeach()
 add_custom_command(OUTPUT "${VFG_SHOT_HEADER}"
   COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${VFG_SHOT_HEADER}"
     -Vn vfg_shot_change_shader "${VFG_SHOT_SHADER}"
@@ -51,7 +60,9 @@ add_custom_command(OUTPUT "${PUSHFLOW_RECONSTRUCT_HEADER}"
   DEPENDS "${PUSHFLOW_RECONSTRUCT_SHADER}" VERBATIM)
 add_custom_target(vfg_presenter_shaders DEPENDS
   "${VFG_CONTENT_HEADER}" "${VFG_SHOT_HEADER}" "${PUSHFLOW_PACK_HEADER}"
-  "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
+  "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}"
+  "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_update_shader.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_compose_shader.h")
 target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
   "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
 add_dependencies(obs-nr-fg-presenter vfg_presenter_shaders)
@@ -70,6 +81,7 @@ add_dependencies(obs-nr-filter obs-nr-fg-presenter)
 add_executable(vfg_shot_change_gpu_tests
   tools/tests/vfg_shot_change_gpu_tests.cpp
   tools/fg-presenter/vfg_gpu.cpp
+  tools/fg-presenter/vfg_hud_lock.cpp
   tools/fg-presenter/vfg_shot_change.cpp
   tools/fg-presenter/pushflow_shader_bytecode.cpp)
 target_compile_features(vfg_shot_change_gpu_tests PRIVATE cxx_std_20)
@@ -80,6 +92,21 @@ target_link_libraries(vfg_shot_change_gpu_tests PRIVATE fg_ipc d3d12 dxgi user32
 add_dependencies(vfg_shot_change_gpu_tests vfg_presenter_shaders)
 add_test(NAME vfg_shot_change_gpu COMMAND vfg_shot_change_gpu_tests)
 set_tests_properties(vfg_shot_change_gpu PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS gpu)
+
+add_executable(vfg_hud_lock_gpu_tests
+  tools/tests/vfg_hud_lock_gpu_tests.cpp
+  tools/fg-presenter/vfg_gpu.cpp
+  tools/fg-presenter/vfg_hud_lock.cpp
+  tools/fg-presenter/vfg_shot_change.cpp
+  tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_features(vfg_hud_lock_gpu_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_hud_lock_gpu_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_hud_lock_gpu_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_hud_lock_gpu_tests PRIVATE src src/fg tools/fg-presenter "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(vfg_hud_lock_gpu_tests PRIVATE fg_ipc d3d12 dxgi user32 winmm)
+add_dependencies(vfg_hud_lock_gpu_tests vfg_presenter_shaders)
+add_test(NAME vfg_hud_lock_gpu COMMAND vfg_hud_lock_gpu_tests)
+set_tests_properties(vfg_hud_lock_gpu PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS gpu)
 
 add_executable(vfg_native_smoke_tests tools/tests/vfg_native_smoke_tests.cpp)
 target_compile_features(vfg_native_smoke_tests PRIVATE cxx_std_20)
@@ -181,6 +208,7 @@ add_executable(pushflow_backend_tests
   tools/fg-presenter/pushflow_ort.cpp
   tools/fg-presenter/pushflow_shader_bytecode.cpp
   tools/fg-presenter/vfg_shot_change.cpp
+  tools/fg-presenter/vfg_hud_lock.cpp
   tools/fg-presenter/vfg_gpu.cpp)
 add_dependencies(pushflow_backend_tests vfg_presenter_shaders pushflow_loader_fixture)
 target_compile_features(pushflow_backend_tests PRIVATE cxx_std_20)

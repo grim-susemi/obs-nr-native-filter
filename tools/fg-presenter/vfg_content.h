@@ -15,6 +15,13 @@ struct ContentStep {
     bool continuous;
 };
 
+// Repeat classification controls synthesis and HUD learning, not 1x playback.
+template<typename Present>
+void present_content_repeat(bool interpolate, bool split, const Present& present)
+{
+    if (!interpolate || split) present();
+}
+
 // The transport predecessor and the last presented unique original are distinct
 // owners. Repeated content advances the former without replacing the latter.
 class ContentHistory {

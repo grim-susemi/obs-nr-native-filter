@@ -3,6 +3,7 @@
 #include "fg_vfg_session.h"
 #include "vfg_content.h"
 #include "vfg_shot_change.h"
+#include "vfg_hud_lock.h"
 #include <wrl/client.h>
 #include <array>
 #include <functional>
@@ -38,6 +39,7 @@ class DescriptorStager final {
 public:
     explicit DescriptorStager(ID3D12Device*);
     void write_srv(ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE dest) const;
+    void write_uav(ID3D12Resource*, D3D12_CPU_DESCRIPTOR_HANDLE dest) const;
 };
 
 class Gpu final {
@@ -49,6 +51,7 @@ class Gpu final {
         ComPtr<ID3D12CommandAllocator> alloc;
         ComPtr<ID3D12GraphicsCommandList> list;
         UINT64 fenceVal{};
+        std::shared_ptr<VfgHudLock> hudUse;
     };
     static constexpr size_t ring_slots = 4;
     std::array<CmdSlot, ring_slots> ring_{};
@@ -73,8 +76,9 @@ class Gpu final {
     ComPtr<ID3D12DescriptorHeap> compareViews_;
     UINT compareViewStride_{};
     ComPtr<ID3D12Resource> compareFlags_, compareZero_, compareReadback_;
-    uint64_t compareFence_{};
+    uint64_t compareFence_{}, discardedCompareFence_{};
     std::unique_ptr<VfgShotChange> shotChange_;
+    std::shared_ptr<VfgHudLock> hudLock_;
     uint32_t compareParity_{};
     std::array<uint64_t, 2> shotSlotFence_{};
     void init_compare();
@@ -90,10 +94,18 @@ public:
         unsigned prevIndex, currIndex;
         bool shotCompared;
         uint32_t shotParity;
+        bool hudLock;
+        unsigned subframe;
     };
     struct CompareResult {
         bool same, cut, flash;
         uint32_t parity;
+    };
+    struct PresentCopy {
+        ID3D12Resource* source;
+        ID3D12Resource* destination;
+        int beforeIndex = -1;
+        uint32_t splitPercent = 50;
     };
     ComPtr<ID3D12CommandQueue> ipcQueue, drawQueue;
     std::array<ComPtr<ID3D12Resource>, content_input_count> input;
@@ -114,6 +126,8 @@ public:
     // occurs on submission, and polling never maps an unfinished readback.
     [[nodiscard]] bool begin_compare(unsigned previous, unsigned current, HANDLE ready);
     [[nodiscard]] std::optional<CompareResult> compare_result();
+    // Drop the result now, but keep its readback unavailable until GPU completion.
+    void discard_compare() noexcept;
     // Speculative admission never waits on the ring. Zero means no submission.
     [[nodiscard]] uint64_t record_draw(const Draw&);
     void mark_inputs_read(unsigned prevIndex, unsigned currIndex, uint64_t fenceVal);
@@ -125,7 +139,16 @@ public:
         check(drawQueue->Signal(done_.Get(), value), "backend reader fence");
         mark_inputs_read(prevIndex, currIndex, value);
     }
+    // Called at the presenter poll, even without an incoming original.
+    void sync_hud_lock(bool enabled);
+    // On exceptional unwind only; a confirmed lost device needs no live-queue drain.
+    [[nodiscard]] bool drain_hud_on_unwind() const noexcept;
+    void update_hud_lock(unsigned current, unsigned previous, bool reset);
+    [[nodiscard]] std::weak_ptr<const VfgHudLock> hud_lock() const noexcept { return hudLock_; }
     void set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels);
+    // Synthetic display must be recorded on the current Gpu ring command list.
+    [[nodiscard]] ID3D12Resource* record_synthetic_display(ID3D12GraphicsCommandList*, const SyntheticFrame&);
+    void record_present_copy(ID3D12GraphicsCommandList*, const PresentCopy&);
     UINT present(ID3D12Resource*, bool synthetic, int beforeIndex = -1, uint32_t splitPercent = 50);
     // Deadline is on clock_ns(). No GPU work is submitted on a missed admission.
     [[nodiscard]] std::optional<UINT> try_present_synthetic(const SyntheticFrame&, uint64_t deadlineNs,
