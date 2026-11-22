@@ -19,6 +19,13 @@
 !/docs
 !/packaging
 
+# PushFlow companion model builder (generated packs stay out of the tree)
+!/scripts/
+/scripts/*
+!/scripts/pushflow/
+/scripts/pushflow/*
+!/scripts/pushflow/prepare-models.py
+
 # Exclude lock files
 *.lock.json
 
