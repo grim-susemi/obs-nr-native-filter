@@ -1035,35 +1035,40 @@ struct BlockingLogPipe {
 };
 
 struct BlockedWriteWitness {
-    DWORD pipeAvailBytes{};
+    DWORD sample1AvailBytes{};
+    DWORD sample2AvailBytes{};
+    uint64_t dwellMs{};
     uint32_t framesFed{};
 };
 
 BlockedWriteWitness saturate_and_confirm_blocked_write(BlockingLogPipe& logPipe, GpuFixture& gfx,
     ipc::Producer& producer, Controller& controller, uint32_t startFrame = 1)
 {
+    const auto confirmSustainedBlock = [&](uint32_t framesFed) -> std::optional<BlockedWriteWitness> {
+        const auto avail1 = logPipe.avail_bytes();
+        if (avail1 == 0 || !controller.log_write_in_flight()) return std::nullopt;
+        const auto t0 = clock_ns();
+        Sleep(80);
+        const auto dwellMs = (clock_ns() - t0) / 1'000'000ULL;
+        const auto avail2 = logPipe.avail_bytes();
+        if (controller.log_write_in_flight() && avail2 == avail1 && dwellMs >= 70) {
+            return BlockedWriteWitness{avail1, avail2, dwellMs, framesFed};
+        }
+        return std::nullopt;
+    };
+
     const auto start = clock_ns();
     const auto deadline = start + 6'000'000'000ULL;
     uint32_t f = 0;
     while (clock_ns() < deadline) {
-        const auto avail = logPipe.avail_bytes();
-        if (avail > 0 && controller.log_write_in_flight()) {
-            // Confirm WriteFile stays blocked in kernel across 80 ms without pipe drain.
-            Sleep(80);
-            if (controller.log_write_in_flight() && logPipe.avail_bytes() == avail) {
-                return {avail, f};
-            }
-        }
+        if (const auto witnessed = confirmSustainedBlock(f)) return *witnessed;
         const auto ts = start + uint64_t{f} * 16'666'667ULL;
         pace_to(ts);
         gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, ((startFrame + f) * 20) % 480);
         const auto pub = producer.publish(gfx.tex.Get(), ts, clock_ns(), false, 0, nullptr, 50);
         if (pub != ipc::Status::Ok && pub != ipc::Status::Dropped) {
-            const auto afterAvail = logPipe.avail_bytes();
-            if (afterAvail > 0 && controller.log_write_in_flight()) {
-                return {afterAvail, f};
-            }
-            throw std::runtime_error("publish failed while saturating pipe");
+            if (const auto witnessed = confirmSustainedBlock(f)) return *witnessed;
+            throw std::runtime_error("publish failed without sustained kernel pipe WriteFile block");
         }
         ++f;
     }
@@ -1135,7 +1140,10 @@ void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path
     logPipe.close();
 
     write_pipe_witness_log(logDir / L"ab-watchdog-stalled-pipe-log.log",
-        "WITNESS scenario=watchdog pipe_avail_bytes=" + std::to_string(witness.pipeAvailBytes) +
+        "WITNESS scenario=watchdog sample1_avail=" + std::to_string(witness.sample1AvailBytes) +
+        " sample2_avail=" + std::to_string(witness.sample2AvailBytes) +
+        " pipe_avail_bytes=" + std::to_string(witness.sample2AvailBytes) +
+        " dwell_ms=" + std::to_string(witness.dwellMs) +
         " frames_fed=" + std::to_string(witness.framesFed) +
         " log_write_in_flight=1 old_pid=" + std::to_string(oldPid) +
         " exit_ms=" + std::to_string(watchdogElapsedMs) + " exit_reason=3",
@@ -1184,8 +1192,9 @@ void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path
     expect(count_tokens(recText, "event=present_original ") >= 5 &&
         count_tokens(recText, "event=present_vfg_subframe ") == 0,
         "watchdog recovered child must present 1x original frames only");
-    std::printf("PASS ab_watchdog_stalled_pipe_log old_pid=%lu new_pid=%lu pipe_avail=%lu exit_ms=%llu orig=%zu\n",
-        oldPid, newPid, witness.pipeAvailBytes, static_cast<unsigned long long>(watchdogElapsedMs),
+    std::printf("PASS ab_watchdog_stalled_pipe_log old_pid=%lu new_pid=%lu pipe_avail=%lu dwell_ms=%llu exit_ms=%llu orig=%zu\n",
+        oldPid, newPid, witness.sample2AvailBytes, static_cast<unsigned long long>(witness.dwellMs),
+        static_cast<unsigned long long>(watchdogElapsedMs),
         count_tokens(recText, "event=present_original "));
 }
 
@@ -1261,13 +1270,17 @@ void run_pushflow_pipe_close_case(const std::wstring& presenter, const fs::path&
         logPipe.close();
         write_pipe_witness_log(witnessPath,
             "WITNESS scenario=" + std::string(useControllerStop ? "userstop" : "esc") +
-            " pipe_avail_bytes=" + std::to_string(witness.pipeAvailBytes) +
+            " sample1_avail=" + std::to_string(witness.sample1AvailBytes) +
+            " sample2_avail=" + std::to_string(witness.sample2AvailBytes) +
+            " pipe_avail_bytes=" + std::to_string(witness.sample2AvailBytes) +
+            " dwell_ms=" + std::to_string(witness.dwellMs) +
             " frames_fed=" + std::to_string(witness.framesFed) +
             " log_write_in_flight=1 old_pid=" + std::to_string(oldPid) +
             " exit_ms=" + std::to_string(closeElapsedMs) + " exit_reason=1 marker_cleaned=1",
             pipeSnap);
-        std::printf("PASS ab_pushflow_%s_stalled_pipe_log pid=%lu pipe_avail=%lu exit_ms=%llu\n",
-            useControllerStop ? "userstop" : "esc", oldPid, witness.pipeAvailBytes,
+        std::printf("PASS ab_pushflow_%s_stalled_pipe_log pid=%lu pipe_avail=%lu dwell_ms=%llu exit_ms=%llu\n",
+            useControllerStop ? "userstop" : "esc", oldPid, witness.sample2AvailBytes,
+            static_cast<unsigned long long>(witness.dwellMs),
             static_cast<unsigned long long>(closeElapsedMs));
     }
 

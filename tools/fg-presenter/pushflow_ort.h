@@ -7,7 +7,9 @@
 #include "pushflow_tensor_contract.h"
 #include <d3d12.h>
 #include <wrl/client.h>
+#pragma warning(push, 0)
 #include <dml_provider_factory.h>
+#pragma warning(pop)
 #include <array>
 #include <cstdio>
 #include <functional>

@@ -180,8 +180,16 @@ void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a,
         static_cast<long long>(telemetry.shiftNs), telemetry.hudLock, telemetry.shotCut,
         telemetry.pacingRepair, telemetry.adaptiveFg, telemetry.adaptiveTargetFps);
     if (len > 0) {
+        const auto bytes = static_cast<DWORD>(std::min<int>(len, static_cast<int>(sizeof(line) - 1)));
+        const int fd = _fileno(f.log);
+        const HANDLE hLog = fd >= 0 ? reinterpret_cast<HANDLE>(_get_osfhandle(fd)) : INVALID_HANDLE_VALUE;
         const LogWriteScope ioScope{f.view};
-        fwrite(line, 1, static_cast<size_t>(std::min<int>(len, static_cast<int>(sizeof(line) - 1))), f.log);
+        if (hLog != INVALID_HANDLE_VALUE) {
+            DWORD written{};
+            (void)WriteFile(hLog, line, bytes, &written, nullptr);
+        } else {
+            fwrite(line, 1, bytes, f.log);
+        }
     }
 }
 
@@ -355,7 +363,7 @@ void frames(Feed& f)
     ContentHistory history;
     UniqueCadence cadence;
     uint64_t lastOriginalTarget{};
-    uint64_t lastPeriod{};
+    uint64_t lastPeriod{}, lastLockedPeriod{};
     bool sawRepeat = false;
     PushPacingRepair repair;
     TransportIntervalEstimator transport;
@@ -457,7 +465,7 @@ void frames(Feed& f)
             if (!step.continuous) {
                 hudReset = true;
                 cadence.reset();
-                lastOriginalTarget = lastPeriod = 0;
+                lastOriginalTarget = lastPeriod = lastLockedPeriod = 0;
                 sawRepeat = false;
                 repair.reset();
                 rate.reset();
@@ -551,7 +559,7 @@ void frames(Feed& f)
         if (repairing != wasRepairing) {
             cadence.reset();
             repair.reset();
-            previousRepairedPtsNs = lastOriginalTarget = lastPeriod = 0;
+            previousRepairedPtsNs = lastOriginalTarget = lastPeriod = lastLockedPeriod = 0;
             wasRepairing = repairing;
         }
         auto timestamp = b.obsTick ? b.obsTick : b.timestampNs;
@@ -569,7 +577,13 @@ void frames(Feed& f)
         }
         telemetry.multiplier = interpolate ? mult : 1u;
         contentFps = rate.observe(b.timestampNs, ++uniqueOrdinal, staticHold);
-        auto period = interpolate ? cadence.observe(timestamp) : 0;
+        const auto lockedPeriod = interpolate ? cadence.observe(timestamp) : 0;
+        if (lockedPeriod && lockedPeriod != lastLockedPeriod) {
+            fprintf(f.log, "event=cadence_locked period_ns=%llu repairing=%d\n",
+                static_cast<unsigned long long>(lockedPeriod), repairing ? 1 : 0);
+        }
+        lastLockedPeriod = lockedPeriod;
+        auto period = lockedPeriod;
         const auto previous = repairing ? previousRepairedPtsNs :
             anchor ? (anchor->frame.obsTick ? anchor->frame.obsTick : anchor->frame.timestampNs) : 0;
         if (!period && interpolate && anchor && (repairing || (b.obsTick != 0) == (anchor->frame.obsTick != 0)) &&
@@ -710,7 +724,7 @@ void frames(Feed& f)
             history.invalidate();
             hudReset = true;
             cadence.reset();
-            lastOriginalTarget = lastPeriod = 0;
+            lastOriginalTarget = lastPeriod = lastLockedPeriod = 0;
             sawRepeat = false;
             previousRepairedPtsNs = 0;
         }

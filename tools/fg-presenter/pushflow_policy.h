@@ -122,7 +122,8 @@ public:
     }
     bool steady() { return ++completed_ != steady_interval || clear(); }
     bool begin_teardown(bool userClosing) const { return !ownsRun_ || userClosing || arm(); }
-    bool finish_teardown(bool userClosing, bool clean) const { return !ownsRun_ || !(userClosing || clean) || clear(); }
+    // User-close marker removal is owned solely by the parent Controller observer.
+    bool finish_teardown(bool userClosing, bool clean) const { return !ownsRun_ || userClosing || !clean || clear(); }
 
     bool clear() const
     {
@@ -132,9 +133,4 @@ public:
         return !ec;
     }
 };
-
-inline bool clear_starting_on_user_close(const fs::path& directory, bool active, ExitReason reason)
-{
-    return !active || reason != ExitReason::UserClosed || StartingMarker(directory).clear();
-}
 } // namespace nr::fg::vfg::pushflow

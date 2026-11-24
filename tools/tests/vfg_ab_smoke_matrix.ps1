@@ -158,7 +158,19 @@ Invoke-Checked 'ab-shot-change' { & $abRunner $modPresenter $LogDir shot-change 
 Invoke-Checked 'ab-hud-lock' { & $abRunner $modPresenter $LogDir hud-lock }
 Invoke-Checked 'vfg-hud-lock-gpu' { & $hudGpu }
 
-# (d1) Same-PID live Pacing Repair OFF -> ON -> OFF on 17/50ms input
+# (d1) Same-PID live Pacing Repair OFF -> ON -> OFF on 17/50ms input (real libobs vfg_pacing_repair property + runner cross-check)
+Invoke-Checked 'libobs-pacing-repair-ab' {
+    Push-Location $LibObsDir
+    $env:OBS_NR_VFG_PACING_LOG = (Join-Path $LogDir 'ab-pacing-repair-libobs.log')
+    $env:OBS_NR_VFG_RUNTIME = (Join-Path $LibObsDir 'nvidia-vfg')
+    try {
+        & $filterTests $pluginDll $pluginData $modPresenter (Join-Path $LibObsDir 'libobs-d3d11.dll') (Join-Path $LogDir 'libobs-pacing-repair') pacing-repair-ab
+    } finally {
+        Remove-Item Env:OBS_NR_VFG_PACING_LOG -ErrorAction SilentlyContinue
+        Remove-Item Env:OBS_NR_VFG_RUNTIME -ErrorAction SilentlyContinue
+        Pop-Location
+    }
+}
 $pacingOut = Invoke-Checked 'ab-pacing-repair' { & $abRunner $modPresenter $LogDir pacing-repair }
 $pacingOut | ForEach-Object { Write-Host $_ }
 $pacingSegs = @{}

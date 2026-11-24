@@ -92,7 +92,8 @@ void lifecycle(TestRun& test, const fs::path& marks)
         StartingMarker manual(marks);
         const bool once = manual.begin() == StartingMarker::Open::PreviousCrash;
         return once && !fs::exists(starting) && !fs::exists(quarantine) &&
-            manual.begin() == StartingMarker::Open::Armed && manual.finish_teardown(true, true);
+            manual.begin() == StartingMarker::Open::Armed && manual.finish_teardown(true, true) &&
+            fs::exists(starting) && manual.finish_teardown(false, true) && !fs::exists(starting);
     };
     test.expect(retry(), "quarantine-only degrades exactly one manual open");
     std::ofstream(starting) << "stale fixture\n";

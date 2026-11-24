@@ -67,6 +67,14 @@ public:
     static std::wstring find_pushflow_dir(PushFlowTier tier);
 };
 namespace detail {
-void write_event_bounded(const std::wstring& path, const std::string& text, DWORD timeoutMs = 150) noexcept;
+struct WriteEventStatus {
+    bool opened{};
+    bool pended{};
+    bool cancelled{};
+    bool deferredToPool{};
+};
+WriteEventStatus write_event_bounded(const std::wstring& path, const std::string& text,
+    DWORD timeoutMs = 150, HANDLE reapedEvent = nullptr, bool failPoolPrep = false,
+    bool simulateCancelDelay = false) noexcept;
 }
 } // namespace nr::fg::vfg

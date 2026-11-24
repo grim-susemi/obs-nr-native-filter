@@ -3,17 +3,21 @@
 #include <graphics/vec4.h>
 #include <util/text-lookup.h>
 #include <windows.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 std::filesystem::path vfg_stage_anr_addon(const std::filesystem::path& fixture,
     const std::filesystem::path& addon, bool stageCompanions);
@@ -23,6 +27,7 @@ constexpr uint32_t width = 320, height = 180;
 std::atomic_uint32_t fixtureWidth{width};
 std::atomic_bool fixtureBlue{};
 std::atomic_bool fixtureAnimate{};
+std::atomic_bool fixturePacing1750{};
 std::atomic_uint32_t fixtureFrameSeq{};
 constexpr char filterId[] = "susemi_fg_tap";
 using Pixels = std::array<uint8_t, 4>;
@@ -85,10 +90,11 @@ void render_fixture(void*, gs_effect_t*)
         gs_draw_sprite(nullptr, 0, fixtureWidth.load(), height);
     if (fixtureAnimate.load()) {
         const auto seq = fixtureFrameSeq.fetch_add(1);
+        const auto unique = fixturePacing1750.load() ? (seq / 4 * 2 + (seq % 4 != 0)) : seq;
         const vec4 bar{1.f, 1.f, 1.f, 1.f};
         gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &bar);
         gs_matrix_push();
-        gs_matrix_translate3f(static_cast<float>((seq * 16) % 240), 40.f, 0.f);
+        gs_matrix_translate3f(static_cast<float>((unique * 16) % 240), 40.f, 0.f);
         while (gs_effect_loop(effect, "Solid"))
             gs_draw_sprite(nullptr, 0, 32, 64);
         gs_matrix_pop();
@@ -805,6 +811,143 @@ void immediate_esc_reopen_case(const fs::path& scratch, const fs::path& log, con
         firstPid, field(secondOffer, "pid=").c_str(), count_events(tail, "event=present_vfg_subframe "));
 }
 
+void pacing_repair_ab_case(const fs::path& log)
+{
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    fixtureFrameSeq.store(0);
+    fixturePacing1750.store(true);
+    fixtureAnimate.store(true);
+    struct ResetFixture {
+        ~ResetFixture()
+        {
+            fixtureAnimate.store(false);
+            fixturePacing1750.store(false);
+        }
+    } resetFixture;
+
+    auto input = source("vfg_test_color");
+    auto data = settings();
+    obs_data_set_int(data.get(), "vfg_backend", 0);
+    obs_data_set_int(data.get(), "vfg_multiplier", 2);
+    obs_data_set_bool(data.get(), "vfg_pacing_repair", false);
+    obs_data_set_bool(data.get(), "vfg_adaptive_fg", false);
+    auto filter = source(filterId, data.get());
+    obs_source_filter_add(input.get(), filter.get());
+    obs_set_output_source(0, input.get());
+    struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+    const auto props = properties(filter.get());
+
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get()),
+        "start NativeVfg for real-OBS pacing repair A/B");
+    await([&] {
+        return !event(text_of(log), "event=initialized backend=nvidia-vfg-native ", "pacing_repair=0 adaptive_fg=0").empty();
+    }, "NativeVfg initialized with pacing_repair=0 adaptive_fg=0", 12000);
+
+    struct OrigSample { uint64_t serial; double qpcMs; int repair; int64_t shiftNs; };
+    const auto parseOriginals = [](const std::string& text) {
+        std::vector<OrigSample> out;
+        std::istringstream iss(text);
+        for (std::string line; std::getline(iss, line);) {
+            if (!line.starts_with("event=present_original ")) continue;
+            const auto b = field(line, " b=");
+            const auto q = field(line, " qpc_ns=");
+            const auto pr = field(line, " pacing_repair=");
+            const auto sh = field(line, " pacing_shift_ns=");
+            if (b.empty() || q.empty() || pr.empty() || sh.empty()) continue;
+            out.push_back({std::stoull(b), static_cast<double>(std::stoull(q)) / 1e6, std::stoi(pr), std::stoll(sh)});
+        }
+        return out;
+    };
+
+    const auto countWhere = [&](int wantRepair, size_t startIdx) {
+        const auto rows = parseOriginals(text_of(log));
+        size_t count = 0;
+        for (size_t i = startIdx; i < rows.size(); ++i)
+            if (rows[i].repair == wantRepair) ++count;
+        return count;
+    };
+
+    await([&] { return countWhere(0, 0) >= 56; }, "segment 1 (OFF) 56 originals", 10000);
+    const size_t seg1EndIdx = parseOriginals(text_of(log)).size();
+
+    {
+        auto up = settings();
+        obs_data_set_bool(up.get(), "vfg_pacing_repair", true);
+        obs_source_update(filter.get(), up.get());
+    }
+    await([&] { return countWhere(1, seg1EndIdx) >= 56; }, "segment 2 (ON) 56 originals", 10000);
+    const size_t seg2EndIdx = parseOriginals(text_of(log)).size();
+
+    {
+        auto up = settings();
+        obs_data_set_bool(up.get(), "vfg_pacing_repair", false);
+        obs_source_update(filter.get(), up.get());
+    }
+    await([&] { return countWhere(0, seg2EndIdx) >= 56; }, "segment 3 (OFF) 56 originals", 10000);
+
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()),
+        "stop NativeVfg after real-OBS pacing repair A/B");
+    obs_source_filter_remove(input.get(), filter.get());
+
+    const auto fullLog = text_of(log);
+    wchar_t copyDest[4096]{};
+    const auto copyLen = GetEnvironmentVariableW(L"OBS_NR_VFG_PACING_LOG", copyDest, ARRAYSIZE(copyDest));
+    if (copyLen && copyLen < ARRAYSIZE(copyDest)) {
+        std::error_code ec;
+        fs::create_directories(fs::path(copyDest).parent_path(), ec);
+        fs::copy_file(log, fs::path(copyDest), fs::copy_options::overwrite_existing, ec);
+        expect(!ec, "copy real-OBS pacing repair presenter log");
+    }
+
+    expect(count_events(fullLog, "event=offer ") == 1, "single presenter PID across OFF->ON->OFF");
+    expect(count_events(fullLog, "adaptive_fg=1") == 0, "adaptive_fg must stay 0");
+    expect(count_events(fullLog, "hud_lock=1") == 0, "hud_lock must stay 0");
+    expect(count_events(fullLog, "event=error") == 0, "zero errors in real-OBS pacing repair A/B");
+    expect(fullLog.find("event=cadence_locked period_ns=33333333 repairing=1") != std::string::npos,
+        "UniqueCadence 30 Hz lock observed during ON segment");
+
+    const auto rows = parseOriginals(fullLog);
+    const auto checkSegment = [&](int segNum, int wantRepair, size_t lo, size_t hi) {
+        std::vector<OrigSample> seg;
+        for (size_t i = lo; i < hi && i < rows.size(); ++i)
+            if (rows[i].repair == wantRepair) seg.push_back(rows[i]);
+        expect(seg.size() >= 56, "insufficient segment originals");
+        std::vector<double> errs;
+        int64_t shiftNz = 0;
+        for (size_t i = 17; i < seg.size(); ++i) {
+            errs.push_back(std::abs((seg[i].qpcMs - seg[i - 1].qpcMs) - 33.333333));
+            if (seg[i].shiftNs != 0) ++shiftNz;
+        }
+        for (size_t i = 0; i < 17; ++i)
+            if (seg[i].shiftNs != 0) ++shiftNz;
+        std::sort(errs.begin(), errs.end());
+        const size_t p90Idx = std::min(errs.size() - 1, (errs.size() * 9 + 9) / 10 - 1);
+        const double p90 = errs[p90Idx];
+        const double maxErr = errs.back();
+        size_t subs = 0;
+        std::istringstream iss(fullLog);
+        for (std::string line; std::getline(iss, line);) {
+            if (!line.starts_with("event=present_vfg_subframe ")) continue;
+            const auto b = field(line, "b=");
+            if (b.empty()) continue;
+            const auto s = std::stoull(b);
+            if (s >= seg.front().serial && s <= seg.back().serial) ++subs;
+        }
+        std::printf("PACING_LIBOBS seg=%d repair=%d first_serial=%llu last_serial=%llu settled_dts=%zu p90_err=%.2fms max_err=%.2fms subframes=%zu shift_nz=%lld\n",
+            segNum, wantRepair, static_cast<unsigned long long>(seg.front().serial),
+            static_cast<unsigned long long>(seg.back().serial), errs.size(), p90, maxErr, subs, static_cast<long long>(shiftNz));
+        if (wantRepair) {
+            expect(subs > 0 && shiftNz > 0 && p90 <= 5.0 && maxErr <= 8.0, "real-OBS pacing ON threshold failed");
+        } else {
+            expect(p90 >= 10.0, "real-OBS pacing OFF judder threshold failed");
+        }
+    };
+    checkSegment(1, 0, 0, seg1EndIdx);
+    checkSegment(2, 1, seg1EndIdx, seg2EndIdx);
+    checkSegment(3, 0, seg2EndIdx, rows.size());
+    std::puts("PASS libobs_pacing_repair_ab");
+}
+
 void run_isolated(wchar_t** argv, const Scenario& s)
 {
     std::printf("START %ls\n", s.name);
@@ -915,6 +1058,15 @@ int run_host(int argc, wchar_t** argv)
             if (scenario == L"anr-missing-companion" || scenario == L"anr-missing-pack") {
                 vfg_anr_fallback_case(fs::path(argv[0]).parent_path() / L"anr_benign_fixture.dll", log,
                     scenario == L"anr-missing-pack");
+                return 0;
+            }
+            if (scenario == L"pacing-repair-ab") {
+                wchar_t rtBuf[4096]{};
+                if (!GetEnvironmentVariableW(L"OBS_NR_VFG_RUNTIME", rtBuf, ARRAYSIZE(rtBuf))) {
+                    const auto siblingRt = fs::path(argv[4]).parent_path() / L"nvidia-vfg";
+                    SetEnvironmentVariableW(L"OBS_NR_VFG_RUNTIME", siblingRt.c_str());
+                }
+                pacing_repair_ab_case(log);
                 return 0;
             }
             if (scenario == L"k-immediate-esc-reopen") {

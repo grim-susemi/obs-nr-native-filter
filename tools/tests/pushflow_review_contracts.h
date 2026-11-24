@@ -156,7 +156,7 @@ inline void ownership_and_timeout_controls(TestRun& test, const std::filesystem:
                 shutdownSawFault = fault;
                 stamp_exit_reason(session, ExitReason::Fault);
                 const auto reason = read_exit_reason(session);
-                cleanup = clear_starting_on_user_close(dir, item.active, reason);
+                cleanup = !item.active || reason != ExitReason::UserClosed || StartingMarker(dir).clear();
                 return reason == ExitReason::UserClosed;
             });
         } catch (const ipc::Error& failure) {

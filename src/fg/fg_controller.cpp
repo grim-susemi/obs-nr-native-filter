@@ -91,12 +91,39 @@ fs::path marker_dir()
     const auto local = env_path(L"LOCALAPPDATA");
     return local.empty() ? fs::path{} : fs::path(local) / L"obs-nr-native-filter";
 }
+constexpr char kUserClosedFallbackPayload[] = "reason=user_closed_marker_cleanup_failed\n";
+
 struct PendingIoWrite {
     Handle file;
     Handle event;
     OVERLAPPED ov{};
     std::string text;
+    HMODULE module{};
+    HANDLE reapedEvent{};
+    ~PendingIoWrite()
+    {
+        file = {};
+        event = {};
+        text.clear();
+        if (module) {
+            FreeLibrary(module);
+            module = nullptr;
+        }
+    }
 };
+
+VOID CALLBACK wait_reap_callback(PTP_CALLBACK_INSTANCE instance, PVOID ctx, PTP_WAIT wait, TP_WAIT_RESULT) noexcept
+{
+    std::unique_ptr<PendingIoWrite> own(static_cast<PendingIoWrite*>(ctx));
+    CloseThreadpoolWait(wait);
+    const HANDLE notify = own->reapedEvent;
+    const HMODULE mod = own->module;
+    own->module = nullptr;
+    own.reset();
+    if (notify) SetEvent(notify);
+    if (mod) FreeLibraryWhenCallbackReturns(instance, mod);
+}
+
 void write_event(const char* event) noexcept
 {
     try {
@@ -111,22 +138,45 @@ bool clear_starting_marker(const fs::path& marks, std::error_code& ec) noexcept
         ec = std::make_error_code(std::errc::no_such_file_or_directory);
         return false;
     }
-    const auto starting = marks / L"pushflow-starting.txt";
-    const bool present = fs::exists(starting, ec);
-    if (ec) return false;
-    if (present) fs::remove(starting, ec);
+    fs::remove(marks / L"pushflow-starting.txt", ec);
     return !ec;
+}
+bool read_valid_user_closed_fallback(const fs::path& userClosedMark) noexcept
+{
+    std::ifstream in(userClosedMark, std::ios::binary);
+    if (!in) return false;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (in.bad()) return false;
+    return content == kUserClosedFallbackPayload || content == "reason=user_closed_marker_cleanup_failed\r\n";
 }
 enum class MarkerCleanupStatus { NotNeeded, Pending, Succeeded, Failed };
 } // namespace
 
 namespace detail {
-void write_event_bounded(const std::wstring& path, const std::string& text, DWORD timeoutMs) noexcept
+WriteEventStatus write_event_bounded(const std::wstring& path, const std::string& text,
+    DWORD timeoutMs, HANDLE reapedEvent, bool failPoolPrep, bool simulateCancelDelay) noexcept
 {
+    WriteEventStatus status{};
     try {
-        if (path.empty() || text.empty()) return;
-        const bool isPipe = path.rfind(LR"(\\.\pipe\)", 0) == 0;
+        if (path.empty() || text.empty()) return status;
+        HMODULE selfMod = nullptr;
+        if (!GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(&write_event_bounded),
+                &selfMod) || !selfMod) {
+            return status;
+        }
         auto pending = std::make_unique<PendingIoWrite>();
+        pending->module = selfMod;
+        pending->reapedEvent = reapedEvent;
+        PTP_WAIT tpWait = failPoolPrep ? nullptr : CreateThreadpoolWait(wait_reap_callback, pending.get(), nullptr);
+        if (!tpWait) return status;
+        struct WaitGuard {
+            PTP_WAIT w{};
+            ~WaitGuard() { if (w) CloseThreadpoolWait(w); }
+        } waitGuard{tpWait};
+
+        const bool isPipe = path.rfind(LR"(\\.\pipe\)", 0) == 0;
         pending->file.value = CreateFileW(path.c_str(),
             isPipe ? GENERIC_WRITE : FILE_APPEND_DATA,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -136,10 +186,11 @@ void write_event_bounded(const std::wstring& path, const std::string& text, DWOR
             nullptr);
         if (pending->file.value == INVALID_HANDLE_VALUE) {
             pending->file.value = nullptr;
-            return;
+            return status;
         }
+        status.opened = true;
         pending->event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!pending->event.value) return;
+        if (!pending->event.value) return status;
         pending->text = text;
         pending->ov.hEvent = pending->event.value;
         if (!isPipe) {
@@ -149,37 +200,24 @@ void write_event_bounded(const std::wstring& path, const std::string& text, DWOR
         DWORD written{};
         if (!WriteFile(pending->file.value, pending->text.data(),
                 static_cast<DWORD>(pending->text.size()), &written, &pending->ov)) {
-            if (GetLastError() != ERROR_IO_PENDING) return;
+            if (GetLastError() != ERROR_IO_PENDING) return status;
+            status.pended = true;
             if (WaitForSingleObject(pending->event.value, timeoutMs) != WAIT_OBJECT_0) {
-                CancelIoEx(pending->file.value, &pending->ov);
+                status.cancelled = true;
+                if (!simulateCancelDelay) CancelIoEx(pending->file.value, &pending->ov);
                 if (WaitForSingleObject(pending->event.value, 50) != WAIT_OBJECT_0) {
-                    // Kernel I/O is still in flight; retain OVERLAPPED, event, handle, and buffer until signaled.
-                    HMODULE selfMod = nullptr;
-                    GetModuleHandleExW(
-                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                        reinterpret_cast<LPCWSTR>(&write_event_bounded),
-                        &selfMod);
-                    TP_CALLBACK_ENVIRON env{};
-                    InitializeThreadpoolEnvironment(&env);
-                    if (selfMod) SetThreadpoolCallbackLibrary(&env, selfMod);
-                    const bool queued = TrySubmitThreadpoolCallback(
-                        [](PTP_CALLBACK_INSTANCE, PVOID ctx) {
-                            std::unique_ptr<PendingIoWrite> own(static_cast<PendingIoWrite*>(ctx));
-                            WaitForSingleObject(own->event.value, INFINITE);
-                        },
-                        pending.get(), &env) != FALSE;
-                    DestroyThreadpoolEnvironment(&env);
-                    if (queued) {
-                        pending.release();
-                    } else {
-                        if (selfMod) FreeLibrary(selfMod);
-                        WaitForSingleObject(pending->event.value, INFINITE);
-                    }
+                    // Kernel I/O is still in flight; transfer ownership to pre-allocated TP_WAIT.
+                    status.deferredToPool = true;
+                    const HANDLE ev = pending->event.value;
+                    waitGuard.w = nullptr;
+                    pending.release();
+                    SetThreadpoolWait(tpWait, ev, nullptr);
                 }
             }
         }
     } catch (...) {
     }
+    return status;
 }
 } // namespace detail
 
@@ -307,21 +345,37 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         const auto userClosedMark = marks / L"pushflow-user-closed.txt";
         std::error_code ec;
         bool fallbackFailed = false;
-        if (!marks.empty() && fs::exists(userClosedMark, ec) && !ec) {
+        const bool userClosedExists = !marks.empty() && fs::exists(userClosedMark, ec);
+        if (ec) {
+            fallbackFailed = true;
+            write_event("event=pushflow_fallback_probe_failed\n");
+        } else if (userClosedExists) {
+            const bool validFallback = read_valid_user_closed_fallback(userClosedMark);
             std::error_code qEc;
             const bool hasQuarantine = fs::exists(quarantine, qEc);
-            if (!qEc && !hasQuarantine) {
+            if (qEc || !validFallback) {
+                fallbackFailed = true;
+                write_event(!validFallback ? "event=pushflow_fallback_corrupt\n" : "event=pushflow_quarantine_probe_failed\n");
+                std::error_code rmEc;
+                fs::remove(userClosedMark, rmEc);
+            } else if (!hasQuarantine) {
                 std::error_code clearEc;
                 if (clear_starting_marker(marks, clearEc)) {
                     std::error_code rmEc;
-                    fs::remove(userClosedMark, rmEc);
+                    if (!fs::remove(userClosedMark, rmEc) && rmEc) {
+                        fallbackFailed = true;
+                        write_event("event=pushflow_fallback_remove_failed\n");
+                    }
                 } else {
                     fallbackFailed = true;
                     write_event("event=pushflow_marker_cleanup_failed\n");
                 }
-            } else if (!qEc) {
+            } else {
                 std::error_code rmEc;
-                fs::remove(userClosedMark, rmEc);
+                if (!fs::remove(userClosedMark, rmEc) && rmEc) {
+                    fallbackFailed = true;
+                    write_event("event=pushflow_fallback_remove_failed\n");
+                }
             }
         }
         std::error_code startEc, qCheckEc;
@@ -415,34 +469,31 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         const auto wdMs = InterlockedCompareExchange64(&s->view->watchdogElapsedMs, 0, 0);
         const auto wdInit = InterlockedCompareExchange(&s->view->watchdogInitializing, 0, 0) != 0;
         const auto forced = InterlockedCompareExchange(&s->view->forceTerminated, 0, 0) != 0;
-        const auto pfActive = InterlockedCompareExchange(&s->view->pushflowActive, 0, 0) != 0;
         const auto drainFailed = InterlockedCompareExchange(&s->view->drainFailed, 0, 0) != 0;
         bool cleanupFailed = false;
         bool fallbackRecorded = false;
         bool fallbackWriteFailed = false;
-        if (reason == ExitReason::UserClosed && backend == Backend::PushFlow) {
-            if (pfActive) {
-                std::error_code ec;
-                if (clear_starting_marker(marks, ec)) {
-                    s->markerCleanupStatus.store(MarkerCleanupStatus::Succeeded, std::memory_order_release);
-                } else {
-                    cleanupFailed = true;
-                    s->markerCleanupStatus.store(MarkerCleanupStatus::Failed, std::memory_order_release);
-                    std::error_code dirEc;
-                    if (!marks.empty() && (fs::create_directories(marks, dirEc) || !dirEc)) {
-                        std::ofstream fallback(marks / L"pushflow-user-closed.txt", std::ios::binary | std::ios::trunc);
-                        fallback << "reason=user_closed_marker_cleanup_failed\n";
-                        fallback.flush();
-                        const bool wrote = fallback.good();
-                        fallback.close();
-                        if (wrote && !fallback.fail()) fallbackRecorded = true;
-                        else fallbackWriteFailed = true;
-                    } else {
-                        fallbackWriteFailed = true;
-                    }
-                }
-            } else {
+        const bool needsUserCloseCleanup =
+            s->markerCleanupStatus.load(std::memory_order_acquire) == MarkerCleanupStatus::Pending;
+        if (reason == ExitReason::UserClosed && backend == Backend::PushFlow && needsUserCloseCleanup) {
+            std::error_code ec;
+            if (clear_starting_marker(marks, ec)) {
                 s->markerCleanupStatus.store(MarkerCleanupStatus::Succeeded, std::memory_order_release);
+            } else {
+                cleanupFailed = true;
+                s->markerCleanupStatus.store(MarkerCleanupStatus::Failed, std::memory_order_release);
+                std::error_code dirEc;
+                if (!marks.empty() && (fs::create_directories(marks, dirEc) || !dirEc)) {
+                    std::ofstream fallbackFile(marks / L"pushflow-user-closed.txt", std::ios::binary | std::ios::trunc);
+                    fallbackFile << kUserClosedFallbackPayload;
+                    fallbackFile.flush();
+                    const bool wrote = fallbackFile.good();
+                    fallbackFile.close();
+                    if (wrote && !fallbackFile.fail()) fallbackRecorded = true;
+                    else fallbackWriteFailed = true;
+                } else {
+                    fallbackWriteFailed = true;
+                }
             }
         }
         std::string diag;

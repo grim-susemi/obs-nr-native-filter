@@ -122,28 +122,82 @@ void malformed_child(const fs::path& exe, const fs::path& log)
 
 void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::path& scratch)
 {
-    // 1. Overlapped write_event_bounded must not UAF when pipe buffer saturates and CancelIoEx fires.
-    const auto pipeName = std::wstring(LR"(\\.\pipe\obs-nr-ctrl-cancel-)") + std::to_wstring(GetCurrentProcessId());
-    const Handle pipe{CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
-        PIPE_TYPE_BYTE | PIPE_WAIT, 1, 64, 64, 0, nullptr)};
-    expect(pipe.value != INVALID_HANDLE_VALUE, "create controller cancel pipe");
-    const Handle stopPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    std::thread server([&] {
-        if (ConnectNamedPipe(pipe.value, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
-            WaitForSingleObject(stopPipe.value, INFINITE);
-        }
-    });
-    const std::string bigPayload(16384, 'X');
-    const auto t0 = clock_ns();
-    nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50);
-    const auto elapsedMs = (clock_ns() - t0) / 1'000'000ULL;
-    expect(elapsedMs < 600, "bounded overlapped write must return within timeout + cancel window");
-    SetEvent(stopPipe.value);
-    CancelIoEx(pipe.value, nullptr);
-    DisconnectNamedPipe(pipe.value);
-    server.join();
+    const std::string bigPayload(262144, 'X');
 
-    // 2. Pending vs Succeeded marker status and UserClosed fallback consumption on locked starting marker.
+    // 1a. Normal mode: overlapped WriteFile hits ERROR_IO_PENDING, CancelIoEx cancels it within 50ms grace.
+    {
+        const auto pipeName = std::wstring(LR"(\\.\pipe\obs-nr-ctrl-cancel-a-)") + std::to_wstring(GetCurrentProcessId());
+        const Handle pipe{CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_WAIT, 1, 64, 64, 0, nullptr)};
+        expect(pipe.value != INVALID_HANDLE_VALUE, "create controller cancel pipe 1a");
+        const Handle stopPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        const Handle connectedPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        std::thread server([&] {
+            if (ConnectNamedPipe(pipe.value, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+                SetEvent(connectedPipe.value);
+                WaitForSingleObject(stopPipe.value, INFINITE);
+            }
+        });
+        struct ServerJoin {
+            HANDLE stop; HANDLE p; std::thread& t;
+            ~ServerJoin() { SetEvent(stop); CancelIoEx(p, nullptr); DisconnectNamedPipe(p); if (t.joinable()) t.join(); }
+        } serverGuard{stopPipe.value, pipe.value, server};
+        Sleep(20);
+        const auto t0 = clock_ns();
+        const auto ioRes = nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50);
+        const auto elapsedMs = (clock_ns() - t0) / 1'000'000ULL;
+        expect(WaitForSingleObject(connectedPipe.value, 1000) == WAIT_OBJECT_0, "server pipe 1a connected");
+        expect(ioRes.opened && ioRes.pended && ioRes.cancelled && !ioRes.deferredToPool,
+            "1a: overlapped write must hit ERROR_IO_PENDING and complete via CancelIoEx");
+        expect(elapsedMs < 600, "1a: bounded overlapped write must return promptly");
+    }
+
+    // 1b. Delayed completion past cancel grace: PendingIoWrite + module stay retained in TP_WAIT until kernel completion.
+    {
+        const auto pipeName = std::wstring(LR"(\\.\pipe\obs-nr-ctrl-cancel-b-)") + std::to_wstring(GetCurrentProcessId());
+        const Handle pipe{CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_WAIT, 1, 64, 64, 0, nullptr)};
+        expect(pipe.value != INVALID_HANDLE_VALUE, "create controller cancel pipe 1b");
+        const Handle stopPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        const Handle connectedPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        const Handle reapedEvent{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        expect(stopPipe.value && connectedPipe.value && reapedEvent.value, "create 1b events");
+        std::thread server([&] {
+            if (ConnectNamedPipe(pipe.value, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+                SetEvent(connectedPipe.value);
+                WaitForSingleObject(stopPipe.value, INFINITE);
+            }
+        });
+        struct ServerJoin {
+            HANDLE stop; HANDLE p; std::thread& t;
+            ~ServerJoin() { SetEvent(stop); CancelIoEx(p, nullptr); DisconnectNamedPipe(p); if (t.joinable()) t.join(); }
+        } serverGuard{stopPipe.value, pipe.value, server};
+        Sleep(20);
+        const auto t0 = clock_ns();
+        const auto ioRes = nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50, reapedEvent.value, false, true);
+        const auto elapsedMs = (clock_ns() - t0) / 1'000'000ULL;
+        expect(WaitForSingleObject(connectedPipe.value, 1000) == WAIT_OBJECT_0, "server pipe 1b connected");
+        expect(ioRes.opened && ioRes.pended && ioRes.cancelled && ioRes.deferredToPool,
+            "1b: pending write past cancel grace must hand off to TP_WAIT");
+        expect(elapsedMs < 600, "1b: caller must return bounded without waiting for kernel completion");
+        expect(WaitForSingleObject(reapedEvent.value, 30) == WAIT_TIMEOUT,
+            "1b: PendingIoWrite must stay retained while kernel WriteFile has not completed");
+        SetEvent(stopPipe.value);
+        CancelIoEx(pipe.value, nullptr);
+        DisconnectNamedPipe(pipe.value);
+        server.join();
+        expect(WaitForSingleObject(reapedEvent.value, 2000) == WAIT_OBJECT_0,
+            "1b: TP_WAIT callback must reap PendingIoWrite after kernel I/O completes");
+    }
+
+    // 1c. Forced threadpool-prep failure must return immediately without INFINITE wait.
+    const auto tFail0 = clock_ns();
+    const auto failRes = nr::fg::vfg::detail::write_event_bounded(L"\\\\.\\pipe\\unused", "ignored", 50, nullptr, true, false);
+    const auto failMs = (clock_ns() - tFail0) / 1'000'000ULL;
+    expect(!failRes.opened && !failRes.pended && !failRes.deferredToPool && failMs < 50,
+        "1c: threadpool wait preparation failure must return bounded without issuing WriteFile");
+
+    // 2. Pending vs Succeeded marker status and UserClosed fallback consumption on locked/corrupt markers.
     const auto localApp = scratch / L"ctrl-localapp";
     const auto marks = localApp / L"obs-nr-native-filter";
     fs::remove_all(localApp);
@@ -187,6 +241,38 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         Controller ctrl(opts);
         expect(!fs::exists(starting) && !fs::exists(fallback),
             "next Controller consumes user-closed fallback and starting marker together");
+        ctrl.stop(true);
+    }
+    // Corrupt/truncated fallback must NOT clear starting marker and must degrade to 1x.
+    {
+        std::ofstream(starting) << "real_crash_marker\n";
+        std::ofstream(fallback) << "reason=trunc";
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.multiplier = 2;
+        Controller ctrl(opts);
+        expect(!fs::exists(fallback), "corrupt fallback marker is discarded");
+        const auto ctrlText = [&] { std::ifstream s(scratch / L"ctrl-marker.log"); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(ctrlText.find("event=pushflow_fallback_corrupt") != std::string::npos &&
+            ctrlText.find("event=pushflow_previous_crash_detected") != std::string::npos,
+            "corrupt fallback triggers crash degradation instead of clearing starting marker");
+        ctrl.stop(true);
+    }
+    // Locked fallback (remove failure) must degrade to 1x instead of launching 2x PushFlow with stale fallback.
+    {
+        std::ofstream(starting) << "prior_starting\n";
+        std::ofstream(fallback) << "reason=user_closed_marker_cleanup_failed\n";
+        const Handle lockedFb{CreateFileW(fallback.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr)};
+        expect(lockedFb.value != INVALID_HANDLE_VALUE, "lock fallback marker without FILE_SHARE_DELETE");
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.multiplier = 2;
+        Controller ctrl(opts);
+        const auto ctrlText = [&] { std::ifstream s(scratch / L"ctrl-marker.log"); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(ctrlText.find("event=pushflow_fallback_remove_failed") != std::string::npos &&
+            ctrlText.find("event=pushflow_previous_crash_detected") != std::string::npos,
+            "unremovable fallback marker forces 1x degradation");
         ctrl.stop(true);
     }
     fs::remove_all(localApp);

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
+#pragma warning(push, 0)
 #include <onnxruntime_c_api.h>
+#pragma warning(pop)
 #include <array>
 #include <exception>
 #include <string_view>
