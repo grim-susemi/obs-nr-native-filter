@@ -240,8 +240,8 @@ try {
     Invoke-Checked 'ab-pushflow-stalled-esc' { & $abRunner $modPresenter $LogDir pushflow-stalled-esc }
     Invoke-Checked 'ab-pushflow-userstop-stalled' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled }
     Invoke-Checked 'ab-stalled-log-esc' { & $abRunner $modPresenter $LogDir stalled-log-esc }
-    Invoke-Checked 'ab-watchdog-stalled-unshared-log' { & $abRunner $modPresenter $LogDir watchdog-stalled-unshared-log }
-    Invoke-Checked 'ab-pushflow-userstop-stalled-unshared-log' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled-unshared-log }
+    Invoke-Checked 'ab-watchdog-stalled-pipe-log' { & $abRunner $modPresenter $LogDir watchdog-stalled-pipe-log }
+    Invoke-Checked 'ab-pushflow-userstop-stalled-pipe-log' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled-pipe-log }
     Invoke-Checked 'ab-pushflow-midrun-crash' { & $abRunner $modPresenter $LogDir pushflow-midrun-crash }
 } finally {
     Remove-Item Env:OBS_NR_PUSHFLOW_RUNTIME -ErrorAction SilentlyContinue

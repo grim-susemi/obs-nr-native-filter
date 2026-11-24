@@ -94,6 +94,7 @@ struct Feed {
     std::atomic_int result{-1};
     std::atomic_bool initializing{true};
     std::atomic_bool pushflowActive{false};
+    std::atomic<LONG> pendingAffinityLog{-1};
     pushflow::PreviewMultiplier previewMultiplier;
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
     bool active() { return state(view) == 1 && !stopped(); }
@@ -144,40 +145,6 @@ DWORD fixture_ms(const Session& s, const wchar_t* name)
     wchar_t* end{};
     const auto delay = wcstoul(value, &end, 10);
     return *end ? 0 : std::min(delay, 30'000ul);
-}
-
-void append_log_unshared(const wchar_t* path, const char* text) noexcept
-{
-    if (!path || !*path || !text || !*text) return;
-    const HANDLE handle = CreateFileW(path, FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) return;
-    DWORD written{};
-    WriteFile(handle, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
-    CloseHandle(handle);
-}
-
-HANDLE launch_unshared_log_async(const wchar_t* logPath, const char* line, DWORD stallMs = 0) noexcept
-{
-    if (!logPath || !*logPath || !line || !*line) return nullptr;
-    struct Args {
-        std::wstring logPath;
-        std::string line;
-        DWORD stallMs;
-    };
-    auto* args = new (std::nothrow) Args{logPath, line, stallMs};
-    if (!args) return nullptr;
-    const HANDLE thread = CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-        std::unique_ptr<Args> data(static_cast<Args*>(param));
-        if (data->stallMs) Sleep(data->stallMs);
-        append_log_unshared(data->logPath.c_str(), data->line.c_str());
-        return 0;
-    }, args, 0, nullptr);
-    if (!thread) {
-        delete args;
-        return nullptr;
-    }
-    return thread;
 }
 
 void clear_pushflow_starting_on_close(const Feed& f) noexcept
@@ -338,12 +305,15 @@ void frames(Feed& f)
             pushflowBackend = owner.get();
             backend = std::move(owner);
             f.pushflowActive.store(true);
+            InterlockedExchange(&f.view.pushflowActive, 1);
             if (pushflowBackend->open({f.view, f.log, [&f] { f.beat(); }, userClosing, 0, &f.previewMultiplier}, &gpu))
                 vfg = pushflowBackend;
             else if (pushflowBackend->runtime_fault())
                 check(E_FAIL, "PushFlow initialization fault");
-            else
+            else {
                 f.pushflowActive.store(false);
+                InterlockedExchange(&f.view.pushflowActive, 0);
+            }
             break;
         }
         case Backend::AnrExperimental: {
@@ -451,6 +421,8 @@ void frames(Feed& f)
     while (f.active() && !(pushflowBackend && pushflowBackend->runtime_fault())) {
         if (faultArm.h && WaitForSingleObject(faultArm.h, 0) == WAIT_OBJECT_0)
             throw std::runtime_error("test_live_consumer_fault");
+        if (const LONG aff = f.pendingAffinityLog.exchange(-1, std::memory_order_acq_rel); aff >= 0)
+            fprintf(f.log, "event=display_affinity affinity=0x%lX\n", static_cast<DWORD>(aff));
         sync_reflex();
         sync_affinity();
         sync_hud_lock();
@@ -795,6 +767,7 @@ void frames(Feed& f)
     backend.reset();
     clear_pushflow_starting_on_close(f);
     f.pushflowActive.store(false);
+    InterlockedExchange(&f.view.pushflowActive, 0);
     if (consumer.close() != ipc::Status::Closed) {
         if (f.view.backend == Backend::PushFlow) drain_failure();
         check(E_FAIL, "IPC drain incomplete");
@@ -835,8 +808,11 @@ int wmain(int argc, wchar_t** argv)
     if (!view) return 2;
     struct View { Session* p; ~View() { UnmapViewOfFile(p); } } map{view};
 
-    const HANDLE logHandle = CreateFileW(argv[4], FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool isPipeLog = wcsncmp(argv[4], L"\\\\.\\pipe\\", 9) == 0;
+    const HANDLE logHandle = CreateFileW(argv[4],
+        isPipeLog ? GENERIC_WRITE : FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        isPipeLog ? OPEN_EXISTING : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (logHandle == INVALID_HANDLE_VALUE) return 2;
     const int logFd = _open_osfhandle(reinterpret_cast<intptr_t>(logHandle), _O_APPEND | _O_BINARY);
     if (logFd == -1) { CloseHandle(logHandle); return 2; }
@@ -1037,8 +1013,6 @@ int wmain(int argc, wchar_t** argv)
         SetEvent(workerDone.h);
         PostMessageW(window, workerFinished, 0, 0);
     });
-    const DWORD stallUnsharedLogMs = fixture_ms(*view, L"OBS_NR_TEST_STALL_UNSHARED_LOG_MS");
-    HANDLE watchdogLogThread = nullptr;
     MSG msg{};
     while (feed.result.load() < 0 && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_TIMER) {
@@ -1049,27 +1023,17 @@ int wmain(int argc, wchar_t** argv)
             if (feed.stopped()) {
                 break;
             } else if (elapsed > timeout) {
+                InterlockedExchange(&view->watchdogInitializing, initializing ? 1 : 0);
+                InterlockedExchange64(&view->watchdogElapsedMs,
+                    static_cast<LONG64>(std::max<int64_t>(1, elapsed / ms)));
                 stamp_exit_reason(*view, ExitReason::Watchdog);
-                char timeoutLine[128];
-                const int len = snprintf(timeoutLine, sizeof(timeoutLine),
-                    "event=watchdog_timeout initializing=%d elapsed_ms=%lld\n",
-                    initializing ? 1 : 0, static_cast<long long>(elapsed / ms));
-                if (len > 0)
-                    watchdogLogThread = launch_unshared_log_async(argv[4], timeoutLine, stallUnsharedLogMs);
                 break;
             }
             DWORD currentAffinity = WDA_NONE;
             const DWORD wantedAffinity = display_affinity(InterlockedCompareExchange(&view->hideFromCapture, 0, 0));
             if (GetWindowDisplayAffinity(window, &currentAffinity) && currentAffinity != wantedAffinity) {
-                if (SetWindowDisplayAffinity(window, wantedAffinity)) {
-                    char affinityLine[96];
-                    const int len = snprintf(affinityLine, sizeof(affinityLine),
-                        "event=display_affinity affinity=0x%lX\n", wantedAffinity);
-                    if (len > 0) {
-                        if (const HANDLE h = launch_unshared_log_async(argv[4], affinityLine, stallUnsharedLogMs))
-                            CloseHandle(h);
-                    }
-                }
+                if (SetWindowDisplayAffinity(window, wantedAffinity))
+                    feed.pendingAffinityLog.store(static_cast<LONG>(wantedAffinity), std::memory_order_release);
             }
         }
         TranslateMessage(&msg);
@@ -1081,34 +1045,9 @@ int wmain(int argc, wchar_t** argv)
     ShowWindow(window, SW_HIDE);
     if (WaitForSingleObject(workerDone.h, 1000) != WAIT_OBJECT_0) {
         const auto reason = read_exit_reason(*view);
-        if (reason == ExitReason::UserClosed) {
-            try {
-                (void)pushflow::clear_starting_on_user_close(pushflow::marker_directory(),
-                    feed.pushflowActive.load(), reason);
-            } catch (...) {
-            }
-        }
-        char terminateLine[128];
-        const int len = snprintf(terminateLine, sizeof(terminateLine),
-            "event=shutdown_force_terminate watchdog=%d exit_reason=%ld\n",
-            reason == ExitReason::Watchdog, static_cast<LONG>(reason));
-        HANDLE forceLogThread = len > 0
-            ? launch_unshared_log_async(argv[4], terminateLine, stallUnsharedLogMs)
-            : nullptr;
-        HANDLE waitHandles[2]{};
-        DWORD waitCount = 0;
-        if (watchdogLogThread) waitHandles[waitCount++] = watchdogLogThread;
-        if (forceLogThread) waitHandles[waitCount++] = forceLogThread;
-        if (waitCount) {
-            WaitForMultipleObjects(waitCount, waitHandles, TRUE, 150);
-            for (DWORD i = 0; i < waitCount; ++i) CloseHandle(waitHandles[i]);
-        }
+        InterlockedExchange(&view->forceTerminated, 1);
         TerminateProcess(GetCurrentProcess(), reason == ExitReason::UserClosed ? 0u : 2u);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    }
-    if (watchdogLogThread) {
-        WaitForSingleObject(watchdogLogThread, 150);
-        CloseHandle(watchdogLogThread);
     }
     worker.join();
     DestroyWindow(window);

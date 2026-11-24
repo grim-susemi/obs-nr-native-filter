@@ -51,19 +51,11 @@ bool check_refusal(const LinkCase& test, const fs::path& dll)
     require(attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT),
         "fixture does not have the reparse attribute");
     const auto validation = nr::fg::anr::validate_addon(dll.native(), true);
-    unsigned loaderCalls{}, launcherCalls{};
-    const auto load = [&] { ++loaderCalls; };
-    const auto launch = [&] { ++launcherCalls; };
-    if (validation.status == ValidationStatus::Accepted) {
-        load();
-        launch();
-    }
     std::cout << test.label << " status=" << nr::fg::anr::status_name(validation.status)
-        << " relative_path=" << validation.relativePath << " loader_calls=" << loaderCalls
-        << " launcher_calls=" << launcherCalls << " reparse_attribute=1\n";
+        << " relative_path=" << validation.relativePath << " reparse_attribute=1\n";
     require(link.remove(), "remove owned link without following it");
     return validation.status == ValidationStatus::ReparseOrRootEscape && validation.relativePath == test.expectedPath &&
-        !validation.addon && loaderCalls == 0 && launcherCalls == 0;
+        !validation.addon;
 }
 } // namespace
 

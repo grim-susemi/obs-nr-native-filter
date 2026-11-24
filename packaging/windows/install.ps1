@@ -328,7 +328,13 @@ function Get-HttpFile([string]$Url, [string]$Dest) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dest) | Out-Null
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if ($curl) {
-        & $curl.Source -fsSL --retry 2 -o $Dest $Url
+        $curlArgs = @('-fsSL', '--retry', '2')
+        if ($Url -match '\Ahttps://127\.0\.0\.1[:/]' -and $env:OBS_NR_CURL_CA_BUNDLE -and
+            (Test-Path -LiteralPath $env:OBS_NR_CURL_CA_BUNDLE -PathType Leaf)) {
+            $curlArgs += @('--cacert', $env:OBS_NR_CURL_CA_BUNDLE)
+        }
+        $curlArgs += @('-o', $Dest, $Url)
+        & $curl.Source @curlArgs
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest -PathType Leaf)) { return }
     }
     Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing

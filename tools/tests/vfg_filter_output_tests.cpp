@@ -677,15 +677,20 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
             expect(PostMessageW(window, WM_KEYDOWN, VK_ESCAPE, 0) != FALSE, "Esc on recovered 1x");
         } else expect(TerminateProcess(child.value, 8) != FALSE, "second unexpected exit");
         await([&] { return WaitForSingleObject(child.value, 0) == WAIT_OBJECT_0; }, "replacement closed");
-        if (s.closeRecovered)
-            expect(text_of(quarantine) == "reason=controller_unexpected_exit\n" &&
-                !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty(),
+        if (s.closeRecovered) {
+            await([&] {
+                return !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty();
+            }, "forced Esc in recovered 1x diagnostic", 1000);
+            expect(text_of(quarantine) == "reason=controller_unexpected_exit\n",
                 "forced Esc in recovered 1x preserves quarantine");
+        }
     } else {
         if (oldExit != 0)
             throw std::runtime_error("user/parent close exited " + std::to_string(oldExit));
-        if (s.stall || (s.action == Action::Stop && s.closeRecovered)) expect(
-            !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty(), "stalled user close preserves UserClosed");
+        if (s.stall || (s.action == Action::Stop && s.closeRecovered))
+            await([&] {
+                return !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty();
+            }, "stalled user close preserves UserClosed", 1000);
         expect(!fs::exists(quarantine), "intentional stop never quarantined");
     }
     const auto observed = stats.rawCount.load();

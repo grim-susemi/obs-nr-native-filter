@@ -32,6 +32,8 @@ struct Session {
     uint64_t launchEpoch = 1; // A recovery child must not replay first-launch fixtures.
     wchar_t pushflowRuntimeDir[520]{}, anrDllPath[520]{};
     alignas(4) volatile LONG hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{}, exitReason{};
+    alignas(4) volatile LONG forceTerminated{}, watchdogInitializing{}, pushflowActive{};
+    alignas(8) volatile LONG64 watchdogElapsedMs{};
     alignas(8) volatile LONG64 state; // 0 initializing, 1 offered, 2 drain for resize, 3 drained, -1 stop
     uint64_t generation;
     uint32_t width, height;

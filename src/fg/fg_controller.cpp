@@ -91,16 +91,73 @@ fs::path marker_dir()
     const auto local = env_path(L"LOCALAPPDATA");
     return local.empty() ? fs::path{} : fs::path(local) / L"obs-nr-native-filter";
 }
-void write_event(const char* event)
+void write_event_bounded(const std::wstring& path, const std::string& text, DWORD timeoutMs = 150) noexcept
 {
-    const auto path = resolve_log_path();
-    Handle file{CreateFileW(path.c_str(), FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    if (path.empty() || text.empty()) return;
+    const bool isPipe = path.rfind(LR"(\\.\pipe\)", 0) == 0;
+    Handle file{CreateFileW(path.c_str(),
+        isPipe ? GENERIC_WRITE : FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        isPipe ? OPEN_EXISTING : OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        nullptr)};
     if (file.value == INVALID_HANDLE_VALUE) { file.value = nullptr; return; }
+    Handle done{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    if (!done.value) return;
+    OVERLAPPED ov{};
+    ov.hEvent = done.value;
+    if (!isPipe) {
+        ov.Offset = 0xFFFFFFFFu;
+        ov.OffsetHigh = 0xFFFFFFFFu;
+    }
     DWORD written{};
-    WriteFile(file.value, event, static_cast<DWORD>(strlen(event)), &written, nullptr);
+    if (!WriteFile(file.value, text.data(), static_cast<DWORD>(text.size()), &written, &ov)) {
+        if (GetLastError() != ERROR_IO_PENDING) return;
+        if (WaitForSingleObject(done.value, timeoutMs) != WAIT_OBJECT_0) {
+            CancelIoEx(file.value, &ov);
+            WaitForSingleObject(done.value, 50);
+        }
+    }
+}
+void write_event(const char* event) noexcept
+{
+    try {
+        write_event_bounded(resolve_log_path(), event ? event : "");
+    } catch (...) {
+    }
+}
+bool clear_starting_marker(const fs::path& marks, std::error_code& ec) noexcept
+{
+    ec.clear();
+    if (marks.empty()) {
+        ec = std::make_error_code(std::errc::no_such_file_or_directory);
+        return false;
+    }
+    const auto starting = marks / L"pushflow-starting.txt";
+    if (fs::exists(starting, ec) && !ec) fs::remove(starting, ec);
+    return !ec;
 }
 } // namespace
+
+struct Controller::ChildSession {
+    HANDLE job{}, child{}, mapping{};
+    Session* view{};
+    HANDLE exitSettledEvent{};
+    std::wstring logPath;
+    std::atomic_bool markerCleanupFailed{false};
+    std::jthread observer;
+
+    ~ChildSession()
+    {
+        if (observer.joinable()) observer.join();
+        if (exitSettledEvent) CloseHandle(exitSettledEvent);
+        if (job) CloseHandle(job);
+        if (child) CloseHandle(child);
+        if (view) UnmapViewOfFile(view);
+        if (mapping) CloseHandle(mapping);
+    }
+};
 
 std::wstring Controller::find_runtime_dir()
 {
@@ -200,7 +257,12 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         const auto marks = marker_dir();
         const auto starting = marks / L"pushflow-starting.txt";
         const auto quarantine = marks / L"pushflow-crash-quarantine.txt";
+        const auto userClosedMark = marks / L"pushflow-user-closed.txt";
         std::error_code ec;
+        if (!marks.empty() && fs::exists(userClosedMark, ec)) {
+            if (!fs::exists(quarantine, ec)) fs::remove(starting, ec);
+            fs::remove(userClosedMark, ec);
+        }
         if (!marks.empty() && (fs::exists(starting, ec) || fs::exists(quarantine, ec))) {
             write_event("event=pushflow_previous_crash_detected\n");
             fs::remove(starting, ec);
@@ -266,25 +328,101 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         require(false, "VFG bind presenter job");
     }
     AllowSetForegroundWindow(child.dwProcessId);
+    auto session = std::make_unique<ChildSession>();
+    Handle exitSettled{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    require(exitSettled.value != nullptr, "VFG exit settled event");
     if (!fallback && options.backend != Backend::NativeVfg) {
         auto recovery = options_;
         recovery.multiplier = 1;
         recovery.pushflowRuntimeDir.clear();
         relaunchWorker_ = std::jthread([this, recovery = std::move(recovery)] { run_fallback(recovery); });
     }
-    view_ = view;
+    session->view = view;
     guard.p = nullptr;
-    child_ = process.release();
-    mapping_ = mapping.release();
-    job_ = job.release();
+    session->child = process.release();
+    session->mapping = mapping.release();
+    session->job = job.release();
+    session->exitSettledEvent = exitSettled.release();
+    session->logPath = log;
+    session->observer = std::jthread([s = session.get(), backend = options_.backend, marks = marker_dir()] {
+        WaitForSingleObject(s->child, INFINITE);
+        const auto reason = read_exit_reason(*s->view);
+        const auto wdMs = InterlockedCompareExchange64(&s->view->watchdogElapsedMs, 0, 0);
+        const auto wdInit = InterlockedCompareExchange(&s->view->watchdogInitializing, 0, 0) != 0;
+        const auto forced = InterlockedCompareExchange(&s->view->forceTerminated, 0, 0) != 0;
+        const auto pfActive = InterlockedCompareExchange(&s->view->pushflowActive, 0, 0) != 0;
+        bool cleanupFailed = false;
+        if (reason == ExitReason::UserClosed && backend == Backend::PushFlow && pfActive) {
+            std::error_code ec;
+            if (!clear_starting_marker(marks, ec)) {
+                cleanupFailed = true;
+                s->markerCleanupFailed.store(true, std::memory_order_release);
+                std::error_code fallbackEc;
+                if (!marks.empty()) {
+                    fs::create_directories(marks, fallbackEc);
+                    std::ofstream fallback(marks / L"pushflow-user-closed.txt", std::ios::binary | std::ios::trunc);
+                    fallback << "reason=user_closed_marker_cleanup_failed\n";
+                }
+            }
+        }
+        std::string diag;
+        if (wdMs > 0) {
+            char line[128];
+            const int n = snprintf(line, sizeof(line),
+                "event=watchdog_timeout initializing=%d elapsed_ms=%lld\n",
+                wdInit ? 1 : 0, static_cast<long long>(wdMs));
+            if (n > 0) diag.append(line, static_cast<size_t>(n));
+        }
+        if (forced) {
+            char line[128];
+            const int n = snprintf(line, sizeof(line),
+                "event=shutdown_force_terminate watchdog=%d exit_reason=%ld\n",
+                reason == ExitReason::Watchdog, static_cast<LONG>(reason));
+            if (n > 0) diag.append(line, static_cast<size_t>(n));
+        }
+        if (cleanupFailed) diag += "event=pushflow_marker_cleanup_failed\n";
+        if (!diag.empty()) write_event_bounded(s->logPath, diag, 150);
+        SetEvent(s->exitSettledEvent);
+    });
+    session_ = std::move(session);
+}
+
+ipc::Peer Controller::peer() const { return ipc::identity(session_->child); }
+bool Controller::alive() const noexcept { return session_ && WaitForSingleObject(session_->child, 0) == WAIT_TIMEOUT; }
+bool Controller::exited() const noexcept
+{
+    return relaunchState_.load() != RelaunchState::InFlight &&
+        relaunchState_.load() != RelaunchState::Ready &&
+        session_ && WaitForSingleObject(session_->child, 0) == WAIT_OBJECT_0;
+}
+bool Controller::await_exit_cleanup(DWORD timeoutMs) const noexcept
+{
+    return session_ && session_->exitSettledEvent &&
+        WaitForSingleObject(session_->exitSettledEvent, timeoutMs) == WAIT_OBJECT_0;
+}
+bool Controller::user_close_marker_cleaned() const noexcept
+{
+    return session_ && !session_->markerCleanupFailed.load(std::memory_order_acquire);
+}
+bool Controller::request_resize() noexcept
+{
+    return session_ && session_->view && InterlockedCompareExchange64(&session_->view->state, 2, 1) == 1;
+}
+bool Controller::resize_drained() const noexcept
+{
+    return session_ && session_->view && InterlockedCompareExchange64(&session_->view->state, 3, 3) == 3;
+}
+ExitReason Controller::exit_reason() const noexcept
+{
+    return session_ && session_->view ? read_exit_reason(*session_->view) : ExitReason::None;
 }
 
 void Controller::request_stop(bool userStop) noexcept
 {
     stopRequested_.store(true);
-    if (view_) {
-        if (userStop) stamp_exit_reason(*view_, ExitReason::UserClosed);
-        InterlockedExchange64(&view_->state, -1);
+    if (session_ && session_->view) {
+        if (userStop) stamp_exit_reason(*session_->view, ExitReason::UserClosed);
+        InterlockedExchange64(&session_->view->state, -1);
     }
     wakeRelaunch_.store(true);
     wakeRelaunch_.notify_one();
@@ -296,6 +434,16 @@ void Controller::stop(bool userStop) noexcept
     if (relaunchWorker_.joinable()) relaunchWorker_.join();
     replacement_.reset();
     relaunchState_.store(RelaunchState::Idle);
+    if (userStop && session_ && options_.backend == Backend::PushFlow) {
+        if (session_->child && WaitForSingleObject(session_->child, 0) == WAIT_OBJECT_0) {
+            await_exit_cleanup(200);
+            if (session_->markerCleanupFailed.load(std::memory_order_acquire)) {
+                std::error_code ec;
+                if (clear_starting_marker(marker_dir(), ec))
+                    session_->markerCleanupFailed.store(false, std::memory_order_release);
+            }
+        }
+    }
 }
 
 bool Controller::is_fault_or_watchdog_exit() const noexcept
@@ -313,7 +461,7 @@ bool Controller::can_recover() const noexcept
 bool Controller::begin_async_fallback_relaunch(bool forceFaultOnTimeout) noexcept
 {
     if (!can_recover() || (!forceFaultOnTimeout && !is_fault_or_watchdog_exit() && alive())) return false;
-    if (forceFaultOnTimeout) stamp_exit_reason(*view_, ExitReason::Fault);
+    if (forceFaultOnTimeout && session_ && session_->view) stamp_exit_reason(*session_->view, ExitReason::Fault);
     if (exit_reason() == ExitReason::UserClosed) return false;
     fallbackRestarted_ = true;
     relaunchState_.store(RelaunchState::InFlight);
@@ -327,8 +475,9 @@ void Controller::run_fallback(LaunchOptions recovery)
     wakeRelaunch_.wait(false);
     if (stopRequested_.load() || exit_reason() == ExitReason::UserClosed) return;
     try {
-        if (alive()) TerminateProcess(child_, 2);
-        require(WaitForSingleObject(child_, 1000) == WAIT_OBJECT_0, "VFG faulted child reap");
+        if (alive()) TerminateProcess(session_->child, 2);
+        require(WaitForSingleObject(session_->child, 1000) == WAIT_OBJECT_0, "VFG faulted child reap");
+        await_exit_cleanup(200);
         if (stopRequested_.load() || exit_reason() == ExitReason::UserClosed) return;
         if (recovery.backend == Backend::PushFlow) {
             const auto marks = marker_dir();
@@ -355,16 +504,53 @@ RelaunchState Controller::poll_async_fallback_relaunch() noexcept
 {
     const auto result = relaunchState_.load();
     if (result == RelaunchState::Ready && !stopRequested_.load()) {
-        std::swap(job_, replacement_->job_);
-        std::swap(child_, replacement_->child_);
-        std::swap(mapping_, replacement_->mapping_);
-        std::swap(view_, replacement_->view_);
+        std::swap(session_, replacement_->session_);
         options_.multiplier = 1;
         ++launchEpoch_;
         sync_live_settings();
         relaunchState_.store(RelaunchState::Idle);
     }
     return result;
+}
+
+void Controller::set_fps_overlay(uint32_t pos) noexcept
+{
+    options_.fpsOverlay = pos;
+    if (session_ && session_->view) InterlockedExchange(&session_->view->fpsOverlay, static_cast<LONG>(pos));
+}
+void Controller::set_low_latency(uint32_t on) noexcept
+{
+    options_.lowLatency = on;
+    if (session_ && session_->view) InterlockedExchange(&session_->view->lowLatency, static_cast<LONG>(on));
+}
+void Controller::set_hide_from_capture(uint32_t hide) noexcept
+{
+    options_.hideFromCapture = hide ? 1u : 0u;
+    if (session_ && session_->view)
+        InterlockedExchange(&session_->view->hideFromCapture, static_cast<LONG>(options_.hideFromCapture));
+}
+void Controller::set_hud_lock(uint32_t on) noexcept
+{
+    options_.hudLock = on != 0;
+    if (session_ && session_->view) InterlockedExchange(&session_->view->hudLock, static_cast<LONG>(options_.hudLock));
+}
+void Controller::set_pacing_repair(uint32_t on) noexcept
+{
+    options_.pacingRepair = on != 0;
+    if (session_ && session_->view)
+        InterlockedExchange(&session_->view->pacingRepair, static_cast<LONG>(options_.pacingRepair));
+}
+void Controller::set_adaptive_fg(uint32_t on) noexcept
+{
+    options_.adaptiveFg = on != 0;
+    if (session_ && session_->view)
+        InterlockedExchange(&session_->view->adaptiveFg, static_cast<LONG>(options_.adaptiveFg));
+}
+void Controller::set_adaptive_target_fps(uint32_t fps) noexcept
+{
+    options_.adaptiveTargetFps = fps <= LONG_MAX ? fps : 0;
+    if (session_ && session_->view)
+        InterlockedExchange(&session_->view->adaptiveTargetFps, static_cast<LONG>(options_.adaptiveTargetFps));
 }
 
 void Controller::sync_live_settings() noexcept
@@ -381,34 +567,32 @@ void Controller::sync_live_settings() noexcept
 Controller::~Controller()
 {
     stop();
-    if (job_) CloseHandle(job_);
-    if (child_) CloseHandle(child_);
-    if (view_) UnmapViewOfFile(view_);
-    if (mapping_) CloseHandle(mapping_);
+    session_.reset();
 }
 
 bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID adapter) noexcept
 {
-    if (offer.mapping.size() >= ARRAYSIZE(view_->mapping)) return false;
-    const auto prior = InterlockedCompareExchange64(&view_->state, 0, 0);
+    if (!session_ || !session_->view || offer.mapping.size() >= ARRAYSIZE(session_->view->mapping)) return false;
+    auto* view = session_->view;
+    const auto prior = InterlockedCompareExchange64(&view->state, 0, 0);
     if (prior != 0 && prior != 3) return false;
-    view_->generation = offer.generation;
-    view_->width = shape.width;
-    view_->height = shape.height;
-    view_->splitCompare = shape.splitCompare ? 1u : 0u;
-    view_->multiplier = std::clamp<uint32_t>(options_.multiplier, 1, max_multiplier);
-    view_->quality = static_cast<uint32_t>(options_.quality);
-    view_->adapter = adapter;
-    InterlockedExchange(&view_->fpsOverlay, static_cast<LONG>(std::min<uint32_t>(options_.fpsOverlay, 2)));
-    InterlockedExchange(&view_->lowLatency, static_cast<LONG>(options_.lowLatency ? 1u : 0u));
-    InterlockedExchange(&view_->gpuPriority, static_cast<LONG>(options_.gpuPriority ? 1u : 0u));
-    InterlockedExchange(&view_->hideFromCapture, static_cast<LONG>(options_.hideFromCapture ? 1u : 0u));
-    wcscpy_s(view_->mapping, offer.mapping.c_str());
-    if (!options_.monitorId.empty() && options_.monitorId.size() < ARRAYSIZE(view_->monitorId)) {
-        wcscpy_s(view_->monitorId, options_.monitorId.c_str());
+    view->generation = offer.generation;
+    view->width = shape.width;
+    view->height = shape.height;
+    view->splitCompare = shape.splitCompare ? 1u : 0u;
+    view->multiplier = std::clamp<uint32_t>(options_.multiplier, 1, max_multiplier);
+    view->quality = static_cast<uint32_t>(options_.quality);
+    view->adapter = adapter;
+    InterlockedExchange(&view->fpsOverlay, static_cast<LONG>(std::min<uint32_t>(options_.fpsOverlay, 2)));
+    InterlockedExchange(&view->lowLatency, static_cast<LONG>(options_.lowLatency ? 1u : 0u));
+    InterlockedExchange(&view->gpuPriority, static_cast<LONG>(options_.gpuPriority ? 1u : 0u));
+    InterlockedExchange(&view->hideFromCapture, static_cast<LONG>(options_.hideFromCapture ? 1u : 0u));
+    wcscpy_s(view->mapping, offer.mapping.c_str());
+    if (!options_.monitorId.empty() && options_.monitorId.size() < ARRAYSIZE(view->monitorId)) {
+        wcscpy_s(view->monitorId, options_.monitorId.c_str());
     } else {
-        view_->monitorId[0] = L'\0';
+        view->monitorId[0] = L'\0';
     }
-    return InterlockedCompareExchange64(&view_->state, 1, prior) == prior;
+    return InterlockedCompareExchange64(&view->state, 1, prior) == prior;
 }
 } // namespace nr::fg::vfg
