@@ -145,7 +145,7 @@ std::string format_marker_token_a(uint64_t token)
     snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(token));
     return buf;
 }
-std::optional<uint64_t> parse_token_from_filename(const std::wstring& name)
+std::optional<uint64_t> parse_token_from_filename(std::wstring_view name) noexcept
 {
     constexpr std::wstring_view prefix = L"pushflow-starting-";
     constexpr std::wstring_view suffix = L".txt";
@@ -162,21 +162,41 @@ std::optional<uint64_t> parse_token_from_filename(const std::wstring& name)
     }
     return out ? std::optional<uint64_t>(out) : std::nullopt;
 }
+std::atomic<detail::MarkerMutexCreateFn> g_markerMutexCreateForTest{nullptr};
+HANDLE create_marker_mutex_checked(LPCWSTR name) noexcept
+{
+    if (const auto fn = g_markerMutexCreateForTest.load(std::memory_order_acquire)) {
+        return fn(nullptr, FALSE, name);
+    }
+    wchar_t failMode[8]{};
+    const auto len = GetEnvironmentVariableW(L"OBS_NR_TEST_MARKER_MUTEX_FAIL", failMode, ARRAYSIZE(failMode));
+    if (len == 1 && failMode[0] == L'1') {
+        SetLastError(ERROR_NO_SYSTEM_RESOURCES);
+        return nullptr;
+    }
+    if (len == 1 && failMode[0] == L'2') {
+        SetLastError(ERROR_ALREADY_EXISTS);
+        return CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+    return CreateMutexW(nullptr, FALSE, name);
+}
 uint64_t allocate_marker_token(Handle& outLock)
 {
+    constexpr int maxCollisionAttempts = 64;
     static std::atomic_uint64_t seq{1};
     const uint64_t pidMix = static_cast<uint64_t>(GetCurrentProcessId()) << 32;
-    for (;;) {
+    for (int attempt = 0; attempt < maxCollisionAttempts; ++attempt) {
         const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed);
         const uint64_t tok = pidMix ^ n ^ (clock_ns() & 0xFFFFFFFFULL);
         if (tok == 0) continue;
         const auto name = marker_mutex_name(tok);
-        Handle h{CreateMutexW(nullptr, FALSE, name.c_str())};
-        if (!h.value) continue;
-        if (GetLastError() == ERROR_ALREADY_EXISTS) continue;
+        Handle h{create_marker_mutex_checked(name.c_str())};
+        if (!h.value) break; // Non-collision creation failure must not spin or retry.
+        if (GetLastError() == ERROR_ALREADY_EXISTS) continue; // Bounded retry ONLY on confirmed name collision.
         outLock = std::move(h);
         return tok;
     }
+    return 0;
 }
 bool is_marker_token_active(uint64_t token) noexcept
 {
@@ -185,9 +205,10 @@ bool is_marker_token_active(uint64_t token) noexcept
         const auto name = marker_mutex_name(token);
         Handle h{OpenMutexW(SYNCHRONIZE, FALSE, name.c_str())};
         if (h.value) return true;
-        return GetLastError() == ERROR_ACCESS_DENIED;
+        // Only treat confirmed absence as dead; preserve other hosts' markers fail-closed on lookup errors.
+        return GetLastError() != ERROR_FILE_NOT_FOUND;
     } catch (...) {
-        return false;
+        return true;
     }
 }
 
@@ -202,7 +223,6 @@ struct PendingIoWrite {
     {
         file.reset();
         event.reset();
-        text.clear();
         waitMod.reset();
     }
 };
@@ -477,6 +497,10 @@ WriteEventStatus write_event_bounded(const std::wstring& path, const std::string
     }
     return status;
 }
+void set_marker_mutex_create_fn_for_test(MarkerMutexCreateFn fn) noexcept
+{
+    g_markerMutexCreateForTest.store(fn, std::memory_order_release);
+}
 } // namespace detail
 
 struct Controller::ChildSession {
@@ -684,6 +708,12 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     Handle markerLock;
     if (options_.backend == Backend::PushFlow && options_.multiplier > 1) {
         header.markerOwnerToken = allocate_marker_token(markerLock);
+        if (header.markerOwnerToken == 0) {
+            write_event("event=pushflow_marker_lock_failed_fallback_1x\n");
+            options_.multiplier = 1;
+            options_.pushflowRuntimeDir.clear();
+            std::fill(std::begin(header.pushflowRuntimeDir), std::end(header.pushflowRuntimeDir), L'\0');
+        }
     }
     require(validate_session_header(header), "VFG invalid session header");
     Handle job{CreateJobObjectW(nullptr, nullptr)}, parent;

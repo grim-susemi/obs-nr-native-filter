@@ -30,11 +30,11 @@ void check_header()
         !opts.gpuShotChange && !opts.experimentalAnrOptIn && !opts.hudLock && !opts.pacingRepair &&
         !opts.adaptiveFg && !opts.adaptiveTargetFps, "v0.2.10 launch defaults");
     Session s{};
-    expect(s.sessionVersion == nr::fg::vfg::session_version && s.sessionBytes == sizeof(Session) && validate_session_header(s),
-        "default session version and size");
+    expect(s.sessionVersion == 2 && s.sessionBytes == sizeof(Session) && validate_session_header(s),
+        "default v2 session");
     s.sessionVersion = 99;
     expect(!validate_session_header(s), "reject bad ABI version");
-    s.sessionVersion = nr::fg::vfg::session_version;
+    s.sessionVersion = 2;
     --s.sessionBytes;
     expect(!validate_session_header(s), "reject bad ABI byte count");
     ++s.sessionBytes;
@@ -240,9 +240,7 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
     }
 
     // 1d. Stalled diagnostic open/write in TP_WORK must NOT block write_event_bounded, Controller cleanup, destruction, or reopen.
-    // Also verify zero OS handle leaks across normal, cancel (1a), deferred reap (1b), prep failure (1c), and stalled diag (1d).
-    DWORD baselineHandles = 0;
-    expect(GetProcessHandleCount(GetCurrentProcess(), &baselineHandles) != FALSE, "query baseline handle count");
+    // Also verify zero OS handle leaks across repeated normal diagnostic writes.
     {
         const auto diagLog = scratch / L"ctrl-diag-stall.log";
         fs::remove(diagLog);
@@ -480,6 +478,79 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
             ctrlText.find("event=pushflow_previous_crash_detected") != std::string::npos,
             "unremovable fallback marker forces 1x degradation");
         ctrl.stop(true);
+    }
+
+    // 3. Persistent CreateMutexW failure or bounded collision exhaustion must NOT spin indefinitely or launch unprotected 2x:
+    //    must degrade explicitly to 1x original mode in bounded time with zero OS handle leak.
+    {
+        static std::atomic_int mutexCalls{0};
+        struct MutexHookGuard {
+            ~MutexHookGuard() { nr::fg::vfg::detail::set_marker_mutex_create_fn_for_test(nullptr); }
+        } hookGuard;
+
+        // 3a. Non-collision failure (nullptr + ERROR_NO_SYSTEM_RESOURCES) must break immediately on attempt 1 (no retry spin).
+        mutexCalls.store(0);
+        nr::fg::vfg::detail::set_marker_mutex_create_fn_for_test([](LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR) -> HANDLE {
+            mutexCalls.fetch_add(1, std::memory_order_relaxed);
+            SetLastError(ERROR_NO_SYSTEM_RESOURCES);
+            return nullptr;
+        });
+        const auto failLog = scratch / L"ctrl-mutex-fail.log";
+        fs::remove(failLog);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", failLog.c_str());
+        {
+            const auto t0 = clock_ns();
+            LaunchOptions opts{};
+            opts.backend = Backend::PushFlow;
+            opts.multiplier = 2;
+            Controller ctrl(opts);
+            const auto ms = (clock_ns() - t0) / 1'000'000ULL;
+            expect(mutexCalls.load() == 1 && ms < 1000,
+                "3a: non-collision CreateMutexW failure must stop immediately without retry spin");
+            expect(ctrl.alive(), "3a: fallback 1x presenter launched cleanly");
+            ctrl.stop(true);
+            expect(ctrl.await_exit_cleanup(1500), "3a: controller cleanup after 1x fallback");
+        }
+        const auto failTxt = [&] { std::ifstream s(failLog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(failTxt.find("event=pushflow_marker_lock_failed_fallback_1x") != std::string::npos &&
+            failTxt.find("event=session_started backend=pushflow") != std::string::npos &&
+            failTxt.find("mode=2x") == std::string::npos,
+            "3a: CreateMutexW failure degrades explicitly to 1x without starting unprotected 2x");
+
+        // 3b. Persistent ERROR_ALREADY_EXISTS collision must be bounded at 64 retries, close duplicate handles, and degrade to 1x.
+        mutexCalls.store(0);
+        DWORD handlesBefore = 0, handlesAfter = 0;
+        expect(GetProcessHandleCount(GetCurrentProcess(), &handlesBefore) != FALSE, "query handles before 3b");
+        nr::fg::vfg::detail::set_marker_mutex_create_fn_for_test([](LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR) -> HANDLE {
+            mutexCalls.fetch_add(1, std::memory_order_relaxed);
+            const HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            SetLastError(ERROR_ALREADY_EXISTS);
+            return h;
+        });
+        const auto collLog = scratch / L"ctrl-mutex-collision.log";
+        fs::remove(collLog);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", collLog.c_str());
+        {
+            const auto t0 = clock_ns();
+            LaunchOptions opts{};
+            opts.backend = Backend::PushFlow;
+            opts.multiplier = 2;
+            Controller ctrl(opts);
+            const auto ms = (clock_ns() - t0) / 1'000'000ULL;
+            expect(mutexCalls.load() == 64 && ms < 1000,
+                "3b: ERROR_ALREADY_EXISTS retry loop must be bounded at 64 attempts");
+            expect(ctrl.alive(), "3b: fallback 1x presenter launched cleanly");
+            ctrl.stop(true);
+            expect(ctrl.await_exit_cleanup(1500), "3b: controller cleanup after collision exhaustion");
+        }
+        expect(GetProcessHandleCount(GetCurrentProcess(), &handlesAfter) != FALSE, "query handles after 3b");
+        expect(handlesAfter <= handlesBefore + 2,
+            "3b: bounded collision retries must close existing handles without leaking");
+        const auto collTxt = [&] { std::ifstream s(collLog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(collTxt.find("event=pushflow_marker_lock_failed_fallback_1x") != std::string::npos &&
+            collTxt.find("event=session_started backend=pushflow") != std::string::npos &&
+            collTxt.find("mode=2x") == std::string::npos,
+            "3b: collision exhaustion degrades explicitly to 1x without starting unprotected 2x");
     }
     fs::remove_all(localApp);
 }

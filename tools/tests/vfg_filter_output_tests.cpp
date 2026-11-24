@@ -940,6 +940,74 @@ void immediate_esc_reopen_stalled_diag_case(const fs::path& scratch, const fs::p
         firstPid, field(secondOffer, "pid=").c_str(), count_events(tail, "event=present_vfg_subframe "));
 }
 
+void mutex_failure_fallback_unlocks_tap_case(const fs::path& scratch, const fs::path& log, const std::wstring& pfRuntime)
+{
+    const auto marks = scratch / L"obs-nr-native-filter";
+    fs::remove_all(marks);
+    fs::remove(log);
+    wchar_t prevLog[4096]{};
+    const auto prevLogLen = GetEnvironmentVariableW(L"OBS_NR_VFG_LOG", prevLog, ARRAYSIZE(prevLog));
+    SetEnvironmentVariableW(L"LOCALAPPDATA", scratch.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    SetEnvironmentVariableW(L"OBS_NR_TEST_MARKER_MUTEX_FAIL", L"1");
+
+    fixtureAnimate.store(true);
+    struct MutexFailGuard {
+        std::wstring restoreLog;
+        ~MutexFailGuard()
+        {
+            SetEnvironmentVariableW(L"OBS_NR_TEST_MARKER_MUTEX_FAIL", nullptr);
+            SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", restoreLog.empty() ? nullptr : restoreLog.c_str());
+            fixtureAnimate.store(false);
+        }
+    } guard{prevLogLen && prevLogLen < ARRAYSIZE(prevLog) ? std::wstring(prevLog, prevLogLen) : std::wstring{}};
+
+    auto input = source("vfg_test_color");
+    auto data = settings();
+    obs_data_set_int(data.get(), "vfg_backend", 1);
+    auto filter = source(filterId, data.get());
+    obs_source_filter_add(input.get(), filter.get());
+    obs_set_output_source(0, input.get());
+    struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+    const auto props = properties(filter.get());
+
+    const auto tStart0 = qpc_now_ns();
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get()),
+        "libobs vfg_start under CreateMutexW failure returns cleanly");
+    const auto startMs = (qpc_now_ns() - tStart0) / 1'000'000LL;
+    expect(startMs < 1000, "libobs vfg_start under CreateMutexW failure must NOT spin on tap.command");
+
+    await([&] {
+        const auto t = text_of(log);
+        return t.find("event=pushflow_marker_lock_failed_fallback_1x") != std::string::npos &&
+            count_events(t, "event=present_original ") >= 3;
+    }, "1x fallback output under CreateMutexW failure", 6000);
+    const auto t1 = text_of(log);
+    expect(count_events(t1, "event=present_vfg_subframe ") == 0 &&
+        t1.find("mode=1x") != std::string::npos && t1.find("mode=2x") == std::string::npos,
+        "CreateMutexW failure must NOT start unprotected 2x PushFlow");
+
+    // Verify tap.command lock was released cleanly by stopping and then reopening normal 2x PushFlow.
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()),
+        "libobs vfg_stop after CreateMutexW fallback proves tap.command lock released");
+    SetEnvironmentVariableW(L"OBS_NR_TEST_MARKER_MUTEX_FAIL", nullptr);
+    const auto reopenOff = text_of(log).size();
+    await([&] {
+        return obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get());
+    }, "libobs vfg_start resumes 2x PushFlow after mutex failure clears", 2500);
+    await([&] {
+        const auto tail = text_of(log).substr(reopenOff);
+        return !event(tail, "event=initialized backend=pushflow ").empty() &&
+            count_events(tail, "event=present_vfg_subframe ") >= 3;
+    }, "2x PushFlow synthesis resumes after mutex fallback recovery", 10000);
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()), "stop resumed 2x PushFlow");
+    obs_source_filter_remove(input.get(), filter.get());
+    std::printf("PASS k-mutex-fail-fallback-unlock start_ms=%lld orig=%zu\n",
+        static_cast<long long>(startMs), count_events(t1, "event=present_original "));
+}
+
 void pacing_repair_ab_case(const fs::path& log)
 {
     SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
@@ -1138,6 +1206,7 @@ int run_host(int argc, wchar_t** argv)
             const auto pfLen = GetEnvironmentVariableW(L"OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME", pfBuf, ARRAYSIZE(pfBuf));
             if (pfLen && pfLen < ARRAYSIZE(pfBuf)) {
                 run_isolated(argv, Scenario{L"k-immediate-esc-reopen", Action::Escape});
+                run_isolated(argv, Scenario{L"k-mutex-fail-fallback-unlock", Action::Escape});
             }
         }
         const auto plugin = std::filesystem::path(argv[1]).string();
@@ -1204,6 +1273,13 @@ int run_host(int argc, wchar_t** argv)
                 expect(pfLen && pfLen < ARRAYSIZE(pfBuf), "OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME required");
                 immediate_esc_reopen_case(scratch, log, std::wstring(pfBuf, pfLen));
                 immediate_esc_reopen_stalled_diag_case(scratch, scratch / L"reopen-diag-stalled.log", std::wstring(pfBuf, pfLen));
+                return 0;
+            }
+            if (scenario == L"k-mutex-fail-fallback-unlock") {
+                wchar_t pfBuf[4096]{};
+                const auto pfLen = GetEnvironmentVariableW(L"OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME", pfBuf, ARRAYSIZE(pfBuf));
+                expect(pfLen && pfLen < ARRAYSIZE(pfBuf), "OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME required");
+                mutex_failure_fallback_unlocks_tap_case(scratch, scratch / L"mutex-fail-fallback.log", std::wstring(pfBuf, pfLen));
                 return 0;
             }
             SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", (scratch / L"missing-runtime").c_str());

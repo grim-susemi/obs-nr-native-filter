@@ -70,7 +70,9 @@ std::vector<std::wstring> list_starting_markers(const fs::path& dir)
 {
     std::vector<std::wstring> out;
     std::error_code ec;
-    if (!fs::exists(dir, ec)) return out;
+    const bool exists = fs::exists(dir, ec);
+    expect(!ec, "check PushFlow marker directory existence");
+    if (!exists) return out;
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const auto name = it->path().filename().wstring();
         if (name == L"pushflow-starting.txt" ||
@@ -78,6 +80,7 @@ std::vector<std::wstring> list_starting_markers(const fs::path& dir)
             out.push_back(name);
         }
     }
+    expect(!ec, "enumerate PushFlow marker directory");
     return out;
 }
 
@@ -1672,12 +1675,11 @@ void run_pushflow_cross_process_markers(const std::wstring& presenter, const fs:
     // Simulate abrupt startup crash of host-B (kill both host-B process and presenter pidB with no quarantine/fallback).
     {
         Handle presB{OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pidB)};
-        if (presB.value) {
-            TerminateProcess(presB.value, 9);
-            WaitForSingleObject(presB.value, 2000);
-        }
-        TerminateProcess(hostBProc.value, 9);
-        WaitForSingleObject(hostBProc.value, 2000);
+        expect(presB.value != nullptr, "open host-B presenter for crash injection");
+        expect(TerminateProcess(presB.value, 9) != FALSE, "TerminateProcess host-B presenter");
+        expect(WaitForSingleObject(presB.value, 2000) == WAIT_OBJECT_0, "reap host-B presenter");
+        expect(TerminateProcess(hostBProc.value, 9) != FALSE, "TerminateProcess host-B helper");
+        expect(WaitForSingleObject(hostBProc.value, 2000) == WAIT_OBJECT_0, "reap host-B helper");
         hostBCleanup.pidB = 0;
         hostBCleanup.proc = nullptr;
     }

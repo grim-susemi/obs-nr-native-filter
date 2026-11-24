@@ -83,5 +83,7 @@ struct WriteTestHooks {
 };
 WriteEventStatus write_event_bounded(const std::wstring& path, const std::string& text,
     DWORD timeoutMs = 150, const WriteTestHooks* hooks = nullptr) noexcept;
+using MarkerMutexCreateFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR);
+void set_marker_mutex_create_fn_for_test(MarkerMutexCreateFn fn) noexcept;
 }
 } // namespace nr::fg::vfg

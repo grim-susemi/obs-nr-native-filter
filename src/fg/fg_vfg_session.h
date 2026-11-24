@@ -5,7 +5,7 @@
 
 namespace nr::fg::vfg {
 inline constexpr uint32_t max_multiplier = 4;
-inline constexpr uint32_t session_version = 3;
+inline constexpr uint32_t session_version = 2;
 inline std::wstring format_marker_token_w(uint64_t token)
 {
     wchar_t buf[24]{};
