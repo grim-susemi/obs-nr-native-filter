@@ -163,6 +163,11 @@ bool try_recover_peer_exit(Tap& tap, const char* reason, bool forceFaultOnTimeou
     return true;
 }
 
+struct TestWaitSpan {
+    volatile int64_t waitStartNs;
+    volatile int64_t waitEndNs;
+};
+
 // The isolated libobs fixture releases this bounded checkpoint after acting
 // on its own presenter. It is never taken without both fixture events.
 bool test_checkpoint(Tap& tap, const wchar_t* stage)
@@ -178,8 +183,18 @@ bool test_checkpoint(Tap& tap, const wchar_t* stage)
     const auto resumed = OpenEventW(SYNCHRONIZE, FALSE, (std::wstring(name) + L".resume").c_str());
     if (resumed) {
         tap.testCheckpointUsed = true;
+        const auto waitMap = OpenFileMappingW(FILE_MAP_WRITE, FALSE, (std::wstring(name) + L".wait").c_str());
+        auto* waitView = waitMap ? static_cast<TestWaitSpan*>(MapViewOfFile(waitMap, FILE_MAP_WRITE, 0, 0, sizeof(TestWaitSpan))) : nullptr;
         SetEvent(observed);
+        const auto waitStart = static_cast<int64_t>(clock_ns());
         WaitForSingleObject(resumed, 250);
+        const auto waitEnd = static_cast<int64_t>(clock_ns());
+        if (waitView) {
+            InterlockedExchange64(&waitView->waitStartNs, waitStart);
+            InterlockedExchange64(&waitView->waitEndNs, waitEnd);
+            UnmapViewOfFile(waitView);
+        }
+        if (waitMap) CloseHandle(waitMap);
         CloseHandle(resumed);
     }
     CloseHandle(observed);

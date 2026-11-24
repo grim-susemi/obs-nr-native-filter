@@ -424,25 +424,47 @@ size_t count_events(const std::string& text, const char* token)
     return count;
 }
 
+struct TestWaitSpan {
+    volatile int64_t waitStartNs;
+    volatile int64_t waitEndNs;
+};
+
+int64_t qpc_now_ns() noexcept
+{
+    LARGE_INTEGER tick{}, rate{};
+    QueryPerformanceCounter(&tick);
+    QueryPerformanceFrequency(&rate);
+    const auto t = static_cast<uint64_t>(tick.QuadPart), f = static_cast<uint64_t>(rate.QuadPart);
+    return static_cast<int64_t>(t / f * 1000000000ULL + t % f * 1000000000ULL / f);
+}
+
 struct RenderStats {
     std::atomic_uint64_t rawCount{}, gaps{}, maxNs{}, ticks{};
-    std::atomic_llong resumeAtNs{};
+    const TestWaitSpan* waitSpan{};
     uint64_t lastTimestamp{};
-    Clock::time_point tickStarted{};
+    int64_t tickStartedNs{};
     static void tick(void* opaque, float)
     {
-        static_cast<RenderStats*>(opaque)->tickStarted = Clock::now();
+        static_cast<RenderStats*>(opaque)->tickStartedNs = qpc_now_ns();
     }
     static void rendered(void* opaque)
     {
         auto& s = *static_cast<RenderStats*>(opaque);
-        if (s.tickStarted == Clock::time_point{}) return;
-        const auto resumeAt = Clock::time_point{Clock::duration{s.resumeAtNs.load()}};
-        const auto start = s.tickStarted > resumeAt ? s.tickStarted : resumeAt;
-        const auto now = Clock::now();
-        if (now <= start) return;
-        const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now - start).count());
+        const int64_t tickStart = s.tickStartedNs;
+        if (!tickStart) return;
+        const int64_t now = qpc_now_ns();
+        if (now <= tickStart) return;
+        int64_t elapsed = now - tickStart;
+        if (s.waitSpan) {
+            const int64_t wStart = InterlockedCompareExchange64(const_cast<volatile int64_t*>(&s.waitSpan->waitStartNs), 0, 0);
+            const int64_t wEnd = InterlockedCompareExchange64(const_cast<volatile int64_t*>(&s.waitSpan->waitEndNs), 0, 0);
+            if (wEnd > wStart && wEnd > tickStart && wStart < now) {
+                const int64_t overlapStart = wStart > tickStart ? wStart : tickStart;
+                const int64_t overlapEnd = wEnd < now ? wEnd : now;
+                if (overlapEnd > overlapStart) elapsed -= (overlapEnd - overlapStart);
+            }
+        }
+        const auto ns = static_cast<uint64_t>(elapsed);
         auto prior = s.maxNs.load();
         while (ns > prior && !s.maxNs.compare_exchange_weak(prior, ns)) {}
         ++s.ticks;
@@ -489,8 +511,17 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     const auto key = LR"(Local\nr-t2-)" + std::to_wstring(GetCurrentProcessId()) + L"-" + s.name;
     const Handle reached{CreateEventW(nullptr, TRUE, FALSE, key.c_str())},
         resume{CreateEventW(nullptr, TRUE, FALSE, (key + L".resume").c_str())},
-        armFault{CreateEventW(nullptr, TRUE, FALSE, (key + L".fault").c_str())};
-    expect(reached.value && resume.value && armFault.value, "create isolated checkpoint events");
+        armFault{CreateEventW(nullptr, TRUE, FALSE, (key + L".fault").c_str())},
+        waitMap{CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(TestWaitSpan),
+            (key + L".wait").c_str())};
+    expect(reached.value && resume.value && armFault.value && waitMap.value, "create isolated checkpoint events");
+    auto* waitView = static_cast<TestWaitSpan*>(MapViewOfFile(waitMap.value, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(TestWaitSpan)));
+    expect(waitView != nullptr, "map isolated checkpoint wait span");
+    struct WaitViewGuard {
+        TestWaitSpan* ptr;
+        ~WaitViewGuard() { if (ptr) UnmapViewOfFile(ptr); }
+    } waitViewGuard{waitView};
+    *waitView = {};
     const bool resize = s.action == Action::ResizeFault;
     const bool recover = s.action != Action::Escape && s.action != Action::Close &&
         s.action != Action::Stop && s.action != Action::Detach && s.action != Action::BadPeer;
@@ -515,6 +546,7 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
     const auto props = properties(filter.get());
     RenderStats stats;
+    stats.waitSpan = waitView;
     expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get()), "start PushFlow");
     std::string initial;
     await([&] {
@@ -582,7 +614,6 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
         await([&] { return text_of(log).find("test_live_consumer_fault") != std::string::npos; },
             "fault state before resize", 225);
         fixtureWidth.store(352);
-        stats.resumeAtNs.store(Clock::now().time_since_epoch().count());
         SetEvent(resume.value);
         break;
     case Action::Kill:
@@ -596,7 +627,6 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
         }
         expect(TerminateProcess(old.value, s.action == Action::ExitZero ? 0 : 7) != FALSE &&
             WaitForSingleObject(old.value, s.checkpoint ? 200 : 1500) == WAIT_OBJECT_0, "terminate owned presenter");
-        if (s.checkpoint) stats.resumeAtNs.store(Clock::now().time_since_epoch().count());
         SetEvent(resume.value);
         break;
     case Action::Stop:
@@ -610,7 +640,6 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     case Action::BadPeer:
         expect(WaitForSingleObject(reached.value, 2000) == WAIT_OBJECT_0 &&
             WaitForSingleObject(old.value, 0) == WAIT_TIMEOUT, "corrupt identity while original child lives");
-        stats.resumeAtNs.store(Clock::now().time_since_epoch().count());
         SetEvent(resume.value);
         break;
     case Action::Fault:
@@ -664,9 +693,14 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     transcript = text_of(log);
     const auto restarts = count_events(transcript, "event=controller_auto_fallback_1x_relaunch");
     expect(restarts == static_cast<size_t>(recover), "exact relaunch count after the last close");
+    const auto oldGenStr = oldOffer.empty() ? std::string("none(pre-offer)") : field(oldOffer, "generation=");
+    if (recover) {
+        expect(!field(newOffer, "generation=").empty(), "recovered offer has generation");
+        if (earlyCheckpoint) expect(oldOffer.empty(), "early checkpoint has no prior offer");
+    }
     std::printf("PASS %ls old_pid=%lu old_exit=%lu old_generation=%s new_pid=%s new_generation=%s relaunches=%zu "
         "elapsed_ms=%lld max_render_ns=%llu raw_frames=%llu raw_gaps=%llu\n", s.name, oldPid, oldExit,
-        field(oldOffer, "generation=").c_str(), field(newOffer, "pid=").c_str(), field(newOffer, "generation=").c_str(),
+        oldGenStr.c_str(), field(newOffer, "pid=").c_str(), field(newOffer, "generation=").c_str(),
         restarts, static_cast<long long>(elapsed), static_cast<unsigned long long>(stats.maxNs.load()),
         static_cast<unsigned long long>(stats.rawCount.load()), static_cast<unsigned long long>(stats.gaps.load()));
     if (s.action != Action::Detach) obs_source_filter_remove(input.get(), filter.get());

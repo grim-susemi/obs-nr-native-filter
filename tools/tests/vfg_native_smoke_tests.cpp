@@ -139,11 +139,24 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     const uint32_t warmupCount = parity ? 16 : 0;
     const uint32_t count = parity ? (warmupCount + 120) : hotfix ? 360 : wiring ? 180 : cadence ? 96 : 45;
     uint64_t measureStartNs = 0;
+    HANDLE paceTimer = parity
+        ? CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+        : nullptr;
+    struct TimerClose { HANDLE h; ~TimerClose() { if (h) CloseHandle(h); } } paceTimerGuard{paceTimer};
     for (uint32_t f = 0; f < count; ++f) {
         const auto ts = start + uint64_t{f} * 1'000'000'000 / 60;
         if (cadence || parity) {
             while (clock_ns() < ts) {
-                if (ts - (std::min)(ts, clock_ns()) > 2'000'000) Sleep(1);
+                const auto rem = ts - (std::min)(ts, clock_ns());
+                if (parity && paceTimer) {
+                    if (rem <= 300'000ULL) { YieldProcessor(); continue; }
+                    LARGE_INTEGER due{};
+                    due.QuadPart = -static_cast<LONGLONG>((rem - 200'000ULL) / 100ULL);
+                    if (SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE) &&
+                        WaitForSingleObject(paceTimer, static_cast<DWORD>(rem / 1'000'000ULL + 2)) != WAIT_FAILED)
+                        continue;
+                }
+                if (rem > 2'000'000) Sleep(1);
                 else SwitchToThread();
             }
         }

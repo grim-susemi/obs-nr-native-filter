@@ -93,7 +93,7 @@ function Parse-ParityLog([string]$Path, [int]$Mult) {
     }
 }
 
-# (a) Baseline ad4d8963 vs modified steady-state latency and presentation/drop parity (median of 3 interleaved trials)
+# (a) Baseline ad4d8963 vs modified steady-state latency and presentation/drop parity (every individual trial + median summary)
 $trials = 3
 $baseSamples = @{ 2 = [System.Collections.Generic.List[object]]::new(); 4 = [System.Collections.Generic.List[object]]::new() }
 $modSamples = @{ 2 = [System.Collections.Generic.List[object]]::new(); 4 = [System.Collections.Generic.List[object]]::new() }
@@ -103,8 +103,28 @@ for ($t = 1; $t -le $trials; $t++) {
     Invoke-Checked "parity-baseline-t$t" { & $baseSmoke $basePresenter $baseParityDir --parity }
     Invoke-Checked "parity-modified-t$t" { & $modSmoke $modPresenter $modParityDir --parity }
     foreach ($mult in @(2, 4)) {
-        $baseSamples[$mult].Add((Parse-ParityLog (Join-Path $baseParityDir "parity-${mult}x.log") $mult))
-        $modSamples[$mult].Add((Parse-ParityLog (Join-Path $modParityDir "parity-${mult}x.log") $mult))
+        $bTrial = Parse-ParityLog (Join-Path $baseParityDir "parity-${mult}x.log") $mult
+        $mTrial = Parse-ParityLog (Join-Path $modParityDir "parity-${mult}x.log") $mult
+        $baseSamples[$mult].Add($bTrial)
+        $modSamples[$mult].Add($mTrial)
+        $tP50Delta = $mTrial.P50Ms - $bTrial.P50Ms
+        $tP95Delta = $mTrial.P95Ms - $bTrial.P95Ms
+        $tDropDelta = [int]($mTrial.DropCount - $bTrial.DropCount)
+        $maxDropDelta = [Math]::Max(2, [int][Math]::Floor(0.02 * (120 * $mult)))
+        Write-Host ("PARITY {0}x trial={1}: base(p50={2:N2}ms p95={3:N2}ms origRate={4:N3} subRate={5:N3} drop={6}) mod(p50={7:N2}ms p95={8:N2}ms origRate={9:N3} subRate={10:N3} drop={11}) delta(p50={12:+0.00;-0.00}ms p95={13:+0.00;-0.00}ms drop={14:+0;-0})" -f `
+            $mult, $t, $bTrial.P50Ms, $bTrial.P95Ms, $bTrial.OrigRate, $bTrial.SubRate, [int]$bTrial.DropCount, `
+            $mTrial.P50Ms, $mTrial.P95Ms, $mTrial.OrigRate, $mTrial.SubRate, [int]$mTrial.DropCount, $tP50Delta, $tP95Delta, $tDropDelta)
+        if ($tP50Delta -gt 1.5) { throw "Parity ${mult}x trial $t p50 delta ${tP50Delta} ms > +1.5 ms" }
+        if ($tP95Delta -gt 3.0) { throw "Parity ${mult}x trial $t p95 delta ${tP95Delta} ms > +3.0 ms" }
+        if ($mTrial.OrigRate -lt ($bTrial.OrigRate - 0.02) -or $mTrial.OrigRate -lt 0.95) {
+            throw "Parity ${mult}x trial $t orig_present_rate regression: mod=$($mTrial.OrigRate) base=$($bTrial.OrigRate)"
+        }
+        if ($mTrial.SubRate -lt ($bTrial.SubRate - 0.05)) {
+            throw "Parity ${mult}x trial $t subframe_present_rate regression: mod=$($mTrial.SubRate) base=$($bTrial.SubRate)"
+        }
+        if ($tDropDelta -gt $maxDropDelta) {
+            throw "Parity ${mult}x trial $t drop delta $tDropDelta > $maxDropDelta"
+        }
     }
 }
 
@@ -127,20 +147,8 @@ foreach ($mult in @(2, 4)) {
     $p50Delta = $mP50 - $bP50
     $p95Delta = $mP95 - $bP95
     $dropDelta = [int]($mDrop - $bDrop)
-    $maxDropDelta = [Math]::Max(2, [int][Math]::Floor(0.02 * (120 * $mult)))
     Write-Host ("PARITY {0}x (median-of-{1}): base(p50={2:N2}ms p95={3:N2}ms origRate={4:N3} subRate={5:N3} drop={6}) mod(p50={7:N2}ms p95={8:N2}ms origRate={9:N3} subRate={10:N3} drop={11}) delta(p50={12:+0.00;-0.00}ms p95={13:+0.00;-0.00}ms drop={14:+0;-0})" -f `
         $mult, $trials, $bP50, $bP95, $bOrig, $bSub, [int]$bDrop, $mP50, $mP95, $mOrig, $mSub, [int]$mDrop, $p50Delta, $p95Delta, $dropDelta)
-    if ($p50Delta -gt 1.5) { throw "Parity ${mult}x p50 delta ${p50Delta} ms > +1.5 ms" }
-    if ($p95Delta -gt 3.0) { throw "Parity ${mult}x p95 delta ${p95Delta} ms > +3.0 ms" }
-    if ($mOrig -lt ($bOrig - 0.02) -or $mOrig -lt 0.95) {
-        throw "Parity ${mult}x orig_present_rate regression: mod=$mOrig base=$bOrig"
-    }
-    if ($mSub -lt ($bSub - 0.05)) {
-        throw "Parity ${mult}x subframe_present_rate regression: mod=$mSub base=$bSub"
-    }
-    if ($dropDelta -gt $maxDropDelta) {
-        throw "Parity ${mult}x drop delta $dropDelta > $maxDropDelta"
-    }
 }
 
 # (b) NativeVfg + VfgShotChange ON
@@ -232,6 +240,8 @@ try {
     Invoke-Checked 'ab-pushflow-stalled-esc' { & $abRunner $modPresenter $LogDir pushflow-stalled-esc }
     Invoke-Checked 'ab-pushflow-userstop-stalled' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled }
     Invoke-Checked 'ab-stalled-log-esc' { & $abRunner $modPresenter $LogDir stalled-log-esc }
+    Invoke-Checked 'ab-watchdog-stalled-unshared-log' { & $abRunner $modPresenter $LogDir watchdog-stalled-unshared-log }
+    Invoke-Checked 'ab-pushflow-userstop-stalled-unshared-log' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled-unshared-log }
     Invoke-Checked 'ab-pushflow-midrun-crash' { & $abRunner $modPresenter $LogDir pushflow-midrun-crash }
 } finally {
     Remove-Item Env:OBS_NR_PUSHFLOW_RUNTIME -ErrorAction SilentlyContinue

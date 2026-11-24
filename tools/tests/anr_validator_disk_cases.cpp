@@ -39,23 +39,19 @@ struct Scratch {
     }
 };
 
-struct FixtureLoader {
-    unsigned calls{};
-    void load(const nr::fg::anr::PinnedAddon& pinned)
-    {
-        ++calls;
-        const auto module = LoadLibraryExW(pinned.canonicalPath.c_str(), nullptr,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!module) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "fixture load");
-        struct Loaded {
-            HMODULE module;
-            ~Loaded() { FreeLibrary(module); }
-        } loaded{module};
-        require(GetProcAddress(loaded.module, "NVSDK_NGX_D3D12_Init_Ext") != nullptr &&
-            GetProcAddress(loaded.module, "NVSDK_NGX_D3D12_Shutdown1") != nullptr,
-            "Windows resolved fixture exports");
-    }
-};
+void load_pinned_fixture(const nr::fg::anr::PinnedAddon& pinned)
+{
+    const auto module = LoadLibraryExW(pinned.canonicalPath.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "fixture load");
+    struct Loaded {
+        HMODULE module;
+        ~Loaded() { FreeLibrary(module); }
+    } loaded{module};
+    require(GetProcAddress(loaded.module, "NVSDK_NGX_D3D12_Init_Ext") != nullptr &&
+        GetProcAddress(loaded.module, "NVSDK_NGX_D3D12_Shutdown1") != nullptr,
+        "Windows resolved fixture exports");
+}
 } // namespace
 
 void anr_validator_disk_cases()
@@ -70,9 +66,7 @@ void anr_validator_disk_cases()
     const auto path = scratch.dir / L"nvngx_dlssg.dll";
     fs::copy_file(binary, path);
 
-    // Each case crosses this same gate. Only the accepted branch can reach the fixture loader.
     const auto exercise = [&](std::string_view expectedMissing) {
-        FixtureLoader loader;
         const auto validation = nr::fg::anr::validate_addon(path.native(), true);
         if (validation.status == ValidationStatus::Accepted) {
             require(validation.addon != nullptr, "accepted token");
@@ -87,19 +81,18 @@ void anr_validator_disk_cases()
             };
             verifyPin(path);
             for (auto relative : companions) verifyPin(scratch.dir / fs::path(relative).make_preferred());
-            loader.load(pinned);
+            load_pinned_fixture(pinned);
             std::cout << "fixture_sha256=" << pinned.sha256 << " pinned_files=19\n";
         }
         const auto expected = expectedMissing.empty() ? ValidationStatus::Accepted :
             ValidationStatus::IncompleteAddonMissingCompanions;
-        if (validation.status != expected || validation.relativePath != expectedMissing ||
-            loader.calls != (expectedMissing.empty() ? 1u : 0u)) {
+        if (validation.status != expected || validation.relativePath != expectedMissing) {
             std::cerr << "unexpected fixture result: status=" << nr::fg::anr::status_name(validation.status)
-                << " relative_path=" << validation.relativePath << " loader_calls=" << loader.calls << '\n';
+                << " relative_path=" << validation.relativePath << '\n';
             throw std::runtime_error("validator/loader boundary result");
         }
         std::cout << "disk status=" << nr::fg::anr::status_name(validation.status)
-            << " relative_path=" << validation.relativePath << " loader_calls=" << loader.calls << '\n';
+            << " relative_path=" << validation.relativePath << '\n';
     };
     require(nr::fg::anr::validate_addon(path.native(), false).status == ValidationStatus::OptInRequired,
         "real fixture opt-in gate");
