@@ -819,6 +819,127 @@ void immediate_esc_reopen_case(const fs::path& scratch, const fs::path& log, con
         firstPid, field(secondOffer, "pid=").c_str(), count_events(tail, "event=present_vfg_subframe "));
 }
 
+void immediate_esc_reopen_stalled_diag_case(const fs::path& scratch, const fs::path& log, const std::wstring& pfRuntime)
+{
+    const auto marks = scratch / L"obs-nr-native-filter";
+    fs::remove_all(marks);
+    fs::remove(log);
+    wchar_t prevLog[4096]{};
+    const auto prevLogLen = GetEnvironmentVariableW(L"OBS_NR_VFG_LOG", prevLog, ARRAYSIZE(prevLog));
+    SetEnvironmentVariableW(L"LOCALAPPDATA", scratch.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+
+    const auto stallName = LR"(Local\obs-nr-libobs-diag-stall-)" + std::to_wstring(GetCurrentProcessId());
+    const auto reapName = LR"(Local\obs-nr-libobs-diag-reap-)" + std::to_wstring(GetCurrentProcessId());
+    const Handle stallEv{CreateEventW(nullptr, TRUE, FALSE, stallName.c_str())};
+    const Handle reapEv{CreateEventW(nullptr, TRUE, FALSE, reapName.c_str())};
+    expect(stallEv.value && reapEv.value, "create libobs diag stall events");
+
+    fixtureAnimate.store(true);
+    struct DiagStallGuard {
+        HANDLE ev{};
+        std::wstring restoreLog;
+        ~DiagStallGuard()
+        {
+            if (ev) SetEvent(ev);
+            SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", nullptr);
+            SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", nullptr);
+            SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+            SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", restoreLog.empty() ? nullptr : restoreLog.c_str());
+            fixtureAnimate.store(false);
+        }
+    } guard{stallEv.value, prevLogLen && prevLogLen < ARRAYSIZE(prevLog) ? std::wstring(prevLog, prevLogLen) : std::wstring{}};
+
+    SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", stallName.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", reapName.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+
+    auto input = source("vfg_test_color");
+    auto data = settings();
+    obs_data_set_int(data.get(), "vfg_backend", 1);
+    auto filter = source(filterId, data.get());
+    obs_source_filter_add(input.get(), filter.get());
+    obs_set_output_source(0, input.get());
+    struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+    const auto props = properties(filter.get());
+
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get()), "start PushFlow for stalled diag");
+    await([&] {
+        const auto t = text_of(log);
+        return !event(t, "event=initialized backend=pushflow ").empty() &&
+            count_events(t, "event=present_vfg_subframe ") >= 3 &&
+            !event(t, "event=offer ", "epoch=1").empty();
+    }, "initial PushFlow synthesis before diag-stalled Esc");
+    const auto firstOffer = event(text_of(log), "event=offer ", "epoch=1");
+    const auto firstPid = std::stoul(field(firstOffer, "pid="));
+    const auto hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(std::stoull(field(firstOffer, "hwnd="), nullptr, 16)));
+    const Handle firstProc{OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, firstPid)};
+    expect(firstProc.value != nullptr, "open first PushFlow presenter (diag-stalled)");
+
+    // Lock the armed starting marker without FILE_SHARE_DELETE so observer cleanup fails cleanly,
+    // writes pushflow-user-closed.txt, and triggers write_event_bounded() -> TP_WORK stall on stallEv.
+    fs::path armedMarker;
+    await([&] {
+        std::error_code ec;
+        for (fs::directory_iterator it(marks, ec), end; !ec && it != end; it.increment(ec)) {
+            const auto name = it->path().filename().wstring();
+            if (name == L"pushflow-starting.txt" ||
+                (name.starts_with(L"pushflow-starting-") && name.ends_with(L".txt"))) {
+                armedMarker = it->path();
+                return true;
+            }
+        }
+        return false;
+    }, "locate armed starting marker before diag-stalled Esc");
+    {
+        Handle markerLock{CreateFileW(armedMarker.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+        expect(markerLock.value != INVALID_HANDLE_VALUE, "lock armed starting marker without FILE_SHARE_DELETE");
+
+        expect(PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0) != FALSE, "Esc on PushFlow preview (diag-stalled)");
+        await([&] { return WaitForSingleObject(firstProc.value, 0) == WAIT_OBJECT_0; }, "bounded Esc exit", 2500);
+        // Allow observer thread to record fallback, enter write_event_bounded() -> TP_WORK, and block on stallEv.
+        await([&] { return fs::exists(marks / L"pushflow-user-closed.txt"); },
+            "observer writes user-closed fallback before diag TP_WORK", 2000);
+        Sleep(350);
+    }
+    expect(WaitForSingleObject(reapEv.value, 20) == WAIT_TIMEOUT,
+        "diagnostic TP_WORK must still be stalled before immediate libobs reopen");
+
+    // Reopen while diagnostic TP_WORK from session 1 is STILL blocked on stallEv.
+    const auto reopenOffset = text_of(log).size();
+    await([&] {
+        return obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get());
+    }, "immediate libobs vfg_start while prior diag TP_WORK is stalled", 2000);
+    await([&] {
+        const auto tail = text_of(log).substr(reopenOffset);
+        return !event(tail, "event=initialized backend=pushflow ").empty() &&
+            count_events(tail, "event=present_vfg_subframe ") >= 3;
+    }, "reopen resumes 2x PushFlow synthesis while diag TP_WORK remains stalled", 10000);
+    expect(WaitForSingleObject(reapEv.value, 20) == WAIT_TIMEOUT,
+        "prior diagnostic TP_WORK remained blocked throughout reopen synthesis");
+
+    const auto tail = text_of(log).substr(reopenOffset);
+    expect(tail.find("event=pushflow_previous_crash_detected") == std::string::npos,
+        "stalled-diag libobs reopen must NOT misclassify as previous crash");
+    const auto secondOffer = event(tail, "event=offer ", "epoch=1");
+    expect(std::stoul(field(secondOffer, "pid=")) != firstPid && field(secondOffer, "mode=") == "2x",
+        "stalled-diag libobs reopen launched fresh 2x PushFlow PID");
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()), "stop reopened PushFlow (diag-stalled)");
+    obs_source_filter_remove(input.get(), filter.get());
+
+    // Release stalled diagnostic TP_WORK and verify deferred write completes cleanly.
+    SetEvent(stallEv.value);
+    expect(WaitForSingleObject(reapEv.value, 2000) == WAIT_OBJECT_0,
+        "stalled diagnostic TP_WORK finishes and releases resources once stall clears");
+    const auto fullLog = text_of(log);
+    expect(fullLog.find("event=pushflow_marker_cleanup_failed") != std::string::npos,
+        "deferred diag write completed cleanly to log after stall cleared");
+    std::printf("PASS k-immediate-esc-reopen-diag-stalled first_pid=%lu second_pid=%s subframes=%zu\n",
+        firstPid, field(secondOffer, "pid=").c_str(), count_events(tail, "event=present_vfg_subframe "));
+}
+
 void pacing_repair_ab_case(const fs::path& log)
 {
     SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
@@ -1082,6 +1203,7 @@ int run_host(int argc, wchar_t** argv)
                 const auto pfLen = GetEnvironmentVariableW(L"OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME", pfBuf, ARRAYSIZE(pfBuf));
                 expect(pfLen && pfLen < ARRAYSIZE(pfBuf), "OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME required");
                 immediate_esc_reopen_case(scratch, log, std::wstring(pfBuf, pfLen));
+                immediate_esc_reopen_stalled_diag_case(scratch, scratch / L"reopen-diag-stalled.log", std::wstring(pfBuf, pfLen));
                 return 0;
             }
             SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", (scratch / L"missing-runtime").c_str());

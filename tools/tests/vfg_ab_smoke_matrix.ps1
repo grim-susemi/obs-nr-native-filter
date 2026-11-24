@@ -256,6 +256,7 @@ try {
     Invoke-Checked 'ab-pushflow-esc-stalled-pipe-log' { & $abRunner $modPresenter $LogDir pushflow-esc-stalled-pipe-log }
     Invoke-Checked 'ab-pushflow-userstop-stalled-pipe-log' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled-pipe-log }
     Invoke-Checked 'ab-pushflow-overlapping-markers' { & $abRunner $modPresenter $LogDir pushflow-overlapping-markers }
+    Invoke-Checked 'ab-pushflow-cross-process-markers' { & $abRunner $modPresenter $LogDir pushflow-cross-process-markers }
     Invoke-Checked 'ab-pushflow-midrun-crash' { & $abRunner $modPresenter $LogDir pushflow-midrun-crash }
 } finally {
     Remove-Item Env:OBS_NR_PUSHFLOW_RUNTIME -ErrorAction SilentlyContinue

@@ -89,22 +89,9 @@ class StartingMarker {
     unsigned completed_{};
     bool ownsRun_{};
 
-    static std::wstring token_hex_w(uint64_t token)
-    {
-        wchar_t buf[24]{};
-        swprintf_s(buf, L"%016llx", static_cast<unsigned long long>(token));
-        return buf;
-    }
-    static std::string token_hex_a(uint64_t token)
-    {
-        char buf[24]{};
-        snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(token));
-        return buf;
-    }
     fs::path starting() const
     {
-        if (ownerToken_ == 0) return directory_ / L"pushflow-starting.txt";
-        return directory_ / (L"pushflow-starting-" + token_hex_w(ownerToken_) + L".txt");
+        return directory_ / nr::fg::vfg::starting_marker_filename(ownerToken_);
     }
     bool arm() const
     {
@@ -112,8 +99,7 @@ class StartingMarker {
         fs::create_directories(directory_, ec);
         if (ec) return false;
         std::ofstream file(starting(), std::ios::trunc);
-        if (ownerToken_ != 0) file << "token=" << token_hex_a(ownerToken_) << '\n';
-        else file << "pushflow_start_or_teardown\n";
+        file << "pushflow_start_or_teardown\n";
         file.close();
         return !!file;
     }

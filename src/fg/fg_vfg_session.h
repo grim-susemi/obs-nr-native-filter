@@ -1,10 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "fg_ipc.h"
+#include <cstdio>
 
 namespace nr::fg::vfg {
 inline constexpr uint32_t max_multiplier = 4;
-inline constexpr uint32_t session_version = 2;
+inline constexpr uint32_t session_version = 3;
+inline std::wstring format_marker_token_w(uint64_t token)
+{
+    wchar_t buf[24]{};
+    swprintf_s(buf, L"%016llx", static_cast<unsigned long long>(token));
+    return buf;
+}
+inline std::wstring starting_marker_filename(uint64_t ownerToken)
+{
+    if (ownerToken == 0) return L"pushflow-starting.txt";
+    return L"pushflow-starting-" + format_marker_token_w(ownerToken) + L".txt";
+}
+inline std::wstring marker_mutex_name(uint64_t ownerToken)
+{
+    return L"Local\\obs-nr-pf-tok-" + format_marker_token_w(ownerToken);
+}
 enum class Backend : uint32_t { NativeVfg = 0, PushFlow = 1, AnrExperimental = 2 };
 enum class PushFlowTier : uint32_t { Fast = 0, Quality = 1 };
 enum class ExitReason : LONG { None = 0, UserClosed = 1, Fault = 2, Watchdog = 3 };

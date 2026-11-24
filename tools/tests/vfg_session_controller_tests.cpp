@@ -30,11 +30,11 @@ void check_header()
         !opts.gpuShotChange && !opts.experimentalAnrOptIn && !opts.hudLock && !opts.pacingRepair &&
         !opts.adaptiveFg && !opts.adaptiveTargetFps, "v0.2.10 launch defaults");
     Session s{};
-    expect(s.sessionVersion == 2 && s.sessionBytes == sizeof(Session) && validate_session_header(s),
-        "default v2 session");
+    expect(s.sessionVersion == nr::fg::vfg::session_version && s.sessionBytes == sizeof(Session) && validate_session_header(s),
+        "default session version and size");
     s.sessionVersion = 99;
     expect(!validate_session_header(s), "reject bad ABI version");
-    s.sessionVersion = 2;
+    s.sessionVersion = nr::fg::vfg::session_version;
     --s.sessionBytes;
     expect(!validate_session_header(s), "reject bad ABI byte count");
     ++s.sessionBytes;
@@ -240,12 +240,19 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
     }
 
     // 1d. Stalled diagnostic open/write in TP_WORK must NOT block write_event_bounded, Controller cleanup, destruction, or reopen.
+    // Also verify zero OS handle leaks across normal, cancel (1a), deferred reap (1b), prep failure (1c), and stalled diag (1d).
+    DWORD baselineHandles = 0;
+    expect(GetProcessHandleCount(GetCurrentProcess(), &baselineHandles) != FALSE, "query baseline handle count");
     {
         const auto diagLog = scratch / L"ctrl-diag-stall.log";
         fs::remove(diagLog);
         const Handle stallEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
         const Handle reapEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
         expect(stallEv.value && reapEv.value, "create 1d direct stall events");
+        struct StallSignalGuard {
+            HANDLE ev{};
+            ~StallSignalGuard() { if (ev) SetEvent(ev); }
+        } stallGuard{stallEv.value};
         const nr::fg::vfg::detail::WriteTestHooks stallHooks{reapEv.value, stallEv.value, false, false};
         const auto t0 = clock_ns();
         const auto st = nr::fg::vfg::detail::write_event_bounded(diagLog.wstring(), "event=direct_stall_probe\n", 50, &stallHooks);
@@ -259,6 +266,21 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         const auto txt = [&] { std::ifstream s(diagLog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
         expect(txt.find("event=direct_stall_probe") != std::string::npos,
             "1d direct: deferred write wrote payload once stall cleared");
+
+        // Repeated normal diagnostic writes must not leak file/event/threadpool handles.
+        DWORD handlesBeforeLoop = 0, handlesAfterLoop = 0;
+        expect(GetProcessHandleCount(GetCurrentProcess(), &handlesBeforeLoop) != FALSE, "query handles before normal loop");
+        for (int i = 0; i < 16; ++i) {
+            const Handle loopReap{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+            const nr::fg::vfg::detail::WriteTestHooks loopHooks{loopReap.value, nullptr, false, false};
+            const auto ws = nr::fg::vfg::detail::write_event_bounded(diagLog.wstring(), "event=handle_leak_probe\n", 150, &loopHooks);
+            expect(ws.opened && !ws.timedOut && !ws.deferredToPool, "normal write succeeds cleanly");
+            expect(WaitForSingleObject(loopReap.value, 1000) == WAIT_OBJECT_0, "normal write reaps handles");
+        }
+        Sleep(30);
+        expect(GetProcessHandleCount(GetCurrentProcess(), &handlesAfterLoop) != FALSE, "query handles after normal loop");
+        expect(handlesAfterLoop <= handlesBeforeLoop + 2,
+            "repeated diagnostic write_event_bounded calls must not leak OS handles");
     }
 
     const auto localApp = scratch / L"ctrl-localapp";
@@ -279,12 +301,14 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         const Handle reapEv{CreateEventW(nullptr, TRUE, FALSE, reapName.c_str())};
         expect(stallEv.value && reapEv.value, "create 1d controller diag stall events");
         struct EnvClear {
+            HANDLE ev{};
             ~EnvClear()
             {
+                if (ev) SetEvent(ev);
                 SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", nullptr);
                 SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", nullptr);
             }
-        } envClear;
+        } envClear{stallEv.value};
         SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", stallName.c_str());
         SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", reapName.c_str());
 
@@ -325,6 +349,47 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         expect(totalMs < 10000, "1d total bounded");
     }
     SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
+
+    // Kernel-object cross-host token isolation check:
+    // While another host holds Local\obs-nr-pf-tok-<extTok>, our Controller MUST preserve its starting marker;
+    // once that external mutex closes (host died), the next Controller MUST treat it as a crash marker and consume it.
+    {
+        constexpr uint64_t extTok = 0x0000FEDCBA987654ULL;
+        const auto extMarker = marks / nr::fg::vfg::starting_marker_filename(extTok);
+        const auto extMutexName = nr::fg::vfg::marker_mutex_name(extTok);
+        const auto xlog = scratch / L"ctrl-xhost.log";
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", xlog.c_str());
+        {
+            Handle extLock{CreateMutexW(nullptr, FALSE, extMutexName.c_str())};
+            expect(extLock.value != nullptr, "create simulated external host mutex");
+            std::ofstream(extMarker) << "pushflow_start_or_teardown\n";
+            fs::remove(xlog);
+            LaunchOptions opts{};
+            opts.backend = Backend::PushFlow;
+            opts.multiplier = 2;
+            Controller ctrl(opts);
+            expect(fs::exists(extMarker), "live external host starting marker must NOT be deleted by Controller");
+            const auto logTxt = [&] { std::ifstream s(xlog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+            expect(logTxt.find("event=pushflow_previous_crash_detected") == std::string::npos,
+                "live external host marker must NOT trigger crash degradation in our Controller");
+            ctrl.stop(true);
+            expect(ctrl.await_exit_cleanup(1500), "cleanup after live external marker check");
+        }
+        // extLock is now closed (external host exited without cleaning extMarker) -> next Controller must detect crash & consume extMarker.
+        {
+            fs::remove(xlog);
+            LaunchOptions opts{};
+            opts.backend = Backend::PushFlow;
+            opts.multiplier = 2;
+            Controller ctrl(opts);
+            expect(!fs::exists(extMarker), "dead external host starting marker must be consumed on crash detection");
+            const auto logTxt = [&] { std::ifstream s(xlog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+            expect(logTxt.find("event=pushflow_previous_crash_detected") != std::string::npos,
+                "dead external host starting marker must trigger crash degradation");
+            ctrl.stop(true);
+            expect(ctrl.await_exit_cleanup(1500), "cleanup after dead external marker check");
+        }
+    }
 
     // 2. Pending vs Succeeded marker status, cross-token fallback isolation, and fail-closed markers.
     SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", (scratch / L"ctrl-marker.log").c_str());

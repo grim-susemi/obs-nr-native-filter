@@ -66,19 +66,24 @@ std::string field_value(const std::string& line, std::string_view key)
     return line.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
-size_t count_starting_markers(const fs::path& dir)
+std::vector<std::wstring> list_starting_markers(const fs::path& dir)
 {
+    std::vector<std::wstring> out;
     std::error_code ec;
-    size_t n = 0;
-    if (!fs::exists(dir, ec)) return 0;
+    if (!fs::exists(dir, ec)) return out;
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const auto name = it->path().filename().wstring();
         if (name == L"pushflow-starting.txt" ||
             (name.starts_with(L"pushflow-starting-") && name.ends_with(L".txt"))) {
-            ++n;
+            out.push_back(name);
         }
     }
-    return n;
+    return out;
+}
+
+size_t count_starting_markers(const fs::path& dir)
+{
+    return list_starting_markers(dir).size();
 }
 
 std::wstring secondary_monitor_id()
@@ -1373,7 +1378,9 @@ void run_pushflow_overlapping_markers(const std::wstring& presenter, const fs::p
             count_tokens(read_text(logA), "event=present_vfg_subframe ") >= 3) break;
     }
     wait_log_token(logA, "event=present_vfg_subframe ", ctrlA);
-    expect(count_starting_markers(marksDir) == 1, "overlap A must arm 1 starting marker");
+    const auto markersAfterA = list_starting_markers(marksDir);
+    expect(markersAfterA.size() == 1, "overlap A must arm 1 starting marker");
+    const std::wstring markerA = markersAfterA[0];
 
     // 2. Start overlapping session B (PushFlow 2x) while A is active
     SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logB.c_str());
@@ -1392,9 +1399,13 @@ void run_pushflow_overlapping_markers(const std::wstring& presenter, const fs::p
             count_tokens(read_text(logB), "event=present_vfg_subframe ") >= 3) break;
     }
     wait_log_token(logB, "event=present_vfg_subframe ", ctrlB);
-    expect(count_starting_markers(marksDir) == 2, "overlap A + B must hold 2 isolated starting markers");
+    const auto markersAfterB = list_starting_markers(marksDir);
+    expect(markersAfterB.size() == 2, "overlap A + B must hold 2 isolated starting markers");
+    const std::wstring markerB = (markersAfterB[0] == markerA) ? markersAfterB[1] : markersAfterB[0];
+    expect(markerA != markerB && fs::exists(marksDir / markerA) && fs::exists(marksDir / markerB),
+        "overlap A and B must have distinct named starting markers");
 
-    // 3. Close A cleanly via VK_ESCAPE (UserClosed): A's starting marker is removed, B's MUST survive untouched!
+    // 3. Close A cleanly via VK_ESCAPE (UserClosed): exact markerA is removed, exact markerB MUST survive untouched!
     const auto offerLineA = find_line(read_text(logA), "event=offer ");
     const auto hwndA = std::stoull(field_value(offerLineA, "hwnd="), nullptr, 16);
     expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndA)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
@@ -1404,12 +1415,12 @@ void run_pushflow_overlapping_markers(const std::wstring& presenter, const fs::p
     expect(!ctrlA.alive() && ctrlA.await_exit_cleanup(1000) && ctrlA.user_close_marker_cleaned(),
         "overlap A UserClosed cleanup must complete");
     expect(prodA.retire() == ipc::Status::Ok, "retire overlap A");
-    expect(count_starting_markers(marksDir) == 1,
-        "closing A via UserClosed must NOT delete B's starting marker");
+    expect(!fs::exists(marksDir / markerA) && fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 1,
+        "closing A via UserClosed must remove exact markerA and preserve exact markerB");
     expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"), "UserClosed A must not write quarantine");
 
     // 4. Crash B mid-init without writing quarantine (simulating host exit before fallback quarantine):
-    //    B's surviving starting marker MUST force C to degrade to 1x!
+    //    B's exact surviving starting markerB MUST remain on disk and force C to degrade to 1x!
     const auto offerLineB = find_line(read_text(logB), "event=offer ");
     const auto pidB = std::stoul(field_value(offerLineB, "pid="));
     Handle childB{OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pidB)};
@@ -1418,7 +1429,8 @@ void run_pushflow_overlapping_markers(const std::wstring& presenter, const fs::p
     expect(WaitForSingleObject(childB.value, 2000) == WAIT_OBJECT_0, "overlap B reaped");
     expect(ctrlB.await_exit_cleanup(1000), "overlap B observer settles");
     expect(prodB.retire() == ipc::Status::Ok, "retire overlap B");
-    expect(count_starting_markers(marksDir) == 1, "crashed B starting marker must survive on disk");
+    expect(fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 1,
+        "crashed B exact markerB must survive on disk");
 
     SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logC.c_str());
     ipc::Producer prodC(gfx.dev.Get(), unique_mapping(L"ovC"), gfx.shape);
@@ -1442,9 +1454,263 @@ void run_pushflow_overlapping_markers(const std::wstring& presenter, const fs::p
     expect(count_tokens(cTxt, "event=present_original ") >= 20 &&
         count_tokens(cTxt, "event=present_vfg_subframe ") == 0,
         "C must degrade to 1x original after B crash");
-    expect(count_starting_markers(marksDir) == 0, "C consumed B's starting marker cleanly");
-    std::printf("PASS ab_pushflow_overlapping_markers pidB=%lu orig=%zu\n",
-        pidB, count_tokens(cTxt, "event=present_original "));
+    expect(!fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 0,
+        "C consumed exact markerB cleanly");
+    std::printf("PASS ab_pushflow_overlapping_markers markerA=%ls markerB=%ls pidB=%lu orig=%zu\n",
+        markerA.c_str(), markerB.c_str(), pidB, count_tokens(cTxt, "event=present_original "));
+}
+
+void run_pushflow_cross_process_helper(const std::wstring& presenter, const fs::path& logDir,
+    const std::wstring& monId, const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    auto readEnvW = [](const wchar_t* k) -> std::wstring {
+        wchar_t buf[512]{};
+        const auto n = GetEnvironmentVariableW(k, buf, ARRAYSIZE(buf));
+        return (n && n < ARRAYSIZE(buf)) ? std::wstring(buf, n) : std::wstring{};
+    };
+    const auto readyName = readEnvW(L"OBS_NR_XPROC_READY_EVENT");
+    const auto holdName = readEnvW(L"OBS_NR_XPROC_HOLD_EVENT");
+    const auto infoPath = fs::path(readEnvW(L"OBS_NR_XPROC_INFO_FILE"));
+    expect(!readyName.empty() && !holdName.empty() && !infoPath.empty(), "helper env vars required");
+    Handle readyEv{OpenEventW(EVENT_MODIFY_STATE, FALSE, readyName.c_str())};
+    Handle holdEv{OpenEventW(SYNCHRONIZE, FALSE, holdName.c_str())};
+    expect(readyEv.value && holdEv.value, "open cross-process sync events");
+
+    const auto logB = logDir / L"ab-pushflow-xproc-b.log";
+    fs::remove(logB);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logB.c_str());
+    GpuFixture gfx(640, 360);
+    ipc::Producer prodB(gfx.dev.Get(), unique_mapping(L"xpB"), gfx.shape);
+    LaunchOptions optsB{};
+    optsB.backend = Backend::PushFlow;
+    optsB.pushflowTier = PushFlowTier::Fast;
+    optsB.pushflowRuntimeDir = pfRuntime;
+    optsB.multiplier = 2;
+    optsB.monitorId = monId;
+    Controller ctrlB(optsB);
+    const auto offB = prodB.connect(ctrlB.peer());
+    expect(ctrlB.offer(offB, gfx.shape, gfx.luid), "offer xproc B");
+    expect(WaitForSingleObject(prodB.control_event(), 10000) == WAIT_OBJECT_0, "handshake xproc B");
+    wait_log_token(logB, "event=initialized backend=pushflow", ctrlB);
+    for (uint32_t f = 0; f < 20; ++f) {
+        pace_to(clock_ns() + 16'666'667ULL);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+        publish_ok_or_dropped(prodB, gfx.tex.Get(), clock_ns());
+        if (!list_starting_markers(marksDir).empty() &&
+            count_tokens(read_text(logB), "event=present_vfg_subframe ") >= 3) break;
+    }
+    wait_log_token(logB, "event=present_vfg_subframe ", ctrlB);
+    const auto markers = list_starting_markers(marksDir);
+    expect(markers.size() == 1, "xproc B must arm 1 starting marker");
+    const auto offerLineB = find_line(read_text(logB), "event=offer ");
+    const auto pidB = std::stoul(field_value(offerLineB, "pid="));
+    {
+        std::ofstream out(infoPath, std::ios::binary | std::ios::trunc);
+        out << pidB << '\n';
+        for (wchar_t wc : markers[0]) out << static_cast<char>(wc);
+        out << '\n';
+    }
+    SetEvent(readyEv.value);
+    // Keep feeding frames periodically so presenter watchdog (2000ms) does not fire until host kills or holdEv clears.
+    uint32_t frame = 20;
+    while (WaitForSingleObject(holdEv.value, 33) == WAIT_TIMEOUT && ctrlB.alive()) {
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (frame * 20) % 480);
+        publish_ok_or_dropped(prodB, gfx.tex.Get(), clock_ns());
+        ++frame;
+    }
+}
+
+void run_pushflow_cross_process_markers(const std::wstring& presenter, const fs::path& logDir,
+    const std::wstring& monId, const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    fs::remove_all(marksDir);
+    const auto logA = logDir / L"ab-pushflow-xproc-a.log";
+    const auto logA2 = logDir / L"ab-pushflow-xproc-a2.log";
+    const auto logC = logDir / L"ab-pushflow-xproc-c.log";
+    const auto infoFile = logDir / L"xproc-b-info.txt";
+    fs::remove(logA);
+    fs::remove(logA2);
+    fs::remove(logC);
+    fs::remove(infoFile);
+
+    const auto selfPid = std::to_wstring(GetCurrentProcessId());
+    const auto readyName = LR"(Local\obs-nr-xp-ready-)" + selfPid;
+    const auto holdName = LR"(Local\obs-nr-xp-hold-)" + selfPid;
+    Handle readyEv{CreateEventW(nullptr, TRUE, FALSE, readyName.c_str())};
+    Handle holdEv{CreateEventW(nullptr, TRUE, FALSE, holdName.c_str())};
+    expect(readyEv.value && holdEv.value, "create cross-process events");
+
+    wchar_t selfExe[4096]{};
+    const auto selfLen = GetModuleFileNameW(nullptr, selfExe, ARRAYSIZE(selfExe));
+    expect(selfLen && selfLen < ARRAYSIZE(selfExe), "query self exe path");
+
+    struct HelperEnvGuard {
+        ~HelperEnvGuard()
+        {
+            SetEnvironmentVariableW(L"OBS_NR_XPROC_READY_EVENT", nullptr);
+            SetEnvironmentVariableW(L"OBS_NR_XPROC_HOLD_EVENT", nullptr);
+            SetEnvironmentVariableW(L"OBS_NR_XPROC_INFO_FILE", nullptr);
+        }
+    } envGuard;
+    SetEnvironmentVariableW(L"OBS_NR_XPROC_READY_EVENT", readyName.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_XPROC_HOLD_EVENT", holdName.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_XPROC_INFO_FILE", infoFile.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+
+    auto cmd = L"\"" + std::wstring(selfExe, selfLen) + L"\" \"" + presenter + L"\" \"" +
+        logDir.wstring() + L"\" pushflow-cross-process-helper";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    expect(CreateProcessW(selfExe, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &si, &pi) != FALSE, "launch cross-process host-B helper");
+    Handle hostBProc{pi.hProcess}, hostBThread{pi.hThread};
+    struct HostBCleanup {
+        HANDLE proc{};
+        DWORD pidB{};
+        ~HostBCleanup()
+        {
+            if (pidB) {
+                Handle pB{OpenProcess(PROCESS_TERMINATE, FALSE, pidB)};
+                if (pB.value) TerminateProcess(pB.value, 9);
+            }
+            if (proc) TerminateProcess(proc, 9);
+        }
+    } hostBCleanup{hostBProc.value, 0};
+
+    expect(WaitForSingleObject(readyEv.value, 15000) == WAIT_OBJECT_0, "wait for cross-process host-B ready");
+    std::ifstream infoIn(infoFile);
+    std::string pidBStr, markerBStr;
+    expect(std::getline(infoIn, pidBStr) && std::getline(infoIn, markerBStr) && !markerBStr.empty(),
+        "read cross-process host-B info");
+    const DWORD pidB = std::stoul(pidBStr);
+    hostBCleanup.pidB = pidB;
+    const std::wstring markerB(markerBStr.begin(), markerBStr.end());
+    expect(fs::exists(marksDir / markerB), "host-B exact markerB must exist on disk");
+
+    // Host A starts 2x PushFlow in this separate process against the SAME LOCALAPPDATA.
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logA.c_str());
+    GpuFixture gfx(640, 360);
+    LaunchOptions optsA{};
+    optsA.backend = Backend::PushFlow;
+    optsA.pushflowTier = PushFlowTier::Fast;
+    optsA.pushflowRuntimeDir = pfRuntime;
+    optsA.multiplier = 2;
+    optsA.monitorId = monId;
+    std::wstring markerA;
+    {
+        ipc::Producer prodA(gfx.dev.Get(), unique_mapping(L"xpA"), gfx.shape);
+        Controller ctrlA(optsA);
+        const auto offA = prodA.connect(ctrlA.peer());
+        expect(ctrlA.offer(offA, gfx.shape, gfx.luid), "offer xproc A");
+        expect(WaitForSingleObject(prodA.control_event(), 10000) == WAIT_OBJECT_0, "handshake xproc A");
+        wait_log_token(logA, "event=initialized backend=pushflow", ctrlA);
+        for (uint32_t f = 0; f < 15; ++f) {
+            pace_to(clock_ns() + 16'666'667ULL);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(prodA, gfx.tex.Get(), clock_ns());
+            if (count_starting_markers(marksDir) == 2 &&
+                count_tokens(read_text(logA), "event=present_vfg_subframe ") >= 3) break;
+        }
+        wait_log_token(logA, "event=present_vfg_subframe ", ctrlA);
+        const auto m2 = list_starting_markers(marksDir);
+        expect(m2.size() == 2, "xproc host-A + host-B must hold 2 isolated markers");
+        markerA = (m2[0] == markerB) ? m2[1] : m2[0];
+        expect(markerA != markerB && fs::exists(marksDir / markerA) && fs::exists(marksDir / markerB),
+            "host-A and host-B markers must be distinct");
+
+        // Host-A UserClosed -> exact markerA removed, exact markerB from host-B MUST survive!
+        const auto offerLineA = find_line(read_text(logA), "event=offer ");
+        const auto hwndA = std::stoull(field_value(offerLineA, "hwnd="), nullptr, 16);
+        expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndA)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+            "Esc xproc A");
+        const auto dl = clock_ns() + 2'500'000'000ULL;
+        while (ctrlA.alive() && clock_ns() < dl) Sleep(10);
+        expect(!ctrlA.alive() && ctrlA.await_exit_cleanup(1000) && ctrlA.user_close_marker_cleaned(),
+            "xproc A UserClosed cleanup");
+        expect(prodA.retire() == ipc::Status::Ok, "retire xproc A");
+    }
+    expect(!fs::exists(marksDir / markerA) && fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 1,
+        "xproc host-A UserClosed must delete ONLY markerA and preserve live host-B markerB");
+
+    // Host-A REOPENS 2x PushFlow while separate host-B is STILL active: must succeed 2x AND preserve markerB!
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logA2.c_str());
+    {
+        ipc::Producer prodA2(gfx.dev.Get(), unique_mapping(L"xpA2"), gfx.shape);
+        Controller ctrlA2(optsA);
+        const auto offA2 = prodA2.connect(ctrlA2.peer());
+        expect(ctrlA2.offer(offA2, gfx.shape, gfx.luid), "offer xproc A2");
+        expect(WaitForSingleObject(prodA2.control_event(), 10000) == WAIT_OBJECT_0, "handshake xproc A2");
+        wait_log_token(logA2, "event=initialized backend=pushflow", ctrlA2);
+        for (uint32_t f = 0; f < 15; ++f) {
+            pace_to(clock_ns() + 16'666'667ULL);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(prodA2, gfx.tex.Get(), clock_ns());
+            if (count_tokens(read_text(logA2), "event=present_vfg_subframe ") >= 3) break;
+        }
+        wait_log_token(logA2, "event=present_vfg_subframe ", ctrlA2);
+        const auto a2Txt = read_text(logA2);
+        expect(a2Txt.find("event=pushflow_previous_crash_detected") == std::string::npos,
+            "host-A reopen while live host-B runs must NOT misclassify markerB as crash");
+        expect(fs::exists(marksDir / markerB),
+            "host-A reopen must preserve live host-B markerB");
+
+        const auto offerLineA2 = find_line(a2Txt, "event=offer ");
+        const auto hwndA2 = std::stoull(field_value(offerLineA2, "hwnd="), nullptr, 16);
+        expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndA2)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+            "Esc xproc A2");
+        const auto dl2 = clock_ns() + 2'500'000'000ULL;
+        while (ctrlA2.alive() && clock_ns() < dl2) Sleep(10);
+        expect(!ctrlA2.alive() && ctrlA2.await_exit_cleanup(1000) && ctrlA2.user_close_marker_cleaned(),
+            "xproc A2 UserClosed cleanup");
+        expect(prodA2.retire() == ipc::Status::Ok, "retire xproc A2");
+    }
+    expect(fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 1,
+        "after host-A2 closes, live host-B markerB still survives");
+
+    // Simulate abrupt startup crash of host-B (kill both host-B process and presenter pidB with no quarantine/fallback).
+    {
+        Handle presB{OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pidB)};
+        if (presB.value) {
+            TerminateProcess(presB.value, 9);
+            WaitForSingleObject(presB.value, 2000);
+        }
+        TerminateProcess(hostBProc.value, 9);
+        WaitForSingleObject(hostBProc.value, 2000);
+        hostBCleanup.pidB = 0;
+        hostBCleanup.proc = nullptr;
+    }
+    expect(fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 1,
+        "crashed host-B exact markerB must remain on disk");
+
+    // Host-C opens 2x -> detects host-B's crash, degrades to 1x originals, and consumes exact markerB!
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logC.c_str());
+    ipc::Producer prodC(gfx.dev.Get(), unique_mapping(L"xpC"), gfx.shape);
+    Controller ctrlC(optsA);
+    const auto offC = prodC.connect(ctrlC.peer());
+    expect(ctrlC.offer(offC, gfx.shape, gfx.luid), "offer xproc C");
+    expect(WaitForSingleObject(prodC.control_event(), 10000) == WAIT_OBJECT_0, "handshake xproc C");
+    const auto startC = clock_ns();
+    for (uint32_t f = 0; f < 30; ++f) {
+        const auto ts = startC + uint64_t{f} * 1'000'000'000ULL / 30;
+        pace_to(ts);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+        publish_ok_or_dropped(prodC, gfx.tex.Get(), ts);
+    }
+    Sleep(200);
+    wait_controller_exit(ctrlC);
+    expect(prodC.retire() == ipc::Status::Ok, "retire xproc C");
+    const auto cTxt = read_text(logC);
+    expect(cTxt.find("event=pushflow_previous_crash_detected") != std::string::npos,
+        "host-C must detect crashed host-B markerB");
+    expect(count_tokens(cTxt, "event=present_original ") >= 20 &&
+        count_tokens(cTxt, "event=present_vfg_subframe ") == 0,
+        "host-C must degrade to 1x original after host-B crash");
+    expect(!fs::exists(marksDir / markerB) && count_starting_markers(marksDir) == 0,
+        "host-C consumed exact markerB cleanly");
+    std::printf("PASS ab_pushflow_cross_process_markers markerA=%ls markerB=%ls pidB=%lu orig=%zu\n",
+        markerA.c_str(), markerB.c_str(), pidB, count_tokens(cTxt, "event=present_original "));
 }
 
 void run_anr_ab(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
@@ -1644,6 +1910,14 @@ int wmain(int argc, wchar_t** argv)
             const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-overlapping-markers");
             run_pushflow_overlapping_markers(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-cross-process-helper") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-cross-process-helper");
+            run_pushflow_cross_process_helper(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-cross-process-markers") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-cross-process-markers");
+            run_pushflow_cross_process_markers(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
         } else if (mode == L"anr-ab") {
             const auto dll = readEnv(L"OBS_NR_TEST_ANR_MOCK_DLL");
             expect(!dll.empty(), "OBS_NR_TEST_ANR_MOCK_DLL required for anr-ab");
