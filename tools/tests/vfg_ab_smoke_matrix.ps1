@@ -241,6 +241,7 @@ try {
     Invoke-Checked 'ab-pushflow-userstop-stalled' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled }
     Invoke-Checked 'ab-stalled-log-esc' { & $abRunner $modPresenter $LogDir stalled-log-esc }
     Invoke-Checked 'ab-watchdog-stalled-pipe-log' { & $abRunner $modPresenter $LogDir watchdog-stalled-pipe-log }
+    Invoke-Checked 'ab-pushflow-esc-stalled-pipe-log' { & $abRunner $modPresenter $LogDir pushflow-esc-stalled-pipe-log }
     Invoke-Checked 'ab-pushflow-userstop-stalled-pipe-log' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled-pipe-log }
     Invoke-Checked 'ab-pushflow-midrun-crash' { & $abRunner $modPresenter $LogDir pushflow-midrun-crash }
 } finally {
@@ -248,12 +249,14 @@ try {
 }
 Invoke-Checked 'ab-pushflow-empty' { & $abRunner $modPresenter $LogDir pushflow-empty }
 
-# (f2) Real libobs vfg_filter_output_tests (all 17 close/recovery scenarios + render tick < 5 ms)
+# (f2) Real libobs vfg_filter_output_tests (all 17 close/recovery scenarios + immediate Esc reopen + render tick < 5 ms)
 Invoke-Checked 'libobs-vfg-filter-output' {
     Push-Location $LibObsDir
+    $env:OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME = $PushFlowRuntimeDir
     try {
         & $filterTests $pluginDll $pluginData $modPresenter (Join-Path $LibObsDir 'libobs-d3d11.dll') (Join-Path $LogDir 'libobs-vfg-output')
     } finally {
+        Remove-Item Env:OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME -ErrorAction SilentlyContinue
         Pop-Location
     }
 }

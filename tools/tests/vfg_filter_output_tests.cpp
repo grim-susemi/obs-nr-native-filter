@@ -22,6 +22,8 @@ namespace {
 constexpr uint32_t width = 320, height = 180;
 std::atomic_uint32_t fixtureWidth{width};
 std::atomic_bool fixtureBlue{};
+std::atomic_bool fixtureAnimate{};
+std::atomic_uint32_t fixtureFrameSeq{};
 constexpr char filterId[] = "susemi_fg_tap";
 using Pixels = std::array<uint8_t, 4>;
 constexpr Pixels red{255, 0, 0, 255}, blue{0, 0, 255, 255}, transparent{};
@@ -81,6 +83,16 @@ void render_fixture(void*, gs_effect_t*)
     gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &color);
     while (gs_effect_loop(effect, "Solid"))
         gs_draw_sprite(nullptr, 0, fixtureWidth.load(), height);
+    if (fixtureAnimate.load()) {
+        const auto seq = fixtureFrameSeq.fetch_add(1);
+        const vec4 bar{1.f, 1.f, 1.f, 1.f};
+        gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &bar);
+        gs_matrix_push();
+        gs_matrix_translate3f(static_cast<float>((seq * 16) % 240), 40.f, 0.f);
+        while (gs_effect_loop(effect, "Solid"))
+            gs_draw_sprite(nullptr, 0, 32, 64);
+        gs_matrix_pop();
+    }
 }
 
 Pixels probe(obs_source_t* src, const Pixels& background, bool sourceOver)
@@ -701,7 +713,9 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     const auto oldGenStr = oldOffer.empty() ? std::string("none(pre-offer)") : field(oldOffer, "generation=");
     if (recover) {
         expect(!field(newOffer, "generation=").empty(), "recovered offer has generation");
-        if (earlyCheckpoint) expect(oldOffer.empty(), "early checkpoint has no prior offer");
+        if (earlyCheckpoint)
+            expect(event(transcript, "event=offer ", "epoch=1").empty(),
+                "early checkpoint transcript must have no epoch=1 offer");
     }
     std::printf("PASS %ls old_pid=%lu old_exit=%lu old_generation=%s new_pid=%s new_generation=%s relaunches=%zu "
         "elapsed_ms=%lld max_render_ns=%llu raw_frames=%llu raw_gaps=%llu\n", s.name, oldPid, oldExit,
@@ -730,6 +744,66 @@ constexpr std::array scenarios{
         Scenario{L"parent-detach", Action::Detach},
         Scenario{L"bad-live-peer", Action::BadPeer, nullptr, nullptr, L"bad_peer"},
 };
+
+void immediate_esc_reopen_case(const fs::path& scratch, const fs::path& log, const std::wstring& pfRuntime)
+{
+    const auto marks = scratch / L"obs-nr-native-filter";
+    fs::remove_all(marks);
+    SetEnvironmentVariableW(L"LOCALAPPDATA", scratch.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    fixtureAnimate.store(true);
+    struct ResetAnimate { ~ResetAnimate() { fixtureAnimate.store(false); } } resetAnimate;
+
+    auto input = source("vfg_test_color");
+    auto data = settings();
+    obs_data_set_int(data.get(), "vfg_backend", 1);
+    auto filter = source(filterId, data.get());
+    obs_source_filter_add(input.get(), filter.get());
+    obs_set_output_source(0, input.get());
+    struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+    const auto props = properties(filter.get());
+
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get()), "start PushFlow");
+    std::string firstInit;
+    await([&] {
+        const auto t = text_of(log);
+        firstInit = event(t, "event=initialized backend=pushflow ");
+        return !firstInit.empty() && count_events(t, "event=present_vfg_subframe ") >= 3 &&
+            !event(t, "event=offer ", "epoch=1").empty();
+    }, "initial PushFlow synthesis before immediate Esc");
+    const auto firstOffer = event(text_of(log), "event=offer ", "epoch=1");
+    const auto firstPid = std::stoul(field(firstOffer, "pid="));
+    const auto hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(std::stoull(field(firstOffer, "hwnd="), nullptr, 16)));
+    const Handle firstProc{OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, firstPid)};
+    expect(firstProc.value != nullptr, "open first PushFlow presenter");
+    expect(fs::exists(marks / L"pushflow-starting.txt"), "pushflow-starting.txt armed during synthesis");
+
+    expect(PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0) != FALSE, "Esc on PushFlow preview");
+    // Wait ONLY for OS child exit (no test-side await_exit_cleanup) to test the immediate OBS reopen boundary.
+    await([&] { return WaitForSingleObject(firstProc.value, 0) == WAIT_OBJECT_0; }, "bounded Esc exit", 2500);
+
+    const auto reopenOffset = text_of(log).size();
+    await([&] {
+        return obs_property_button_clicked(obs_properties_get(props.get(), "vfg_start"), filter.get());
+    }, "immediate libobs vfg_start right after Esc", 2000);
+    await([&] {
+        const auto tail = text_of(log).substr(reopenOffset);
+        return !event(tail, "event=initialized backend=pushflow ").empty() &&
+            count_events(tail, "event=present_vfg_subframe ") >= 3;
+    }, "immediate reopen resumes PushFlow synthesis", 10000);
+
+    const auto tail = text_of(log).substr(reopenOffset);
+    expect(tail.find("event=pushflow_previous_crash_detected") == std::string::npos,
+        "immediate OBS reopen after Esc must NOT misclassify as previous crash");
+    const auto secondOffer = event(tail, "event=offer ", "epoch=1");
+    expect(std::stoul(field(secondOffer, "pid=")) != firstPid && field(secondOffer, "mode=") == "2x",
+        "immediate reopen launched fresh 2x PushFlow PID");
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()), "stop reopened PushFlow");
+    obs_source_filter_remove(input.get(), filter.get());
+    std::printf("PASS k-immediate-esc-reopen first_pid=%lu second_pid=%s subframes=%zu\n",
+        firstPid, field(secondOffer, "pid=").c_str(), count_events(tail, "event=present_vfg_subframe "));
+}
 
 void run_isolated(wchar_t** argv, const Scenario& s)
 {
@@ -788,6 +862,11 @@ int run_host(int argc, wchar_t** argv)
                 }
             }
             expect(failed == 0, "isolated libobs recovery failures");
+            wchar_t pfBuf[4096]{};
+            const auto pfLen = GetEnvironmentVariableW(L"OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME", pfBuf, ARRAYSIZE(pfBuf));
+            if (pfLen && pfLen < ARRAYSIZE(pfBuf)) {
+                run_isolated(argv, Scenario{L"k-immediate-esc-reopen", Action::Escape});
+            }
         }
         const auto plugin = std::filesystem::path(argv[1]).string();
         const auto data = std::filesystem::path(argv[2]).string();
@@ -836,6 +915,13 @@ int run_host(int argc, wchar_t** argv)
             if (scenario == L"anr-missing-companion" || scenario == L"anr-missing-pack") {
                 vfg_anr_fallback_case(fs::path(argv[0]).parent_path() / L"anr_benign_fixture.dll", log,
                     scenario == L"anr-missing-pack");
+                return 0;
+            }
+            if (scenario == L"k-immediate-esc-reopen") {
+                wchar_t pfBuf[4096]{};
+                const auto pfLen = GetEnvironmentVariableW(L"OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME", pfBuf, ARRAYSIZE(pfBuf));
+                expect(pfLen && pfLen < ARRAYSIZE(pfBuf), "OBS_NR_TEST_IMMEDIATE_REOPEN_RUNTIME required");
+                immediate_esc_reopen_case(scratch, log, std::wstring(pfBuf, pfLen));
                 return 0;
             }
             SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", (scratch / L"missing-runtime").c_str());

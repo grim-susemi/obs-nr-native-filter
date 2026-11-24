@@ -958,7 +958,6 @@ struct BlockingLogPipe {
     std::string captured;
     std::mutex mutex;
     std::atomic_bool tokenSeen{false};
-    std::atomic_bool drainPaused{false};
     std::thread reader;
 
     BlockingLogPipe(std::wstring_view tag, std::string stopAfterToken)
@@ -967,7 +966,7 @@ struct BlockingLogPipe {
         pipeName = LR"(\\.\pipe\obs-nr-stalled-log-)" + std::wstring(tag) + L"-" +
             std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++seq);
         pipe = CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_BYTE | PIPE_WAIT, 1, 64, 64, 0, nullptr);
+            PIPE_TYPE_BYTE | PIPE_WAIT, 1, 512, 512, 0, nullptr);
         expect(pipe != INVALID_HANDLE_VALUE, "CreateNamedPipeW for blocking log pipe");
         stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         expect(stopEvent != nullptr, "CreateEventW for blocking log pipe");
@@ -988,18 +987,26 @@ struct BlockingLogPipe {
                 {
                     std::lock_guard lock(mutex);
                     captured.append(buf, got);
-                    if (!token.empty() && captured.find(token) != std::string::npos) {
+                    const auto pos = token.empty() ? std::string::npos : captured.find(token);
+                    if (pos != std::string::npos && captured.find('\n', pos) != std::string::npos) {
                         tokenSeen.store(true, std::memory_order_release);
                         pauseNow = true;
                     }
                 }
                 if (pauseNow) {
-                    drainPaused.store(true, std::memory_order_release);
                     WaitForSingleObject(stopEvent, INFINITE);
                     break;
                 }
             }
         });
+    }
+
+    DWORD avail_bytes() const
+    {
+        DWORD avail{};
+        if (pipe != INVALID_HANDLE_VALUE && PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr))
+            return avail;
+        return 0;
     }
 
     std::string snapshot()
@@ -1027,15 +1034,60 @@ struct BlockingLogPipe {
     ~BlockingLogPipe() { close(); }
 };
 
-void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path&, const std::wstring& monId,
+struct BlockedWriteWitness {
+    DWORD pipeAvailBytes{};
+    uint32_t framesFed{};
+};
+
+BlockedWriteWitness saturate_and_confirm_blocked_write(BlockingLogPipe& logPipe, GpuFixture& gfx,
+    ipc::Producer& producer, Controller& controller, uint32_t startFrame = 1)
+{
+    const auto start = clock_ns();
+    const auto deadline = start + 6'000'000'000ULL;
+    uint32_t f = 0;
+    while (clock_ns() < deadline) {
+        const auto avail = logPipe.avail_bytes();
+        if (avail > 0 && controller.log_write_in_flight()) {
+            // Confirm WriteFile stays blocked in kernel across 80 ms without pipe drain.
+            Sleep(80);
+            if (controller.log_write_in_flight() && logPipe.avail_bytes() == avail) {
+                return {avail, f};
+            }
+        }
+        const auto ts = start + uint64_t{f} * 16'666'667ULL;
+        pace_to(ts);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, ((startFrame + f) * 20) % 480);
+        const auto pub = producer.publish(gfx.tex.Get(), ts, clock_ns(), false, 0, nullptr, 50);
+        if (pub != ipc::Status::Ok && pub != ipc::Status::Dropped) {
+            const auto afterAvail = logPipe.avail_bytes();
+            if (afterAvail > 0 && controller.log_write_in_flight()) {
+                return {afterAvail, f};
+            }
+            throw std::runtime_error("publish failed while saturating pipe");
+        }
+        ++f;
+    }
+    throw std::runtime_error("failed to observe real kernel pipe WriteFile block (avail=" +
+        std::to_string(logPipe.avail_bytes()) + " in_flight=" +
+        std::to_string(controller.log_write_in_flight() ? 1 : 0) + ")");
+}
+
+void write_pipe_witness_log(const fs::path& path, const std::string& header, const std::string& pipeSnapshot)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << header << "\n--- PIPE CAPTURE BEFORE BLOCK ---\n" << pipeSnapshot << "\n";
+    out.close();
+    expect(out.good(), "write pipe witness log");
+}
+
+void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
     const std::wstring& pfRuntime, const fs::path& marksDir)
 {
     fs::remove_all(marksDir);
-    BlockingLogPipe logPipe(L"wd", "event=test_worker_stalled");
+    BlockingLogPipe logPipe(L"wd", "event=present_original ");
     SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
     SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logPipe.pipeName.c_str());
     SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
-    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_WORKER_MS", L"7000");
 
     GpuFixture gfx(640, 360);
     auto producer = std::make_unique<ipc::Producer>(gfx.dev.Get(), unique_mapping(L"pfwdpipe"), gfx.shape);
@@ -1046,58 +1098,114 @@ void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path
     opts.multiplier = 2;
     opts.monitorId = monId;
     Controller controller(opts);
+    const auto oldPid = controller.peer().pid;
     const auto offer = producer->connect(controller.peer());
     expect(controller.offer(offer, gfx.shape, gfx.luid), "offer watchdog pipe");
     expect(WaitForSingleObject(producer->control_event(), 10000) == WAIT_OBJECT_0, "handshake watchdog pipe");
 
-    const auto waitDeadline = clock_ns() + 15'000'000'000ULL;
+    // Feed warmup frames until the first present_original line is read from the pipe, then reader pauses.
+    const auto warmStart = clock_ns();
+    uint32_t warmFrame = 0;
+    const auto waitDeadline = warmStart + 15'000'000'000ULL;
     while (!logPipe.tokenSeen.load(std::memory_order_acquire) && clock_ns() < waitDeadline) {
-        expect(controller.alive(), "presenter exited before test_worker_stalled");
-        Sleep(5);
+        expect(controller.alive(), "presenter exited before present_original on pipe");
+        const auto ts = warmStart + uint64_t{warmFrame} * 16'666'667ULL;
+        pace_to(ts);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (warmFrame * 20) % 480);
+        publish_ok_or_dropped(*producer, gfx.tex.Get(), ts);
+        ++warmFrame;
     }
-    expect(logPipe.tokenSeen.load(std::memory_order_acquire), "timed out waiting for test_worker_stalled on pipe");
+    expect(logPipe.tokenSeen.load(std::memory_order_acquire), "timed out waiting for present_original on pipe");
     expect(fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be armed before watchdog");
+
+    const auto witness = saturate_and_confirm_blocked_write(logPipe, gfx, *producer, controller, warmFrame);
+    expect(controller.alive(), "presenter should still be blocked in WriteFile when witness observed");
 
     const auto stallStart = clock_ns();
     const auto deadline = stallStart + 4'500'000'000ULL;
     while (controller.alive() && clock_ns() < deadline) Sleep(10);
     const auto watchdogElapsedMs = (clock_ns() - stallStart) / 1'000'000ULL;
-    expect(!controller.alive(), "no-input watchdog must terminate despite stalled pipe log");
+    expect(!controller.alive(), "no-input watchdog must terminate despite blocked kernel WriteFile");
     expect(controller.await_exit_cleanup(500), "watchdog exit cleanup must remain bounded despite blocked pipe");
     expect(controller.exit_reason() == ExitReason::Watchdog, "watchdog must preserve ExitReason::Watchdog");
     expect(fs::exists(marksDir / L"pushflow-starting.txt"), "watchdog must NOT clear starting marker");
+    const auto pipeSnap = logPipe.snapshot();
     expect(producer->retire() == ipc::Status::Ok, "retire watchdog pipe");
     producer.reset();
+    logPipe.close();
+
+    write_pipe_witness_log(logDir / L"ab-watchdog-stalled-pipe-log.log",
+        "WITNESS scenario=watchdog pipe_avail_bytes=" + std::to_string(witness.pipeAvailBytes) +
+        " frames_fed=" + std::to_string(witness.framesFed) +
+        " log_write_in_flight=1 old_pid=" + std::to_string(oldPid) +
+        " exit_ms=" + std::to_string(watchdogElapsedMs) + " exit_reason=3",
+        pipeSnap);
+
+    const auto recLog = logDir / L"ab-watchdog-stalled-pipe-recovery.log";
+    fs::remove(recLog);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", recLog.c_str());
 
     expect(controller.can_recover() && controller.begin_async_fallback_relaunch(),
         "watchdog must remain eligible for 1x fallback recovery");
+    bool reachedReady = false;
     const auto recDeadline = clock_ns() + 8'000'000'000ULL;
     while (clock_ns() < recDeadline) {
-        if (controller.poll_async_fallback_relaunch() == RelaunchState::Ready) break;
+        if (controller.poll_async_fallback_relaunch() == RelaunchState::Ready) {
+            reachedReady = true;
+            break;
+        }
         Sleep(10);
     }
+    expect(reachedReady, "watchdog recovery must reach RelaunchState::Ready");
     expect(fs::exists(marksDir / L"pushflow-crash-quarantine.txt"),
         "watchdog recovery must persist crash quarantine");
-    wait_controller_exit(controller);
-    logPipe.close();
+    const auto newPid = controller.peer().pid;
+    expect(newPid != 0 && newPid != oldPid, "watchdog recovery must launch a new presenter PID");
 
-    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_WORKER_MS", nullptr);
-    std::printf("PASS ab_watchdog_stalled_pipe_log exit_ms=%llu\n",
-        static_cast<unsigned long long>(watchdogElapsedMs));
+    {
+        ipc::Producer recProducer(gfx.dev.Get(), unique_mapping(L"pfwdrec"), gfx.shape);
+        const auto recOffer = recProducer.connect(controller.peer());
+        expect(controller.offer(recOffer, gfx.shape, gfx.luid), "offer watchdog 1x recovery");
+        expect(WaitForSingleObject(recProducer.control_event(), 10000) == WAIT_OBJECT_0,
+            "handshake watchdog 1x recovery");
+        wait_log_token(recLog, "event=initialized ", controller);
+        const auto recStart = clock_ns();
+        for (uint32_t f = 0; f < 25; ++f) {
+            const auto ts = recStart + uint64_t{f} * 16'666'667ULL;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(recProducer, gfx.tex.Get(), ts);
+        }
+        wait_log_token(recLog, "event=present_original ", controller);
+        wait_controller_exit(controller);
+        expect(recProducer.retire() == ipc::Status::Ok, "retire watchdog 1x recovery");
+    }
+    const auto recText = read_text(recLog);
+    expect(count_tokens(recText, "event=present_original ") >= 5 &&
+        count_tokens(recText, "event=present_vfg_subframe ") == 0,
+        "watchdog recovered child must present 1x original frames only");
+    std::printf("PASS ab_watchdog_stalled_pipe_log old_pid=%lu new_pid=%lu pipe_avail=%lu exit_ms=%llu orig=%zu\n",
+        oldPid, newPid, witness.pipeAvailBytes, static_cast<unsigned long long>(watchdogElapsedMs),
+        count_tokens(recText, "event=present_original "));
 }
 
-void run_pushflow_userstop_stalled_pipe_log(const std::wstring& presenter, const fs::path& logDir,
-    const std::wstring& monId, const std::wstring& pfRuntime, const fs::path& marksDir)
+void run_pushflow_pipe_close_case(const std::wstring& presenter, const fs::path& logDir,
+    const std::wstring& monId, const std::wstring& pfRuntime, const fs::path& marksDir, bool useControllerStop)
 {
     fs::remove_all(marksDir);
-    BlockingLogPipe logPipe(L"user", "event=initialized backend=pushflow");
+    const std::wstring tag = useControllerStop ? L"userstop" : L"esc";
+    const auto witnessPath = logDir / (useControllerStop ? L"ab-pushflow-userstop-stalled-pipe-log.log"
+                                                         : L"ab-pushflow-esc-stalled-pipe-log.log");
+    const auto reopenPath = logDir / (useControllerStop ? L"ab-pushflow-userstop-stalled-pipe-log-reopen.log"
+                                                        : L"ab-pushflow-esc-stalled-pipe-log-reopen.log");
+    BlockingLogPipe logPipe(tag, "event=present_original ");
     SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
     SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logPipe.pipeName.c_str());
     SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
 
     GpuFixture gfx(640, 360);
     {
-        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfuserpipe"), gfx.shape);
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(useControllerStop ? L"pfustoppipe" : L"pfescpipe"), gfx.shape);
         LaunchOptions opts{};
         opts.backend = Backend::PushFlow;
         opts.pushflowTier = PushFlowTier::Fast;
@@ -1105,35 +1213,41 @@ void run_pushflow_userstop_stalled_pipe_log(const std::wstring& presenter, const
         opts.multiplier = 2;
         opts.monitorId = monId;
         Controller controller(opts);
+        const auto oldPid = controller.peer().pid;
         const auto offer = producer.connect(controller.peer());
-        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer userstop pipe");
-        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake userstop pipe");
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer pipe close");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake pipe close");
 
-        const auto waitDeadline = clock_ns() + 15'000'000'000ULL;
+        const auto warmStart = clock_ns();
+        uint32_t warmFrame = 0;
+        const auto waitDeadline = warmStart + 15'000'000'000ULL;
         while (!logPipe.tokenSeen.load(std::memory_order_acquire) && clock_ns() < waitDeadline) {
-            expect(controller.alive(), "presenter exited before initialized on pipe");
-            Sleep(5);
-        }
-        expect(logPipe.tokenSeen.load(std::memory_order_acquire), "timed out waiting for pushflow init on pipe");
-        expect(fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must exist before user close");
-
-        // Publish frames while pipe reader is paused so worker enters and blocks in kernel pipe WriteFile()
-        const auto start = clock_ns();
-        for (uint32_t f = 0; f < 10; ++f) {
-            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            expect(controller.alive(), "presenter exited before present_original on pipe");
+            const auto ts = warmStart + uint64_t{warmFrame} * 16'666'667ULL;
             pace_to(ts);
-            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (warmFrame * 20) % 480);
             publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+            ++warmFrame;
         }
+        expect(logPipe.tokenSeen.load(std::memory_order_acquire), "timed out waiting for present_original on pipe");
+        expect(fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must exist before close");
 
-        const auto offerLine = find_line(logPipe.snapshot(), "event=offer ");
-        const auto hwndVal = std::stoull(field_value(offerLine, "hwnd="), nullptr, 16);
-        const auto escSentNs = clock_ns();
-        expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndVal)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
-            "PostMessage VK_ESCAPE while pipe WriteFile blocked");
-        const auto exitDeadline = escSentNs + 2'200'000'000ULL;
+        const auto witness = saturate_and_confirm_blocked_write(logPipe, gfx, producer, controller, warmFrame);
+        expect(controller.alive(), "presenter should still be blocked in WriteFile before close");
+
+        const auto closeSentNs = clock_ns();
+        if (useControllerStop) {
+            controller.request_stop(true);
+        } else {
+            const auto offerLine = find_line(logPipe.snapshot(), "event=offer ");
+            const auto hwndVal = std::stoull(field_value(offerLine, "hwnd="), nullptr, 16);
+            expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndVal)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+                "PostMessage VK_ESCAPE while pipe WriteFile blocked");
+        }
+        const auto exitDeadline = closeSentNs + 2'200'000'000ULL;
         while (controller.alive() && clock_ns() < exitDeadline) Sleep(10);
-        const auto escElapsedMs = (clock_ns() - escSentNs) / 1'000'000ULL;
+        const auto closeElapsedMs = (clock_ns() - closeSentNs) / 1'000'000ULL;
+        if (useControllerStop) controller.stop(true);
         expect(!controller.alive(), "user close must exit within 2.2s even while pipe WriteFile blocked");
         expect(controller.await_exit_cleanup(500), "user close exit cleanup must remain bounded despite blocked pipe");
         expect(controller.user_close_marker_cleaned(), "user close marker cleanup must report success");
@@ -1142,17 +1256,25 @@ void run_pushflow_userstop_stalled_pipe_log(const std::wstring& presenter, const
             "pushflow-starting.txt must be cleaned independently of blocked pipe log");
         expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"),
             "user close must not write crash quarantine");
-        expect(producer.retire() == ipc::Status::Ok, "retire userstop pipe");
+        const auto pipeSnap = logPipe.snapshot();
+        expect(producer.retire() == ipc::Status::Ok, "retire pipe close");
         logPipe.close();
-        std::printf("PASS ab_pushflow_userstop_stalled_pipe_log exit_ms=%llu\n",
-            static_cast<unsigned long long>(escElapsedMs));
+        write_pipe_witness_log(witnessPath,
+            "WITNESS scenario=" + std::string(useControllerStop ? "userstop" : "esc") +
+            " pipe_avail_bytes=" + std::to_string(witness.pipeAvailBytes) +
+            " frames_fed=" + std::to_string(witness.framesFed) +
+            " log_write_in_flight=1 old_pid=" + std::to_string(oldPid) +
+            " exit_ms=" + std::to_string(closeElapsedMs) + " exit_reason=1 marker_cleaned=1",
+            pipeSnap);
+        std::printf("PASS ab_pushflow_%s_stalled_pipe_log pid=%lu pipe_avail=%lu exit_ms=%llu\n",
+            useControllerStop ? "userstop" : "esc", oldPid, witness.pipeAvailBytes,
+            static_cast<unsigned long long>(closeElapsedMs));
     }
 
-    const auto logReopen = logDir / L"ab-pushflow-userstop-stalled-pipe-log-reopen.log";
-    fs::remove(logReopen);
-    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logReopen.c_str());
+    fs::remove(reopenPath);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", reopenPath.c_str());
     {
-        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfuserpipe-re"), gfx.shape);
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(useControllerStop ? L"pfustoppipe-re" : L"pfescpipe-re"), gfx.shape);
         LaunchOptions opts{};
         opts.backend = Backend::PushFlow;
         opts.pushflowTier = PushFlowTier::Fast;
@@ -1161,10 +1283,10 @@ void run_pushflow_userstop_stalled_pipe_log(const std::wstring& presenter, const
         opts.monitorId = monId;
         Controller controller(opts);
         const auto offer = producer.connect(controller.peer());
-        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer userstop pipe reopen");
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer pipe close reopen");
         expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0,
-            "handshake userstop pipe reopen");
-        wait_log_token(logReopen, "event=initialized backend=pushflow", controller);
+            "handshake pipe close reopen");
+        wait_log_token(reopenPath, "event=initialized backend=pushflow", controller);
 
         const auto start = clock_ns();
         for (uint32_t f = 0; f < 35; ++f) {
@@ -1175,16 +1297,16 @@ void run_pushflow_userstop_stalled_pipe_log(const std::wstring& presenter, const
         }
         Sleep(300);
         wait_controller_exit(controller);
-        expect(producer.retire() == ipc::Status::Ok, "retire userstop pipe reopen");
+        expect(producer.retire() == ipc::Status::Ok, "retire pipe close reopen");
 
-        const auto cr = read_text(logReopen);
+        const auto cr = read_text(reopenPath);
         expect(cr.find("event=pushflow_previous_crash_detected") == std::string::npos,
             "reopen after blocked-pipe user close must NOT trigger false crash quarantine");
         expect(count_tokens(cr, "event=present_vfg_subframe ") >= 5,
             "reopen after blocked-pipe user close must resume PushFlow synthesis");
         expect(count_tokens(cr, "event=error") == 0, "unexpected error on reopen");
-        std::printf("PASS ab_pushflow_userstop_stalled_pipe_log_reopen subframes=%zu\n",
-            count_tokens(cr, "event=present_vfg_subframe "));
+        std::printf("PASS ab_pushflow_%s_stalled_pipe_log_reopen subframes=%zu\n",
+            useControllerStop ? "userstop" : "esc", count_tokens(cr, "event=present_vfg_subframe "));
     }
 }
 
@@ -1373,10 +1495,14 @@ int wmain(int argc, wchar_t** argv)
             const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for watchdog-stalled-pipe-log");
             run_watchdog_stalled_pipe_log(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-esc-stalled-pipe-log") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-esc-stalled-pipe-log");
+            run_pushflow_pipe_close_case(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter", false);
         } else if (mode == L"pushflow-userstop-stalled-pipe-log") {
             const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-userstop-stalled-pipe-log");
-            run_pushflow_userstop_stalled_pipe_log(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+            run_pushflow_pipe_close_case(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter", true);
         } else if (mode == L"anr-ab") {
             const auto dll = readEnv(L"OBS_NR_TEST_ANR_MOCK_DLL");
             expect(!dll.empty(), "OBS_NR_TEST_ANR_MOCK_DLL required for anr-ab");

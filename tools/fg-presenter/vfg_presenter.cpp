@@ -147,15 +147,11 @@ DWORD fixture_ms(const Session& s, const wchar_t* name)
     return *end ? 0 : std::min(delay, 30'000ul);
 }
 
-void clear_pushflow_starting_on_close(const Feed& f) noexcept
-{
-    try {
-        if (pushflow::clear_starting_on_user_close(pushflow::marker_directory(), f.pushflowActive.load(),
-            read_exit_reason(f.view))) return;
-    } catch (...) {
-    }
-    fprintf(f.log, "event=pushflow_marker_cleanup_failed\n");
-}
+struct LogWriteScope {
+    Session& view;
+    explicit LogWriteScope(Session& v) noexcept : view(v) { InterlockedIncrement(&view.logWriteInFlight); }
+    ~LogWriteScope() { InterlockedDecrement(&view.logWriteInFlight); }
+};
 
 double window_refresh(HWND window) noexcept
 {
@@ -183,7 +179,10 @@ void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a,
         q(a ? a->timestampNs : 0), id, q(eventNs ? eventNs : clock_ns()), q(workNs), telemetry.multiplier,
         static_cast<long long>(telemetry.shiftNs), telemetry.hudLock, telemetry.shotCut,
         telemetry.pacingRepair, telemetry.adaptiveFg, telemetry.adaptiveTargetFps);
-    if (len > 0) fwrite(line, 1, static_cast<size_t>(std::min<int>(len, static_cast<int>(sizeof(line) - 1))), f.log);
+    if (len > 0) {
+        const LogWriteScope ioScope{f.view};
+        fwrite(line, 1, static_cast<size_t>(std::min<int>(len, static_cast<int>(sizeof(line) - 1))), f.log);
+    }
 }
 
 void pace_until(uint64_t targetNs, Feed& f, HANDLE timer)
@@ -269,11 +268,9 @@ void frames(Feed& f)
     const auto userClosing = [&f] { return read_exit_reason(f.view) == ExitReason::UserClosed; };
     const auto drain_failure = [&] {
         stamp_exit_reason(f.view, ExitReason::Fault);
+        InterlockedExchange(&f.view.drainFailed, 1);
         const bool userClosed = f.view.backend == Backend::PushFlow &&
             read_exit_reason(f.view) == ExitReason::UserClosed;
-        if (userClosed) clear_pushflow_starting_on_close(f);
-        fprintf(f.log, "event=error message=presenter_drain_failed\n");
-        fflush(f.log);
         ShowWindowAsync(f.window, SW_HIDE);
         TerminateProcess(GetCurrentProcess(), userClosed ? 0u : 5u);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
@@ -765,7 +762,6 @@ void frames(Feed& f)
         drain_failure();
     }
     backend.reset();
-    clear_pushflow_starting_on_close(f);
     f.pushflowActive.store(false);
     InterlockedExchange(&f.view.pushflowActive, 0);
     if (consumer.close() != ipc::Status::Closed) {

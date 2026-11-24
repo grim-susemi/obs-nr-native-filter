@@ -462,6 +462,8 @@ bool start(Tap& tap, bool off)
         blog(LOG_WARNING, "[vfg] presenter launch refused: %s", obs_module_text("VFG.Status.AnrOptInRequired"));
         return false;
     }
+    // Settle any exited Controller's observer/marker cleanup before creating the next session.
+    tap.controller.reset();
     try {
         LaunchOptions opts{};
         opts.multiplier = off ? 1u : std::clamp<uint32_t>(tap.multiplier, 2, max_multiplier);

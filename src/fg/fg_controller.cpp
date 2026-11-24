@@ -91,39 +91,16 @@ fs::path marker_dir()
     const auto local = env_path(L"LOCALAPPDATA");
     return local.empty() ? fs::path{} : fs::path(local) / L"obs-nr-native-filter";
 }
-void write_event_bounded(const std::wstring& path, const std::string& text, DWORD timeoutMs = 150) noexcept
-{
-    if (path.empty() || text.empty()) return;
-    const bool isPipe = path.rfind(LR"(\\.\pipe\)", 0) == 0;
-    Handle file{CreateFileW(path.c_str(),
-        isPipe ? GENERIC_WRITE : FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        isPipe ? OPEN_EXISTING : OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-        nullptr)};
-    if (file.value == INVALID_HANDLE_VALUE) { file.value = nullptr; return; }
-    Handle done{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
-    if (!done.value) return;
+struct PendingIoWrite {
+    Handle file;
+    Handle event;
     OVERLAPPED ov{};
-    ov.hEvent = done.value;
-    if (!isPipe) {
-        ov.Offset = 0xFFFFFFFFu;
-        ov.OffsetHigh = 0xFFFFFFFFu;
-    }
-    DWORD written{};
-    if (!WriteFile(file.value, text.data(), static_cast<DWORD>(text.size()), &written, &ov)) {
-        if (GetLastError() != ERROR_IO_PENDING) return;
-        if (WaitForSingleObject(done.value, timeoutMs) != WAIT_OBJECT_0) {
-            CancelIoEx(file.value, &ov);
-            WaitForSingleObject(done.value, 50);
-        }
-    }
-}
+    std::string text;
+};
 void write_event(const char* event) noexcept
 {
     try {
-        write_event_bounded(resolve_log_path(), event ? event : "");
+        detail::write_event_bounded(resolve_log_path(), event ? event : "");
     } catch (...) {
     }
 }
@@ -135,24 +112,94 @@ bool clear_starting_marker(const fs::path& marks, std::error_code& ec) noexcept
         return false;
     }
     const auto starting = marks / L"pushflow-starting.txt";
-    if (fs::exists(starting, ec) && !ec) fs::remove(starting, ec);
+    const bool present = fs::exists(starting, ec);
+    if (ec) return false;
+    if (present) fs::remove(starting, ec);
     return !ec;
 }
+enum class MarkerCleanupStatus { NotNeeded, Pending, Succeeded, Failed };
 } // namespace
+
+namespace detail {
+void write_event_bounded(const std::wstring& path, const std::string& text, DWORD timeoutMs) noexcept
+{
+    try {
+        if (path.empty() || text.empty()) return;
+        const bool isPipe = path.rfind(LR"(\\.\pipe\)", 0) == 0;
+        auto pending = std::make_unique<PendingIoWrite>();
+        pending->file.value = CreateFileW(path.c_str(),
+            isPipe ? GENERIC_WRITE : FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            isPipe ? OPEN_EXISTING : OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            nullptr);
+        if (pending->file.value == INVALID_HANDLE_VALUE) {
+            pending->file.value = nullptr;
+            return;
+        }
+        pending->event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!pending->event.value) return;
+        pending->text = text;
+        pending->ov.hEvent = pending->event.value;
+        if (!isPipe) {
+            pending->ov.Offset = 0xFFFFFFFFu;
+            pending->ov.OffsetHigh = 0xFFFFFFFFu;
+        }
+        DWORD written{};
+        if (!WriteFile(pending->file.value, pending->text.data(),
+                static_cast<DWORD>(pending->text.size()), &written, &pending->ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) return;
+            if (WaitForSingleObject(pending->event.value, timeoutMs) != WAIT_OBJECT_0) {
+                CancelIoEx(pending->file.value, &pending->ov);
+                if (WaitForSingleObject(pending->event.value, 50) != WAIT_OBJECT_0) {
+                    // Kernel I/O is still in flight; retain OVERLAPPED, event, handle, and buffer until signaled.
+                    HMODULE selfMod = nullptr;
+                    GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                        reinterpret_cast<LPCWSTR>(&write_event_bounded),
+                        &selfMod);
+                    TP_CALLBACK_ENVIRON env{};
+                    InitializeThreadpoolEnvironment(&env);
+                    if (selfMod) SetThreadpoolCallbackLibrary(&env, selfMod);
+                    const bool queued = TrySubmitThreadpoolCallback(
+                        [](PTP_CALLBACK_INSTANCE, PVOID ctx) {
+                            std::unique_ptr<PendingIoWrite> own(static_cast<PendingIoWrite*>(ctx));
+                            WaitForSingleObject(own->event.value, INFINITE);
+                        },
+                        pending.get(), &env) != FALSE;
+                    DestroyThreadpoolEnvironment(&env);
+                    if (queued) {
+                        pending.release();
+                    } else {
+                        if (selfMod) FreeLibrary(selfMod);
+                        WaitForSingleObject(pending->event.value, INFINITE);
+                    }
+                }
+            }
+        }
+    } catch (...) {
+    }
+}
+} // namespace detail
 
 struct Controller::ChildSession {
     HANDLE job{}, child{}, mapping{};
     Session* view{};
     HANDLE exitSettledEvent{};
     std::wstring logPath;
-    std::atomic_bool markerCleanupFailed{false};
+    std::atomic<MarkerCleanupStatus> markerCleanupStatus{MarkerCleanupStatus::NotNeeded};
     std::jthread observer;
 
     ~ChildSession()
     {
+        // Terminate any live child in the kill-on-close job BEFORE joining observer.
+        if (job) {
+            CloseHandle(job);
+            job = nullptr;
+        }
         if (observer.joinable()) observer.join();
         if (exitSettledEvent) CloseHandle(exitSettledEvent);
-        if (job) CloseHandle(job);
         if (child) CloseHandle(child);
         if (view) UnmapViewOfFile(view);
         if (mapping) CloseHandle(mapping);
@@ -259,14 +306,34 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         const auto quarantine = marks / L"pushflow-crash-quarantine.txt";
         const auto userClosedMark = marks / L"pushflow-user-closed.txt";
         std::error_code ec;
-        if (!marks.empty() && fs::exists(userClosedMark, ec)) {
-            if (!fs::exists(quarantine, ec)) fs::remove(starting, ec);
-            fs::remove(userClosedMark, ec);
+        bool fallbackFailed = false;
+        if (!marks.empty() && fs::exists(userClosedMark, ec) && !ec) {
+            std::error_code qEc;
+            const bool hasQuarantine = fs::exists(quarantine, qEc);
+            if (!qEc && !hasQuarantine) {
+                std::error_code clearEc;
+                if (clear_starting_marker(marks, clearEc)) {
+                    std::error_code rmEc;
+                    fs::remove(userClosedMark, rmEc);
+                } else {
+                    fallbackFailed = true;
+                    write_event("event=pushflow_marker_cleanup_failed\n");
+                }
+            } else if (!qEc) {
+                std::error_code rmEc;
+                fs::remove(userClosedMark, rmEc);
+            }
         }
-        if (!marks.empty() && (fs::exists(starting, ec) || fs::exists(quarantine, ec))) {
+        std::error_code startEc, qCheckEc;
+        const bool startExists = !marks.empty() && fs::exists(starting, startEc);
+        const bool qExists = !marks.empty() && fs::exists(quarantine, qCheckEc);
+        if (fallbackFailed || startEc || qCheckEc || startExists || qExists) {
             write_event("event=pushflow_previous_crash_detected\n");
-            fs::remove(starting, ec);
-            fs::remove(quarantine, ec);
+            if (!marks.empty()) {
+                std::error_code rmEc;
+                fs::remove(starting, rmEc);
+                fs::remove(quarantine, rmEc);
+            }
             options_.multiplier = 1;
         } else {
             const auto dir = has_pushflow_runtime(options.pushflowRuntimeDir, options.pushflowTier)
@@ -331,12 +398,6 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     auto session = std::make_unique<ChildSession>();
     Handle exitSettled{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     require(exitSettled.value != nullptr, "VFG exit settled event");
-    if (!fallback && options.backend != Backend::NativeVfg) {
-        auto recovery = options_;
-        recovery.multiplier = 1;
-        recovery.pushflowRuntimeDir.clear();
-        relaunchWorker_ = std::jthread([this, recovery = std::move(recovery)] { run_fallback(recovery); });
-    }
     session->view = view;
     guard.p = nullptr;
     session->child = process.release();
@@ -344,6 +405,10 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     session->job = job.release();
     session->exitSettledEvent = exitSettled.release();
     session->logPath = log;
+    session->markerCleanupStatus.store(
+        (options_.backend == Backend::PushFlow && options_.multiplier > 1) ?
+            MarkerCleanupStatus::Pending : MarkerCleanupStatus::NotNeeded,
+        std::memory_order_release);
     session->observer = std::jthread([s = session.get(), backend = options_.backend, marks = marker_dir()] {
         WaitForSingleObject(s->child, INFINITE);
         const auto reason = read_exit_reason(*s->view);
@@ -351,21 +416,37 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         const auto wdInit = InterlockedCompareExchange(&s->view->watchdogInitializing, 0, 0) != 0;
         const auto forced = InterlockedCompareExchange(&s->view->forceTerminated, 0, 0) != 0;
         const auto pfActive = InterlockedCompareExchange(&s->view->pushflowActive, 0, 0) != 0;
+        const auto drainFailed = InterlockedCompareExchange(&s->view->drainFailed, 0, 0) != 0;
         bool cleanupFailed = false;
-        if (reason == ExitReason::UserClosed && backend == Backend::PushFlow && pfActive) {
-            std::error_code ec;
-            if (!clear_starting_marker(marks, ec)) {
-                cleanupFailed = true;
-                s->markerCleanupFailed.store(true, std::memory_order_release);
-                std::error_code fallbackEc;
-                if (!marks.empty()) {
-                    fs::create_directories(marks, fallbackEc);
-                    std::ofstream fallback(marks / L"pushflow-user-closed.txt", std::ios::binary | std::ios::trunc);
-                    fallback << "reason=user_closed_marker_cleanup_failed\n";
+        bool fallbackRecorded = false;
+        bool fallbackWriteFailed = false;
+        if (reason == ExitReason::UserClosed && backend == Backend::PushFlow) {
+            if (pfActive) {
+                std::error_code ec;
+                if (clear_starting_marker(marks, ec)) {
+                    s->markerCleanupStatus.store(MarkerCleanupStatus::Succeeded, std::memory_order_release);
+                } else {
+                    cleanupFailed = true;
+                    s->markerCleanupStatus.store(MarkerCleanupStatus::Failed, std::memory_order_release);
+                    std::error_code dirEc;
+                    if (!marks.empty() && (fs::create_directories(marks, dirEc) || !dirEc)) {
+                        std::ofstream fallback(marks / L"pushflow-user-closed.txt", std::ios::binary | std::ios::trunc);
+                        fallback << "reason=user_closed_marker_cleanup_failed\n";
+                        fallback.flush();
+                        const bool wrote = fallback.good();
+                        fallback.close();
+                        if (wrote && !fallback.fail()) fallbackRecorded = true;
+                        else fallbackWriteFailed = true;
+                    } else {
+                        fallbackWriteFailed = true;
+                    }
                 }
+            } else {
+                s->markerCleanupStatus.store(MarkerCleanupStatus::Succeeded, std::memory_order_release);
             }
         }
         std::string diag;
+        if (drainFailed) diag += "event=error message=presenter_drain_failed\n";
         if (wdMs > 0) {
             char line[128];
             const int n = snprintf(line, sizeof(line),
@@ -381,10 +462,19 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
             if (n > 0) diag.append(line, static_cast<size_t>(n));
         }
         if (cleanupFailed) diag += "event=pushflow_marker_cleanup_failed\n";
-        if (!diag.empty()) write_event_bounded(s->logPath, diag, 150);
+        if (fallbackRecorded) diag += "event=pushflow_user_closed_fallback_recorded\n";
+        if (fallbackWriteFailed) diag += "event=pushflow_fallback_write_failed\n";
+        if (!diag.empty()) detail::write_event_bounded(s->logPath, diag, 150);
         SetEvent(s->exitSettledEvent);
     });
     session_ = std::move(session);
+    // Start relaunchWorker_ last, after session_ is committed, so constructor errors never deadlock unwind.
+    if (!fallback && options.backend != Backend::NativeVfg) {
+        auto recovery = options_;
+        recovery.multiplier = 1;
+        recovery.pushflowRuntimeDir.clear();
+        relaunchWorker_ = std::jthread([this, recovery = std::move(recovery)] { run_fallback(recovery); });
+    }
 }
 
 ipc::Peer Controller::peer() const { return ipc::identity(session_->child); }
@@ -402,7 +492,14 @@ bool Controller::await_exit_cleanup(DWORD timeoutMs) const noexcept
 }
 bool Controller::user_close_marker_cleaned() const noexcept
 {
-    return session_ && !session_->markerCleanupFailed.load(std::memory_order_acquire);
+    if (!session_) return false;
+    const auto status = session_->markerCleanupStatus.load(std::memory_order_acquire);
+    return status == MarkerCleanupStatus::Succeeded || status == MarkerCleanupStatus::NotNeeded;
+}
+bool Controller::log_write_in_flight() const noexcept
+{
+    return session_ && session_->view &&
+        InterlockedCompareExchange(&session_->view->logWriteInFlight, 0, 0) > 0;
 }
 bool Controller::request_resize() noexcept
 {
@@ -435,14 +532,8 @@ void Controller::stop(bool userStop) noexcept
     replacement_.reset();
     relaunchState_.store(RelaunchState::Idle);
     if (userStop && session_ && options_.backend == Backend::PushFlow) {
-        if (session_->child && WaitForSingleObject(session_->child, 0) == WAIT_OBJECT_0) {
-            await_exit_cleanup(200);
-            if (session_->markerCleanupFailed.load(std::memory_order_acquire)) {
-                std::error_code ec;
-                if (clear_starting_marker(marker_dir(), ec))
-                    session_->markerCleanupFailed.store(false, std::memory_order_release);
-            }
-        }
+        if (session_->child && WaitForSingleObject(session_->child, 0) == WAIT_OBJECT_0)
+            await_exit_cleanup(250);
     }
 }
 

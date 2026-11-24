@@ -45,6 +45,7 @@ public:
     bool exited() const noexcept;
     bool await_exit_cleanup(DWORD timeoutMs = 300) const noexcept;
     bool user_close_marker_cleaned() const noexcept;
+    bool log_write_in_flight() const noexcept;
     bool offer(const ipc::Offer&, const ipc::Shape&, LUID) noexcept;
     bool request_resize() noexcept;
     bool resize_drained() const noexcept;
@@ -65,4 +66,7 @@ public:
     static std::wstring find_runtime_dir();
     static std::wstring find_pushflow_dir(PushFlowTier tier);
 };
+namespace detail {
+void write_event_bounded(const std::wstring& path, const std::string& text, DWORD timeoutMs = 150) noexcept;
+}
 } // namespace nr::fg::vfg

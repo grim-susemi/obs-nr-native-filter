@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 using namespace nr::fg::vfg;
@@ -118,6 +119,78 @@ void malformed_child(const fs::path& exe, const fs::path& log)
     expect(text.find("event=error message=unsupported_session_version") != std::string::npos &&
         text.find("event=initialized ") == std::string::npos, "malformed child rejects before backend init");
 }
+
+void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::path& scratch)
+{
+    // 1. Overlapped write_event_bounded must not UAF when pipe buffer saturates and CancelIoEx fires.
+    const auto pipeName = std::wstring(LR"(\\.\pipe\obs-nr-ctrl-cancel-)") + std::to_wstring(GetCurrentProcessId());
+    const Handle pipe{CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
+        PIPE_TYPE_BYTE | PIPE_WAIT, 1, 64, 64, 0, nullptr)};
+    expect(pipe.value != INVALID_HANDLE_VALUE, "create controller cancel pipe");
+    const Handle stopPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::thread server([&] {
+        if (ConnectNamedPipe(pipe.value, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            WaitForSingleObject(stopPipe.value, INFINITE);
+        }
+    });
+    const std::string bigPayload(16384, 'X');
+    const auto t0 = clock_ns();
+    nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50);
+    const auto elapsedMs = (clock_ns() - t0) / 1'000'000ULL;
+    expect(elapsedMs < 600, "bounded overlapped write must return within timeout + cancel window");
+    SetEvent(stopPipe.value);
+    CancelIoEx(pipe.value, nullptr);
+    DisconnectNamedPipe(pipe.value);
+    server.join();
+
+    // 2. Pending vs Succeeded marker status and UserClosed fallback consumption on locked starting marker.
+    const auto localApp = scratch / L"ctrl-localapp";
+    const auto marks = localApp / L"obs-nr-native-filter";
+    fs::remove_all(localApp);
+    fs::create_directories(marks);
+    SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", exe.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", (scratch / L"ctrl-marker.log").c_str());
+    {
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.multiplier = 2;
+        Controller ctrl(opts);
+        expect(!ctrl.user_close_marker_cleaned(), "active PushFlow cleanup status must start Pending, not Succeeded");
+        ctrl.stop(true);
+        expect(ctrl.await_exit_cleanup(1500) && ctrl.user_close_marker_cleaned(),
+            "UserClosed PushFlow settles cleanup status to Succeeded");
+    }
+    // Stage pushflow-user-closed.txt + locked pushflow-starting.txt -> next Controller must NOT drop fallback when remove fails.
+    const auto starting = marks / L"pushflow-starting.txt";
+    const auto fallback = marks / L"pushflow-user-closed.txt";
+    {
+        std::ofstream(starting) << "locked\n";
+        std::ofstream(fallback) << "reason=user_closed_marker_cleanup_failed\n";
+    }
+    {
+        const Handle locked{CreateFileW(starting.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr)};
+        expect(locked.value != INVALID_HANDLE_VALUE, "lock starting marker without FILE_SHARE_DELETE");
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.multiplier = 2;
+        Controller ctrl(opts);
+        expect(fs::exists(fallback), "fallback marker must remain if starting marker removal failed");
+        ctrl.stop(true);
+    }
+    // Unlock and let next Controller consume both markers cleanly.
+    {
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.multiplier = 2;
+        Controller ctrl(opts);
+        expect(!fs::exists(starting) && !fs::exists(fallback),
+            "next Controller consumes user-closed fallback and starting marker together");
+        ctrl.stop(true);
+    }
+    fs::remove_all(localApp);
+}
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -133,7 +206,8 @@ int wmain(int argc, wchar_t** argv)
         reject_parent_options();
         runtime_contract(scratch);
         malformed_child(exe, log);
-        std::puts("PASS vfg_session_controller: v2 defaults, malformed header and paths, parent and child admission");
+        cancel_io_ex_and_marker_fallback_contract(exe, scratch);
+        std::puts("PASS vfg_session_controller: v2 defaults, malformed header and paths, parent and child admission, overlapped cancel & marker fallback");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL vfg_session_controller: %s\n", e.what());
