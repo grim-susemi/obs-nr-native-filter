@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.11',
+    [string]$Version = '0.2.12',
     [string]$Configuration = 'Release'
 )
 $ErrorActionPreference = 'Stop'
@@ -17,6 +17,23 @@ $OutDir = (Resolve-Path $OutDir).Path
 $name = "obs-nr-native-filter-$Version-windows-x64"
 $stage = Join-Path $OutDir $name
 $zip = Join-Path $OutDir "$name.zip"
+
+function Assert-ReleaseArtifacts([string[]]$Entries, [string]$PluginPath, [string]$Surface) {
+    $pluginCount = 0
+    foreach ($entry in $Entries) {
+        # ZipFile may emit Windows separators; compare the full normalized path.
+        $path = $entry.Replace('\', '/')
+        switch -Regex ($path) {
+            '\.dll$' {
+                if ($path -cne $PluginPath) { throw "$Surface contains forbidden release artifact: $entry" }
+                $pluginCount++
+            }
+            '\.(onnx|nrx|7z|nupkg|lib)$' { throw "$Surface contains forbidden release artifact: $entry" }
+        }
+    }
+    if ($pluginCount -ne 1) { throw "$Surface must contain exactly one $PluginPath (found $pluginCount)." }
+}
+
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 
@@ -49,8 +66,13 @@ $extra = [ordered]@{
     'oneclick\dlss-prompt.png' = Join-Path $repo 'docs\oneclick\dlss-prompt.png'
     'oneclick\obs-filters.png' = Join-Path $repo 'docs\oneclick\obs-filters.png'
     'standalone-upscale.md' = Join-Path $repo 'docs\standalone-upscale.md'
+    'pushfps-ab-guide.md'  = Join-Path $repo 'docs\pushfps-ab-guide.md'
     'LICENSE.txt'          = Join-Path $repo 'LICENSE'
     'notices\CREDITS.md'   = Join-Path $repo 'provenance\source-notices\CREDITS.md'
+    'notices\README.md'    = Join-Path $repo 'provenance\source-notices\README.md'
+    'notices\PushFPS-NOTICE.md' = Join-Path $repo 'provenance\source-notices\PushFPS-NOTICE.md'
+    'notices\ONNXRuntime-MIT.txt' = Join-Path $repo 'provenance\source-notices\ONNXRuntime-MIT.txt'
+    'notices\RIFE-MIT.txt' = Join-Path $repo 'provenance\source-notices\RIFE-MIT.txt'
     'notices\NR-R3.md'    = Join-Path $repo 'provenance\source-notices\NR-R3.md'
     'notices\RenoDX-MIT.txt' = Join-Path $repo 'provenance\source-notices\RenoDX-MIT.txt'
     'notices\AMD-FidelityFX-CAS-MIT.txt' = Join-Path $repo 'provenance\source-notices\AMD-FidelityFX-CAS-MIT.txt'
@@ -66,8 +88,25 @@ foreach ($rel in $extra.Keys) {
     }
 }
 
+$pluginPath = 'files/obs-plugins/64bit/obs-nr-filter.dll'
+$stageEntries = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force |
+    ForEach-Object { $_.FullName.Substring($stage.Length + 1) })
+Assert-ReleaseArtifacts $stageEntries $pluginPath 'Staging directory'
+
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $true)
+$candidate = Join-Path $OutDir "$name.$([guid]::NewGuid().ToString('N')).tmp"
+try {
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $candidate, [IO.Compression.CompressionLevel]::Optimal, $true)
+    $archive = [IO.Compression.ZipFile]::OpenRead($candidate)
+    try {
+        Assert-ReleaseArtifacts @($archive.Entries.FullName) "$name/$pluginPath" 'ZIP'
+    } finally {
+        $archive.Dispose()
+    }
+    Move-Item -LiteralPath $candidate -Destination $zip
+} finally {
+    if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Force }
+}
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllLines((Join-Path $OutDir 'SHA256SUMS.txt'), [string[]]@("$hash  $name.zip"))
 Write-Host "zip    $zip"

@@ -25,7 +25,30 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
     return barrier;
 }
 }
-Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
+DescriptorStager::DescriptorStager(ID3D12Device* device) : device_(device)
+{
+    const D3D12_DESCRIPTOR_HEAP_DESC staging{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+        D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    check(device_->CreateDescriptorHeap(&staging, IID_PPV_ARGS(&cpu_)), "CPU descriptor heap");
+}
+
+void DescriptorStager::write_srv(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest) const
+{
+    const auto source = cpu_->GetCPUDescriptorHandleForHeapStart();
+    device_->CreateShaderResourceView(resource, desc, source);
+    device_->CopyDescriptorsSimple(1, dest, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+void DescriptorStager::write_uav(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE dest) const
+{
+    const auto source = cpu_->GetCPUDescriptorHandleForHeapStart();
+    device_->CreateUnorderedAccessView(resource, nullptr, nullptr, source);
+    device_->CopyDescriptorsSimple(1, dest, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+}
+
+Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier)
+    : window_(window), pushflow_(s.backend == Backend::PushFlow)
 {
     ComPtr<IDXGIFactory5> factory5;
     ComPtr<IDXGIFactory4> factory;
@@ -48,8 +71,7 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
         check(device_->CreateCommandList(0, dq.Type, slot.alloc.Get(), nullptr, IID_PPV_ARGS(&slot.list)), "present list");
         check(slot.list->Close(), "initial list close");
     }
-    const auto fenceFlags = multiplier > 1 ? D3D12_FENCE_FLAG_SHARED : D3D12_FENCE_FLAG_NONE;
-    check(device_->CreateFence(0, fenceFlags, IID_PPV_ARGS(&done_)), "present fence");
+    check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done_)), "present fence");
     event_.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event_.h) check(E_FAIL, "present fence event");
 
@@ -102,21 +124,13 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier) : window_(window)
         }
         dividerUpload_->Unmap(0, nullptr);
     }
+    if (s.gpuShotChange) shotChange_ = std::make_unique<VfgShotChange>(device_.Get());
     if (multiplier <= 1) return;
-    outputCount = std::clamp<uint32_t>(multiplier, 2, max_multiplier) - 1;
-    device_->GetCopyableFootprints(&desc_, 0, 1, 0, &footprint_, nullptr, nullptr, &bytes);
-    D3D12_RESOURCE_DESC buffer{};
-    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = bytes; buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
-    buffer.SampleDesc.Count = 1;
-    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    allocated = device_->GetResourceAllocationInfo(0, 1, &buffer).SizeInBytes;
-    const size_t totalExchange = 2 + outputCount;
-    for (size_t i = 0; i < totalExchange; ++i) {
-        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
-            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&exchange[i])), "CUDA exchange buffer");
-        check(device_->CreateSharedHandle(exchange[i].Get(), nullptr, GENERIC_ALL, nullptr, &exported[i].h), "CUDA NT handle");
-    }
+    auto syntheticDesc = desc_;
+    syntheticDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    for (auto& t : syntheticTex)
+        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &syntheticDesc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t)), "synthetic texture");
     init_compare();
 }
 
@@ -129,8 +143,9 @@ void Gpu::init_compare()
     check(device_->CreateDescriptorHeap(&views, IID_PPV_ARGS(&compareViews_)), "content compare descriptor heap");
     compareViewStride_ = device_->GetDescriptorHandleIncrementSize(views.Type);
     auto handle = compareViews_->GetCPUDescriptorHandleForHeapStart();
+    const DescriptorStager stager(device_.Get());
     for (const auto& texture : input) {
-        device_->CreateShaderResourceView(texture.Get(), nullptr, handle);
+        stager.write_srv(texture.Get(), nullptr, handle);
         handle.ptr += compareViewStride_;
     }
 
@@ -170,6 +185,7 @@ void Gpu::init_compare()
     allocate(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, compareFlags_);
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     allocate(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, compareZero_);
+    buffer.Width = compare_bytes + 256;
     allocate(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, compareReadback_);
     void* mapped{};
     const D3D12_RANGE noRead{0, 0}, written{0, compare_bytes};
@@ -199,7 +215,10 @@ bool Gpu::commands_ready() const
 bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
 {
     if (compareFence_ || !commands_ready()) return false;
-    auto* cmd = begin();
+    if (done_->GetCompletedValue() < discardedCompareFence_) return false;
+    if (!compareRoot_) init_compare();
+    if (shotChange_ && done_->GetCompletedValue() < shotSlotFence_[compareParity_ ^ 1u]) return false;
+    auto* cmd = begin_available();
     auto flagsToCopy = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     cmd->ResourceBarrier(1, &flagsToCopy);
     cmd->CopyBufferRegion(compareFlags_.Get(), 0, compareZero_.Get(), 0, compare_bytes);
@@ -221,6 +240,13 @@ bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
     cmd->SetComputeRootDescriptorTable(1, view);
     cmd->SetComputeRootUnorderedAccessView(2, compareFlags_->GetGPUVirtualAddress());
     cmd->Dispatch(static_cast<UINT>((desc_.Width + 63) / 64), (desc_.Height + 15) / 16, 1);
+    if (shotChange_) {
+        compareParity_ ^= 1u;
+        auto previousView = view;
+        previousView.ptr = base + UINT64{compareViewStride_} * previous;
+        shotChange_->record(cmd, {previousView, view, static_cast<uint32_t>(desc_.Width), desc_.Height,
+            compareParity_, 1}, compareReadback_.Get());
+    }
     for (unsigned i = 0; i < 2; ++i)
         std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
     barriers[2] = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -229,26 +255,36 @@ bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
     flagsToCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     flagsToCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     cmd->ResourceBarrier(1, &flagsToCopy);
-    finish(false);
-    compareFence_ = fence_;
-    inputReadFence_[previous] = inputReadFence_[current] = fence_;
+    compareFence_ = finish(false);
+    if (shotChange_) shotSlotFence_[compareParity_] = compareFence_;
+    mark_inputs_read(previous, current, compareFence_);
     check(done_->SetEventOnCompletion(compareFence_, ready), "content compare event");
     return true;
 }
 
-std::optional<bool> Gpu::compare_result()
+std::optional<Gpu::CompareResult> Gpu::compare_result()
 {
     const auto completed = done_->GetCompletedValue();
     if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "content compare device removed");
     if (!compareFence_ || completed == UINT64_MAX || completed < compareFence_) return {};
     void* mapped{};
-    const D3D12_RANGE readRange{0, compare_bytes}, noWrite{0, 0};
+    const D3D12_RANGE readRange{0, compare_bytes + (shotChange_ ? 256 : 0)}, noWrite{0, 0};
     check(compareReadback_->Map(0, &readRange, &mapped), "content compare result map");
     const auto* flags = static_cast<const uint32_t*>(mapped);
     const bool same = std::all_of(flags, flags + compare_bytes / sizeof(*flags), [](uint32_t x) { return x == 0; });
+    const auto* shot = flags + compare_bytes / sizeof(*flags);
+    const CompareResult result{same, shotChange_ && shot[compareParity_ * 2] != 0,
+        shotChange_ && shot[7 + compareParity_ * 4] != 0, compareParity_};
     compareReadback_->Unmap(0, &noWrite);
     compareFence_ = 0;
-    return same;
+    return result;
+}
+
+void Gpu::discard_compare() noexcept
+{
+    if (!compareFence_) return;
+    discardedCompareFence_ = compareFence_;
+    compareFence_ = 0;
 }
 
 ID3D12GraphicsCommandList* Gpu::begin()
@@ -259,18 +295,29 @@ ID3D12GraphicsCommandList* Gpu::begin()
         if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "present device removed");
         if (completed < slot.fenceVal) {
             check(done_->SetEventOnCompletion(slot.fenceVal, event_.h), "ring slot fence event");
-            if (WaitForSingleObject(event_.h, 240) != WAIT_OBJECT_0) {
+            const auto wait = WaitForSingleObject(event_.h, waitMs_);
+            if (!pushflow_ && wait != WAIT_OBJECT_0) {
+                check(device_->GetDeviceRemovedReason(), "present device removed");
                 ShowWindowAsync(window_, SW_HIDE);
                 TerminateProcess(GetCurrentProcess(), 5);
                 __fastfail(FAST_FAIL_FATAL_APP_EXIT);
             }
+            // The owner must classify the close and drain without unwinding Gpu.
+            check_ring_wait(wait, device_->GetDeviceRemovedReason());
         }
     }
+    return begin_available();
+}
+ID3D12GraphicsCommandList* Gpu::begin_available()
+{
+    auto& slot = ring_[ringIdx_];
+    check(device_->GetDeviceRemovedReason(), "present device removed");
+    slot.hudUse.reset(); // A reusable allocator's previous submission has completed.
     check(slot.alloc->Reset(), "present allocator reset");
     check(slot.list->Reset(slot.alloc.Get(), nullptr), "present list reset");
     return slot.list.Get();
 }
-void Gpu::finish(bool sync)
+uint64_t Gpu::finish(bool sync)
 {
     auto& slot = ring_[ringIdx_];
     check(slot.list->Close(), "present close");
@@ -280,59 +327,85 @@ void Gpu::finish(bool sync)
     check(drawQueue->Signal(done_.Get(), sigFence), "present queue signal");
     slot.fenceVal = sigFence;
     ringIdx_ = (ringIdx_ + 1) % ring_slots;
-    if (!sync) {
+    if (!pushflow_ && sync) {
+        const char* operation = "present queue fence event";
+        HRESULT hr = done_->SetEventOnCompletion(sigFence, event_.h);
+        if (SUCCEEDED(hr) && WaitForSingleObject(event_.h, waitMs_) != WAIT_OBJECT_0) {
+            operation = "present fence wait";
+            hr = E_FAIL;
+        }
+        const auto completed = done_->GetCompletedValue();
         const auto removed = device_->GetDeviceRemovedReason();
-        if (FAILED(removed)) check(removed, "present device removed");
+        if (SUCCEEDED(removed) && (completed == UINT64_MAX || completed < sigFence)) {
+            ShowWindowAsync(window_, SW_HIDE);
+            TerminateProcess(GetCurrentProcess(), 5);
+            __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+        }
+        check(removed, "present device removed");
+        check(hr, operation);
+        return sigFence;
+    }
+    if (sync) {
+        check(done_->SetEventOnCompletion(sigFence, event_.h), "present queue fence event");
+        const auto wait = WaitForSingleObject(event_.h, waitMs_);
+        check_ring_wait(wait, device_->GetDeviceRemovedReason());
+        const auto completed = done_->GetCompletedValue();
+        check(completed == UINT64_MAX || completed < sigFence ? E_FAIL : S_OK, "present fence incomplete");
+    } else {
+        check(device_->GetDeviceRemovedReason(), "present device removed");
+    }
+    return sigFence;
+}
+uint64_t Gpu::record_draw(const Draw& draw)
+{
+    if (!commands_ready()) return 0;
+    draw(begin_available());
+    return finish(false);
+}
+void Gpu::mark_inputs_read(unsigned previous, unsigned current, uint64_t fenceVal)
+{
+    inputReadFence_[previous] = std::max(inputReadFence_[previous], fenceVal);
+    inputReadFence_[current] = std::max(inputReadFence_[current], fenceVal);
+}
+void Gpu::sync_hud_lock(bool enabled)
+{
+    if (!enabled) hudLock_.reset();
+    if (std::none_of(ring_.begin(), ring_.end(), [](const auto& slot) { return bool(slot.hudUse); })) return;
+    const auto completed = done_->GetCompletedValue();
+    if (completed == UINT64_MAX) {
+        check(device_->GetDeviceRemovedReason(), "present device removed");
         return;
     }
-    const char* operation = "present queue fence event";
-    HRESULT hr = done_->SetEventOnCompletion(sigFence, event_.h);
-    if (SUCCEEDED(hr) && WaitForSingleObject(event_.h, 240) != WAIT_OBJECT_0) {
-        operation = "present fence wait";
-        hr = E_FAIL;
-    }
-    const auto completed = done_->GetCompletedValue();
-    const auto removed = device_->GetDeviceRemovedReason();
-    if (SUCCEEDED(removed) && (completed == UINT64_MAX || completed < sigFence)) {
-        ShowWindowAsync(window_, SW_HIDE);
-        TerminateProcess(GetCurrentProcess(), 5);
-        __fastfail(FAST_FAIL_FATAL_APP_EXIT);
-    }
-    check(removed, "present device removed");
-    check(hr, operation);
+    for (auto& slot : ring_)
+        if (slot.fenceVal <= completed) slot.hudUse.reset();
 }
-void Gpu::move(ID3D12Resource* texture, ID3D12Resource* buffer, bool toBuffer)
+
+bool Gpu::drain_hud_on_unwind() const noexcept
 {
-    auto* cmd = ring_[ringIdx_].list.Get();
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    auto& t = b.Transition;
-    t = {texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
-        toBuffer ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST};
-    cmd->ResourceBarrier(1, &b);
-    D3D12_TEXTURE_COPY_LOCATION tex{}, buf{};
-    tex.pResource = texture;
-    tex.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    buf.pResource = buffer;
-    buf.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    buf.PlacedFootprint = footprint_;
-    cmd->CopyTextureRegion(toBuffer ? &buf : &tex, 0, 0, 0, toBuffer ? &tex : &buf, nullptr);
-    std::swap(t.StateBefore, t.StateAfter);
-    cmd->ResourceBarrier(1, &b);
+    if (std::none_of(ring_.begin(), ring_.end(), [](const auto& slot) { return bool(slot.hudUse); })) return true;
+    // ExecuteCommandLists precedes the regular signal. Mark the queue again rather
+    // than trusting a slot fence that may not have been updated before the throw.
+    ComPtr<ID3D12Fence> drain;
+    Handle ready;
+    if (SUCCEEDED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&drain))) &&
+        (ready.h = CreateEventW(nullptr, FALSE, FALSE, nullptr)) &&
+        SUCCEEDED(drawQueue->Signal(drain.Get(), 1)) &&
+        SUCCEEDED(drain->SetEventOnCompletion(1, ready.h)) &&
+        WaitForSingleObject(ready.h, 240) == WAIT_OBJECT_0 && drain->GetCompletedValue() == 1)
+        return true;
+    return FAILED(device_->GetDeviceRemovedReason());
 }
-std::optional<uint64_t> Gpu::try_stage(unsigned previous, unsigned current)
+
+void Gpu::update_hud_lock(unsigned current, unsigned previous, bool reset)
 {
-    // The ring is owned by this thread and the draw fence is monotonic, so
-    // begin() cannot wait for an allocator once this check passes.
-    if (!commands_ready()) return {};
-    (void)begin();
-    move(input[previous].Get(), exchange[0].Get(), true);
-    move(input[current].Get(), exchange[1].Get(), true);
-    finish(false);
-    inputReadFence_[previous] = inputReadFence_[current] = fence_;
-    // The same draw queue has also consumed any previously presented CUDA outputs
-    // before this signal, so CUDA can safely reuse all exchange buffers.
-    return fence_;
+    if (!hudLock_) {
+        hudLock_ = std::make_shared<VfgHudLock>(device_.Get(), input, syntheticTex);
+        reset = true;
+    }
+    const auto held = reset ? current : previous;
+    hudLock_->update(begin(), current, held, reset);
+    ring_[ringIdx_].hudUse = hudLock_;
+    mark_inputs_read(held, current, finish(false));
 }
 void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const uint32_t* pixels)
 {
@@ -377,16 +450,14 @@ UINT Gpu::present(ID3D12Resource* source, bool synthetic, int beforeIndex, uint3
 {
     if (!latencyReady_ && WaitForSingleObject(latency_.h, 240) != WAIT_OBJECT_0)
         check(E_FAIL, "swapchain latency timeout");
+    (void)begin();
     return present_ready(source, synthetic, beforeIndex, splitPercent, splitSwap);
 }
 
-std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t deadlineNs,
+std::optional<UINT> Gpu::try_present_synthetic(const SyntheticFrame& frame, uint64_t deadlineNs,
     int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
-    // Don't let begin() enter its normal blocking allocator wait on this path.
-    const auto completed = done_->GetCompletedValue();
-    if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "present device removed");
-    if (completed < ring_[ringIdx_].fenceVal) return {};
+    if (!commands_ready()) return {};
     const auto now = clock_ns();
     if (now >= deadlineNs) return {};
     if (!latencyReady_) {
@@ -396,37 +467,51 @@ std::optional<UINT> Gpu::try_present_synthetic(ID3D12Resource* source, uint64_t 
         if (result != WAIT_OBJECT_0)
             check(result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : E_FAIL, "synthetic swapchain wait");
         latencyReady_ = true;
-        // If the thread woke too late, keep the acquired signal for the next
-        // admitted frame. Waiting again without a Present could miss the signal.
-        if (clock_ns() >= deadlineNs) return {};
     }
-    return present_ready(source, true, beforeIndex, splitPercent, splitSwap);
+    // Keep any acquired latency signal for the next frame if we woke too late.
+    if (clock_ns() >= deadlineNs) return {};
+    auto* cmd = begin_available();
+    auto* display = record_synthetic_display(cmd, frame);
+    const auto id = present_ready(display, true, beforeIndex, splitPercent, splitSwap);
+    if (shotChange_ && frame.shotCompared) shotSlotFence_[frame.shotParity] = fence_;
+    mark_inputs_read(frame.prevIndex, frame.currIndex, fence_);
+    return id;
 }
 
-UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap)
+ID3D12Resource* Gpu::record_synthetic_display(ID3D12GraphicsCommandList* cmd, const SyntheticFrame& frame)
 {
-    latencyReady_ = false;
-    ComPtr<ID3D12Resource> dst;
-    check(swap_->GetBuffer(swap_->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&dst)), "back buffer");
-    auto* cmd = begin();
+    frame.resolve(cmd);
+    auto* display = frame.texture;
+    if (frame.hudLock) {
+        hudLock_->compose(cmd, frame.subframe, frame.prevIndex);
+        ring_[ringIdx_].hudUse = hudLock_; // Also protects scratch through cut copy and the present copy.
+        display = hudLock_->output();
+    }
+    if (shotChange_ && frame.shotCompared)
+        shotChange_->replace_on_cut(cmd, display, input[frame.currIndex].Get(), frame.shotParity);
+    return display;
+}
+
+void Gpu::record_present_copy(ID3D12GraphicsCommandList* cmd, const PresentCopy& copy)
+{
     const auto drawHud = [&] {
         const UINT dstX = hudPos_ == 2 ? static_cast<UINT>(desc_.Width) - hudW_ - hudInset_ : hudInset_;
-        D3D12_TEXTURE_COPY_LOCATION dloc{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION dloc{copy.destination, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
         D3D12_TEXTURE_COPY_LOCATION sloc{hudUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, hudFp_};
         D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
         cmd->CopyTextureRegion(&dloc, dstX, hudInset_, 0, &sloc, &box);
     };
     const auto drawSplit = [&] {
         const UINT width = static_cast<UINT>(desc_.Width);
-        const UINT split = static_cast<UINT>(UINT64{width} * std::min(splitPercent, 100u) / 100);
-        auto barrier = transition(before[beforeIndex].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const UINT split = static_cast<UINT>(UINT64{width} * std::min(copy.splitPercent, 100u) / 100);
+        auto barrier = transition(before[copy.beforeIndex].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         cmd->ResourceBarrier(1, &barrier);
-        D3D12_TEXTURE_COPY_LOCATION d{dst.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-        D3D12_TEXTURE_COPY_LOCATION s{before[beforeIndex].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-        if (!splitSwap && split) {
+        D3D12_TEXTURE_COPY_LOCATION d{copy.destination, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION s{before[copy.beforeIndex].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        if (!copy.splitSwap && split) {
             D3D12_BOX box{0, 0, 0, split, desc_.Height, 1};
             cmd->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
-        } else if (splitSwap && split < width) {
+        } else if (copy.splitSwap && split < width) {
             D3D12_BOX box{split, 0, 0, width, desc_.Height, 1};
             cmd->CopyTextureRegion(&d, split, 0, 0, &s, &box);
         }
@@ -436,38 +521,33 @@ UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex,
         D3D12_TEXTURE_COPY_LOCATION green{dividerUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, dividerFp_};
         cmd->CopyTextureRegion(&d, std::min(split, width - 3), 0, 0, &green, nullptr);
     };
-    if (synthetic) {
-        move(dst.Get(), source, false);
-        if ((hudW_ && hudH_) || beforeIndex >= 0) {
-            D3D12_RESOURCE_BARRIER hb{};
-            hb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            hb.Transition = {dst.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST};
-            cmd->ResourceBarrier(1, &hb);
-            if (beforeIndex >= 0) drawSplit();
-            else if (hudW_ && hudH_) drawHud();
-            std::swap(hb.Transition.StateBefore, hb.Transition.StateAfter);
-            cmd->ResourceBarrier(1, &hb);
-        }
-    } else {
-        D3D12_RESOURCE_BARRIER b[2]{};
-        b[0].Transition = {dst.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST};
-        b[1].Transition = {source, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
-        cmd->ResourceBarrier(2, b);
-        cmd->CopyResource(dst.Get(), source);
-        if (beforeIndex >= 0) drawSplit();
-        else if (hudW_ && hudH_) drawHud();
-        for (auto& barrier : b) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-        cmd->ResourceBarrier(2, b);
-    }
-    finish(false);
+    D3D12_RESOURCE_BARRIER b[]{
+        transition(copy.destination, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+        transition(copy.source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+    };
+    cmd->ResourceBarrier(2, b);
+    cmd->CopyResource(copy.destination, copy.source);
+    if (copy.beforeIndex >= 0) drawSplit();
+    else if (hudW_ && hudH_) drawHud();
+    for (auto& barrier : b) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    cmd->ResourceBarrier(2, b);
+}
+
+UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap)
+{
+    latencyReady_ = false;
+    ComPtr<ID3D12Resource> dst;
+    check(swap_->GetBuffer(swap_->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&dst)), "back buffer");
+    record_present_copy(ring_[ringIdx_].list.Get(), {source, dst.Get(), beforeIndex, splitPercent, splitSwap});
+    const auto submitted = finish(false);
     if (!synthetic) {
         for (unsigned i = 0; i < input.size(); ++i)
-            if (source == input[i].Get()) inputReadFence_[i] = fence_;
+            if (source == input[i].Get()) mark_inputs_read(i, i, submitted);
     }
-    if (beforeIndex >= 0) inputReadFence_[beforeIndex] = fence_;
+    if (beforeIndex >= 0) {
+        const auto index = static_cast<unsigned>(beforeIndex);
+        mark_inputs_read(index, index, submitted);
+    }
     const auto hr = allowTearing_ ? swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING) : swap_->Present(1, 0);
     check(hr == S_OK ? hr : FAILED(hr) ? hr : E_FAIL, "DXGI Present");
     UINT presentId{};

@@ -8,17 +8,23 @@ param(
     [string]$Runtime = '',
     [string]$SrRuntime = '',
     [string]$VfgRuntimeDir = '',
+    [string]$PushFlowRuntimeDir = '',
+    [string]$PushFlowModelsDir = '',
+    [string]$PushFlowModelZipUrl = '',
+    [string]$PushFlowModelZipSha = '',
     [string]$StageCleanupDir = '',
     [switch]$RuntimeDecided,
     [switch]$DownloadOptional,
     [switch]$SkipOptional,
+    [switch]$DownloadPushFlow,
+    [switch]$SkipPushFlow,
     [switch]$Uninstall,
     [switch]$Yes,
     [switch]$NoPause,
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.11'
+$Version = '0.2.12'
 $RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'
@@ -263,15 +269,33 @@ function Get-PackagePaths {
 function Test-PackagePath([string]$Relative) {
     return $Relative -in (Get-PackagePaths)
 }
+function Test-PushFlowModelName([string]$Name) {
+    return $Name -match '\A[A-Za-z0-9._-]+\.onnx(?:\.txt)?\z' -and -not $Name.Contains('..') -and
+        $Name -notmatch '\A(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])\.'
+}
 function Assert-ReceiptFile([string]$Relative, [string]$Backup) {
+    $modelsPrefix = 'bin\64bit\pushflow\models\'
     $allowed = (Test-PackagePath $Relative) -or $Relative -in @($RuntimeRel, $SrRel) -or
-        $Relative -in @($VfgDlls | ForEach-Object { "$VfgDirRel\$_" })
+        $Relative -in @($VfgDlls | ForEach-Object { "$VfgDirRel\$_" }) -or
+        $Relative -in 'bin\64bit\pushflow\onnxruntime.dll', 'bin\64bit\pushflow\DirectML.dll' -or
+        ($Relative.StartsWith($modelsPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+         (Test-PushFlowModelName $Relative.Substring($modelsPrefix.Length)))
     if (-not $allowed) { throw 'Invalid installer receipt path' }
     if ($Backup) {
         $root = [regex]::Escape((Get-FullPath $StateDir))
         $suffix = [regex]::Escape($Relative)
         if ((Get-FullPath $Backup) -notmatch "^$root\\backup-(?:[0-9a-f]{32}|\d{8}-\d{6})\\$suffix$") {
             throw 'Invalid installer backup path'
+        }
+    }
+}
+function Assert-PushFlowPath([string]$Root, [string]$Relative) {
+    $path = $Root
+    foreach ($component in $Relative.Split('\')) {
+        $path = Join-Path $path $component
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'PushFlow path must not contain a reparse point'
         }
     }
 }
@@ -288,6 +312,11 @@ function Test-NvidiaSigned([string]$Path) {
         return $sig.Status -eq 'Valid' -and $sig.SignerCertificate -and ($sig.SignerCertificate.Subject -match 'NVIDIA Corporation')
     } catch { return $false }
 }
+function Test-MicrosoftSigned([string]$Path) {
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    return $sig.Status -eq 'Valid' -and $sig.SignerCertificate -and
+        ($sig.SignerCertificate.Subject -match '(?:^|,\s*)O=Microsoft Corporation(?:,|$)')
+}
 function Test-VfgDir([string]$Dir) {
     if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $false }
     foreach ($n in $VfgDlls) {
@@ -299,7 +328,13 @@ function Get-HttpFile([string]$Url, [string]$Dest) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Dest) | Out-Null
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if ($curl) {
-        & $curl.Source -fsSL --retry 2 -o $Dest $Url
+        $curlArgs = @('-fsSL', '--retry', '2')
+        if ($Url -match '\Ahttps://127\.0\.0\.1[:/]' -and $env:OBS_NR_CURL_CA_BUNDLE -and
+            (Test-Path -LiteralPath $env:OBS_NR_CURL_CA_BUNDLE -PathType Leaf)) {
+            $curlArgs += @('--cacert', $env:OBS_NR_CURL_CA_BUNDLE)
+        }
+        $curlArgs += @('-o', $Dest, $Url)
+        & $curl.Source @curlArgs
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest -PathType Leaf)) { return }
     }
     Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
@@ -427,15 +462,17 @@ function Test-Writable([string]$Dir) {
     return $true
 }
 
-function Invoke-Elevated([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, [string]$StageDir) {
+function Invoke-Elevated([string]$Dir, [string]$RuntimeSource, $Optional, [string]$StageDir) {
     Show-Screen $(if ($script:L -eq 'ko') {'관리자 권한'} else {'Administrator permission'})
     Say 'admin' @() 'Yellow'
     $quote = { param($s) '"' + $s + '"' }
     $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote $PSCommandPath),
         '-ObsDir', (& $quote $Dir), '-Lang', $script:L, '-StateDir', (& $quote $StateDir), '-RuntimeDecided')
     if ($RuntimeSource) { $argv += @('-Runtime', (& $quote $RuntimeSource)) }
-    if ($SrSource) { $argv += @('-SrRuntime', (& $quote $SrSource)) }
-    if ($VfgSourceDir) { $argv += @('-VfgRuntimeDir', (& $quote $VfgSourceDir)) }
+    if ($Optional.sr) { $argv += @('-SrRuntime', (& $quote $Optional.sr)) }
+    if ($Optional.vfg) { $argv += @('-VfgRuntimeDir', (& $quote $Optional.vfg)) }
+    if ($Optional.pushflow.runtime) { $argv += @('-PushFlowRuntimeDir', (& $quote $Optional.pushflow.runtime)) }
+    if ($Optional.pushflow.models) { $argv += @('-PushFlowModelsDir', (& $quote $Optional.pushflow.models)) }
     if ($StageDir) { $argv += @('-StageCleanupDir', (& $quote $StageDir)) }
     if ($Uninstall) { $argv += '-Uninstall' }
     if ($Yes) { $argv += '-Yes' }
@@ -612,7 +649,146 @@ function Copy-WithDir([string]$From, [string]$To) {
     Copy-Item -LiteralPath $From -Destination $To -Force
 }
 
-function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, $Manifest) {
+function Assert-ArchivePath([string]$Name) {
+    $path = $Name.Replace('\', '/').TrimEnd('/')
+    if ($path -match '\A/|[:\x00-\x1f]' -or
+        @($path.Split('/') | Where-Object { -not $_ -or $_ -match '[. ]\z' }).Count) {
+        throw 'Invalid archive entry path'
+    }
+    return $path
+}
+
+function Expand-PushFlowZip([string]$Archive, [string]$Destination, [string]$Member = '') {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $selected = @{}
+        foreach ($entry in $zip.Entries) {
+            $name = Assert-ArchivePath $entry.FullName
+            if (-not $entry.Name) { continue }
+            $leaf = [IO.Path]::GetFileName($name)
+            if ($Member) {
+                if ($name -cne $Member) { continue }
+            } elseif ($name -ne $leaf -and $name -ne "models/$leaf") {
+                continue
+            } elseif (-not (Test-PushFlowModelName $leaf)) {
+                continue
+            }
+            if ($selected.ContainsKey($leaf)) { throw 'Duplicate PushFlow archive member' }
+            $selected[$leaf] = $entry
+        }
+        if (-not $selected.Count -or (-not $Member -and -not @($selected.Keys -like '*.onnx').Count)) {
+            throw 'PushFlow archive is missing required files'
+        }
+        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+        foreach ($leaf in $selected.Keys) {
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($selected[$leaf], (Join-Path $Destination $leaf))
+        }
+    } finally { $zip.Dispose() }
+}
+
+function Expand-PinnedRifeModel([string]$Archive, [string]$Destination, $Model) {
+    $member = 'rife_v2/' + $Model.name + '.onnx'
+    $tar = Join-Path ([Environment]::SystemDirectory) 'tar.exe'
+    $names = @()
+    if (Test-Path -LiteralPath $tar -PathType Leaf) {
+        $listing = & $tar -tf $Archive 2>$null
+        if ($LASTEXITCODE -eq 0) { $names = @($listing) }
+    }
+    $seven = $null
+    if (-not $names.Count) {
+        $seven = (Get-Command 7z.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+        if (-not $seven -and $env:ProgramFiles) {
+            $candidate = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $seven = $candidate }
+        }
+        if (-not $seven) { throw 'Reading pinned RIFE archives requires Windows tar or 7-Zip' }
+        $listing = & $seven l -slt -ba -- $Archive
+        if ($LASTEXITCODE -ne 0) { throw 'Could not list the pinned RIFE archive' }
+        $names = @($listing | Where-Object { $_.StartsWith('Path = ') } | ForEach-Object { $_.Substring(7) })
+    }
+    $matches = @($names | ForEach-Object { Assert-ArchivePath $_ } | Where-Object { $_ -ceq $member })
+    if ($matches.Count -ne 1) { throw 'Pinned RIFE archive is missing its unique model member' }
+    $scratch = Join-Path (Split-Path -Parent $Archive) $Model.name
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    if ($seven) { & $seven x -y "-o$scratch" -- $Archive $member | Out-Null }
+    else { & $tar -xf $Archive -C $scratch -- $member }
+    if ($LASTEXITCODE -ne 0) { throw 'Could not extract the pinned RIFE model' }
+    $relative = $member.Replace('/', '\')
+    Assert-PushFlowPath $scratch $relative
+    $file = Join-Path $scratch $relative
+    if ((Get-Sha $file) -ne $Model.hash) { throw 'RIFE model SHA-256 mismatch' }
+    Copy-WithDir $file (Join-Path $Destination $Model.output)
+}
+
+function Get-VerifiedPushFlowFile([string]$Url, [string]$Destination, [string]$Sha) {
+    if ($Url -notmatch '\Ahttps://' -or $Sha -notmatch '\A[0-9a-f]{64}\z') {
+        throw 'PushFlow downloads require an HTTPS URL and a SHA-256 pin'
+    }
+    Get-HttpFile $Url $Destination
+    if ((Get-Sha $Destination) -ne $Sha) { throw 'PushFlow download SHA-256 mismatch' }
+}
+
+function Resolve-PushFlow([string]$StageDir) {
+    $out = @{ runtime = ''; models = '' }
+    if ($SkipPushFlow) { return $out }
+    if ($PushFlowRuntimeDir) { $out.runtime = Get-FullPath $PushFlowRuntimeDir }
+    if ($PushFlowModelsDir) { $out.models = Get-FullPath $PushFlowModelsDir }
+    if ($RuntimeDecided) { return $out }
+    if (($PushFlowModelZipUrl -and -not $PushFlowModelZipSha) -or
+        ($PushFlowModelZipSha -and -not $PushFlowModelZipUrl) -or ($out.models -and $PushFlowModelZipUrl)) {
+        throw 'Specify either a PushFlow models directory or a model ZIP URL and SHA-256 pair'
+    }
+    $download = $DownloadPushFlow
+    if (-not ($download -or $SkipOptional -or $Yes -or $out.runtime)) {
+        $prompt = if ($script:L -eq 'ko') { 'PushFlow 런타임과 RIFE 모델을 다운로드할까요? (y/N)' }
+                  else { 'Download the PushFlow runtime and RIFE models? (y/N)' }
+        $download = (Read-Host (Format-Console $prompt)).Trim() -match '^(y|yes|ㅛ|예|네)$'
+    }
+    if ($download -and -not $out.runtime) {
+        $out.runtime = Join-Path $StageDir 'pushflow'
+        $nuget = 'https://api.nuget.org/v3-flatcontainer'
+        $packages = @(
+            @{ id = 'microsoft.ml.onnxruntime.directml'; version = '1.20.1'; member = 'runtimes/win-x64/native/onnxruntime.dll'
+               hash = '6763468507b7cfc777b1334b3e174c11a540ddacb7bd4354bc2e0ec89e56eec2' }
+            @{ id = 'microsoft.ai.directml'; version = '1.15.4'; member = 'bin/x64-win/DirectML.dll'
+               hash = '4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9' }
+        )
+        foreach ($package in $packages) {
+            $name = "$($package.id).$($package.version).nupkg"
+            $file = Join-Path $StageDir $name
+            Get-VerifiedPushFlowFile "$nuget/$($package.id)/$($package.version)/$name" $file $package.hash
+            Expand-PushFlowZip $file $out.runtime $package.member
+            if (-not (Test-MicrosoftSigned (Join-Path $out.runtime ([IO.Path]::GetFileName($package.member))))) {
+                throw 'PushFlow runtime Microsoft signature verification failed'
+            }
+        }
+    }
+    if ($PushFlowModelZipUrl) {
+        $out.models = Join-Path $StageDir 'models'
+        $file = Join-Path $StageDir 'pushflow-models.zip'
+        Get-VerifiedPushFlowFile $PushFlowModelZipUrl $file $PushFlowModelZipSha
+        Expand-PushFlowZip $file $out.models
+    } elseif ($download -and -not $out.models) {
+        $out.models = Join-Path $StageDir 'models'
+        $rife = 'https://github.com/AmusementClub/vs-mlrt/releases/download/external-models'
+        $models = @(
+            @{ name = 'rife_v4.25_lite'; output = 'pushflow-fast.onnx'; archive = '7d53e29fff5e67345b19f4ce97dfd1e34b490eedc752df2236904fda1a13842c'
+               hash = '610b5de57cdcfbcce9914c23e60a1cd357779a6f9582a1bcfcb035f8eb38509b' }
+            @{ name = 'rife_v4.26'; output = 'pushflow-quality.onnx'; archive = 'dfdabd84a2a3db773f87604b8cc255e94a6a72f13550d910ccd3b4ee2606cd4f'
+               hash = 'af25762dfec02a4bbb949decea63988b01fa56c46c0ff9dc66ac8e2f12cbb661' }
+        )
+        foreach ($model in $models) {
+            $name = $model.name + '.7z'
+            $file = Join-Path $StageDir $name
+            Get-VerifiedPushFlowFile "$rife/$name" $file $model.archive
+            Expand-PinnedRifeModel $file $out.models $model
+        }
+    }
+    return $out
+}
+
+function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, $Manifest, $PushFlow) {
     $backupDir = Join-Path $StateDir ('backup-' + [guid]::NewGuid().ToString('N'))
     $rollbackDir = Join-Path $StateDir ('rollback-' + [guid]::NewGuid().ToString('N'))
     $rels = @($Manifest.Keys)
@@ -647,6 +823,27 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
     if ($SrSource) { $sources[$SrRel] = $SrSource }
     if ($VfgSourceDir) {
         foreach ($dll in $VfgDlls) { $sources["$VfgDirRel\$dll"] = Join-Path $VfgSourceDir $dll }
+    }
+    if ($PushFlow.runtime) {
+        foreach ($dll in 'onnxruntime.dll', 'DirectML.dll') {
+            $source = Join-Path $PushFlow.runtime $dll
+            if (-not (Test-MicrosoftSigned $source)) { throw 'PushFlow runtime Microsoft signature verification failed' }
+            $sources["bin\64bit\pushflow\$dll"] = $source
+        }
+    }
+    if ($PushFlow.models) {
+        $models = @(Get-ChildItem -LiteralPath $PushFlow.models -File -Force |
+            Where-Object { $_.Name -match '\.onnx(?:\.txt)?\z' })
+        if (-not @($models.Name -like '*.onnx').Count) { throw 'PushFlow models directory has no ONNX model' }
+        foreach ($model in $models) {
+            $rel = "bin\64bit\pushflow\models\$($model.Name)"
+            Assert-ReceiptFile $rel ''
+            if ($model.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'PushFlow model must not be a reparse point' }
+            $sources[$rel] = $model.FullName
+        }
+    }
+    foreach ($rel in @($sources.Keys) + @($owned.Keys)) {
+        if ($rel -like 'bin\64bit\pushflow\*') { Assert-PushFlowPath $Dir $rel }
     }
     $touched = @()
     $rollbackSafe = $true
@@ -720,8 +917,12 @@ function Read-State {
 }
 
 function Remove-EmptyPluginDirs([string]$Dir) {
-    foreach ($sub in 'data\obs-plugins\obs-nr-filter\locale', 'data\obs-plugins\obs-nr-filter', $VfgDirRel, 'bin\64bit\dlss') {
+    foreach ($sub in 'data\obs-plugins\obs-nr-filter\locale', 'data\obs-plugins\obs-nr-filter', $VfgDirRel, 'bin\64bit\dlss',
+            'bin\64bit\pushflow\models', 'bin\64bit\pushflow') {
         $path = Join-Path $Dir $sub
+        if ($sub -like 'bin\64bit\pushflow*') {
+            try { Assert-PushFlowPath $Dir $sub } catch { continue }
+        }
         $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
         if ($item -and $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
                 -not (Get-ChildItem -LiteralPath $path -Force | Select-Object -First 1)) {
@@ -733,7 +934,16 @@ function Remove-EmptyPluginDirs([string]$Dir) {
 function Remove-Files([string]$Dir, $Manifest, $State) {
     $useState = [bool]($State -and $State.obsDir -and (Test-SamePath ([string]$State.obsDir) $Dir))
     if ($useState -and $State.PSObject.Properties['ownedFiles']) {
-        foreach ($entry in @($State.ownedFiles)) { Assert-ReceiptFile $entry.relative $entry.backup }
+        foreach ($entry in @($State.ownedFiles)) {
+            Assert-ReceiptFile $entry.relative $entry.backup
+            if ($entry.relative -like 'bin\64bit\pushflow\*') {
+                Assert-PushFlowPath $Dir $entry.relative
+                if ($entry.backup) {
+                    $backupRelative = (Get-FullPath $entry.backup).Substring((Get-FullPath $StateDir).Length + 1)
+                    Assert-PushFlowPath $StateDir $backupRelative
+                }
+            }
+        }
         foreach ($entry in @($State.ownedFiles)) {
             $rel = [string]$entry.relative
             $dst = Join-Path $Dir $rel
@@ -811,11 +1021,13 @@ function Invoke-Install {
     Write-Step 4 5 (T 'sOpt')
     $stageDir = Join-Path $env:TEMP ('obs-nr-stage-' + [guid]::NewGuid().ToString('N'))
     try {
+        $pushflow = Resolve-PushFlow $stageDir
         $opt = Resolve-OptionalRuntimes $dir $stageDir
-        if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir $runtimeSource $opt.sr $opt.vfg $stageDir) }
+        $opt.pushflow = $pushflow
+        if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir $runtimeSource $opt $stageDir) }
         Show-Screen ''
         Write-Step 5 5 (T 'sCopy')
-        Install-Files $dir $runtimeSource $opt.sr $opt.vfg $manifest
+        Install-Files $dir $runtimeSource $opt.sr $opt.vfg $manifest $pushflow
     } finally {
         if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue }
         if ($StageCleanupDir -and (Test-Path -LiteralPath $StageCleanupDir) -and ([IO.Path]::GetFileName($StageCleanupDir) -like 'obs-nr-stage-*')) {
@@ -833,6 +1045,7 @@ function Invoke-Install {
         Write-Host 'Next: Start OBS > right-click source > Filters > Effect Filters [+]'
         Write-Host 'Filter guide: INSTALL-ONECLICK.md / Remove: uninstall.bat'
     }
+    Write-Host 'ANR frame generation setup: docs/pushfps-ab-guide.md'
     return 0
 }
 
@@ -847,7 +1060,7 @@ function Invoke-Uninstall {
     if (-not $ObsDir -and $state -and (Test-ObsDir ([string]$state.obsDir))) { $hint = [string]$state.obsDir }
     $dir = Select-Obs $hint
     Wait-ObsClosed $dir
-    if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir '' '' '' '') }
+    if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir '' @{} '') }
     Write-Step 3 3 (T 'sRemove')
     Remove-Files $dir $manifest $state
     Write-Host ''

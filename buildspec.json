@@ -1,7 +1,7 @@
 {
   "name": "obs-nr-filter",
   "displayName": "Native NR",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "dependencies": {
     "obs-studio": {
       "version": "32.2.2",

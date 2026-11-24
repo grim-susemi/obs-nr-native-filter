@@ -21,7 +21,203 @@ $script:VfgDlls = @('one.dll', 'two.dll')
 $dir = Join-Path $root 'obs'
 $rel = 'obs-plugins\64bit\obs-nr-filter.dll'
 function Put($path, $value) { New-Item -ItemType Directory -Force (Split-Path -Parent $path) | Out-Null; [IO.File]::WriteAllText($path, $value) }
+function Assert-Rejected([scriptblock]$Action, [string]$Reason) {
+    try { & $Action } catch {
+        Assert-Equal $_.Exception.Message $Reason 'unexpected rejection reason'
+        return
+    }
+    throw "expected rejection: $Reason"
+}
+function Test-PushFlowOwnership {
+    $obs = Join-Path $root 'pushflow-obs'
+    $StateDir = Join-Path $root 'pushflow-ownership-state'
+    $runtime = Join-Path $root 'pushflow-runtime'
+    $models = Join-Path $root 'pushflow-models'
+    $push = @{ runtime = $runtime; models = $models }
+    $manifest = [ordered]@{}
+    $dll = 'bin\64bit\pushflow\DirectML.dll'
+    $model = 'bin\64bit\pushflow\models\pushflow-fast.onnx'
+    $facts = "$model.txt"
+    $ownedFiles = @('bin\64bit\pushflow\onnxruntime.dll', $dll, $model, $facts)
+    function Test-MicrosoftSigned { return $true } # Authenticode is exercised separately from ownership.
+    Put (Join-Path $runtime 'onnxruntime.dll') 'ORT'
+    Put (Join-Path $runtime 'DirectML.dll') 'DML'
+    Put (Join-Path $models 'pushflow-fast.onnx') 'first'
+    Put (Join-Path $models 'pushflow-fast.onnx.txt') 'metadata'
+
+    Install-Files $obs '' '' '' $manifest $push
+    $state = Read-State
+    Assert-Equal (($state.ownedFiles.relative | Sort-Object) -join ',') (($ownedFiles | Sort-Object) -join ',') 'PushFlow owned files'
+    foreach ($entry in $state.ownedFiles) {
+        Assert-Equal $entry.hash (Get-Sha (Join-Path $obs $entry.relative)) 'receipt must record installed bytes'
+    }
+    Remove-Files $obs $manifest $state
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $obs 'bin\64bit\pushflow')) $false 'clean uninstall must remove model child and runtime parent'
+    Write-Host 'PASS PushFlow receipt and child-first uninstall'
+
+    Put (Join-Path $obs $dll) 'foreign DML'
+    Install-Files $obs '' '' '' $manifest $push
+    Put (Join-Path $obs $model) 'external model edit'
+    Put (Join-Path $models 'pushflow-fast.onnx') 'second'
+    Put (Join-Path $models 'pushflow-fast.onnx.txt') 'updated metadata'
+    Install-Files $obs '' '' '' $manifest $push
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs $model))) 'external model edit' 'upgrade must preserve changed model'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs $facts))) 'updated metadata' 'upgrade must replace unchanged metadata'
+    Remove-Files $obs $manifest (Read-State)
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs $model))) 'external model edit' 'uninstall must preserve changed model'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs $dll))) 'foreign DML' 'uninstall must restore foreign runtime'
+    Write-Host 'PASS PushFlow upgrade and external edit preservation'
+
+    Install-Files $obs '' '' '' $manifest $push
+    $statePath = Join-Path $StateDir 'install-state.json'
+    $oldReceipt = Get-Sha $statePath
+    $priorHashes = @($ownedFiles | ForEach-Object { Get-Sha (Join-Path $obs $_) })
+    Put (Join-Path $runtime 'DirectML.dll') 'new DML'
+    Put (Join-Path $models 'new.onnx') 'new model'
+    Put (Join-Path $models 'pushflow-fast.onnx.txt') 'revised metadata'
+    $realCopy = ${function:Copy-WithDir}
+    $failedSource = Join-Path $models 'new.onnx'
+    function Copy-WithDir([string]$From, [string]$To) {
+        if ($From -eq $failedSource) {
+            Put $To 'partial'
+            throw 'fixture PushFlow copy failure'
+        }
+        & $realCopy $From $To
+    }
+    Assert-Rejected { Install-Files $obs '' '' '' $manifest $push } 'fixture PushFlow copy failure'
+    Assert-Equal (Get-Sha $statePath) $oldReceipt 'rollback must leave receipt intact'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $obs 'bin\64bit\pushflow\models\new.onnx')) $false 'rollback must remove partial new model'
+    Assert-Equal (($ownedFiles | ForEach-Object { Get-Sha (Join-Path $obs $_) }) -join ',') ($priorHashes -join ',') 'rollback must restore the complete installed set'
+    Assert-Equal @(Get-ChildItem -LiteralPath $StateDir -Filter 'rollback-*').Count 0 'rollback must clean staging'
+    Write-Host 'PASS PushFlow mid-copy rollback'
+
+    $state = Read-State
+    $state.ownedFiles += [pscustomobject]@{ relative = 'bin\64bit\pushflow\models\..\sentinel.onnx'; hash = 'unused'; backup = '' }
+    Assert-Rejected { Remove-Files $obs $manifest $state } 'Invalid installer receipt path'
+    Assert-Equal (($ownedFiles | ForEach-Object { Get-Sha (Join-Path $obs $_) }) -join ',') ($priorHashes -join ',') 'receipt rejection must precede all file changes'
+    Assert-Equal (Get-Sha $statePath) $oldReceipt 'receipt rejection must not delete or replace state'
+    Write-Host 'PASS PushFlow receipt path containment'
+}
+
+function Test-PushFlowStaging {
+    $stage = Join-Path $root 'pushflow-staging'
+    $assets = Join-Path $root 'pushflow-fixtures'
+    New-Item -ItemType Directory -Path $assets | Out-Null
+    $Yes = $true; $DownloadPushFlow = $true
+    $PushFlowRuntimeDir = ''; $PushFlowModelsDir = ''
+    $PushFlowModelZipUrl = ''; $PushFlowModelZipSha = ''
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    function New-FixtureZip($file, $members) {
+        $archive = [IO.Compression.ZipFile]::Open($file, 'Create')
+        try {
+            foreach ($member in $members) {
+                $writer = [IO.StreamWriter]::new($archive.CreateEntry($member).Open())
+                try { $writer.Write("fixture $member") } finally { $writer.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+    }
+    $ort = 'microsoft.ml.onnxruntime.directml.1.20.1.nupkg'
+    $dml = 'microsoft.ai.directml.1.15.4.nupkg'
+    New-FixtureZip (Join-Path $assets $ort) @('runtimes/win-x64/native/onnxruntime.dll', 'ignored/readme.txt')
+    New-FixtureZip (Join-Path $assets $dml) @('bin/x64-win/DirectML.dll')
+    New-FixtureZip (Join-Path $assets 'companion.zip') @('models/custom.onnx', 'models/custom.onnx.txt', 'RIFE-MIT.txt')
+    $realSha = ${function:Get-Sha}
+    function Get-Sha([string]$path) {
+        switch ([IO.Path]::GetFileName($path)) {
+            $ort { return '6763468507b7cfc777b1334b3e174c11a540ddacb7bd4354bc2e0ec89e56eec2' }
+            $dml { return '4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9' }
+            'rife_v4.25_lite.7z' { return '7d53e29fff5e67345b19f4ce97dfd1e34b490eedc752df2236904fda1a13842c' }
+            'rife_v4.26.7z' { return 'dfdabd84a2a3db773f87604b8cc255e94a6a72f13550d910ccd3b4ee2606cd4f' }
+            default { return (& $realSha $path) }
+        }
+    }
+    function Get-HttpFile([string]$Url, [string]$Dest) {
+        $uri = [uri]$Url
+        if ($uri.Host -eq 'github.com' -and $uri.AbsolutePath.StartsWith('/AmusementClub/vs-mlrt/releases/download/external-models/')) {
+            Put $Dest "fixture $($uri.Segments[-1])"
+        } elseif ($uri.Host -in 'api.nuget.org', 'fixture.invalid') {
+            Copy-WithDir (Join-Path $assets $uri.Segments[-1]) $Dest
+        } else { throw 'unexpected fixture download' }
+    }
+    $signatureStatus = 'Valid'
+    function Get-AuthenticodeSignature([string]$LiteralPath) {
+        return @{ Status = $signatureStatus; SignerCertificate = @{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, C=US' } }
+    }
+    function Expand-PinnedRifeModel([string]$Archive, [string]$Destination, $Model) {
+        $fixture = [IO.File]::ReadAllText($Archive)
+        Put (Join-Path $Destination $Model.output) $fixture
+    }
+
+    $resolved = Resolve-PushFlow (Join-Path $stage 'default')
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $resolved.runtime 'DirectML.dll'))) 'fixture bin/x64-win/DirectML.dll' 'only x64 DML member'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $resolved.runtime 'onnxruntime.dll'))) 'fixture runtimes/win-x64/native/onnxruntime.dll' 'only x64 ORT member'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $resolved.models 'pushflow-fast.onnx'))) 'fixture rife_v4.25_lite.7z' 'default fast model'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $resolved.models 'pushflow-quality.onnx'))) 'fixture rife_v4.26.7z' 'default quality model'
+    Write-Host 'PASS PushFlow optional runtime and default model staging (mocked downloads)'
+
+    $DownloadPushFlow = $false
+    $PushFlowModelZipUrl = 'https://fixture.invalid/companion.zip'
+    $PushFlowModelZipSha = '0' * 64
+    Assert-Rejected { Resolve-PushFlow (Join-Path $stage 'bad-hash') } 'PushFlow download SHA-256 mismatch'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $stage 'bad-hash\models')) $false 'hash failure must write no extracted model'
+    $PushFlowModelZipSha = Get-Sha (Join-Path $assets 'companion.zip')
+    $companion = Resolve-PushFlow (Join-Path $stage 'companion')
+    Assert-Equal ((Get-ChildItem -LiteralPath $companion.models -Name | Sort-Object) -join ',') 'custom.onnx,custom.onnx.txt' 'ZIP ships only models and sidecars to OBS'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $companion.models 'custom.onnx'))) 'fixture models/custom.onnx' 'benign control must extract the model bytes'
+
+    $rejectedStage = Join-Path $stage 'rejected-companion'
+    $rejectedModels = Join-Path $rejectedStage 'models'
+    $sentinel = Join-Path $rejectedModels 'keep.onnx'
+    Put $sentinel 'pre-existing model'
+    & {
+        $validatePath = ${function:Assert-ArchivePath}
+        function Assert-ArchivePath([string]$Name) {
+            # Reject the ordinary notice after both model entries have been seen.
+            if ($Name -eq 'RIFE-MIT.txt') { throw 'fixture archive path rejected' }
+            & $validatePath $Name
+        }
+        Assert-Rejected { Resolve-PushFlow $rejectedStage } 'fixture archive path rejected'
+    }
+    Assert-Equal ((Get-ChildItem -LiteralPath $rejectedModels -Force -Recurse -Name) -join ',') 'keep.onnx' 'rejected ZIP must produce no model or sidecar'
+    Assert-Equal ([IO.File]::ReadAllText($sentinel)) 'pre-existing model' 'rejected ZIP must leave destination bytes unchanged'
+    Write-Host 'PASS PushFlow benign ZIP control and extraction-boundary rejection'
+
+    foreach ($name in @('/sandbox/readme.txt', 'models/../readme.txt')) {
+        Assert-Rejected { Assert-ArchivePath $name } 'Invalid archive entry path'
+    }
+    Write-Host 'PASS PushFlow model ZIP pin and in-memory archive path rejection'
+
+    $PushFlowModelZipUrl = ''; $PushFlowModelZipSha = ''
+    $DownloadPushFlow = $true; $signatureStatus = 'NotSigned'
+    Assert-Rejected { Resolve-PushFlow (Join-Path $stage 'bad-signature') } 'PushFlow runtime Microsoft signature verification failed'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $stage 'bad-signature\models')) $false 'signature failure must not stage models'
+    Write-Host 'PASS PushFlow Microsoft Authenticode gate (mocked signature status)'
+}
+
+function Test-PushFlowElevation {
+    $dir = Join-Path $root 'OBS with spaces'
+    $runtime = Join-Path $root 'runtime stage with spaces'
+    $models = Join-Path $root 'model stage with spaces'
+    $optional = @{ pushflow = @{ runtime = $runtime; models = $models } }
+    $script:L = 'en'
+    function Show-Screen { }
+    function Start-Process($FilePath, $Verb, $ArgumentList, [switch]$Wait, [switch]$PassThru) {
+        Assert-Equal $Verb 'RunAs' 'actual elevation is never invoked in this fixture'
+        $forwarded = @{}
+        $quotedPaths = [regex]::Matches(($ArgumentList -join ' '), ' (-PushFlowRuntimeDir|-PushFlowModelsDir) "([^"]+)"')
+        foreach ($path in $quotedPaths) { $forwarded[$path.Groups[1].Value] = $path.Groups[2].Value }
+        Assert-Equal $forwarded['-PushFlowRuntimeDir'] $runtime 'runtime path must reach elevated child as one argument'
+        Assert-Equal $forwarded['-PushFlowModelsDir'] $models 'models path must reach elevated child as one argument'
+        return @{ ExitCode = 42 }
+    }
+    # Invoke-Elevated catches launch errors, so an assertion in the mock returns 1 instead of 42.
+    Assert-Equal (Invoke-Elevated $dir '' $optional (Join-Path $root 'staging root')) 42 'mocked elevated child must receive both staged directories'
+    Write-Host 'PASS PushFlow UAC argument forwarding (mocked Start-Process)'
+}
 try {
+    Test-PushFlowOwnership
+    Test-PushFlowStaging
+    Test-PushFlowElevation
     $target = Join-Path $dir $rel
     $src = Join-Path $Payload $rel
     $failures = @()

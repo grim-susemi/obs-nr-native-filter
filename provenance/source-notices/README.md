@@ -36,4 +36,15 @@ preflight_match flag. A changed input is kept as a finding, never silently erase
 
 ## Copy normalization
 
-CREDITS.md and RenoDX-MIT.txt are LF-normalized copies of S/docs/CREDITS.md and S/Licenses/RenoDX_ATTRIBUTION.txt. Content is identical modulo CRLF to LF (the native editor writes LF only); the source sha256 values are recorded in the notice entries of source-lock.json.
+The original CREDITS.md and RenoDX-MIT.txt entries came from S/docs/CREDITS.md and
+S/Licenses/RenoDX_ATTRIBUTION.txt, with CRLF normalized to LF. The original source
+hashes remain in source-lock.json. CREDITS.md now also records OBS additions.
+
+## OBS Native NR PushFPS A/B additions
+
+- [PushFPS-NOTICE.md](PushFPS-NOTICE.md): selected source from [DosukaSOL/PushFPS](https://github.com/DosukaSOL/PushFPS/tree/4e5c0491d0f5f7c01f1c4718e2b156857573abcd), its Veyra lineage, the dated OBS modifications, and the upstream Section 7 permission limited to PushFPS-authored portions.
+- [ONNXRuntime-MIT.txt](ONNXRuntime-MIT.txt): MIT text from the vendored [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime) 1.20.1 header distribution. The optional runtime uses [Microsoft DirectML 1.15.4](https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.4), which has its own package terms.
+- [RIFE-MIT.txt](RIFE-MIT.txt): MIT text from [hzwer/ECCV2022-RIFE](https://github.com/hzwer/ECCV2022-RIFE/blob/19b903effb008cefbffaea2c4a0b877beaece6b1/LICENSE). [AmusementClub/vs-mlrt](https://github.com/AmusementClub/vs-mlrt) distributes the optional RIFE ONNX exports separately.
+
+See [CREDITS.md](CREDITS.md) for the attribution chain. These notices do not
+imply that the ZIP contains any third-party runtime, model, or addon.

@@ -319,7 +319,10 @@ Consumer::Consumer(ID3D12CommandQueue* queue,const Offer& offer,const Peer& prod
  std::array<Handle,14> incoming;
  for(size_t i=0;i<incoming.size();++i)incoming[i]=Handle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(h.handles[i])));
  p->frameEvent=std::move(incoming[12]);p->controlEvent=std::move(incoming[13]);p->generation=h.generation;
+ wchar_t inject[2]{};
+ const bool reject=GetEnvironmentVariableW(L"OBS_NR_TEST_REJECT_FIRST_IMPORT",inject,ARRAYSIZE(inject))==1&&inject[0]==L'1';
  try{
+  if(reject)throw Error(Status::Rejected,E_FAIL,"test_first_import_rejected");
   for(size_t i=0;i<p->slots.size();++i){
    auto& slot=p->slots[i];check(p->device->OpenSharedHandle(incoming[i*3].value,IID_PPV_ARGS(&slot.texture)),"import texture");
    check(p->device->OpenSharedHandle(incoming[i*3+1].value,IID_PPV_ARGS(&slot.write)),"import write fence");
@@ -331,7 +334,13 @@ Consumer::Consumer(ID3D12CommandQueue* queue,const Offer& offer,const Peer& prod
  }catch(const Error&){
   for(auto& slot:p->slots)slot={};
   for(auto& handle:incoming)handle=Handle{};
-  store(h.transfer,static_cast<uint64_t>(Transfer::Rejected));SetEvent(p->controlEvent.value);throw;
+  store(h.transfer,static_cast<uint64_t>(Transfer::Rejected));SetEvent(p->controlEvent.value);
+  if(reject){
+   SetEnvironmentVariableW(L"OBS_NR_TEST_REJECT_FIRST_IMPORT",nullptr);
+   wchar_t stall[8]{};const auto len=GetEnvironmentVariableW(L"OBS_NR_TEST_REJECT_STALL_MS",stall,ARRAYSIZE(stall));
+   if(len&&len<ARRAYSIZE(stall))Sleep(std::min(wcstoul(stall,nullptr,10),30'000ul));
+  }
+  throw;
  }
  for(auto& handle:incoming)handle=Handle{};
  store(h.transfer,static_cast<uint64_t>(Transfer::Ready));win(SetEvent(p->controlEvent.value)!=FALSE,"import ack");

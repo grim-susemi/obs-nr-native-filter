@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <intrin.h>
 #include <string>
 #include <vector>
 
@@ -126,12 +127,11 @@ struct NativeVfg::Impl {
     CUresult (__stdcall* cuCtxPopCurrent)(CUcontext*){};
     CUresult (__stdcall* cuStreamCreate)(CUstream*, unsigned int){};
     CUresult (__stdcall* cuStreamDestroy)(CUstream){};
-    CUresult (__stdcall* cuStreamSynchronize)(CUstream){};
+    CUresult (__stdcall* cuStreamQuery)(CUstream){};
     CUresult (__stdcall* cuEventCreate)(CUevent*, unsigned int){};
     CUresult (__stdcall* cuEventDestroy)(CUevent){};
     CUresult (__stdcall* cuEventRecord)(CUevent, CUstream){};
     CUresult (__stdcall* cuEventQuery)(CUevent){};
-    CUresult (__stdcall* cuEventSynchronize)(CUevent){};
     CUresult (__stdcall* cuImportExternalMemory)(CUexternalMemory*, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC*){};
     CUresult (__stdcall* cuExternalMemoryGetMappedBuffer)(CUdeviceptr*, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC*){};
     CUresult (__stdcall* cuDestroyExternalMemory)(CUexternalMemory){};
@@ -161,7 +161,13 @@ struct NativeVfg::Impl {
         CUdeviceptr pointer{};
         void* image{};
     };
-    std::array<MappedBuffer, Gpu::max_exchange> mapped{};
+    static constexpr size_t maxExchange = 2 + (max_multiplier - 1);
+    Gpu& gpu;
+    std::array<ComPtr<ID3D12Resource>, maxExchange> exchange;
+    std::array<Handle, maxExchange> exported;
+    ComPtr<ID3D12Fence> stageFence;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    std::array<MappedBuffer, maxExchange> mapped{};
     size_t mappedCount{};
 
     CUdevice device{};
@@ -171,8 +177,14 @@ struct NativeVfg::Impl {
     std::array<CUevent, max_multiplier> subEvents{};
     bool retained{};
     void* effect{};
-    uint32_t multiplier{2};
+    const uint32_t ceiling;
+    uint32_t activeMultiplier;
+    std::optional<FgPairTicket> activePair;
+    uint64_t nextPairId{};
+    bool failed{}, pending{};
     unsigned version{};
+
+    Impl(Gpu& owner, uint32_t limit) : gpu(owner), ceiling(limit), activeMultiplier(limit) {}
 
     void cu_check(CUresult r, const char* op) const
     {
@@ -200,12 +212,31 @@ struct NativeVfg::Impl {
         }
     };
 
+    void copy(ID3D12GraphicsCommandList* cmd, ID3D12Resource* texture, size_t bufferIndex) const
+    {
+        const bool input = bufferIndex < 2;
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Transition = {texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON,
+            input ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST};
+        cmd->ResourceBarrier(1, &barrier);
+        const D3D12_TEXTURE_COPY_LOCATION tex{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        const D3D12_TEXTURE_COPY_LOCATION buf{exchange[bufferIndex].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, footprint};
+        cmd->CopyTextureRegion(input ? &buf : &tex, 0, 0, 0, input ? &tex : &buf, nullptr);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd->ResourceBarrier(1, &barrier);
+    }
+
     ~Impl()
     {
         if (retained && cuCtxPushCurrent && cuCtxPopCurrent) {
             CUcontext prev{};
             if (cuCtxPushCurrent(cudaContext) == CUDA_SUCCESS) {
-                if (stream && cuStreamSynchronize) (void)cuStreamSynchronize(stream);
+                // Never free imported resources while a failed submission may
+                // still own them. The outer worker watchdog covers a wedged API.
+                if (pending) {
+                    TerminateProcess(GetCurrentProcess(), 5);
+                    __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+                }
                 if (stageSemaphore) (void)cuDestroyExternalSemaphore(stageSemaphore);
                 if (effect && destroyEffect) destroyEffect(effect);
                 for (size_t i = 0; i < mappedCount; ++i) {
@@ -227,11 +258,12 @@ struct NativeVfg::Impl {
     }
 };
 
-NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& session)
-    : impl_(std::make_unique<Impl>())
+NativeVfg::NativeVfg(const fs::path& runtimeDir, Gpu& gpu, const Session& session,
+    bool gpuShotChange, const std::function<void()>& beat)
+    : impl_(std::make_unique<Impl>(gpu, std::clamp<uint32_t>(session.multiplier, 2, max_multiplier)))
 {
     auto& p = *impl_;
-    p.multiplier = std::clamp<uint32_t>(session.multiplier, 2, max_multiplier);
+    if (beat) beat();
 
     wchar_t sysDir[MAX_PATH]{};
     const auto n = GetSystemDirectoryW(sysDir, ARRAYSIZE(sysDir));
@@ -251,12 +283,11 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
     p.cuCtxPopCurrent = bind_sym<decltype(p.cuCtxPopCurrent)>(nvcuda, "cuCtxPopCurrent_v2");
     p.cuStreamCreate = bind_sym<decltype(p.cuStreamCreate)>(nvcuda, "cuStreamCreate");
     p.cuStreamDestroy = bind_sym<decltype(p.cuStreamDestroy)>(nvcuda, "cuStreamDestroy_v2");
-    p.cuStreamSynchronize = bind_sym<decltype(p.cuStreamSynchronize)>(nvcuda, "cuStreamSynchronize");
+    p.cuStreamQuery = bind_sym<decltype(p.cuStreamQuery)>(nvcuda, "cuStreamQuery");
     p.cuEventCreate = bind_sym<decltype(p.cuEventCreate)>(nvcuda, "cuEventCreate");
     p.cuEventDestroy = bind_sym<decltype(p.cuEventDestroy)>(nvcuda, "cuEventDestroy_v2");
     p.cuEventRecord = bind_sym<decltype(p.cuEventRecord)>(nvcuda, "cuEventRecord");
     p.cuEventQuery = bind_sym<decltype(p.cuEventQuery)>(nvcuda, "cuEventQuery");
-    p.cuEventSynchronize = bind_sym<decltype(p.cuEventSynchronize)>(nvcuda, "cuEventSynchronize");
     p.cuImportExternalMemory = bind_sym<decltype(p.cuImportExternalMemory)>(nvcuda, "cuImportExternalMemory");
     p.cuExternalMemoryGetMappedBuffer = bind_sym<decltype(p.cuExternalMemoryGetMappedBuffer)>(nvcuda, "cuExternalMemoryGetMappedBuffer");
     p.cuDestroyExternalMemory = bind_sym<decltype(p.cuDestroyExternalMemory)>(nvcuda, "cuDestroyExternalMemory");
@@ -297,14 +328,16 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
     p.cu_check(p.cuStreamCreate(&p.stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
     {
         Handle fenceHandle; // A Win32 NT handle remains owned by this process after import.
-        check(gpu.d3d_device()->CreateSharedHandle(gpu.staging_fence(), nullptr, GENERIC_ALL, nullptr, &fenceHandle.h),
+        check(gpu.d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&p.stageFence)),
+            "CUDA staging fence");
+        check(gpu.d3d_device()->CreateSharedHandle(p.stageFence.Get(), nullptr, GENERIC_ALL, nullptr, &fenceHandle.h),
             "CUDA staging fence NT handle");
         CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC desc{};
         desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
         desc.handle.win32.handle = fenceHandle.h;
         p.cu_check(p.cuImportExternalSemaphore(&p.stageSemaphore, &desc), "cuImportExternalSemaphore");
     }
-    for (uint32_t s = 1; s < p.multiplier; ++s) {
+    for (uint32_t s = 1; s < p.ceiling; ++s) {
         p.cu_check(p.cuEventCreate(&p.subEvents[s], 2u /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
     }
 
@@ -317,6 +350,7 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
         p.libraries.push_back(dll);
         if (std::wcscmp(name, L"NVVideoEffects.dll") == 0) core = dll;
         if (std::wcscmp(name, L"NVCVImage.dll") == 0) image = dll;
+        if (beat) beat();
     }
 
     p.createEffect = bind_sym<decltype(p.createEffect)>(core, "NvVFX_CreateEffect");
@@ -340,23 +374,40 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
     unsigned char layout = 0;
     p.cv_check(p.fromD3D(DXGI_FORMAT_R8G8B8A8_UNORM, &pixFmt, &compType, &layout), "NvCVImage_FromD3DFormat");
 
-    const size_t total = 2 + gpu.outputCount;
+    auto* device = gpu.d3d_device();
+    const auto texture = gpu.input.front()->GetDesc();
+    uint64_t bytes{};
+    device->GetCopyableFootprints(&texture, 0, 1, 0, &p.footprint, nullptr, nullptr, &bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = bytes; buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const auto allocated = device->GetResourceAllocationInfo(0, 1, &buffer).SizeInBytes;
+    const size_t total = 2 + (p.ceiling - 1);
     for (size_t i = 0; i < total; ++i) {
+        check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&p.exchange[i])), "CUDA exchange buffer");
+        check(device->CreateSharedHandle(p.exchange[i].Get(), nullptr, GENERIC_ALL, nullptr, &p.exported[i].h),
+            "CUDA resource NT handle");
         auto& buf = p.mapped[i];
         CUDA_EXTERNAL_MEMORY_HANDLE_DESC hdesc{};
         hdesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
-        hdesc.handle.win32.handle = gpu.exported[i].h;
-        hdesc.size = gpu.allocated;
+        hdesc.handle.win32.handle = p.exported[i].h;
+        hdesc.size = allocated;
         hdesc.flags = CU_EXTERNAL_MEMORY_DEDICATED;
         p.cu_check(p.cuImportExternalMemory(&buf.memory, &hdesc), "cuImportExternalMemory");
         p.mappedCount = i + 1;
 
         CUDA_EXTERNAL_MEMORY_BUFFER_DESC bdesc{};
-        bdesc.size = gpu.bytes;
+        bdesc.size = bytes;
         p.cu_check(p.cuExternalMemoryGetMappedBuffer(&buf.pointer, buf.memory, &bdesc), "cuExternalMemoryGetMappedBuffer");
         p.cv_check(p.imageCreate(1, 1, pixFmt, compType, layout, 0, 1, &buf.image), "NvCVImage_Create");
         p.imageDealloc(buf.image);
-        p.cv_check(p.imageInit(buf.image, session.width, session.height, static_cast<int>(gpu.pitch()),
+        p.cv_check(p.imageInit(buf.image, session.width, session.height, static_cast<int>(p.footprint.Footprint.RowPitch),
             reinterpret_cast<void*>(buf.pointer), pixFmt, compType, layout, 1), "NvCVImage_Init");
     }
 
@@ -366,63 +417,109 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, const Gpu& gpu, const Session& 
     p.cv_check(p.setU32(p.effect, "InputWidth", session.width), "InputWidth");
     p.cv_check(p.setU32(p.effect, "InputHeight", session.height), "InputHeight");
     p.cv_check(p.setU32(p.effect, "Mode", mode), "Mode");
-    p.cv_check(p.setU32(p.effect, "AutomaticShotChangeDetectionEnabled", 1), "AutomaticShotChangeDetectionEnabled");
+    p.cv_check(p.setU32(p.effect, "AutomaticShotChangeDetectionEnabled", gpuShotChange ? 0u : 1u),
+        "AutomaticShotChangeDetectionEnabled");
     p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "initial SrcImage0");
     p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "initial SrcImage1");
+    if (beat) beat();
     p.cv_check(p.loadEffect(p.effect), "NvVFX_Load");
+    if (beat) beat();
     p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[2].image), "initial DstImage0");
-    p.cv_check(p.setU32(p.effect, "FrameMultiplier", p.multiplier), "FrameMultiplier");
+    p.cv_check(p.setU32(p.effect, "FrameMultiplier", p.activeMultiplier), "FrameMultiplier");
 }
 
 NativeVfg::~NativeVfg() = default;
 
-bool NativeVfg::enqueue_subframes(uint64_t stageFence, bool shotChange)
+std::optional<FgPairTicket> NativeVfg::submit_pair(const FgPairDesc& pair, unsigned prevIndex, unsigned currIndex)
 {
     auto& p = *impl_;
-    Impl::CtxGuard ctx(p);
-    CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};
-    wait.params.fence.value = stageFence;
-    p.cu_check(p.cuWaitExternalSemaphoresAsync(&p.stageSemaphore, &wait, 1, p.stream), "cuWaitExternalSemaphoresAsync");
-    p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "SetImage SrcImage0");
-    p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "SetImage SrcImage1");
-    p.cv_check(p.setU32(p.effect, "ShotChange", shotChange ? 1u : 0u), "SetU32 ShotChange");
-    for (uint32_t sub = 1; sub < p.multiplier; ++sub) {
-        p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[1 + sub].image), "SetImage DstImage0");
-        p.cv_check(p.setU32(p.effect, "FrameIndex", sub), "SetU32 FrameIndex");
-        p.cv_check(p.runEffect(p.effect, 1), "NvVFX_Run");
-        p.cu_check(p.cuEventRecord(p.subEvents[sub], p.stream), "cuEventRecord");
+    if (p.activePair && !subframe_ready(*p.activePair, p.activePair->lastSubmittedSub)) return {};
+    if (pair.effectiveMultiplier < 2 || pair.effectiveMultiplier > p.ceiling)
+        check(E_INVALIDARG, "Native VFG pair multiplier");
+    const auto stageFence = p.gpu.record_draw([&](ID3D12GraphicsCommandList* cmd) {
+        p.copy(cmd, pair.prevTex, 0);
+        p.copy(cmd, pair.currTex, 1);
+    });
+    if (!stageFence) return {};
+    p.gpu.mark_inputs_read(prevIndex, currIndex, stageFence);
+    // The draw queue also contains all previous resolves, so starting this
+    // pair after this signal cannot overwrite an output still being read.
+    p.pending = true;
+    p.failed = true;
+    check(p.gpu.drawQueue->Signal(p.stageFence.Get(), stageFence), "CUDA staging fence signal");
+    if (pair.onStageQueued) pair.onStageQueued();
+    const auto enqueueStart = clock_ns();
+    {
+        Impl::CtxGuard ctx(p);
+        CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};
+        wait.params.fence.value = stageFence;
+        p.cu_check(p.cuWaitExternalSemaphoresAsync(&p.stageSemaphore, &wait, 1, p.stream), "cuWaitExternalSemaphoresAsync");
+        p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "SetImage SrcImage0");
+        p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "SetImage SrcImage1");
+        if (p.activeMultiplier != pair.effectiveMultiplier) {
+            p.cv_check(p.setU32(p.effect, "FrameMultiplier", pair.effectiveMultiplier), "FrameMultiplier");
+            p.activeMultiplier = pair.effectiveMultiplier;
+        }
+        p.cv_check(p.setU32(p.effect, "ShotChange", pair.shotCut ? 1u : 0u), "SetU32 ShotChange");
+        for (uint32_t sub = 1; sub < p.activeMultiplier; ++sub) {
+            p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[1 + sub].image), "SetImage DstImage0");
+            p.cv_check(p.setU32(p.effect, "FrameIndex", sub), "SetU32 FrameIndex");
+            p.cv_check(p.runEffect(p.effect, 1), "NvVFX_Run");
+            p.cu_check(p.cuEventRecord(p.subEvents[sub], p.stream), "cuEventRecord");
+        }
     }
-    return true;
+    if (pair.onEnqueued) pair.onEnqueued(clock_ns() - enqueueStart);
+    const auto id = ++p.nextPairId;
+    p.activePair.emplace(FgPairTicket{id, prevIndex, currIndex, p.activeMultiplier, p.activeMultiplier - 1,
+        static_cast<uint32_t>(id % 2)});
+    p.failed = false;
+    return p.activePair;
 }
 
-void NativeVfg::wait_subframe(uint32_t subIndex)
+bool NativeVfg::subframe_ready(const FgPairTicket& ticket, uint32_t subIndex)
 {
     auto& p = *impl_;
-    if (!subIndex || subIndex >= p.multiplier || !p.subEvents[subIndex]) return;
-    p.cu_check(p.cuEventSynchronize(p.subEvents[subIndex]), "cuEventSynchronize");
-}
-
-bool NativeVfg::subframe_ready(uint32_t subIndex)
-{
-    auto& p = *impl_;
-    if (!subIndex || subIndex >= p.multiplier || !p.subEvents[subIndex])
+    if (p.failed || !p.activePair || ticket != *p.activePair || !subIndex || subIndex > ticket.lastSubmittedSub)
         return false;
     Impl::CtxGuard ctx(p);
     const auto status = p.cuEventQuery(p.subEvents[subIndex]);
     if (status == CUDA_ERROR_NOT_READY) return false;
+    p.failed = status != CUDA_SUCCESS;
     p.cu_check(status, "cuEventQuery");
     return true;
+}
+
+void NativeVfg::resolve_subframe(ID3D12GraphicsCommandList* cmd, const FgPairTicket& ticket,
+    ID3D12Resource* outTex, uint32_t sub)
+{
+    const auto& p = *impl_;
+    if (p.failed || !p.activePair || ticket != *p.activePair || !sub || sub > ticket.lastSubmittedSub)
+        check(E_INVALIDARG, "inactive Native VFG pair");
+    p.copy(cmd, outTex, 1 + sub);
 }
 
 void NativeVfg::synchronize()
 {
     auto& p = *impl_;
     Impl::CtxGuard ctx(p);
-    p.cu_check(p.cuStreamSynchronize(p.stream), "cuStreamSynchronize drain");
+    const auto expiry = clock_ns() + 5'000'000'000;
+    auto status = p.cuStreamQuery(p.stream);
+    while (status == CUDA_ERROR_NOT_READY && clock_ns() < expiry) {
+        Sleep(1);
+        status = p.cuStreamQuery(p.stream);
+    }
+    p.failed = status != CUDA_SUCCESS;
+    p.cu_check(status, "CUDA stream drain");
+    p.pending = false;
 }
 
-unsigned NativeVfg::sdk_version() const noexcept
+unsigned NativeVfg::version_tag() const noexcept
 {
-    return impl_ ? impl_->version : 0;
+    return impl_->version;
+}
+
+bool NativeVfg::faulted() const noexcept
+{
+    return impl_->failed;
 }
 } // namespace nr::fg::vfg
