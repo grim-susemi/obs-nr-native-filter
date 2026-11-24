@@ -13,7 +13,7 @@ constexpr size_t subframes = max_multiplier - 1;
 
 struct PushFlowBackend::Impl {
     const PushFlowOpen callbacks;
-    pf::StartingMarker marker{pf::marker_directory()};
+    pf::StartingMarker marker{pf::marker_directory(), callbacks.session.markerOwnerToken};
     pf::OrtState ort{callbacks.log};
     Gpu* const gpu;
     ComPtr<ID3D12CommandQueue> queue;

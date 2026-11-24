@@ -156,7 +156,7 @@ inline void ownership_and_timeout_controls(TestRun& test, const std::filesystem:
                 shutdownSawFault = fault;
                 stamp_exit_reason(session, ExitReason::Fault);
                 const auto reason = read_exit_reason(session);
-                cleanup = !item.active || reason != ExitReason::UserClosed || StartingMarker(dir).clear();
+                cleanup = marker.finish_teardown(reason == ExitReason::UserClosed, false);
                 return reason == ExitReason::UserClosed;
             });
         } catch (const ipc::Error& failure) {
@@ -165,8 +165,8 @@ inline void ownership_and_timeout_controls(TestRun& test, const std::filesystem:
         const bool closed = item.first == ExitReason::UserClosed;
         const auto reason = item.first == ExitReason::None ? ExitReason::Fault : item.first;
         test.expect(shutdownSawFault && cleanup && propagated != closed && read_exit_reason(session) == reason &&
-            std::filesystem::exists(quarantine) && std::filesystem::exists(starting) != (closed && item.active),
-            "ring failure honors first exit reason and preserves quarantine");
+            std::filesystem::exists(quarantine) && std::filesystem::exists(starting),
+            "ring failure honors first exit reason and preserves starting/quarantine until Controller");
     }
 }
 } // namespace nr::fg::qa

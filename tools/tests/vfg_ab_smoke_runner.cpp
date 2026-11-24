@@ -66,6 +66,21 @@ std::string field_value(const std::string& line, std::string_view key)
     return line.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
+size_t count_starting_markers(const fs::path& dir)
+{
+    std::error_code ec;
+    size_t n = 0;
+    if (!fs::exists(dir, ec)) return 0;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto name = it->path().filename().wstring();
+        if (name == L"pushflow-starting.txt" ||
+            (name.starts_with(L"pushflow-starting-") && name.ends_with(L".txt"))) {
+            ++n;
+        }
+    }
+    return n;
+}
+
 std::wstring secondary_monitor_id()
 {
     std::wstring found;
@@ -523,7 +538,7 @@ void run_pushflow_stalled_esc(const std::wstring& presenter, const fs::path& log
         expect(c1.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
             "expected UserClosed force terminate");
         expect(count_tokens(c1, "event=controller_auto_fallback_1x_relaunch") == 0, "expected 0 relaunches");
-        expect(!fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be cleaned on Esc");
+        expect(count_starting_markers(marksDir) == 0, "pushflow starting marker must be cleaned on Esc");
         expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"), "Esc must not write quarantine");
         std::printf("PASS ab_pushflow_stalled_esc exit_ms=%llu\n", static_cast<unsigned long long>(escElapsedMs));
     }
@@ -615,7 +630,7 @@ void run_pushflow_userstop_stalled(const std::wstring& presenter, const fs::path
         const auto cs = read_text(logStop);
         expect(cs.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
             "Controller::stop(true) must preserve UserClosed on force terminate");
-        expect(!fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be cleaned on user stop");
+        expect(count_starting_markers(marksDir) == 0, "pushflow starting marker must be cleaned on user stop");
         expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"), "user stop must not write quarantine");
         std::printf("PASS ab_pushflow_userstop_stalled exit_ms=%llu\n", static_cast<unsigned long long>(stopMs));
     }
@@ -697,8 +712,8 @@ void run_pushflow_midrun_crash(const std::wstring& presenter, const fs::path& lo
         const auto preKill = read_text(log);
         const auto steadySub = count_tokens(preKill, "event=present_vfg_subframe ");
         expect(steadySub >= 125, "expected >= 125 steady PushFlow inferences before kill");
-        expect(!fs::exists(marksDir / L"pushflow-starting.txt"),
-            "pushflow-starting.txt must already be cleared after 120 steady inferences");
+        expect(count_starting_markers(marksDir) == 0,
+            "pushflow starting marker must already be cleared after 120 steady inferences");
 
         const auto oldOffer = find_line(preKill, "event=offer ", "epoch=1");
         const auto oldPid = std::stoul(field_value(oldOffer, "pid="));
@@ -946,7 +961,7 @@ void run_stalled_log_esc(const std::wstring& presenter, const fs::path& logDir, 
     const auto c = read_text(log);
     expect(c.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
         "expected unshared shutdown_force_terminate diagnostic");
-    expect(!fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be cleaned even when worker holds log lock");
+    expect(count_starting_markers(marksDir) == 0, "pushflow starting marker must be cleaned even when worker holds log lock");
     SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_LOG_LOCK_MS", nullptr);
     std::printf("PASS ab_stalled_log_esc exit_ms=%llu\n", static_cast<unsigned long long>(escElapsedMs));
 }
@@ -1121,7 +1136,7 @@ void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path
         ++warmFrame;
     }
     expect(logPipe.tokenSeen.load(std::memory_order_acquire), "timed out waiting for present_original on pipe");
-    expect(fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be armed before watchdog");
+    expect(count_starting_markers(marksDir) > 0, "pushflow starting marker must be armed before watchdog");
 
     const auto witness = saturate_and_confirm_blocked_write(logPipe, gfx, *producer, controller, warmFrame);
     expect(controller.alive(), "presenter should still be blocked in WriteFile when witness observed");
@@ -1133,7 +1148,7 @@ void run_watchdog_stalled_pipe_log(const std::wstring& presenter, const fs::path
     expect(!controller.alive(), "no-input watchdog must terminate despite blocked kernel WriteFile");
     expect(controller.await_exit_cleanup(500), "watchdog exit cleanup must remain bounded despite blocked pipe");
     expect(controller.exit_reason() == ExitReason::Watchdog, "watchdog must preserve ExitReason::Watchdog");
-    expect(fs::exists(marksDir / L"pushflow-starting.txt"), "watchdog must NOT clear starting marker");
+    expect(count_starting_markers(marksDir) > 0, "watchdog must NOT clear starting marker");
     const auto pipeSnap = logPipe.snapshot();
     expect(producer->retire() == ipc::Status::Ok, "retire watchdog pipe");
     producer.reset();
@@ -1239,7 +1254,7 @@ void run_pushflow_pipe_close_case(const std::wstring& presenter, const fs::path&
             ++warmFrame;
         }
         expect(logPipe.tokenSeen.load(std::memory_order_acquire), "timed out waiting for present_original on pipe");
-        expect(fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must exist before close");
+        expect(count_starting_markers(marksDir) > 0, "pushflow starting marker must exist before close");
 
         const auto witness = saturate_and_confirm_blocked_write(logPipe, gfx, producer, controller, warmFrame);
         expect(controller.alive(), "presenter should still be blocked in WriteFile before close");
@@ -1261,8 +1276,8 @@ void run_pushflow_pipe_close_case(const std::wstring& presenter, const fs::path&
         expect(controller.await_exit_cleanup(500), "user close exit cleanup must remain bounded despite blocked pipe");
         expect(controller.user_close_marker_cleaned(), "user close marker cleanup must report success");
         expect(controller.exit_reason() == ExitReason::UserClosed, "user close must preserve UserClosed");
-        expect(!fs::exists(marksDir / L"pushflow-starting.txt"),
-            "pushflow-starting.txt must be cleaned independently of blocked pipe log");
+        expect(count_starting_markers(marksDir) == 0,
+            "pushflow starting marker must be cleaned independently of blocked pipe log");
         expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"),
             "user close must not write crash quarantine");
         const auto pipeSnap = logPipe.snapshot();
@@ -1321,6 +1336,115 @@ void run_pushflow_pipe_close_case(const std::wstring& presenter, const fs::path&
         std::printf("PASS ab_pushflow_%s_stalled_pipe_log_reopen subframes=%zu\n",
             useControllerStop ? "userstop" : "esc", count_tokens(cr, "event=present_vfg_subframe "));
     }
+}
+
+void run_pushflow_overlapping_markers(const std::wstring& presenter, const fs::path& logDir,
+    const std::wstring& monId, const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    fs::remove_all(marksDir);
+    const auto logA = logDir / L"ab-pushflow-overlap-a.log";
+    const auto logB = logDir / L"ab-pushflow-overlap-b.log";
+    const auto logC = logDir / L"ab-pushflow-overlap-c.log";
+    fs::remove(logA);
+    fs::remove(logB);
+    fs::remove(logC);
+
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    GpuFixture gfx(640, 360);
+    // 1. Start session A (PushFlow 2x)
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logA.c_str());
+    ipc::Producer prodA(gfx.dev.Get(), unique_mapping(L"ovA"), gfx.shape);
+    LaunchOptions optsA{};
+    optsA.backend = Backend::PushFlow;
+    optsA.pushflowTier = PushFlowTier::Fast;
+    optsA.pushflowRuntimeDir = pfRuntime;
+    optsA.multiplier = 2;
+    optsA.monitorId = monId;
+    Controller ctrlA(optsA);
+    const auto offA = prodA.connect(ctrlA.peer());
+    expect(ctrlA.offer(offA, gfx.shape, gfx.luid), "offer overlap A");
+    expect(WaitForSingleObject(prodA.control_event(), 10000) == WAIT_OBJECT_0, "handshake overlap A");
+    wait_log_token(logA, "event=initialized backend=pushflow", ctrlA);
+    for (uint32_t f = 0; f < 15; ++f) {
+        pace_to(clock_ns() + 16'666'667ULL);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+        publish_ok_or_dropped(prodA, gfx.tex.Get(), clock_ns());
+        if (count_starting_markers(marksDir) == 1 &&
+            count_tokens(read_text(logA), "event=present_vfg_subframe ") >= 3) break;
+    }
+    wait_log_token(logA, "event=present_vfg_subframe ", ctrlA);
+    expect(count_starting_markers(marksDir) == 1, "overlap A must arm 1 starting marker");
+
+    // 2. Start overlapping session B (PushFlow 2x) while A is active
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logB.c_str());
+    ipc::Producer prodB(gfx.dev.Get(), unique_mapping(L"ovB"), gfx.shape);
+    LaunchOptions optsB = optsA;
+    Controller ctrlB(optsB);
+    const auto offB = prodB.connect(ctrlB.peer());
+    expect(ctrlB.offer(offB, gfx.shape, gfx.luid), "offer overlap B");
+    expect(WaitForSingleObject(prodB.control_event(), 10000) == WAIT_OBJECT_0, "handshake overlap B");
+    wait_log_token(logB, "event=initialized backend=pushflow", ctrlB);
+    for (uint32_t f = 0; f < 15; ++f) {
+        pace_to(clock_ns() + 16'666'667ULL);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+        publish_ok_or_dropped(prodB, gfx.tex.Get(), clock_ns());
+        if (count_starting_markers(marksDir) == 2 &&
+            count_tokens(read_text(logB), "event=present_vfg_subframe ") >= 3) break;
+    }
+    wait_log_token(logB, "event=present_vfg_subframe ", ctrlB);
+    expect(count_starting_markers(marksDir) == 2, "overlap A + B must hold 2 isolated starting markers");
+
+    // 3. Close A cleanly via VK_ESCAPE (UserClosed): A's starting marker is removed, B's MUST survive untouched!
+    const auto offerLineA = find_line(read_text(logA), "event=offer ");
+    const auto hwndA = std::stoull(field_value(offerLineA, "hwnd="), nullptr, 16);
+    expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndA)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+        "Esc overlap A");
+    const auto exitDeadlineA = clock_ns() + 2'500'000'000ULL;
+    while (ctrlA.alive() && clock_ns() < exitDeadlineA) Sleep(10);
+    expect(!ctrlA.alive() && ctrlA.await_exit_cleanup(1000) && ctrlA.user_close_marker_cleaned(),
+        "overlap A UserClosed cleanup must complete");
+    expect(prodA.retire() == ipc::Status::Ok, "retire overlap A");
+    expect(count_starting_markers(marksDir) == 1,
+        "closing A via UserClosed must NOT delete B's starting marker");
+    expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"), "UserClosed A must not write quarantine");
+
+    // 4. Crash B mid-init without writing quarantine (simulating host exit before fallback quarantine):
+    //    B's surviving starting marker MUST force C to degrade to 1x!
+    const auto offerLineB = find_line(read_text(logB), "event=offer ");
+    const auto pidB = std::stoul(field_value(offerLineB, "pid="));
+    Handle childB{OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pidB)};
+    expect(childB.value != nullptr, "open overlap B presenter");
+    expect(TerminateProcess(childB.value, 9) != FALSE, "TerminateProcess overlap B");
+    expect(WaitForSingleObject(childB.value, 2000) == WAIT_OBJECT_0, "overlap B reaped");
+    expect(ctrlB.await_exit_cleanup(1000), "overlap B observer settles");
+    expect(prodB.retire() == ipc::Status::Ok, "retire overlap B");
+    expect(count_starting_markers(marksDir) == 1, "crashed B starting marker must survive on disk");
+
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logC.c_str());
+    ipc::Producer prodC(gfx.dev.Get(), unique_mapping(L"ovC"), gfx.shape);
+    Controller ctrlC(optsA);
+    const auto offC = prodC.connect(ctrlC.peer());
+    expect(ctrlC.offer(offC, gfx.shape, gfx.luid), "offer overlap C");
+    expect(WaitForSingleObject(prodC.control_event(), 10000) == WAIT_OBJECT_0, "handshake overlap C");
+    const auto startC = clock_ns();
+    for (uint32_t f = 0; f < 30; ++f) {
+        const auto ts = startC + uint64_t{f} * 1'000'000'000ULL / 30;
+        pace_to(ts);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+        publish_ok_or_dropped(prodC, gfx.tex.Get(), ts);
+    }
+    Sleep(200);
+    wait_controller_exit(ctrlC);
+    expect(prodC.retire() == ipc::Status::Ok, "retire overlap C");
+    const auto cTxt = read_text(logC);
+    expect(cTxt.find("event=pushflow_previous_crash_detected") != std::string::npos,
+        "C must detect B's surviving crash marker after A closed via UserClosed");
+    expect(count_tokens(cTxt, "event=present_original ") >= 20 &&
+        count_tokens(cTxt, "event=present_vfg_subframe ") == 0,
+        "C must degrade to 1x original after B crash");
+    expect(count_starting_markers(marksDir) == 0, "C consumed B's starting marker cleanly");
+    std::printf("PASS ab_pushflow_overlapping_markers pidB=%lu orig=%zu\n",
+        pidB, count_tokens(cTxt, "event=present_original "));
 }
 
 void run_anr_ab(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
@@ -1516,6 +1640,10 @@ int wmain(int argc, wchar_t** argv)
             const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-userstop-stalled-pipe-log");
             run_pushflow_pipe_close_case(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter", true);
+        } else if (mode == L"pushflow-overlapping-markers") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-overlapping-markers");
+            run_pushflow_overlapping_markers(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
         } else if (mode == L"anr-ab") {
             const auto dll = readEnv(L"OBS_NR_TEST_ANR_MOCK_DLL");
             expect(!dll.empty(), "OBS_NR_TEST_ANR_MOCK_DLL required for anr-ab");

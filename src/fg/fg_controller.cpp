@@ -3,8 +3,12 @@
 #include "anr_dll_validator.h"
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <optional>
+#include <unordered_set>
 #include <vector>
 
 namespace nr::fg::vfg {
@@ -93,6 +97,84 @@ fs::path marker_dir()
 }
 constexpr char kUserClosedFallbackPayload[] = "reason=user_closed_marker_cleanup_failed\n";
 
+std::wstring format_marker_token_w(uint64_t token)
+{
+    wchar_t buf[32]{};
+    swprintf_s(buf, L"%016llx", static_cast<unsigned long long>(token));
+    return buf;
+}
+std::string format_marker_token_a(uint64_t token)
+{
+    char buf[32]{};
+    snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(token));
+    return buf;
+}
+fs::path starting_marker_path(const fs::path& marks, uint64_t ownerToken)
+{
+    if (ownerToken == 0) return marks / L"pushflow-starting.txt";
+    return marks / (L"pushflow-starting-" + format_marker_token_w(ownerToken) + L".txt");
+}
+std::optional<uint64_t> parse_token_from_filename(const std::wstring& name)
+{
+    constexpr std::wstring_view prefix = L"pushflow-starting-";
+    constexpr std::wstring_view suffix = L".txt";
+    if (name.size() != prefix.size() + 16 + suffix.size() ||
+        !name.starts_with(prefix) || !name.ends_with(suffix)) return std::nullopt;
+    const auto hex = name.substr(prefix.size(), 16);
+    uint64_t out = 0;
+    for (wchar_t ch : hex) {
+        out <<= 4;
+        if (ch >= L'0' && ch <= L'9') out |= static_cast<uint64_t>(ch - L'0');
+        else if (ch >= L'a' && ch <= L'f') out |= static_cast<uint64_t>(ch - L'a' + 10);
+        else if (ch >= L'A' && ch <= L'F') out |= static_cast<uint64_t>(ch - L'A' + 10);
+        else return std::nullopt;
+    }
+    return out ? std::optional<uint64_t>(out) : std::nullopt;
+}
+struct ActiveMarkerRegistry {
+    std::mutex mtx;
+    std::unordered_set<uint64_t> active;
+    std::atomic_uint64_t seq{1};
+};
+ActiveMarkerRegistry& marker_registry()
+{
+    static ActiveMarkerRegistry* reg = new ActiveMarkerRegistry();
+    return *reg;
+}
+uint64_t allocate_marker_token()
+{
+    auto& reg = marker_registry();
+    const uint64_t pidMix = static_cast<uint64_t>(GetCurrentProcessId()) << 32;
+    for (;;) {
+        const uint64_t n = reg.seq.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t tok = pidMix ^ n ^ (clock_ns() & 0xFFFFFFFFULL);
+        if (tok == 0) continue;
+        std::lock_guard lock(reg.mtx);
+        if (reg.active.insert(tok).second) return tok;
+    }
+}
+void release_marker_token(uint64_t token) noexcept
+{
+    if (!token) return;
+    try {
+        auto& reg = marker_registry();
+        std::lock_guard lock(reg.mtx);
+        reg.active.erase(token);
+    } catch (...) {
+    }
+}
+bool is_marker_token_active(uint64_t token) noexcept
+{
+    if (!token) return false;
+    try {
+        auto& reg = marker_registry();
+        std::lock_guard lock(reg.mtx);
+        return reg.active.contains(token);
+    } catch (...) {
+        return false;
+    }
+}
+
 struct PendingIoWrite {
     Handle file;
     Handle event;
@@ -112,6 +194,30 @@ struct PendingIoWrite {
     }
 };
 
+struct WriteJobResult {
+    std::mutex mtx;
+    detail::WriteEventStatus status{};
+    Handle doneEvent;
+};
+
+struct WriteWorkContext {
+    std::wstring path;
+    DWORD timeoutMs{};
+    bool skipCancelIoEx{};
+    Handle stallBeforeIoEvent;
+    Handle ownedReapedEvent;
+    PTP_WAIT tpWait{};
+    std::unique_ptr<PendingIoWrite> pending;
+    std::shared_ptr<WriteJobResult> result;
+    ~WriteWorkContext()
+    {
+        if (tpWait) {
+            CloseThreadpoolWait(tpWait);
+            tpWait = nullptr;
+        }
+    }
+};
+
 VOID CALLBACK wait_reap_callback(PTP_CALLBACK_INSTANCE instance, PVOID ctx, PTP_WAIT wait, TP_WAIT_RESULT) noexcept
 {
     std::unique_ptr<PendingIoWrite> own(static_cast<PendingIoWrite*>(ctx));
@@ -124,6 +230,100 @@ VOID CALLBACK wait_reap_callback(PTP_CALLBACK_INSTANCE instance, PVOID ctx, PTP_
     if (mod) FreeLibraryWhenCallbackReturns(instance, mod);
 }
 
+VOID CALLBACK write_work_callback(PTP_CALLBACK_INSTANCE instance, PVOID ctx, PTP_WORK work) noexcept
+{
+    std::unique_ptr<WriteWorkContext> wctx(static_cast<WriteWorkContext*>(ctx));
+    CloseThreadpoolWork(work);
+    detail::WriteEventStatus localStatus{};
+    bool deferred = false;
+    try {
+        if (wctx->stallBeforeIoEvent.value) {
+            WaitForSingleObject(wctx->stallBeforeIoEvent.value, INFINITE);
+        }
+        auto& p = wctx->pending;
+        const bool isPipe = wctx->path.rfind(LR"(\\.\pipe\)", 0) == 0;
+        p->file.value = CreateFileW(wctx->path.c_str(),
+            isPipe ? GENERIC_WRITE : FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            isPipe ? OPEN_EXISTING : OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            nullptr);
+        if (p->file.value == INVALID_HANDLE_VALUE) {
+            p->file.value = nullptr;
+        } else {
+            localStatus.opened = true;
+            p->event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (p->event.value) {
+                p->ov.hEvent = p->event.value;
+                if (!isPipe) {
+                    p->ov.Offset = 0xFFFFFFFFu;
+                    p->ov.OffsetHigh = 0xFFFFFFFFu;
+                }
+                DWORD written{};
+                if (!WriteFile(p->file.value, p->text.data(),
+                        static_cast<DWORD>(p->text.size()), &written, &p->ov)) {
+                    if (GetLastError() == ERROR_IO_PENDING) {
+                        localStatus.pended = true;
+                        if (WaitForSingleObject(p->event.value, wctx->timeoutMs) != WAIT_OBJECT_0) {
+                            if (!wctx->skipCancelIoEx) {
+                                localStatus.cancelled = (CancelIoEx(p->file.value, &p->ov) != FALSE);
+                            }
+                            if (WaitForSingleObject(p->event.value, 50) == WAIT_OBJECT_0) {
+                                DWORD tr{};
+                                if (!GetOverlappedResult(p->file.value, &p->ov, &tr, FALSE) &&
+                                    GetLastError() == ERROR_OPERATION_ABORTED) {
+                                    localStatus.aborted = true;
+                                }
+                            } else {
+                                // Kernel I/O is still in flight; transfer ownership to pre-allocated TP_WAIT.
+                                localStatus.deferredToPool = true;
+                                deferred = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {
+    }
+
+    if (deferred) {
+        {
+            std::lock_guard lock(wctx->result->mtx);
+            wctx->result->status = localStatus;
+        }
+        const HANDLE ev = wctx->pending->event.value;
+        PTP_WAIT wait = wctx->tpWait;
+        wctx->tpWait = nullptr;
+        wctx->pending.release();
+        SetEvent(wctx->result->doneEvent.value);
+        wctx->result.reset();
+        SetThreadpoolWait(wait, ev, nullptr);
+        return;
+    }
+
+    {
+        std::lock_guard lock(wctx->result->mtx);
+        wctx->result->status = localStatus;
+    }
+    if (wctx->tpWait) {
+        CloseThreadpoolWait(wctx->tpWait);
+        wctx->tpWait = nullptr;
+    }
+    const HANDLE doneEv = wctx->result->doneEvent.value;
+    const HANDLE reaped = wctx->pending->reapedEvent;
+    const HMODULE mod = wctx->pending->module;
+    wctx->pending->module = nullptr;
+    wctx->pending.reset();
+    SetEvent(doneEv);
+    if (reaped) SetEvent(reaped);
+    wctx->ownedReapedEvent = {};
+    wctx->result.reset();
+    wctx.reset();
+    if (mod) FreeLibraryWhenCallbackReturns(instance, mod);
+}
+
 void write_event(const char* event) noexcept
 {
     try {
@@ -131,90 +331,127 @@ void write_event(const char* event) noexcept
     } catch (...) {
     }
 }
-bool clear_starting_marker(const fs::path& marks, std::error_code& ec) noexcept
+bool clear_starting_marker(const fs::path& marks, uint64_t ownerToken, std::error_code& ec) noexcept
 {
     ec.clear();
     if (marks.empty()) {
         ec = std::make_error_code(std::errc::no_such_file_or_directory);
         return false;
     }
-    fs::remove(marks / L"pushflow-starting.txt", ec);
+    fs::remove(starting_marker_path(marks, ownerToken), ec);
     return !ec;
 }
-bool read_valid_user_closed_fallback(const fs::path& userClosedMark) noexcept
+bool read_bounded_marker_text(const fs::path& file, std::string& out) noexcept
 {
-    std::ifstream in(userClosedMark, std::ios::binary);
-    if (!in) return false;
-    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (in.bad()) return false;
-    return content == kUserClosedFallbackPayload || content == "reason=user_closed_marker_cleanup_failed\r\n";
+    try {
+        std::ifstream in(file, std::ios::binary);
+        if (!in) return false;
+        char buf[129]{};
+        in.read(buf, 128);
+        const auto got = in.gcount();
+        if (in.bad() || (!in.eof() && in.peek() != std::char_traits<char>::eof())) return false;
+        out.assign(buf, static_cast<size_t>(got));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+struct ParsedUserClosedFallback {
+    bool valid{};
+    bool hasToken{};
+    uint64_t token{};
+};
+ParsedUserClosedFallback parse_user_closed_fallback(const fs::path& userClosedMark) noexcept
+{
+    std::string content;
+    if (!read_bounded_marker_text(userClosedMark, content)) return {};
+    if (content == kUserClosedFallbackPayload || content == "reason=user_closed_marker_cleanup_failed\r\n") {
+        return {true, false, 0};
+    }
+    constexpr std::string_view prefix = "token=";
+    if (!content.starts_with(prefix)) return {};
+    std::string_view sv(content);
+    sv.remove_prefix(prefix.size());
+    if (sv.ends_with("\r\n")) sv.remove_suffix(2);
+    else if (sv.ends_with("\n")) sv.remove_suffix(1);
+    if (sv.empty() || sv.size() > 16) return {};
+    uint64_t tok = 0;
+    const auto res = std::from_chars(sv.data(), sv.data() + sv.size(), tok, 16);
+    if (res.ec != std::errc{} || res.ptr != sv.data() + sv.size() || tok == 0) return {};
+    return {true, true, tok};
 }
 enum class MarkerCleanupStatus { NotNeeded, Pending, Succeeded, Failed };
 } // namespace
 
 namespace detail {
 WriteEventStatus write_event_bounded(const std::wstring& path, const std::string& text,
-    DWORD timeoutMs, HANDLE reapedEvent, bool failPoolPrep, bool simulateCancelDelay) noexcept
+    DWORD timeoutMs, const WriteTestHooks* hooks) noexcept
 {
     WriteEventStatus status{};
     try {
         if (path.empty() || text.empty()) return status;
-        HMODULE selfMod = nullptr;
+        if (hooks && hooks->failPoolPrep) return status;
+
+        struct ModulePin {
+            HMODULE mod{};
+            ~ModulePin() { if (mod) FreeLibrary(mod); }
+            HMODULE release() noexcept { auto out = mod; mod = nullptr; return out; }
+        } modPin;
         if (!GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 reinterpret_cast<LPCWSTR>(&write_event_bounded),
-                &selfMod) || !selfMod) {
+                &modPin.mod) || !modPin.mod) {
             return status;
         }
-        auto pending = std::make_unique<PendingIoWrite>();
-        pending->module = selfMod;
-        pending->reapedEvent = reapedEvent;
-        PTP_WAIT tpWait = failPoolPrep ? nullptr : CreateThreadpoolWait(wait_reap_callback, pending.get(), nullptr);
-        if (!tpWait) return status;
-        struct WaitGuard {
-            PTP_WAIT w{};
-            ~WaitGuard() { if (w) CloseThreadpoolWait(w); }
-        } waitGuard{tpWait};
 
-        const bool isPipe = path.rfind(LR"(\\.\pipe\)", 0) == 0;
-        pending->file.value = CreateFileW(path.c_str(),
-            isPipe ? GENERIC_WRITE : FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            isPipe ? OPEN_EXISTING : OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-            nullptr);
-        if (pending->file.value == INVALID_HANDLE_VALUE) {
-            pending->file.value = nullptr;
-            return status;
-        }
-        status.opened = true;
-        pending->event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!pending->event.value) return status;
+        auto result = std::make_shared<WriteJobResult>();
+        result->doneEvent.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!result->doneEvent.value) return status;
+
+        auto pending = std::make_unique<PendingIoWrite>();
+        pending->module = modPin.release();
         pending->text = text;
-        pending->ov.hEvent = pending->event.value;
-        if (!isPipe) {
-            pending->ov.Offset = 0xFFFFFFFFu;
-            pending->ov.OffsetHigh = 0xFFFFFFFFu;
-        }
-        DWORD written{};
-        if (!WriteFile(pending->file.value, pending->text.data(),
-                static_cast<DWORD>(pending->text.size()), &written, &pending->ov)) {
-            if (GetLastError() != ERROR_IO_PENDING) return status;
-            status.pended = true;
-            if (WaitForSingleObject(pending->event.value, timeoutMs) != WAIT_OBJECT_0) {
-                status.cancelled = true;
-                if (!simulateCancelDelay) CancelIoEx(pending->file.value, &pending->ov);
-                if (WaitForSingleObject(pending->event.value, 50) != WAIT_OBJECT_0) {
-                    // Kernel I/O is still in flight; transfer ownership to pre-allocated TP_WAIT.
-                    status.deferredToPool = true;
-                    const HANDLE ev = pending->event.value;
-                    waitGuard.w = nullptr;
-                    pending.release();
-                    SetThreadpoolWait(tpWait, ev, nullptr);
+        pending->reapedEvent = hooks ? hooks->reapedEvent : nullptr;
+
+        auto wctx = std::make_unique<WriteWorkContext>();
+        wctx->path = path;
+        wctx->timeoutMs = timeoutMs;
+        wctx->skipCancelIoEx = hooks && hooks->skipCancelIoEx;
+        if (hooks && hooks->stallBeforeIoEvent) {
+            DuplicateHandle(GetCurrentProcess(), hooks->stallBeforeIoEvent,
+                GetCurrentProcess(), &wctx->stallBeforeIoEvent.value, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        } else {
+            wchar_t evName[256]{};
+            if (GetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", evName, ARRAYSIZE(evName))) {
+                wctx->stallBeforeIoEvent.value = OpenEventW(SYNCHRONIZE, FALSE, evName);
+            }
+            if (!pending->reapedEvent) {
+                wchar_t reapName[256]{};
+                if (GetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", reapName, ARRAYSIZE(reapName))) {
+                    wctx->ownedReapedEvent.value = OpenEventW(EVENT_MODIFY_STATE, FALSE, reapName);
+                    pending->reapedEvent = wctx->ownedReapedEvent.value;
                 }
             }
         }
+        wctx->result = result;
+        wctx->pending = std::move(pending);
+
+        wctx->tpWait = CreateThreadpoolWait(wait_reap_callback, wctx->pending.get(), nullptr);
+        if (!wctx->tpWait) return status;
+
+        PTP_WORK tpWork = CreateThreadpoolWork(write_work_callback, wctx.get(), nullptr);
+        if (!tpWork) return status;
+
+        wctx.release();
+        SubmitThreadpoolWork(tpWork);
+
+        const DWORD waitBudget = timeoutMs + 150;
+        if (WaitForSingleObject(result->doneEvent.value, waitBudget) == WAIT_OBJECT_0) {
+            std::lock_guard lock(result->mtx);
+            return result->status;
+        }
+        status.timedOut = true;
+        return status;
     } catch (...) {
     }
     return status;
@@ -226,6 +463,7 @@ struct Controller::ChildSession {
     Session* view{};
     HANDLE exitSettledEvent{};
     std::wstring logPath;
+    uint64_t markerOwnerToken{};
     std::atomic<MarkerCleanupStatus> markerCleanupStatus{MarkerCleanupStatus::NotNeeded};
     std::jthread observer;
 
@@ -237,6 +475,7 @@ struct Controller::ChildSession {
             job = nullptr;
         }
         if (observer.joinable()) observer.join();
+        release_marker_token(markerOwnerToken);
         if (exitSettledEvent) CloseHandle(exitSettledEvent);
         if (child) CloseHandle(child);
         if (view) UnmapViewOfFile(view);
@@ -340,7 +579,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         throw ipc::Error(ipc::Status::ProtocolError, ERROR_FILE_NOT_FOUND, "NVIDIA VFG runtime DLLs not found");
     if (options.backend == Backend::PushFlow && options.multiplier > 1 && !fallback) {
         const auto marks = marker_dir();
-        const auto starting = marks / L"pushflow-starting.txt";
+        const auto legacyStarting = marks / L"pushflow-starting.txt";
         const auto quarantine = marks / L"pushflow-crash-quarantine.txt";
         const auto userClosedMark = marks / L"pushflow-user-closed.txt";
         std::error_code ec;
@@ -350,17 +589,17 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
             fallbackFailed = true;
             write_event("event=pushflow_fallback_probe_failed\n");
         } else if (userClosedExists) {
-            const bool validFallback = read_valid_user_closed_fallback(userClosedMark);
+            const auto parsed = parse_user_closed_fallback(userClosedMark);
             std::error_code qEc;
             const bool hasQuarantine = fs::exists(quarantine, qEc);
-            if (qEc || !validFallback) {
+            if (qEc || !parsed.valid) {
                 fallbackFailed = true;
-                write_event(!validFallback ? "event=pushflow_fallback_corrupt\n" : "event=pushflow_quarantine_probe_failed\n");
+                write_event(!parsed.valid ? "event=pushflow_fallback_corrupt\n" : "event=pushflow_quarantine_probe_failed\n");
                 std::error_code rmEc;
                 fs::remove(userClosedMark, rmEc);
             } else if (!hasQuarantine) {
                 std::error_code clearEc;
-                if (clear_starting_marker(marks, clearEc)) {
+                if (clear_starting_marker(marks, parsed.hasToken ? parsed.token : 0, clearEc)) {
                     std::error_code rmEc;
                     if (!fs::remove(userClosedMark, rmEc) && rmEc) {
                         fallbackFailed = true;
@@ -378,14 +617,38 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
                 }
             }
         }
-        std::error_code startEc, qCheckEc;
-        const bool startExists = !marks.empty() && fs::exists(starting, startEc);
+        std::error_code scanEc, qCheckEc;
+        bool deadStartingFound = false;
+        std::vector<fs::path> deadMarkers;
+        if (!marks.empty()) {
+            std::error_code dirEc;
+            const bool marksDirExists = fs::exists(marks, dirEc);
+            if (dirEc) {
+                scanEc = dirEc;
+            } else if (marksDirExists) {
+                if (fs::exists(legacyStarting, scanEc)) {
+                    deadStartingFound = true;
+                    deadMarkers.push_back(legacyStarting);
+                }
+                if (!scanEc) {
+                    for (fs::directory_iterator it(marks, scanEc), end; !scanEc && it != end; it.increment(scanEc)) {
+                        const auto fname = it->path().filename().wstring();
+                        if (const auto tok = parse_token_from_filename(fname)) {
+                            if (!is_marker_token_active(*tok)) {
+                                deadStartingFound = true;
+                                deadMarkers.push_back(it->path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         const bool qExists = !marks.empty() && fs::exists(quarantine, qCheckEc);
-        if (fallbackFailed || startEc || qCheckEc || startExists || qExists) {
+        if (fallbackFailed || scanEc || qCheckEc || deadStartingFound || qExists) {
             write_event("event=pushflow_previous_crash_detected\n");
             if (!marks.empty()) {
                 std::error_code rmEc;
-                fs::remove(starting, rmEc);
+                for (const auto& m : deadMarkers) fs::remove(m, rmEc);
                 fs::remove(quarantine, rmEc);
             }
             options_.multiplier = 1;
@@ -396,6 +659,14 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
             std::copy(dir.begin(), dir.end(), header.pushflowRuntimeDir);
         }
     }
+    if (options_.backend == Backend::PushFlow && options_.multiplier > 1) {
+        header.markerOwnerToken = allocate_marker_token();
+    }
+    struct TokenGuard {
+        uint64_t tok{};
+        ~TokenGuard() { release_marker_token(tok); }
+        uint64_t release() noexcept { auto out = tok; tok = 0; return out; }
+    } tokenGuard{header.markerOwnerToken};
     require(validate_session_header(header), "VFG invalid session header");
     Handle job{CreateJobObjectW(nullptr, nullptr)}, parent;
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -459,9 +730,9 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     session->job = job.release();
     session->exitSettledEvent = exitSettled.release();
     session->logPath = log;
+    session->markerOwnerToken = tokenGuard.release();
     session->markerCleanupStatus.store(
-        (options_.backend == Backend::PushFlow && options_.multiplier > 1) ?
-            MarkerCleanupStatus::Pending : MarkerCleanupStatus::NotNeeded,
+        session->markerOwnerToken != 0 ? MarkerCleanupStatus::Pending : MarkerCleanupStatus::NotNeeded,
         std::memory_order_release);
     session->observer = std::jthread([s = session.get(), backend = options_.backend, marks = marker_dir()] {
         WaitForSingleObject(s->child, INFINITE);
@@ -473,11 +744,12 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         bool cleanupFailed = false;
         bool fallbackRecorded = false;
         bool fallbackWriteFailed = false;
+        const uint64_t ownerTok = s->markerOwnerToken;
         const bool needsUserCloseCleanup =
-            s->markerCleanupStatus.load(std::memory_order_acquire) == MarkerCleanupStatus::Pending;
+            s->markerCleanupStatus.load(std::memory_order_acquire) == MarkerCleanupStatus::Pending && ownerTok != 0;
         if (reason == ExitReason::UserClosed && backend == Backend::PushFlow && needsUserCloseCleanup) {
             std::error_code ec;
-            if (clear_starting_marker(marks, ec)) {
+            if (clear_starting_marker(marks, ownerTok, ec)) {
                 s->markerCleanupStatus.store(MarkerCleanupStatus::Succeeded, std::memory_order_release);
             } else {
                 cleanupFailed = true;
@@ -485,7 +757,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
                 std::error_code dirEc;
                 if (!marks.empty() && (fs::create_directories(marks, dirEc) || !dirEc)) {
                     std::ofstream fallbackFile(marks / L"pushflow-user-closed.txt", std::ios::binary | std::ios::trunc);
-                    fallbackFile << kUserClosedFallbackPayload;
+                    fallbackFile << "token=" << format_marker_token_a(ownerTok) << '\n';
                     fallbackFile.flush();
                     const bool wrote = fallbackFile.good();
                     fallbackFile.close();
@@ -515,6 +787,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         if (cleanupFailed) diag += "event=pushflow_marker_cleanup_failed\n";
         if (fallbackRecorded) diag += "event=pushflow_user_closed_fallback_recorded\n";
         if (fallbackWriteFailed) diag += "event=pushflow_fallback_write_failed\n";
+        release_marker_token(ownerTok);
         if (!diag.empty()) detail::write_event_bounded(s->logPath, diag, 150);
         SetEvent(s->exitSettledEvent);
     });

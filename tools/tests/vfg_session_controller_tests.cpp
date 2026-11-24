@@ -7,6 +7,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 using namespace nr::fg::vfg;
@@ -124,7 +125,7 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
 {
     const std::string bigPayload(262144, 'X');
 
-    // 1a. Normal mode: overlapped WriteFile hits ERROR_IO_PENDING, CancelIoEx cancels it within 50ms grace.
+    // 1a. Normal mode: overlapped WriteFile hits ERROR_IO_PENDING, CancelIoEx cancels it with ERROR_OPERATION_ABORTED.
     {
         const auto pipeName = std::wstring(LR"(\\.\pipe\obs-nr-ctrl-cancel-a-)") + std::to_wstring(GetCurrentProcessId());
         const Handle pipe{CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
@@ -147,8 +148,9 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         const auto ioRes = nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50);
         const auto elapsedMs = (clock_ns() - t0) / 1'000'000ULL;
         expect(WaitForSingleObject(connectedPipe.value, 1000) == WAIT_OBJECT_0, "server pipe 1a connected");
-        expect(ioRes.opened && ioRes.pended && ioRes.cancelled && !ioRes.deferredToPool,
-            "1a: overlapped write must hit ERROR_IO_PENDING and complete via CancelIoEx");
+        expect(ioRes.opened && ioRes.pended && ioRes.cancelled && ioRes.aborted &&
+            !ioRes.deferredToPool && !ioRes.timedOut,
+            "1a: overlapped write must hit ERROR_IO_PENDING and complete via CancelIoEx with ERROR_OPERATION_ABORTED");
         expect(elapsedMs < 600, "1a: bounded overlapped write must return promptly");
     }
 
@@ -174,11 +176,12 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         } serverGuard{stopPipe.value, pipe.value, server};
         Sleep(20);
         const auto t0 = clock_ns();
-        const auto ioRes = nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50, reapedEvent.value, false, true);
+        const nr::fg::vfg::detail::WriteTestHooks hooks{reapedEvent.value, nullptr, false, true};
+        const auto ioRes = nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50, &hooks);
         const auto elapsedMs = (clock_ns() - t0) / 1'000'000ULL;
         expect(WaitForSingleObject(connectedPipe.value, 1000) == WAIT_OBJECT_0, "server pipe 1b connected");
-        expect(ioRes.opened && ioRes.pended && ioRes.cancelled && ioRes.deferredToPool,
-            "1b: pending write past cancel grace must hand off to TP_WAIT");
+        expect(ioRes.opened && ioRes.pended && !ioRes.cancelled && ioRes.deferredToPool && !ioRes.timedOut,
+            "1b: delayed pending write past grace must hand off to TP_WAIT without claiming CancelIoEx");
         expect(elapsedMs < 600, "1b: caller must return bounded without waiting for kernel completion");
         expect(WaitForSingleObject(reapedEvent.value, 30) == WAIT_TIMEOUT,
             "1b: PendingIoWrite must stay retained while kernel WriteFile has not completed");
@@ -190,20 +193,140 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
             "1b: TP_WAIT callback must reap PendingIoWrite after kernel I/O completes");
     }
 
-    // 1c. Forced threadpool-prep failure must return immediately without INFINITE wait.
-    const auto tFail0 = clock_ns();
-    const auto failRes = nr::fg::vfg::detail::write_event_bounded(L"\\\\.\\pipe\\unused", "ignored", 50, nullptr, true, false);
-    const auto failMs = (clock_ns() - tFail0) / 1'000'000ULL;
-    expect(!failRes.opened && !failRes.pended && !failRes.deferredToPool && failMs < 50,
-        "1c: threadpool wait preparation failure must return bounded without issuing WriteFile");
+    // 1c. Forced threadpool-prep failure on a LIVE, OPENABLE pipe server must never call CreateFileW.
+    {
+        const auto pipeName = std::wstring(LR"(\\.\pipe\obs-nr-ctrl-cancel-c-)") + std::to_wstring(GetCurrentProcessId());
+        const Handle pipe{CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_WAIT, 2, 64, 64, 0, nullptr)};
+        expect(pipe.value != INVALID_HANDLE_VALUE, "create controller cancel pipe 1c");
+        const Handle stopPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        const Handle connectedPipe{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        const Handle connOvEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        expect(stopPipe.value && connectedPipe.value && connOvEv.value, "create 1c events");
+        std::thread server([&] {
+            OVERLAPPED ov{};
+            ov.hEvent = connOvEv.value;
+            if (!ConnectNamedPipe(pipe.value, &ov)) {
+                const auto err = GetLastError();
+                if (err == ERROR_IO_PENDING) {
+                    const HANDLE waits[2]{connOvEv.value, stopPipe.value};
+                    if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0) return;
+                } else if (err != ERROR_PIPE_CONNECTED) {
+                    return;
+                }
+            }
+            SetEvent(connectedPipe.value);
+            WaitForSingleObject(stopPipe.value, INFINITE);
+        });
+        struct ServerJoin {
+            HANDLE stop; HANDLE p; std::thread& t;
+            ~ServerJoin() { SetEvent(stop); CancelIoEx(p, nullptr); DisconnectNamedPipe(p); if (t.joinable()) t.join(); }
+        } serverGuard{stopPipe.value, pipe.value, server};
+        Sleep(20);
+        const nr::fg::vfg::detail::WriteTestHooks failHooks{nullptr, nullptr, true, false};
+        const auto tFail0 = clock_ns();
+        const auto failRes = nr::fg::vfg::detail::write_event_bounded(pipeName, "small", 50, &failHooks);
+        const auto failMs = (clock_ns() - tFail0) / 1'000'000ULL;
+        expect(!failRes.opened && !failRes.pended && !failRes.deferredToPool && !failRes.timedOut && failMs < 50,
+            "1c: threadpool preparation failure must return bounded");
+        expect(WaitForSingleObject(connectedPipe.value, 60) == WAIT_TIMEOUT,
+            "1c: live pipe server must NOT be connected when threadpool prep fails");
+        // Control on the exact same live pipe server: failPoolPrep=false connects and writes cleanly.
+        const auto ctrlRes = nr::fg::vfg::detail::write_event_bounded(pipeName, bigPayload, 50);
+        expect(WaitForSingleObject(connectedPipe.value, 1000) == WAIT_OBJECT_0,
+            "1c control: same live pipe server must connect when prep succeeds");
+        expect(ctrlRes.opened && ctrlRes.pended && ctrlRes.cancelled && ctrlRes.aborted,
+            "1c control: live pipe write succeeds up to ERROR_IO_PENDING/CancelIoEx");
+    }
 
-    // 2. Pending vs Succeeded marker status and UserClosed fallback consumption on locked/corrupt markers.
+    // 1d. Stalled diagnostic open/write in TP_WORK must NOT block write_event_bounded, Controller cleanup, destruction, or reopen.
+    {
+        const auto diagLog = scratch / L"ctrl-diag-stall.log";
+        fs::remove(diagLog);
+        const Handle stallEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        const Handle reapEv{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        expect(stallEv.value && reapEv.value, "create 1d direct stall events");
+        const nr::fg::vfg::detail::WriteTestHooks stallHooks{reapEv.value, stallEv.value, false, false};
+        const auto t0 = clock_ns();
+        const auto st = nr::fg::vfg::detail::write_event_bounded(diagLog.wstring(), "event=direct_stall_probe\n", 50, &stallHooks);
+        const auto callMs = (clock_ns() - t0) / 1'000'000ULL;
+        expect(st.timedOut && callMs < 500, "1d direct: stalled open/write returns bounded with timedOut=true");
+        expect(WaitForSingleObject(reapEv.value, 20) == WAIT_TIMEOUT,
+            "1d direct: TP_WORK retains state until stalled open/write completes");
+        SetEvent(stallEv.value);
+        expect(WaitForSingleObject(reapEv.value, 2000) == WAIT_OBJECT_0,
+            "1d direct: TP_WORK completes and signals reaped after stall clears");
+        const auto txt = [&] { std::ifstream s(diagLog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(txt.find("event=direct_stall_probe") != std::string::npos,
+            "1d direct: deferred write wrote payload once stall cleared");
+    }
+
     const auto localApp = scratch / L"ctrl-localapp";
     const auto marks = localApp / L"obs-nr-native-filter";
     fs::remove_all(localApp);
     fs::create_directories(marks);
-    SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
     SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", exe.c_str());
+    {
+        // Unset LOCALAPPDATA so PushFlow Controller observer deterministically fails marker cleanup
+        // and invokes detail::write_event_bounded(s->logPath, diag, 150) on stop(true).
+        SetEnvironmentVariableW(L"LOCALAPPDATA", nullptr);
+        const auto diagLog = scratch / L"ctrl-controller-stall.log";
+        fs::remove(diagLog);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", diagLog.c_str());
+        const auto stallName = LR"(Local\obs-nr-diag-stall-)" + std::to_wstring(GetCurrentProcessId());
+        const auto reapName = LR"(Local\obs-nr-diag-reap-)" + std::to_wstring(GetCurrentProcessId());
+        const Handle stallEv{CreateEventW(nullptr, TRUE, FALSE, stallName.c_str())};
+        const Handle reapEv{CreateEventW(nullptr, TRUE, FALSE, reapName.c_str())};
+        expect(stallEv.value && reapEv.value, "create 1d controller diag stall events");
+        struct EnvClear {
+            ~EnvClear()
+            {
+                SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", nullptr);
+                SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", nullptr);
+            }
+        } envClear;
+        SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_STALL_EVENT", stallName.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_TEST_DIAG_REAPED_EVENT", reapName.c_str());
+
+        const auto t0 = clock_ns();
+        {
+            LaunchOptions opts{};
+            opts.backend = Backend::PushFlow;
+            opts.multiplier = 2;
+            auto ctrl = std::make_unique<Controller>(opts);
+            ctrl->stop(true);
+            expect(ctrl->await_exit_cleanup(1800), "1d: await_exit_cleanup must remain bounded while diag open/write stalls");
+            const auto tDestroy0 = clock_ns();
+            ctrl.reset();
+            const auto destroyMs = (clock_ns() - tDestroy0) / 1'000'000ULL;
+            expect(destroyMs < 600, "1d: Controller destruction must not block on stalled diag open/write");
+        }
+        expect(WaitForSingleObject(reapEv.value, 20) == WAIT_TIMEOUT,
+            "1d: observer diagnostic TP_WORK state stays retained while stalled");
+        SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
+        {
+            const auto tReopen0 = clock_ns();
+            LaunchOptions reopenOpts{};
+            reopenOpts.backend = Backend::PushFlow;
+            reopenOpts.multiplier = 2;
+            Controller reopenCtrl(reopenOpts);
+            const auto reopenMs = (clock_ns() - tReopen0) / 1'000'000ULL;
+            expect(reopenMs < 600, "1d: new preview Controller launch must remain bounded while prior diag write is stalled");
+            reopenCtrl.stop(true);
+            expect(reopenCtrl.await_exit_cleanup(1500), "1d: reopen cleanup");
+        }
+        SetEvent(stallEv.value);
+        expect(WaitForSingleObject(reapEv.value, 2000) == WAIT_OBJECT_0,
+            "1d: observer diag TP_WORK must finish and release module/state once stall clears");
+        const auto diagText = [&] { std::ifstream s(diagLog); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(diagText.find("event=pushflow_marker_cleanup_failed") != std::string::npos,
+            "1d: deferred observer diag write completed cleanly to log after stall cleared");
+        const auto totalMs = (clock_ns() - t0) / 1'000'000ULL;
+        expect(totalMs < 10000, "1d total bounded");
+    }
+    SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
+
+    // 2. Pending vs Succeeded marker status, cross-token fallback isolation, and fail-closed markers.
     SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", (scratch / L"ctrl-marker.log").c_str());
     {
         LaunchOptions opts{};
@@ -215,15 +338,32 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         expect(ctrl.await_exit_cleanup(1500) && ctrl.user_close_marker_cleaned(),
             "UserClosed PushFlow settles cleanup status to Succeeded");
     }
-    // Stage pushflow-user-closed.txt + locked pushflow-starting.txt -> next Controller must NOT drop fallback when remove fails.
-    const auto starting = marks / L"pushflow-starting.txt";
+    // Cross-token isolation: fallback for token 0000000000001234 must NOT remove token 0000000000005678's marker.
+    const auto tok1234 = marks / L"pushflow-starting-0000000000001234.txt";
+    const auto tok5678 = marks / L"pushflow-starting-0000000000005678.txt";
     const auto fallback = marks / L"pushflow-user-closed.txt";
     {
-        std::ofstream(starting) << "locked\n";
-        std::ofstream(fallback) << "reason=user_closed_marker_cleanup_failed\n";
+        std::ofstream(tok1234) << "token=0000000000001234\n";
+        std::ofstream(tok5678) << "token=0000000000005678\n";
+        std::ofstream(fallback) << "token=0000000000001234\n";
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.multiplier = 2;
+        Controller ctrl(opts);
+        expect(!fs::exists(tok1234) && !fs::exists(tok5678) && !fs::exists(fallback),
+            "dead unowned token 5678 triggers crash handling while token 1234 is cleared");
+        const auto ctrlText = [&] { std::ifstream s(scratch / L"ctrl-marker.log"); return std::string(std::istreambuf_iterator<char>(s), {}); }();
+        expect(ctrlText.find("event=pushflow_previous_crash_detected") != std::string::npos,
+            "cross-token leftover starting marker must still trigger crash degradation");
+        ctrl.stop(true);
+    }
+    // Stage token=0000000000001234 fallback + locked tok1234 -> next Controller must NOT drop fallback when remove fails.
+    {
+        std::ofstream(tok1234) << "token=0000000000001234\n";
+        std::ofstream(fallback) << "token=0000000000001234\n";
     }
     {
-        const Handle locked{CreateFileW(starting.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        const Handle locked{CreateFileW(tok1234.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, nullptr)};
         expect(locked.value != INVALID_HANDLE_VALUE, "lock starting marker without FILE_SHARE_DELETE");
         LaunchOptions opts{};
@@ -239,11 +379,12 @@ void cancel_io_ex_and_marker_fallback_contract(const fs::path& exe, const fs::pa
         opts.backend = Backend::PushFlow;
         opts.multiplier = 2;
         Controller ctrl(opts);
-        expect(!fs::exists(starting) && !fs::exists(fallback),
-            "next Controller consumes user-closed fallback and starting marker together");
+        expect(!fs::exists(tok1234) && !fs::exists(fallback),
+            "next Controller consumes user-closed fallback and matching starting marker together");
         ctrl.stop(true);
     }
     // Corrupt/truncated fallback must NOT clear starting marker and must degrade to 1x.
+    const auto starting = marks / L"pushflow-starting.txt";
     {
         std::ofstream(starting) << "real_crash_marker\n";
         std::ofstream(fallback) << "reason=trunc";

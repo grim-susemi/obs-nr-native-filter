@@ -783,7 +783,15 @@ void immediate_esc_reopen_case(const fs::path& scratch, const fs::path& log, con
     const auto hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(std::stoull(field(firstOffer, "hwnd="), nullptr, 16)));
     const Handle firstProc{OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, firstPid)};
     expect(firstProc.value != nullptr, "open first PushFlow presenter");
-    expect(fs::exists(marks / L"pushflow-starting.txt"), "pushflow-starting.txt armed during synthesis");
+    expect([&] {
+        std::error_code ec;
+        for (fs::directory_iterator it(marks, ec), end; !ec && it != end; it.increment(ec)) {
+            const auto name = it->path().filename().wstring();
+            if (name == L"pushflow-starting.txt" ||
+                (name.starts_with(L"pushflow-starting-") && name.ends_with(L".txt"))) return true;
+        }
+        return false;
+    }(), "pushflow starting marker armed during synthesis");
 
     expect(PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0) != FALSE, "Esc on PushFlow preview");
     // Wait ONLY for OS child exit (no test-side await_exit_cleanup) to test the immediate OBS reopen boundary.

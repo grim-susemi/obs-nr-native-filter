@@ -71,10 +71,17 @@ struct WriteEventStatus {
     bool opened{};
     bool pended{};
     bool cancelled{};
+    bool aborted{};
     bool deferredToPool{};
+    bool timedOut{};
+};
+struct WriteTestHooks {
+    HANDLE reapedEvent{};
+    HANDLE stallBeforeIoEvent{};
+    bool failPoolPrep{};
+    bool skipCancelIoEx{};
 };
 WriteEventStatus write_event_bounded(const std::wstring& path, const std::string& text,
-    DWORD timeoutMs = 150, HANDLE reapedEvent = nullptr, bool failPoolPrep = false,
-    bool simulateCancelDelay = false) noexcept;
+    DWORD timeoutMs = 150, const WriteTestHooks* hooks = nullptr) noexcept;
 }
 } // namespace nr::fg::vfg

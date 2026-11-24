@@ -30,6 +30,7 @@ struct Session {
     PushFlowTier pushflowTier{};
     uint32_t gpuShotChange{}, experimentalAnrOptIn{};
     uint64_t launchEpoch = 1; // A recovery child must not replay first-launch fixtures.
+    uint64_t markerOwnerToken{}; // Non-zero for PushFlow multiplier > 1 sessions to isolate starting markers.
     wchar_t pushflowRuntimeDir[520]{}, anrDllPath[520]{};
     alignas(4) volatile LONG hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{}, exitReason{};
     alignas(4) volatile LONG forceTerminated{}, watchdogInitializing{}, pushflowActive{}, drainFailed{}, logWriteInFlight{};

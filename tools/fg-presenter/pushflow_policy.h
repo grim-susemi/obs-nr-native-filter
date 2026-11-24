@@ -3,6 +3,8 @@
 #include <windows.h>
 #include "fg_vfg_session.h"
 #include <charconv>
+#include <cstdio>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -83,39 +85,62 @@ inline fs::path marker_directory()
 
 class StartingMarker {
     fs::path directory_;
+    uint64_t ownerToken_{};
     unsigned completed_{};
     bool ownsRun_{};
 
-    fs::path starting() const { return directory_ / L"pushflow-starting.txt"; }
+    static std::wstring token_hex_w(uint64_t token)
+    {
+        wchar_t buf[24]{};
+        swprintf_s(buf, L"%016llx", static_cast<unsigned long long>(token));
+        return buf;
+    }
+    static std::string token_hex_a(uint64_t token)
+    {
+        char buf[24]{};
+        snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(token));
+        return buf;
+    }
+    fs::path starting() const
+    {
+        if (ownerToken_ == 0) return directory_ / L"pushflow-starting.txt";
+        return directory_ / (L"pushflow-starting-" + token_hex_w(ownerToken_) + L".txt");
+    }
     bool arm() const
     {
         std::error_code ec;
         fs::create_directories(directory_, ec);
         if (ec) return false;
         std::ofstream file(starting(), std::ios::trunc);
-        file << "pushflow_start_or_teardown\n";
+        if (ownerToken_ != 0) file << "token=" << token_hex_a(ownerToken_) << '\n';
+        else file << "pushflow_start_or_teardown\n";
         file.close();
         return !!file;
     }
 
 public:
     enum class Open { Armed, PreviousCrash, Failed };
-    explicit StartingMarker(fs::path directory) : directory_(std::move(directory)) {}
+    explicit StartingMarker(fs::path directory, uint64_t ownerToken = 0)
+        : directory_(std::move(directory)), ownerToken_(ownerToken) {}
 
     Open begin()
     {
         if (directory_.empty()) return Open::Failed;
+        const auto legacy = directory_ / L"pushflow-starting.txt";
         const auto quarantine = directory_ / L"pushflow-crash-quarantine.txt";
         std::error_code ec;
-        const bool startingExists = fs::exists(starting(), ec);
+        const bool ownExists = fs::exists(starting(), ec);
+        if (ec) return Open::Failed;
+        const bool legacyExists = ownerToken_ != 0 && fs::exists(legacy, ec);
         if (ec) return Open::Failed;
         const bool quarantined = fs::exists(quarantine, ec);
         if (ec) return Open::Failed;
-        if (startingExists || quarantined) {
-            std::error_code quarantineError;
-            fs::remove(starting(), ec);
-            fs::remove(quarantine, quarantineError);
-            return ec || quarantineError ? Open::Failed : Open::PreviousCrash;
+        if (ownExists || legacyExists || quarantined) {
+            std::error_code legacyError, quarantineError;
+            if (ownExists) fs::remove(starting(), ec);
+            if (legacyExists) fs::remove(legacy, legacyError);
+            if (quarantined) fs::remove(quarantine, quarantineError);
+            return ec || legacyError || quarantineError ? Open::Failed : Open::PreviousCrash;
         }
         ownsRun_ = arm();
         return ownsRun_ ? Open::Armed : Open::Failed;
