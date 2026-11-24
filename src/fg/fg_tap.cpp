@@ -120,9 +120,9 @@ std::vector<MonitorItem> list_monitors()
     return list;
 }
 
-void disconnect(Tap& tap, const char* cause) noexcept
+void disconnect(Tap& tap, const char* cause, bool userStop = false) noexcept
 {
-    if (tap.controller) tap.controller->request_stop();
+    if (tap.controller) tap.controller->request_stop(userStop);
     if (tap.producer) {
         tap.retiredGeneration = tap.producer->generation();
         blog(LOG_INFO, "[vfg] original selected generation=%llu qpc_ns=%llu reason=%s",
@@ -229,7 +229,7 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
     std::unique_lock lock(tap.command, std::try_to_lock);
     if (!lock || !tap.controller) return nullptr;
     if (tap.stopping || tap.detached.load()) {
-        disconnect(tap, "stopped_or_detached");
+        disconnect(tap, "stopped_or_detached", true);
         return nullptr;
     }
     switch (tap.controller->poll_async_fallback_relaunch()) {
@@ -484,7 +484,7 @@ void stop(void* data)
     obs_weak_source_t* queued = nullptr;
     {
         std::lock_guard lock(tap.command);
-        if (tap.controller) tap.controller->stop();
+        if (tap.controller) tap.controller->stop(true);
         if (!tap.stopping && tap.producer) queued = obs_source_get_weak_source(tap.source);
         tap.stopping = true;
         tap.vfgActive.store(false, std::memory_order_release);
@@ -500,7 +500,7 @@ void stop(void* data)
         obs_enter_graphics();
         {
             std::lock_guard lock(state->command);
-            if (state->stopping && state->producer) disconnect(*state, "close_or_filter_removed");
+            if (state->stopping && state->producer) disconnect(*state, "close_or_filter_removed", true);
         }
         obs_leave_graphics();
     }, queued, false);
@@ -895,7 +895,7 @@ extern "C" void nr_register_vfg_tap()
     info.destroy = [](void* data) {
         auto* tap = static_cast<Tap*>(data);
         obs_enter_graphics();
-        if (tap->controller) disconnect(*tap, "filter_destroyed");
+        if (tap->controller) disconnect(*tap, "filter_destroyed", true);
         gs_texrender_destroy(tap->capture);
         tap->splitCanvas.clear();
         obs_leave_graphics();

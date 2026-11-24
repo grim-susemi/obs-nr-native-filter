@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "nr_guides.h"
+#include "vfg_gpu.h"
 #include <wrl/client.h>
 
 namespace nr::fg::vfg {
@@ -21,6 +22,7 @@ class AnrBgra {
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvs_, rtvs_;
+    DescriptorStager stager_;
     std::array<Resource, 2> textures_;
     UINT srvStep_{}, rtvStep_{};
 public:

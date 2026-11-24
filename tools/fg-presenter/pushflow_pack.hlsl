@@ -57,4 +57,3 @@ void main(uint3 id : SV_DispatchThreadID) {
         tensor[10 * plane + i] = 2.0 * float(id.y) / float(padH - 1) - 1.0;
     }
 }
-

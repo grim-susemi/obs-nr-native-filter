@@ -148,6 +148,53 @@ DWORD fixture_ms(const Session& s, const wchar_t* name)
     return *end ? 0 : std::min(delay, 30'000ul);
 }
 
+void append_log_unshared(const wchar_t* path, const char* text) noexcept
+{
+    if (!path || !*path || !text || !*text) return;
+    const HANDLE handle = CreateFileW(path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return;
+    DWORD written{};
+    WriteFile(handle, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    CloseHandle(handle);
+}
+
+void bounded_force_cleanup(const wchar_t* logPath, const char* line, bool pushflowActive, ExitReason reason) noexcept
+{
+    struct Args {
+        std::wstring logPath;
+        std::string line;
+        bool pushflowActive;
+        ExitReason reason;
+    };
+    auto* args = new (std::nothrow) Args{logPath ? logPath : L"", line ? line : "", pushflowActive, reason};
+    if (!args) {
+        append_log_unshared(logPath, line);
+        return;
+    }
+    const HANDLE thread = CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
+        std::unique_ptr<Args> data(static_cast<Args*>(param));
+        append_log_unshared(data->logPath.c_str(), data->line.c_str());
+        if (data->reason == ExitReason::UserClosed) {
+            try {
+                if (!pushflow::clear_starting_on_user_close(pushflow::marker_directory(), data->pushflowActive,
+                    data->reason))
+                    append_log_unshared(data->logPath.c_str(), "event=pushflow_marker_cleanup_failed\n");
+            } catch (...) {
+                append_log_unshared(data->logPath.c_str(), "event=pushflow_marker_cleanup_failed\n");
+            }
+        }
+        return 0;
+    }, args, 0, nullptr);
+    if (!thread) {
+        delete args;
+        append_log_unshared(logPath, line);
+        return;
+    }
+    WaitForSingleObject(thread, 150);
+    CloseHandle(thread);
+}
+
 void clear_pushflow_starting_on_close(const Feed& f) noexcept
 {
     try {
@@ -335,6 +382,12 @@ void frames(Feed& f)
     if (const auto stall = fixture_ms(f.view, L"OBS_NR_TEST_STALL_WORKER_MS")) {
         fprintf(f.log, "event=test_worker_stalled delay_ms=%lu\n", stall);
         Sleep(stall);
+    }
+    if (const auto lockStall = fixture_ms(f.view, L"OBS_NR_TEST_STALL_LOG_LOCK_MS")) {
+        _lock_file(f.log);
+        fprintf(f.log, "event=test_log_locked delay_ms=%lu\n", lockStall);
+        Sleep(lockStall);
+        _unlock_file(f.log);
     }
     const auto faultExitDelay = fixture_ms(f.view, L"OBS_NR_TEST_FAULT_EXIT_DELAY_MS");
     Handle faultArm;
@@ -1013,16 +1066,22 @@ int wmain(int argc, wchar_t** argv)
                 break;
             } else if (elapsed > timeout) {
                 stamp_exit_reason(*view, ExitReason::Watchdog);
-                fprintf(file, "event=watchdog_timeout initializing=%d elapsed_ms=%lld\n",
+                char timeoutLine[128];
+                const int len = snprintf(timeoutLine, sizeof(timeoutLine),
+                    "event=watchdog_timeout initializing=%d elapsed_ms=%lld\n",
                     initializing ? 1 : 0, static_cast<long long>(elapsed / ms));
-                fflush(file);
+                if (len > 0) append_log_unshared(argv[4], timeoutLine);
                 break;
             }
             DWORD currentAffinity = WDA_NONE;
             const DWORD wantedAffinity = display_affinity(InterlockedCompareExchange(&view->hideFromCapture, 0, 0));
             if (GetWindowDisplayAffinity(window, &currentAffinity) && currentAffinity != wantedAffinity) {
-                if (SetWindowDisplayAffinity(window, wantedAffinity))
-                    fprintf(file, "event=display_affinity affinity=0x%lX\n", wantedAffinity);
+                if (SetWindowDisplayAffinity(window, wantedAffinity)) {
+                    char affinityLine[96];
+                    const int len = snprintf(affinityLine, sizeof(affinityLine),
+                        "event=display_affinity affinity=0x%lX\n", wantedAffinity);
+                    if (len > 0) append_log_unshared(argv[4], affinityLine);
+                }
             }
         }
         TranslateMessage(&msg);
@@ -1034,10 +1093,11 @@ int wmain(int argc, wchar_t** argv)
     ShowWindow(window, SW_HIDE);
     if (WaitForSingleObject(workerDone.h, 1000) != WAIT_OBJECT_0) {
         const auto reason = read_exit_reason(*view);
-        fprintf(file, "event=shutdown_force_terminate watchdog=%d exit_reason=%ld\n",
+        char terminateLine[128];
+        const int len = snprintf(terminateLine, sizeof(terminateLine),
+            "event=shutdown_force_terminate watchdog=%d exit_reason=%ld\n",
             reason == ExitReason::Watchdog, static_cast<LONG>(reason));
-        fflush(file);
-        if (reason == ExitReason::UserClosed) clear_pushflow_starting_on_close(feed);
+        bounded_force_cleanup(argv[4], len > 0 ? terminateLine : "", feed.pushflowActive.load(), reason);
         TerminateProcess(GetCurrentProcess(), reason == ExitReason::UserClosed ? 0u : 2u);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }

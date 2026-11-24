@@ -279,17 +279,20 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     job_ = job.release();
 }
 
-void Controller::request_stop() noexcept
+void Controller::request_stop(bool userStop) noexcept
 {
     stopRequested_.store(true);
-    if (view_) InterlockedExchange64(&view_->state, -1);
+    if (view_) {
+        if (userStop) stamp_exit_reason(*view_, ExitReason::UserClosed);
+        InterlockedExchange64(&view_->state, -1);
+    }
     wakeRelaunch_.store(true);
     wakeRelaunch_.notify_one();
 }
 
-void Controller::stop() noexcept
+void Controller::stop(bool userStop) noexcept
 {
-    request_stop();
+    request_stop(userStop);
     if (relaunchWorker_.joinable()) relaunchWorker_.join();
     replacement_.reset();
     relaunchState_.store(RelaunchState::Idle);

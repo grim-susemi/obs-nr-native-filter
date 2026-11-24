@@ -25,11 +25,13 @@ $baseSmoke = Join-Path $baseBin 'vfg_native_smoke_tests.exe'
 $abRunner = Join-Path $modBin 'vfg_ab_smoke_runner.exe'
 $hudGpu = Join-Path $modBin 'vfg_hud_lock_gpu_tests.exe'
 $anrTests = Join-Path $modBin 'anr_mock_dll_tests.exe'
+$anrMockDll = Join-Path $modBin 'anr_mock_dll.dll'
+$guidesShader = Join-Path $ModifiedRoot 'out\build\windows-x64-release\nr_guides.cso'
 $filterTests = Join-Path $modBin 'vfg_filter_output_tests.exe'
 $pluginDll = Join-Path $modBin 'obs-nr-filter.dll'
 $pluginData = Join-Path $ModifiedRoot 'data'
 
-foreach ($p in @($modPresenter, $basePresenter, $modSmoke, $baseSmoke, $abRunner, $hudGpu, $anrTests, $filterTests, $pluginDll)) {
+foreach ($p in @($modPresenter, $basePresenter, $modSmoke, $baseSmoke, $abRunner, $hudGpu, $anrTests, $anrMockDll, $guidesShader, $filterTests, $pluginDll)) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw "Missing required binary: $p" }
 }
 
@@ -228,13 +230,15 @@ $env:OBS_NR_PUSHFLOW_RUNTIME = $PushFlowRuntimeDir
 try {
     Invoke-Checked 'ab-pushflow-smoke' { & $abRunner $modPresenter $LogDir pushflow-smoke }
     Invoke-Checked 'ab-pushflow-stalled-esc' { & $abRunner $modPresenter $LogDir pushflow-stalled-esc }
+    Invoke-Checked 'ab-pushflow-userstop-stalled' { & $abRunner $modPresenter $LogDir pushflow-userstop-stalled }
+    Invoke-Checked 'ab-stalled-log-esc' { & $abRunner $modPresenter $LogDir stalled-log-esc }
     Invoke-Checked 'ab-pushflow-midrun-crash' { & $abRunner $modPresenter $LogDir pushflow-midrun-crash }
 } finally {
     Remove-Item Env:OBS_NR_PUSHFLOW_RUNTIME -ErrorAction SilentlyContinue
 }
 Invoke-Checked 'ab-pushflow-empty' { & $abRunner $modPresenter $LogDir pushflow-empty }
 
-# (f2) Real libobs vfg_filter_output_tests (all 16 close/recovery scenarios + render tick < 5 ms)
+# (f2) Real libobs vfg_filter_output_tests (all 17 close/recovery scenarios + render tick < 5 ms)
 Invoke-Checked 'libobs-vfg-filter-output' {
     Push-Location $LibObsDir
     try {
@@ -244,8 +248,16 @@ Invoke-Checked 'libobs-vfg-filter-output' {
     }
 }
 
-# (g) ANR contract + optional real B15 check
-Invoke-Checked 'anr-mock-dll' { & $anrTests }
+# (g) ANR contract + live A/B HUD toggle & reopen ShotChange + optional real B15 check
+$env:OBS_NR_GUIDES_SHADER = $guidesShader
+$env:OBS_NR_TEST_ANR_MOCK_DLL = $anrMockDll
+try {
+    Invoke-Checked 'anr-mock-dll' { & $anrTests }
+    Invoke-Checked 'ab-anr-mock-ab' { & $abRunner $modPresenter $LogDir anr-ab }
+} finally {
+    Remove-Item Env:OBS_NR_GUIDES_SHADER -ErrorAction SilentlyContinue
+    Remove-Item Env:OBS_NR_TEST_ANR_MOCK_DLL -ErrorAction SilentlyContinue
+}
 if ($env:OBS_NR_TEST_ANR_B15_DLL) {
     Invoke-Checked 'anr-real-b15' { & $anrTests --real-b15-dll $env:OBS_NR_TEST_ANR_B15_DLL }
 } else {

@@ -93,4 +93,3 @@ int main()
     std::printf("%s pushflow_motion (%u failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }
-

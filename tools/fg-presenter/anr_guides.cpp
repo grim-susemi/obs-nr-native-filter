@@ -48,7 +48,7 @@ std::unique_ptr<IAnrGuideProvider> make_anr_guides(ID3D12Device* device, Extent 
     return std::make_unique<Guides>(device, queue.Get(), size, shader);
 }
 
-AnrBgra::AnrBgra(ID3D12Device* device, Extent size) : size_(size)
+AnrBgra::AnrBgra(ID3D12Device* device, Extent size) : size_(size), stager_(device)
 {
     const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER parameter{};
@@ -106,11 +106,9 @@ AnrBgra::AnrBgra(ID3D12Device* device, Extent size) : size_(size)
 
 void AnrBgra::record(ID3D12GraphicsCommandList* list, ID3D12Resource* input, unsigned slot)
 {
-    ComPtr<ID3D12Device> device;
-    check(input->GetDevice(IID_PPV_ARGS(&device)), "ANR BGRA input device");
     auto srv = srvs_->GetCPUDescriptorHandleForHeapStart();
     srv.ptr += slot * srvStep_;
-    device->CreateShaderResourceView(input, nullptr, srv);
+    stager_.write_srv(input, nullptr, srv);
     auto table = srvs_->GetGPUDescriptorHandleForHeapStart();
     table.ptr += slot * srvStep_;
     auto rtv = rtvs_->GetCPUDescriptorHandleForHeapStart();

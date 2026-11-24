@@ -83,4 +83,3 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float3 c = maskForFirst != 0 ? a * m + b * (1.0 - m) : a * (1.0 - m) + b * m;
     output[id.xy] = float4(decodeColor(c), 1.0);
 }
-

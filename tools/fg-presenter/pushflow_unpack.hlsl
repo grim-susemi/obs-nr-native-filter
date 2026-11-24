@@ -33,4 +33,3 @@ void main(uint3 id : SV_DispatchThreadID) {
     const float3 c = lerp(lerp(texel(a), texel(uint2(b.x, a.y)), f.x), lerp(texel(uint2(a.x, b.y)), texel(b), f.x), f.y);
     output[id.xy] = float4(decodeColor(c), 1.0);
 }
-

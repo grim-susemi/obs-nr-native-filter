@@ -200,4 +200,3 @@ Rgb rebuild(const Geometry& g, uint32_t x, uint32_t y, FrameA&& previous, FrameB
 } // namespace reference
 
 } // namespace veyra::pushflow::motion
-

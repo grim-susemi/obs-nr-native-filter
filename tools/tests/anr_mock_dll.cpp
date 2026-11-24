@@ -17,7 +17,6 @@ using Parameter = NVSDK_NGX_Parameter;
 using List = ID3D12GraphicsCommandList;
 constexpr auto success = NVSDK_NGX_Result_Success;
 constexpr auto failure = NVSDK_NGX_Result_FAIL_InvalidParameter;
-constexpr unsigned long long frameBase = 0x100000000ull;
 // The real validator admits only DLLs at least 64 KiB.
 const volatile unsigned char imageSizePad[65536]{1};
 
@@ -136,7 +135,7 @@ __declspec(dllexport) Result NVSDK_CONV NVSDK_NGX_D3D12_EvaluateFeature(List* li
     ID3D12Resource *color{}, *motion{}, *depth{}, *output{}, *disable{};
     unsigned long long serial{};
     unsigned count{}, sub{}, reset{};
-    if (p->Get(k::backbufferFrameId, &serial) != success || serial <= frameBase ||
+    if (p->Get(k::backbufferFrameId, &serial) != success || !serial ||
         p->Get(k::multiFrameCount, &count) != success || p->Get(k::multiFrameIndex, &sub) != success ||
         p->Get(k::reset, &reset) != success || !sub || sub > count || count > 3 ||
         p->Get(k::backbuffer, &color) != success || !color ||

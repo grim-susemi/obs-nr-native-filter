@@ -426,6 +426,7 @@ size_t count_events(const std::string& text, const char* token)
 
 struct RenderStats {
     std::atomic_uint64_t rawCount{}, gaps{}, maxNs{}, ticks{};
+    std::atomic_llong resumeAtNs{};
     uint64_t lastTimestamp{};
     Clock::time_point tickStarted{};
     static void tick(void* opaque, float)
@@ -436,8 +437,12 @@ struct RenderStats {
     {
         auto& s = *static_cast<RenderStats*>(opaque);
         if (s.tickStarted == Clock::time_point{}) return;
+        const auto resumeAt = Clock::time_point{Clock::duration{s.resumeAtNs.load()}};
+        const auto start = s.tickStarted > resumeAt ? s.tickStarted : resumeAt;
+        const auto now = Clock::now();
+        if (now <= start) return;
         const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - s.tickStarted).count());
+            now - start).count());
         auto prior = s.maxNs.load();
         while (ns > prior && !s.maxNs.compare_exchange_weak(prior, ns)) {}
         ++s.ticks;
@@ -577,6 +582,7 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
         await([&] { return text_of(log).find("test_live_consumer_fault") != std::string::npos; },
             "fault state before resize", 225);
         fixtureWidth.store(352);
+        stats.resumeAtNs.store(Clock::now().time_since_epoch().count());
         SetEvent(resume.value);
         break;
     case Action::Kill:
@@ -590,6 +596,7 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
         }
         expect(TerminateProcess(old.value, s.action == Action::ExitZero ? 0 : 7) != FALSE &&
             WaitForSingleObject(old.value, s.checkpoint ? 200 : 1500) == WAIT_OBJECT_0, "terminate owned presenter");
+        if (s.checkpoint) stats.resumeAtNs.store(Clock::now().time_since_epoch().count());
         SetEvent(resume.value);
         break;
     case Action::Stop:
@@ -603,6 +610,7 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     case Action::BadPeer:
         expect(WaitForSingleObject(reached.value, 2000) == WAIT_OBJECT_0 &&
             WaitForSingleObject(old.value, 0) == WAIT_TIMEOUT, "corrupt identity while original child lives");
+        stats.resumeAtNs.store(Clock::now().time_since_epoch().count());
         SetEvent(resume.value);
         break;
     case Action::Fault:
@@ -647,7 +655,7 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
     } else {
         if (oldExit != 0)
             throw std::runtime_error("user/parent close exited " + std::to_string(oldExit));
-        if (s.stall) expect(
+        if (s.stall || (s.action == Action::Stop && s.closeRecovered)) expect(
             !event(text_of(log), "event=shutdown_force_terminate watchdog=0 exit_reason=1").empty(), "stalled user close preserves UserClosed");
         expect(!fs::exists(quarantine), "intentional stop never quarantined");
     }
@@ -669,16 +677,17 @@ constexpr std::array scenarios{
         Scenario{L"wm-close", Action::Close},
         Scenario{L"b-esc-stalled", Action::Escape, L"7000"},
         Scenario{L"wm-close-stalled", Action::Close, L"7000"},
-        Scenario{L"c-exit-zero", Action::ExitZero, nullptr, nullptr, nullptr, false, true},
+        Scenario{L"c-exit-zero", Action::ExitZero, nullptr, nullptr, nullptr, true, true},
         Scenario{L"d-live-consumer-fault", Action::Fault, nullptr, nullptr, nullptr, true},
-        Scenario{L"e-import-rejected", Action::Reject},
+        Scenario{L"e-import-rejected", Action::Reject, nullptr, nullptr, nullptr, true},
         Scenario{L"e-import-rejected-stalled", Action::Reject, nullptr, L"700", nullptr, true},
-        Scenario{L"f-resize-fault", Action::ResizeFault},
-        Scenario{L"g-before-publish", Action::Kill, nullptr, nullptr, L"before_alive"},
-        Scenario{L"h-before-connect", Action::Kill, nullptr, nullptr, L"before_connect"},
-        Scenario{L"i-after-alive", Action::Kill, nullptr, nullptr, L"after_alive"},
-        Scenario{L"j-watchdog", Action::Watchdog, L"7000"},
+        Scenario{L"f-resize-fault", Action::ResizeFault, nullptr, nullptr, nullptr, true},
+        Scenario{L"g-before-publish", Action::Kill, nullptr, nullptr, L"before_alive", true},
+        Scenario{L"h-before-connect", Action::Kill, nullptr, nullptr, L"before_connect", true},
+        Scenario{L"i-after-alive", Action::Kill, nullptr, nullptr, L"after_alive", true},
+        Scenario{L"j-watchdog", Action::Watchdog, L"7000", nullptr, nullptr, true},
         Scenario{L"parent-stop", Action::Stop},
+        Scenario{L"parent-stop-stalled", Action::Stop, nullptr, nullptr, nullptr, false, true},
         Scenario{L"parent-detach", Action::Detach},
         Scenario{L"bad-live-peer", Action::BadPeer, nullptr, nullptr, L"bad_peer"},
 };

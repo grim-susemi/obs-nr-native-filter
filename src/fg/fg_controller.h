@@ -47,8 +47,8 @@ public:
     bool offer(const ipc::Offer&, const ipc::Shape&, LUID) noexcept;
     bool request_resize() noexcept { return InterlockedCompareExchange64(&view_->state, 2, 1) == 1; }
     bool resize_drained() const noexcept { return InterlockedCompareExchange64(&view_->state, 3, 3) == 3; }
-    void request_stop() noexcept;
-    void stop() noexcept;
+    void request_stop(bool userStop = false) noexcept;
+    void stop(bool userStop = false) noexcept;
     ExitReason exit_reason() const noexcept { return read_exit_reason(*view_); }
     bool is_fault_or_watchdog_exit() const noexcept;
     bool can_recover() const noexcept;

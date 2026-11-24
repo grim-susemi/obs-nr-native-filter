@@ -90,13 +90,14 @@ Compute::Compute(Gpu& gpu, const OrtState& ort, const Config& config)
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&clearCpu_)), "PushFlow clear view");
     stride_ = device->GetDescriptorHandleIncrementSize(heap.Type);
+    DescriptorStager stager(device);
     auto cpu = views_->GetCPUDescriptorHandleForHeapStart();
     for (const auto& input : gpu_.input) {
-        device->CreateShaderResourceView(input.Get(), nullptr, cpu);
+        stager.write_srv(input.Get(), nullptr, cpu);
         cpu.ptr += stride_;
     }
     for (const auto& target : gpu_.syntheticTex) {
-        device->CreateUnorderedAccessView(target.Get(), nullptr, nullptr, cpu);
+        stager.write_uav(target.Get(), cpu);
         cpu.ptr += stride_;
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC clear{};
@@ -105,8 +106,9 @@ Compute::Compute(Gpu& gpu, const OrtState& ort, const Config& config)
     clear.Buffer.NumElements = ort_.tensors[0].elements;
     clear.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     auto* input = ort_.tensors[0].buffer.Get();
-    device->CreateUnorderedAccessView(input, nullptr, &clear, cpu);
     device->CreateUnorderedAccessView(input, nullptr, &clear, clearCpu_->GetCPUDescriptorHandleForHeapStart());
+    device->CopyDescriptorsSimple(1, cpu, clearCpu_->GetCPUDescriptorHandleForHeapStart(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     cpu.ptr += stride_;
     // The pack PSO still declares both SRVs when only the timestep is written.
     // Bind a typed null view so this dispatch has no reference to an IPC slot.
@@ -115,7 +117,7 @@ Compute::Compute(Gpu& gpu, const OrtState& ort, const Config& config)
     nullView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     nullView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     nullView.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(nullptr, &nullView, cpu);
+    stager.write_srv(nullptr, &nullView, cpu);
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE Compute::view(UINT offset) const

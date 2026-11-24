@@ -405,6 +405,57 @@ void run_pushflow_smoke(const std::wstring& presenter, const fs::path& logDir, c
         std::printf("PASS ab_pushflow mult=%ux subframes=%zu cuts=%zu\n",
             mult, count_tokens(content, "event=present_vfg_subframe "), count_tokens(content, "shot_cut=1"));
     }
+
+    // Same-PID live HUD Lock 0 -> 1 -> 0 toggle on PushFlow
+    {
+        const auto log = logDir / L"ab-pushflow-hud-toggle.log";
+        fs::remove(log);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+        GpuFixture gfx(1280, 720);
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfhud"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.gpuShotChange = 1;
+        opts.hudLock = 0;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer pf hud");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake pf hud");
+        wait_log_token(log, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 60; ++f) {
+            if (f == 20) controller.set_hud_lock(1);
+            if (f == 40) controller.set_hud_lock(0);
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            if (f >= 28 && f < 34) gfx.fill_frame(0xFFFFFFFFu, 0xFF202020u, (f * 32) % 1000);
+            else gfx.fill_frame(0xFF202020u, 0xFFFFFFFFu, (f * 32) % 1000);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire pf hud");
+
+        const auto content = read_text(log);
+        expect(count_tokens(content, "event=offer ") == 1, "PushFlow HUD toggle must stay on same PID");
+        const auto p0 = content.find("hud_lock=0 ");
+        const auto p1 = content.find("hud_lock=1 ", p0 == std::string::npos ? 0 : p0);
+        const auto p2 = content.find("hud_lock=0 ", p1 == std::string::npos ? 0 : p1);
+        expect(p0 != std::string::npos && p1 != std::string::npos && p2 != std::string::npos,
+            "PushFlow hud_lock must toggle live 0 -> 1 -> 0");
+        expect(count_tokens(content, "shot_cut=1") >= 1, "expected shot_cut=1 during PushFlow hud-toggle");
+        expect(count_tokens(content, "event=present_vfg_subframe ") >= 10, "insufficient PushFlow hud-toggle subframes");
+        expect(count_tokens(content, "event=error") == 0, "unexpected error in PushFlow hud-toggle");
+        std::printf("PASS ab_pushflow_hud_toggle subframes=%zu cuts=%zu\n",
+            count_tokens(content, "event=present_vfg_subframe "), count_tokens(content, "shot_cut=1"));
+    }
 }
 
 void run_pushflow_stalled_esc(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
@@ -498,6 +549,96 @@ void run_pushflow_stalled_esc(const std::wstring& presenter, const fs::path& log
         expect(count_tokens(c2, "event=error") == 0, "unexpected error on reopen");
         std::printf("PASS ab_pushflow_stalled_esc_reopen subframes=%zu\n",
             count_tokens(c2, "event=present_vfg_subframe "));
+    }
+}
+
+void run_pushflow_userstop_stalled(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    fs::remove_all(marksDir);
+    GpuFixture gfx(640, 360);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+
+    // Explicit Controller::stop(true) during stalled PushFlow teardown must stamp UserClosed & clean starting marker
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", L"2500");
+    const auto logStop = logDir / L"ab-pushflow-userstop-stalled.log";
+    fs::remove(logStop);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logStop.c_str());
+    {
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfstop"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer userstop");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake userstop");
+        wait_log_token(logStop, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 25; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+            if (read_text(logStop).find("event=present_vfg_subframe ") != std::string::npos && f >= 5) break;
+        }
+        wait_log_token(logStop, "event=present_vfg_subframe ", controller);
+        const auto stopStart = clock_ns();
+        controller.stop(true);
+        const auto stopDeadline = stopStart + 2'200'000'000ULL;
+        while (controller.alive() && clock_ns() < stopDeadline) Sleep(10);
+        const auto stopMs = (clock_ns() - stopStart) / 1'000'000ULL;
+        expect(!controller.alive() && stopMs < 2200, "Controller::stop(true) must force-exit stalled PushFlow");
+        expect(producer.retire() == ipc::Status::Ok, "retire userstop");
+        const auto cs = read_text(logStop);
+        expect(cs.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
+            "Controller::stop(true) must preserve UserClosed on force terminate");
+        expect(!fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be cleaned on user stop");
+        expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"), "user stop must not write quarantine");
+        std::printf("PASS ab_pushflow_userstop_stalled exit_ms=%llu\n", static_cast<unsigned long long>(stopMs));
+    }
+
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    const auto logStopReopen = logDir / L"ab-pushflow-userstop-reopen.log";
+    fs::remove(logStopReopen);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logStopReopen.c_str());
+    {
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfstop-re"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer userstop reopen");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake userstop reopen");
+        wait_log_token(logStopReopen, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 35; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire userstop reopen");
+
+        const auto cr = read_text(logStopReopen);
+        expect(cr.find("event=pushflow_previous_crash_detected") == std::string::npos,
+            "user stop reopen must NOT trigger false crash quarantine");
+        expect(count_tokens(cr, "event=present_vfg_subframe ") >= 5, "reopen after user stop must resume PushFlow");
+        expect(count_tokens(cr, "event=error") == 0, "unexpected error on user stop reopen");
+        std::printf("PASS ab_pushflow_userstop_reopen subframes=%zu\n",
+            count_tokens(cr, "event=present_vfg_subframe "));
     }
 }
 
@@ -745,6 +886,175 @@ void run_pushflow_empty(const std::wstring& presenter, const fs::path& logDir, c
         "empty PushFlow runtime must present 1x original only");
     std::printf("PASS ab_pushflow_empty originals=%zu\n", count_tokens(content, "event=present_original "));
 }
+
+void run_stalled_log_esc(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    const auto log = logDir / L"ab-stalled-log-esc.log";
+    fs::remove(log);
+    fs::remove_all(marksDir);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_LOG_LOCK_MS", L"5000");
+
+    GpuFixture gfx(640, 360);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfloglock"), gfx.shape);
+    LaunchOptions opts{};
+    opts.backend = Backend::PushFlow;
+    opts.pushflowTier = PushFlowTier::Fast;
+    opts.pushflowRuntimeDir = pfRuntime;
+    opts.multiplier = 2;
+    opts.monitorId = monId;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "offer log lock");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake log lock");
+    wait_log_token(log, "event=test_log_locked", controller);
+
+    const auto offerLine = find_line(read_text(log), "event=offer ");
+    const auto hwndVal = std::stoull(field_value(offerLine, "hwnd="), nullptr, 16);
+    const auto escSentNs = clock_ns();
+    expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndVal)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+        "PostMessage VK_ESCAPE during locked log");
+    const auto exitDeadline = escSentNs + 2'200'000'000ULL;
+    while (controller.alive() && clock_ns() < exitDeadline) Sleep(10);
+    const auto escElapsedMs = (clock_ns() - escSentNs) / 1'000'000ULL;
+    expect(!controller.alive(), "presenter holding FILE* lock did not force-exit within 2.2s");
+    expect(producer.retire() == ipc::Status::Ok, "retire log lock");
+
+    const auto c = read_text(log);
+    expect(c.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
+        "expected unshared shutdown_force_terminate diagnostic");
+    expect(!fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be cleaned even when worker holds log lock");
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_LOG_LOCK_MS", nullptr);
+    std::printf("PASS ab_stalled_log_esc exit_ms=%llu\n", static_cast<unsigned long long>(escElapsedMs));
+}
+
+void run_anr_ab(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& mockDllPath)
+{
+    static constexpr std::string_view companions[]{
+        "nr_fg.ini", "path_table.json", "size_table.json",
+        "adapters/pack.nrx", "kernels/pack.nrx", "kernels-portable/pack.nrx",
+        "programs/fg-lite-any-coopmat-pq10/pack.nrx", "programs/fg-lite-any-coopmat-srgb8/pack.nrx",
+        "programs/fg-lite-any-dp4a-pq10/pack.nrx", "programs/fg-lite-any-dp4a-srgb8/pack.nrx",
+        "programs/fg-lite-any-packed-pq10/pack.nrx", "programs/fg-lite-any-packed-srgb8/pack.nrx",
+        "programs/fg-lite-any-portable-linalg-pq10/pack.nrx", "programs/fg-lite-any-portable-linalg-srgb8/pack.nrx",
+        "programs/fg-lite-any-portable-pq10/pack.nrx", "programs/fg-lite-any-portable-srgb8/pack.nrx",
+        "programs/fg-lite-any-portable-xmx-pq10/pack.nrx", "programs/fg-lite-any-portable-xmx-srgb8/pack.nrx",
+    };
+    const auto addonRoot = logDir / L"anr-ab-addon";
+    std::error_code ec;
+    fs::remove_all(addonRoot, ec);
+    fs::create_directories(addonRoot);
+    struct AddonCleanup {
+        fs::path root;
+        ~AddonCleanup() { std::error_code e; fs::remove_all(root, e); }
+    } cleanup{addonRoot};
+
+    const auto stagedDll = addonRoot / L"nvngx_dlssg.dll";
+    fs::copy_file(mockDllPath, stagedDll, fs::copy_options::overwrite_existing);
+    for (const auto rel : companions) {
+        const auto p = addonRoot / fs::path(rel);
+        fs::create_directories(p.parent_path());
+        std::ofstream f(p, std::ios::binary);
+        f << "inert test companion\n";
+        expect(static_cast<bool>(f), "stage ANR A/B companion");
+    }
+
+    // Session 1: live HUD Lock 0 -> 1 -> 0 on same ANR Mock presenter PID (<= 80 evals limit)
+    {
+        const auto log = logDir / L"ab-anr-hud.log";
+        fs::remove(log);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+        GpuFixture gfx(640, 360);
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"anrhud"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::AnrExperimental;
+        opts.experimentalAnrOptIn = 1;
+        opts.anrDllPath = stagedDll.wstring();
+        opts.multiplier = 2;
+        opts.gpuShotChange = 0;
+        opts.hudLock = 0;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer anr hud");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake anr hud");
+        wait_log_token(log, "event=initialized backend=anr-experimental", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 45; ++f) {
+            if (f == 15) controller.set_hud_lock(1);
+            if (f == 30) controller.set_hud_lock(0);
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            gfx.fill_frame(0xFF202020u, 0xFFFFFFFFu, (f * 16) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire anr hud");
+
+        const auto c = read_text(log);
+        expect(c.find("event=initialized backend=anr-experimental") != std::string::npos, "ANR init missing");
+        expect(count_tokens(c, "event=offer ") == 1, "ANR HUD toggle must stay on same PID");
+        const auto p0 = c.find("hud_lock=0 ");
+        const auto p1 = c.find("hud_lock=1 ", p0 == std::string::npos ? 0 : p0);
+        const auto p2 = c.find("hud_lock=0 ", p1 == std::string::npos ? 0 : p1);
+        expect(p0 != std::string::npos && p1 != std::string::npos && p2 != std::string::npos,
+            "ANR hud_lock must toggle live 0 -> 1 -> 0");
+        expect(count_tokens(c, "event=present_vfg_subframe ") >= 10, "insufficient ANR HUD subframes");
+        expect(count_tokens(c, "event=error") == 0, "unexpected error in ANR HUD toggle");
+        std::printf("PASS ab_anr_hud_toggle subframes=%zu\n", count_tokens(c, "event=present_vfg_subframe "));
+    }
+
+    // Session 2: reopen ANR Mock presenter with gpuShotChange=1 and verify cut classification + synthesis
+    {
+        const auto log = logDir / L"ab-anr-shot-reopen.log";
+        fs::remove(log);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+        GpuFixture gfx(640, 360);
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"anrshot"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::AnrExperimental;
+        opts.experimentalAnrOptIn = 1;
+        opts.anrDllPath = stagedDll.wstring();
+        opts.multiplier = 2;
+        opts.gpuShotChange = 1;
+        opts.hudLock = 1;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer anr shot");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake anr shot");
+        wait_log_token(log, "event=initialized backend=anr-experimental", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 35; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            if (f >= 15 && f < 22) gfx.fill_frame(0xFFFFFFFFu, 0xFF101010u, (f * 16) % 480);
+            else gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 16) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire anr shot");
+
+        const auto c = read_text(log);
+        expect(c.find("event=initialized backend=anr-experimental") != std::string::npos, "ANR shot init missing");
+        expect(c.find("gpu_shot_change=1") != std::string::npos, "ANR gpu_shot_change=1 missing");
+        expect(count_tokens(c, "shot_cut=1") >= 1, "expected shot_cut=1 on ANR reopen");
+        expect(count_tokens(c, "event=present_vfg_subframe ") >= 10, "insufficient ANR shot subframes");
+        expect(count_tokens(c, "event=error") == 0, "unexpected error in ANR shot reopen");
+        std::printf("PASS ab_anr_shot_reopen cuts=%zu subframes=%zu\n",
+            count_tokens(c, "shot_cut=1"), count_tokens(c, "event=present_vfg_subframe "));
+    }
+}
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -785,6 +1095,10 @@ int wmain(int argc, wchar_t** argv)
             const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-stalled-esc");
             run_pushflow_stalled_esc(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-userstop-stalled") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-userstop-stalled");
+            run_pushflow_userstop_stalled(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
         } else if (mode == L"pushflow-midrun-crash") {
             const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-midrun-crash");
@@ -794,7 +1108,15 @@ int wmain(int argc, wchar_t** argv)
             expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-midrun-crash-manual");
             run_pushflow_midrun_crash_manual(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
         } else if (mode == L"pushflow-empty") run_pushflow_empty(presenter, logDir, monId);
-        else throw std::runtime_error("unknown mode");
+        else if (mode == L"stalled-log-esc") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for stalled-log-esc");
+            run_stalled_log_esc(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"anr-ab") {
+            const auto dll = readEnv(L"OBS_NR_TEST_ANR_MOCK_DLL");
+            expect(!dll.empty(), "OBS_NR_TEST_ANR_MOCK_DLL required for anr-ab");
+            run_anr_ab(presenter, logDir, monId, dll);
+        } else throw std::runtime_error("unknown mode");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL vfg_ab_smoke_runner: %s\n", e.what());
