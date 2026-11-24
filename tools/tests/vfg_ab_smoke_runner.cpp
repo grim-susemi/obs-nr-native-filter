@@ -1,0 +1,803 @@
+// SPDX-License-Identifier: GPL-3.0-only
+#include "fg_controller.h"
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+using Microsoft::WRL::ComPtr;
+using namespace nr::fg;
+using namespace nr::fg::vfg;
+
+namespace {
+namespace fs = std::filesystem;
+
+struct Handle {
+    HANDLE value{};
+    ~Handle() { if (value) CloseHandle(value); }
+};
+
+void expect(bool ok, const char* why)
+{
+    if (!ok) throw std::runtime_error(why);
+}
+
+std::string read_text(const fs::path& path)
+{
+    std::ifstream ifs(path);
+    return std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+}
+
+size_t count_tokens(const std::string& text, std::string_view token)
+{
+    size_t c = 0, pos = 0;
+    while ((pos = text.find(token, pos)) != std::string::npos) {
+        ++c;
+        pos += token.size();
+    }
+    return c;
+}
+
+std::string find_line(const std::string& text, std::string_view prefix, std::string_view extra = {})
+{
+    std::istringstream lines(text);
+    for (std::string line; std::getline(lines, line);) {
+        if (line.starts_with(prefix) && (extra.empty() || line.find(extra) != std::string::npos)) return line;
+    }
+    return {};
+}
+
+std::string field_value(const std::string& line, std::string_view key)
+{
+    const auto pos = line.find(key);
+    if (pos == std::string::npos) return {};
+    const auto start = pos + key.size();
+    const auto end = line.find_first_of(" \r\n", start);
+    return line.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+std::wstring secondary_monitor_id()
+{
+    std::wstring found;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+        auto* out = reinterpret_cast<std::wstring*>(lp);
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(mon, &mi) || (mi.dwFlags & MONITORINFOF_PRIMARY)) return TRUE;
+        for (DWORD i = 0;; ++i) {
+            DISPLAY_DEVICEW dd{};
+            dd.cb = sizeof(dd);
+            if (!EnumDisplayDevicesW(mi.szDevice, i, &dd, EDD_GET_DEVICE_INTERFACE_NAME)) break;
+            if (dd.StateFlags & DISPLAY_DEVICE_ACTIVE) {
+                *out = dd.DeviceID;
+                return FALSE;
+            }
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+struct GpuFixture {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    LUID luid{};
+    ipc::Shape shape{};
+    ComPtr<ID3D11Texture2D> tex;
+    std::vector<uint32_t> scratch;
+    std::vector<uint32_t> boxScratch;
+
+    GpuFixture(uint32_t w, uint32_t h) : scratch(size_t{w} * h), boxScratch(size_t{64} * 64)
+    {
+        D3D_FEATURE_LEVEL fl{};
+        expect(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &dev, &fl, &ctx)), "D3D11CreateDevice");
+        ComPtr<IDXGIDevice> dxgi;
+        ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC desc{};
+        expect(SUCCEEDED(dev.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) &&
+            SUCCEEDED(adapter->GetDesc(&desc)), "adapter");
+        luid = desc.AdapterLuid;
+        shape = {w, h, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = shape.format;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        expect(SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &tex)), "CreateTexture2D");
+    }
+
+    void fill_frame(uint32_t bg, uint32_t fg, uint32_t boxX)
+    {
+        std::fill(scratch.begin(), scratch.end(), bg);
+        ctx->UpdateSubresource(tex.Get(), 0, nullptr, scratch.data(), shape.width * 4, 0);
+        std::fill(boxScratch.begin(), boxScratch.end(), fg);
+        const D3D11_BOX box{boxX, shape.height / 2 - 32, 0, boxX + 64, shape.height / 2 + 32, 1};
+        ctx->UpdateSubresource(tex.Get(), 0, &box, boxScratch.data(), 64 * 4, 0);
+    }
+};
+
+void wait_log_token(const fs::path& logPath, std::string_view token, Controller& controller, uint64_t timeoutMs = 15000)
+{
+    const auto deadline = clock_ns() + timeoutMs * 1'000'000ULL;
+    while (clock_ns() < deadline) {
+        const auto txt = read_text(logPath);
+        if (txt.find(token) != std::string::npos) return;
+        expect(controller.alive(), "presenter exited before expected log token");
+        Sleep(5);
+    }
+    throw std::runtime_error("timed out waiting for log token");
+}
+
+void pace_to(uint64_t targetNs)
+{
+    while (clock_ns() < targetNs) {
+        const auto rem = targetNs - clock_ns();
+        if (rem > 2'000'000ULL) Sleep(1);
+        else SwitchToThread();
+    }
+}
+
+void wait_controller_exit(Controller& controller)
+{
+    controller.stop();
+    Sleep(50);
+    for (int i = 0; i < 80 && controller.alive(); ++i) Sleep(50);
+    expect(!controller.alive(), "presenter still alive after stop");
+}
+
+void publish_ok_or_dropped(ipc::Producer& producer, ID3D11Texture2D* tex, uint64_t ts, uint64_t obsTick = 0)
+{
+    const auto pub = producer.publish(tex, ts, clock_ns(), false, obsTick, nullptr, 50);
+    expect(pub == ipc::Status::Ok || pub == ipc::Status::Dropped, "publish");
+}
+
+std::wstring unique_mapping(std::wstring_view tag)
+{
+    static uint32_t seq = 0;
+    return LR"(Local\nr-ab-)" + std::wstring(tag) + L"-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+        std::to_wstring(++seq);
+}
+
+void run_shot_change(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId)
+{
+    const auto log = logDir / L"ab-shot-change.log";
+    fs::remove(log);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    GpuFixture gfx(1280, 720);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"shot"), gfx.shape);
+    LaunchOptions opts{};
+    opts.multiplier = 2;
+    opts.gpuShotChange = 1;
+    opts.monitorId = monId;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+    wait_log_token(log, "event=initialized backend=nvidia-vfg-native", controller);
+
+    const auto start = clock_ns();
+    for (uint32_t f = 0; f < 60; ++f) {
+        const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 60;
+        pace_to(ts);
+        if (f >= 20 && f < 35) gfx.fill_frame(0xFFFFFFFFu, 0xFF101010u, (f * 32) % 1000);
+        else gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 32) % 1000);
+        publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+    }
+    Sleep(300);
+    wait_controller_exit(controller);
+    expect(producer.retire() == ipc::Status::Ok, "retire");
+
+    const auto content = read_text(log);
+    expect(content.find("gpu_shot_change=1") != std::string::npos, "gpu_shot_change=1 missing");
+    expect(count_tokens(content, "shot_cut=1") >= 2, "expected shot_cut=1 on cut frames");
+    expect(count_tokens(content, "event=present_vfg_subframe ") >= 10, "insufficient synthetic subframes");
+    expect(count_tokens(content, "event=error") == 0, "unexpected error in shot-change");
+    std::printf("PASS ab_shot_change cuts=%zu subframes=%zu\n",
+        count_tokens(content, "shot_cut=1"), count_tokens(content, "event=present_vfg_subframe "));
+}
+
+void run_hud_lock(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId)
+{
+    const auto log = logDir / L"ab-hud-lock.log";
+    fs::remove(log);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    GpuFixture gfx(1280, 720);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"hud"), gfx.shape);
+    LaunchOptions opts{};
+    opts.multiplier = 2;
+    opts.gpuShotChange = 1;
+    opts.hudLock = 0;
+    opts.monitorId = monId;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+    wait_log_token(log, "event=initialized backend=nvidia-vfg-native", controller);
+
+    const auto start = clock_ns();
+    for (uint32_t f = 0; f < 90; ++f) {
+        if (f == 30) controller.set_hud_lock(1);
+        if (f == 60) controller.set_hud_lock(0);
+        const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 60;
+        pace_to(ts);
+        if (f >= 45 && f < 55) gfx.fill_frame(0xFFFFFFFFu, 0xFF202020u, (f * 32) % 1000);
+        else gfx.fill_frame(0xFF202020u, 0xFFFFFFFFu, (f * 32) % 1000);
+        publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+    }
+    Sleep(300);
+    wait_controller_exit(controller);
+    expect(producer.retire() == ipc::Status::Ok, "retire");
+
+    const auto content = read_text(log);
+    expect(count_tokens(content, "event=offer ") == 1, "must stay on same PID without restart");
+    const auto p0 = content.find("hud_lock=0 ");
+    const auto p1 = content.find("hud_lock=1 ", p0 == std::string::npos ? 0 : p0);
+    const auto p2 = content.find("hud_lock=0 ", p1 == std::string::npos ? 0 : p1);
+    expect(p0 != std::string::npos && p1 != std::string::npos && p2 != std::string::npos,
+        "hud_lock must toggle live 0 -> 1 -> 0");
+    expect(count_tokens(content, "shot_cut=1") >= 1, "expected shot_cut=1 during hud-lock run");
+    expect(count_tokens(content, "event=present_vfg_subframe ") >= 20, "insufficient synthetic subframes");
+    expect(count_tokens(content, "event=error") == 0, "unexpected error in hud-lock");
+    std::printf("PASS ab_hud_lock subframes=%zu cuts=%zu\n",
+        count_tokens(content, "event=present_vfg_subframe "), count_tokens(content, "shot_cut=1"));
+}
+
+void run_pacing_repair(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId)
+{
+    const auto log = logDir / L"ab-pacing-repair.log";
+    fs::remove(log);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    GpuFixture gfx(1280, 720);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pacing"), gfx.shape);
+    LaunchOptions opts{};
+    opts.multiplier = 2;
+    opts.pacingRepair = 0;
+    opts.adaptiveFg = 0;
+    opts.monitorId = monId;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+    wait_log_token(log, "event=initialized backend=nvidia-vfg-native", controller);
+
+    const auto start = clock_ns();
+    uint32_t lastUnique = UINT32_MAX;
+    uint32_t serial = 0;
+    const uint32_t ticksPerSeg = 112;
+    for (uint32_t seg = 0; seg < 3; ++seg) {
+        const uint32_t repairOn = (seg == 1) ? 1u : 0u;
+        controller.set_pacing_repair(repairOn);
+        const uint32_t segFirstSerial = serial + 1;
+        for (uint32_t k = 0; k < ticksPerSeg; ++k) {
+            const uint32_t tick = seg * ticksPerSeg + k;
+            const auto ts = start + uint64_t{tick} * 1'000'000'000ULL / 60;
+            pace_to(ts);
+            const uint32_t unique = tick / 4 * 2 + (tick % 4 != 0);
+            if (unique != lastUnique) {
+                gfx.fill_frame(0xFF202020u, 0xFF20A0FFu, (unique * 40) % (gfx.shape.width - 128));
+                lastUnique = unique;
+            }
+            const auto pub = producer.publish(gfx.tex.Get(), ts, clock_ns(), false, ts, nullptr, 50);
+            expect(pub == ipc::Status::Ok || pub == ipc::Status::Dropped, "publish");
+            if (pub == ipc::Status::Ok) ++serial;
+        }
+        std::printf("PACING_SEG seg=%u repair=%u first_serial=%u last_serial=%u\n",
+            seg + 1, repairOn, segFirstSerial, serial);
+    }
+    Sleep(300);
+    wait_controller_exit(controller);
+    expect(producer.retire() == ipc::Status::Ok, "retire");
+
+    const auto content = read_text(log);
+    expect(count_tokens(content, "event=offer ") == 1, "must stay on same PID");
+    expect(count_tokens(content, "event=present_vfg_subframe ") >= 30, "insufficient synthetic subframes");
+    expect(count_tokens(content, "event=error") == 0, "unexpected error in pacing-repair");
+    std::printf("PASS ab_pacing_repair_run subframes=%zu\n", count_tokens(content, "event=present_vfg_subframe "));
+}
+
+void run_adaptive(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId)
+{
+    const auto log = logDir / L"ab-adaptive.log";
+    fs::remove(log);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    GpuFixture gfx(1280, 720);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"adaptive"), gfx.shape);
+    LaunchOptions opts{};
+    opts.multiplier = 4;
+    opts.adaptiveFg = 1;
+    opts.adaptiveTargetFps = 120;
+    opts.monitorId = monId;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+    wait_log_token(log, "event=initialized backend=nvidia-vfg-native", controller);
+
+    uint64_t cursorNs = clock_ns();
+    uint32_t serial = 0;
+    const struct SegSpec { uint32_t fps; uint32_t frames; } segs[]{{30, 60}, {60, 120}, {30, 60}};
+    for (uint32_t s = 0; s < 3; ++s) {
+        const uint64_t stepNs = 1'000'000'000ULL / segs[s].fps;
+        const uint32_t firstSerial = serial + 1;
+        for (uint32_t f = 0; f < segs[s].frames; ++f) {
+            cursorNs += stepNs;
+            pace_to(cursorNs);
+            gfx.fill_frame(0xFF181818u, 0xFFFF8020u, ((serial + 1) * 32) % (gfx.shape.width - 128));
+            const auto pub = producer.publish(gfx.tex.Get(), cursorNs, clock_ns(), false, 0, nullptr, 50);
+            expect(pub == ipc::Status::Ok || pub == ipc::Status::Dropped, "publish");
+            if (pub == ipc::Status::Ok) ++serial;
+        }
+        std::printf("ADAPTIVE_SEG seg=%u fps=%u first_serial=%u last_serial=%u\n",
+            s + 1, segs[s].fps, firstSerial, serial);
+    }
+    Sleep(300);
+    wait_controller_exit(controller);
+    expect(producer.retire() == ipc::Status::Ok, "retire");
+
+    const auto content = read_text(log);
+    expect(count_tokens(content, "event=offer ") == 1, "must stay on same PID");
+    expect(count_tokens(content, "event=error") == 0, "unexpected error in adaptive");
+    std::printf("PASS ab_adaptive_run subframes=%zu\n", count_tokens(content, "event=present_vfg_subframe "));
+}
+
+void run_pushflow_smoke(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& pfRuntime)
+{
+    for (const uint32_t mult : {2u, 3u, 4u}) {
+        const auto log = logDir / (L"ab-pushflow-" + std::to_wstring(mult) + L"x.log");
+        fs::remove(log);
+        SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+        SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+        GpuFixture gfx(1280, 720);
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pf"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = mult;
+        opts.gpuShotChange = 1;
+        opts.hudLock = 1;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+        wait_log_token(log, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 40; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            if (f >= 20 && f < 28) gfx.fill_frame(0xFFFFFFFFu, 0xFF101010u, (f * 32) % 1000);
+            else gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 32) % 1000);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire");
+
+        const auto content = read_text(log);
+        expect(content.find("event=initialized backend=pushflow") != std::string::npos, "pushflow init missing");
+        expect(content.find("gpu_shot_change=1") != std::string::npos, "gpu_shot_change=1 missing");
+        expect(content.find("hud_lock=1") != std::string::npos, "hud_lock=1 missing");
+        expect(count_tokens(content, "shot_cut=1") >= 1, "shot_cut=1 missing in PushFlow");
+        expect(count_tokens(content, "event=present_vfg_subframe ") >= (mult - 1) * 5, "insufficient PushFlow subframes");
+        expect(count_tokens(content, "event=error") == 0, "unexpected error in PushFlow smoke");
+        std::printf("PASS ab_pushflow mult=%ux subframes=%zu cuts=%zu\n",
+            mult, count_tokens(content, "event=present_vfg_subframe "), count_tokens(content, "shot_cut=1"));
+    }
+}
+
+void run_pushflow_stalled_esc(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    const auto log = logDir / L"ab-pushflow-stalled-esc.log";
+    fs::remove(log);
+    fs::remove_all(marksDir);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", L"2500");
+
+    GpuFixture gfx(640, 360);
+    {
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfesc"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+        wait_log_token(log, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 30; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+            if (read_text(log).find("event=present_vfg_subframe ") != std::string::npos && f >= 5) break;
+        }
+        wait_log_token(log, "event=present_vfg_subframe ", controller);
+        const auto offerLine = find_line(read_text(log), "event=offer ");
+        const auto hwndVal = std::stoull(field_value(offerLine, "hwnd="), nullptr, 16);
+        const auto escSentNs = clock_ns();
+        expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwndVal)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+            "PostMessage VK_ESCAPE");
+        const auto exitDeadline = escSentNs + 2'200'000'000ULL;
+        while (controller.alive() && clock_ns() < exitDeadline) Sleep(10);
+        const auto escElapsedMs = (clock_ns() - escSentNs) / 1'000'000ULL;
+        expect(!controller.alive(), "stalled Esc presenter did not force-exit within 2.2s");
+        expect(!controller.can_recover(), "UserClosed must disable relaunch");
+        expect(producer.retire() == ipc::Status::Ok, "retire");
+        const auto c1 = read_text(log);
+        expect(c1.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
+            "expected UserClosed force terminate");
+        expect(count_tokens(c1, "event=controller_auto_fallback_1x_relaunch") == 0, "expected 0 relaunches");
+        expect(!fs::exists(marksDir / L"pushflow-starting.txt"), "pushflow-starting.txt must be cleaned on Esc");
+        expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"), "Esc must not write quarantine");
+        std::printf("PASS ab_pushflow_stalled_esc exit_ms=%llu\n", static_cast<unsigned long long>(escElapsedMs));
+    }
+
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    const auto log2 = logDir / L"ab-pushflow-stalled-esc-reopen.log";
+    fs::remove(log2);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log2.c_str());
+    {
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfreopen"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer reopen");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake reopen");
+        wait_log_token(log2, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 35; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 20) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire reopen");
+
+        const auto c2 = read_text(log2);
+        expect(c2.find("event=pushflow_previous_crash_detected") == std::string::npos,
+            "stalled Esc reopen must NOT trigger false crash quarantine");
+        expect(count_tokens(c2, "event=present_vfg_subframe ") >= 5, "reopen must resume PushFlow synthesis");
+        expect(count_tokens(c2, "event=error") == 0, "unexpected error on reopen");
+        std::printf("PASS ab_pushflow_stalled_esc_reopen subframes=%zu\n",
+            count_tokens(c2, "event=present_vfg_subframe "));
+    }
+}
+
+void run_pushflow_midrun_crash(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    const auto log = logDir / L"ab-pushflow-midrun-crash.log";
+    fs::remove(log);
+    fs::remove_all(marksDir);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", L"2500");
+
+    GpuFixture gfx(640, 360);
+    {
+        auto producer = std::make_unique<ipc::Producer>(gfx.dev.Get(), unique_mapping(L"pfmid"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer->connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+        expect(WaitForSingleObject(producer->control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+        wait_log_token(log, "event=initialized backend=pushflow", controller);
+
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 160; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 60;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 16) % 480);
+            publish_ok_or_dropped(*producer, gfx.tex.Get(), ts);
+            if (f >= 135 && count_tokens(read_text(log), "event=present_vfg_subframe ") >= 125) break;
+        }
+        Sleep(150);
+        const auto preKill = read_text(log);
+        const auto steadySub = count_tokens(preKill, "event=present_vfg_subframe ");
+        expect(steadySub >= 125, "expected >= 125 steady PushFlow inferences before kill");
+        expect(!fs::exists(marksDir / L"pushflow-starting.txt"),
+            "pushflow-starting.txt must already be cleared after 120 steady inferences");
+
+        const auto oldOffer = find_line(preKill, "event=offer ", "epoch=1");
+        const auto oldPid = std::stoul(field_value(oldOffer, "pid="));
+        Handle child{OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, oldPid)};
+        expect(child.value != nullptr, "open PushFlow child for mid-run kill");
+        expect(TerminateProcess(child.value, 9) != FALSE, "TerminateProcess mid-run");
+        expect(WaitForSingleObject(child.value, 2000) == WAIT_OBJECT_0, "child reaped");
+        const auto retiredGen = producer->generation();
+        expect(producer->retire() == ipc::Status::Ok, "retire crashed generation");
+        producer.reset();
+        for (int i = 0; i < 40 && ipc::Producer::generation_retained(retiredGen); ++i) Sleep(5);
+
+        expect(controller.can_recover(), "controller must be eligible for 1x recovery");
+        expect(controller.begin_async_fallback_relaunch(), "begin async fallback relaunch");
+        const auto recDeadline = clock_ns() + 10'000'000'000ULL;
+        bool reconnected = false;
+        uint32_t recFrame = 0;
+        while (clock_ns() < recDeadline) {
+            if (!reconnected && controller.poll_async_fallback_relaunch() == RelaunchState::Ready) {
+                producer = std::make_unique<ipc::Producer>(gfx.dev.Get(), unique_mapping(L"pfmid-rec"), gfx.shape);
+                const auto recOffer = producer->connect(controller.peer());
+                expect(controller.offer(recOffer, gfx.shape, gfx.luid), "offer recovery 1x");
+                expect(WaitForSingleObject(producer->control_event(), 10000) == WAIT_OBJECT_0, "handshake recovery");
+                reconnected = true;
+            }
+            if (reconnected) {
+                if (recFrame == 0) {
+                    gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, 16);
+                    publish_ok_or_dropped(*producer, gfx.tex.Get(), clock_ns());
+                    ++recFrame;
+                }
+                const auto txt = read_text(log);
+                const auto recLine = find_line(txt, "event=offer ", "epoch=2");
+                if (!recLine.empty()) {
+                    const auto gen = "generation=" + field_value(recLine, "generation=") + " ";
+                    if (!find_line(txt, "event=present_original ", gen).empty()) break;
+                }
+            }
+            Sleep(16);
+        }
+        Sleep(30);
+        expect(reconnected, "async fallback relaunch never reached Ready");
+        const auto recTxt = read_text(log);
+        const auto recOfferLine = find_line(recTxt, "event=offer ", "epoch=2");
+        expect(!recOfferLine.empty(), "missing epoch=2 offer");
+        const auto newPid = std::stoul(field_value(recOfferLine, "pid="));
+        expect(newPid != oldPid && field_value(recOfferLine, "mode=") == "1x", "recovered PID/1x mismatch");
+        expect(fs::exists(marksDir / L"pushflow-crash-quarantine.txt"),
+            "Controller must persist pushflow-crash-quarantine.txt on mid-run crash");
+
+        const auto recHwnd = std::stoull(field_value(recOfferLine, "hwnd="), nullptr, 16);
+        expect(PostMessageW(reinterpret_cast<HWND>(static_cast<uintptr_t>(recHwnd)), WM_KEYDOWN, VK_ESCAPE, 0) != FALSE,
+            "Esc on recovered 1x window");
+        const auto escDeadline = clock_ns() + 2'200'000'000ULL;
+        while (controller.alive() && clock_ns() < escDeadline) Sleep(10);
+        expect(!controller.alive(), "stalled Esc on recovered 1x window did not exit in time");
+        expect(producer->retire() == ipc::Status::Ok, "retire recovered");
+        const auto afterRecEsc = read_text(log);
+        expect(afterRecEsc.find("event=shutdown_force_terminate watchdog=0 exit_reason=1") != std::string::npos,
+            "expected UserClosed force-terminate on recovered 1x window");
+        expect(count_tokens(afterRecEsc, "event=controller_auto_fallback_1x_relaunch") == 1,
+            "expected exactly 1 relaunch total");
+        expect(fs::exists(marksDir / L"pushflow-crash-quarantine.txt"),
+            "pushflow-crash-quarantine.txt must survive Esc force-terminate of recovered 1x window");
+    }
+
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    wchar_t selfExe[4096]{};
+    const auto selfLen = GetModuleFileNameW(nullptr, selfExe, ARRAYSIZE(selfExe));
+    expect(selfLen > 0 && selfLen < ARRAYSIZE(selfExe), "locate vfg_ab_smoke_runner.exe");
+    std::wstring cmd = L"\"" + std::wstring(selfExe) + L"\" \"" + presenter + L"\" \"" + logDir.wstring() +
+        L"\" pushflow-midrun-crash-manual";
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    std::fflush(stdout);
+    expect(CreateProcessW(selfExe, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi) != FALSE,
+        "spawn pushflow-midrun-crash-manual");
+    const Handle childProc{pi.hProcess}, childThread{pi.hThread};
+    expect(WaitForSingleObject(childProc.value, 60000) == WAIT_OBJECT_0, "manual reopen child timed out");
+    DWORD childCode = 1;
+    expect(GetExitCodeProcess(childProc.value, &childCode) != FALSE && childCode == 0,
+        "pushflow-midrun-crash-manual failed");
+    std::printf("PASS ab_pushflow_midrun_crash\n");
+}
+
+void run_pushflow_midrun_crash_manual(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& pfRuntime, const fs::path& marksDir)
+{
+    GpuFixture gfx(640, 360);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", pfRuntime.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_TEST_STALL_TEARDOWN_MS", nullptr);
+    const auto logManual1 = logDir / L"ab-pushflow-manual1.log";
+    fs::remove(logManual1);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logManual1.c_str());
+    {
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfm1"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer manual1");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake manual1");
+        wait_log_token(logManual1, "event=initialized ", controller);
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 30; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 60;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 16) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(200);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire manual1");
+        const auto m1 = read_text(logManual1);
+        expect(m1.find("event=pushflow_previous_crash_detected") != std::string::npos,
+            "1st manual reopen must detect previous crash quarantine");
+        expect(!fs::exists(marksDir / L"pushflow-crash-quarantine.txt"),
+            "1st manual reopen must consume quarantine");
+        expect(count_tokens(m1, "event=present_original ") > 0 &&
+            count_tokens(m1, "event=present_vfg_subframe ") == 0,
+            "1st manual reopen must degrade once to 1x original");
+    }
+
+    const auto logManual2 = logDir / L"ab-pushflow-manual2.log";
+    fs::remove(logManual2);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", logManual2.c_str());
+    {
+        ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfm2"), gfx.shape);
+        LaunchOptions opts{};
+        opts.backend = Backend::PushFlow;
+        opts.pushflowTier = PushFlowTier::Fast;
+        opts.pushflowRuntimeDir = pfRuntime;
+        opts.multiplier = 2;
+        opts.monitorId = monId;
+        Controller controller(opts);
+        const auto offer = producer.connect(controller.peer());
+        expect(controller.offer(offer, gfx.shape, gfx.luid), "offer manual2");
+        expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake manual2");
+        wait_log_token(logManual2, "event=initialized backend=pushflow", controller);
+        const auto start = clock_ns();
+        for (uint32_t f = 0; f < 40; ++f) {
+            const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 30;
+            pace_to(ts);
+            gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 16) % 480);
+            publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+        }
+        Sleep(300);
+        wait_controller_exit(controller);
+        expect(producer.retire() == ipc::Status::Ok, "retire manual2");
+        const auto m2 = read_text(logManual2);
+        expect(m2.find("event=pushflow_previous_crash_detected") == std::string::npos,
+            "2nd manual reopen must not trigger crash quarantine");
+        expect(count_tokens(m2, "event=present_vfg_subframe ") >= 5, "2nd manual reopen must resume PushFlow");
+        expect(count_tokens(m2, "event=error") == 0, "unexpected error in manual2");
+    }
+    std::printf("PASS ab_pushflow_midrun_crash_manual\n");
+}
+
+void run_pushflow_empty(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId)
+{
+    const auto log = logDir / L"ab-pushflow-empty.log";
+    const auto emptyRt = logDir / L"empty-pushflow-rt";
+    fs::remove(log);
+    fs::create_directories(emptyRt);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", emptyRt.c_str());
+
+    GpuFixture gfx(640, 360);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"pfempty"), gfx.shape);
+    LaunchOptions opts{};
+    opts.backend = Backend::PushFlow;
+    opts.pushflowTier = PushFlowTier::Fast;
+    opts.multiplier = 2;
+    opts.monitorId = monId;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "offer");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "handshake");
+    wait_log_token(log, "event=pushflow_runtime_missing_fallback_1x", controller);
+    const auto start = clock_ns();
+    for (uint32_t f = 0; f < 30; ++f) {
+        const auto ts = start + uint64_t{f} * 1'000'000'000ULL / 60;
+        pace_to(ts);
+        gfx.fill_frame(0xFF101010u, 0xFFFFFFFFu, (f * 16) % 480);
+        publish_ok_or_dropped(producer, gfx.tex.Get(), ts);
+    }
+    Sleep(200);
+    wait_controller_exit(controller);
+    expect(producer.retire() == ipc::Status::Ok, "retire");
+
+    const auto content = read_text(log);
+    expect(content.find("event=pushflow_runtime_missing_fallback_1x") != std::string::npos,
+        "missing pushflow_runtime_missing_fallback_1x");
+    expect(count_tokens(content, "event=present_original ") > 0 &&
+        count_tokens(content, "event=present_vfg_subframe ") == 0,
+        "empty PushFlow runtime must present 1x original only");
+    std::printf("PASS ab_pushflow_empty originals=%zu\n", count_tokens(content, "event=present_original "));
+}
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    try {
+        expect(argc == 4, "usage: vfg_ab_smoke_runner <presenter.exe> <log_dir> <mode>");
+        const std::wstring presenter = argv[1];
+        const fs::path logDir = argv[2];
+        const std::wstring_view mode = argv[3];
+        fs::create_directories(logDir);
+        const auto monId = secondary_monitor_id();
+        expect(!monId.empty(), "no active secondary display");
+        expect(SetEnvironmentVariableW(L"OBS_NR_VFG_QA_MONITOR", monId.c_str()) != FALSE, "set QA monitor");
+
+        const auto vfgRuntime = Controller::find_runtime_dir();
+        const auto isolatedLocalApp = logDir / L"localappdata";
+        fs::create_directories(isolatedLocalApp);
+        expect(SetEnvironmentVariableW(L"LOCALAPPDATA", isolatedLocalApp.c_str()) != FALSE, "isolate LOCALAPPDATA");
+        if (!vfgRuntime.empty()) {
+            expect(SetEnvironmentVariableW(L"OBS_NR_VFG_RUNTIME", vfgRuntime.c_str()) != FALSE, "preserve VFG runtime");
+        }
+
+        auto readEnv = [](const wchar_t* k) -> std::wstring {
+            wchar_t buf[4096]{};
+            const auto n = GetEnvironmentVariableW(k, buf, ARRAYSIZE(buf));
+            return (n && n < ARRAYSIZE(buf)) ? std::wstring(buf, n) : std::wstring{};
+        };
+
+        if (mode == L"shot-change") run_shot_change(presenter, logDir, monId);
+        else if (mode == L"hud-lock") run_hud_lock(presenter, logDir, monId);
+        else if (mode == L"pacing-repair") run_pacing_repair(presenter, logDir, monId);
+        else if (mode == L"adaptive") run_adaptive(presenter, logDir, monId);
+        else if (mode == L"pushflow-smoke") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-smoke");
+            run_pushflow_smoke(presenter, logDir, monId, rt);
+        } else if (mode == L"pushflow-stalled-esc") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-stalled-esc");
+            run_pushflow_stalled_esc(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-midrun-crash") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-midrun-crash");
+            run_pushflow_midrun_crash(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-midrun-crash-manual") {
+            const auto rt = readEnv(L"OBS_NR_PUSHFLOW_RUNTIME");
+            expect(!rt.empty(), "OBS_NR_PUSHFLOW_RUNTIME required for pushflow-midrun-crash-manual");
+            run_pushflow_midrun_crash_manual(presenter, logDir, monId, rt, isolatedLocalApp / L"obs-nr-native-filter");
+        } else if (mode == L"pushflow-empty") run_pushflow_empty(presenter, logDir, monId);
+        else throw std::runtime_error("unknown mode");
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FAIL vfg_ab_smoke_runner: %s\n", e.what());
+        return 1;
+    }
+}

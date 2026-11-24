@@ -177,11 +177,14 @@ void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a,
     const PairTelemetry& telemetry, uint64_t workNs = 0, uint64_t eventNs = 0)
 {
     const auto q = [](uint64_t n) { return static_cast<unsigned long long>(n); };
-    fprintf(f.log, "event=%s generation=%llu b=%llu b_qpc_ns=%llu b_arrival_ns=%llu b_obs_tick=%llu a=%llu a_qpc_ns=%llu present_id=%u qpc_ns=%llu work_ns=%llu eff_mult=%u pacing_shift_ns=%lld hud_lock=%d shot_cut=%d pacing_repair=%d adaptive_fg=%d adaptive_target_fps=%ld\n",
+    char line[512];
+    const int len = snprintf(line, sizeof(line),
+        "event=%s generation=%llu b=%llu b_qpc_ns=%llu b_arrival_ns=%llu b_obs_tick=%llu a=%llu a_qpc_ns=%llu present_id=%u qpc_ns=%llu work_ns=%llu eff_mult=%u pacing_shift_ns=%lld hud_lock=%d shot_cut=%d pacing_repair=%d adaptive_fg=%d adaptive_target_fps=%ld\n",
         kind, q(b.generation), q(b.serial), q(b.timestampNs), q(b.arrivalNs), q(b.obsTick), q(a ? a->serial : 0),
         q(a ? a->timestampNs : 0), id, q(eventNs ? eventNs : clock_ns()), q(workNs), telemetry.multiplier,
         static_cast<long long>(telemetry.shiftNs), telemetry.hudLock, telemetry.shotCut,
         telemetry.pacingRepair, telemetry.adaptiveFg, telemetry.adaptiveTargetFps);
+    if (len > 0) fwrite(line, 1, static_cast<size_t>(std::min<int>(len, static_cast<int>(sizeof(line) - 1))), f.log);
 }
 
 void pace_until(uint64_t targetNs, Feed& f, HANDLE timer)

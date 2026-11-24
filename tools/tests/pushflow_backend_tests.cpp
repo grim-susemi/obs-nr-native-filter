@@ -24,12 +24,11 @@ void oracle_controls(TestRun& test)
         const auto t = times[i];
         exact[i] = allocate();
         auto blend = allocate();
-        // Independent positions from 64 + round(128*t).
-        constexpr int positions[]{96, 107, 128, 149, 160};
-        paint(exact[i], fixtureWidth, {positions[i], 56, 32}, 1);
+        const auto expected = square_at(endpointA, endpointB, t);
+        paint(exact[i], fixtureWidth, expected, 1);
         paint(blend, fixtureWidth, endpointA, static_cast<float>(1 - t));
         paint(blend, fixtureWidth, endpointB, static_cast<float>(t));
-        std::printf("CONTROL t=%.6f x=%d\n", t, positions[i]);
+        std::printf("CONTROL t=%.6f x=%d\n", t, expected.x);
         test.expect(verify_interpolated_square(frame(exact[i]), endpointA, endpointB, t).has_value(),
             "ground truth square passes");
         test.expect(!verify_interpolated_square(frame(blend), endpointA, endpointB, t), "linear alpha blend rejected");
@@ -50,10 +49,12 @@ void oracle_controls(TestRun& test)
     test.expect(!verify_interpolated_square(frame(ghost), endpointA, endpointB, .5),
         "endpoint ghost rejected despite full intermediate occupancy");
     auto nearA = allocate(), nearB = allocate();
-    paint(nearA, fixtureWidth, {107, 56, 32}, .62f);
-    paint(nearA, fixtureWidth, {149, 56, 32}, .43f);
-    paint(nearB, fixtureWidth, {107, 56, 32}, .43f);
-    paint(nearB, fixtureWidth, {149, 56, 32}, .62f);
+    const auto sqThird = square_at(endpointA, endpointB, times[1]);
+    const auto sqTwoThird = square_at(endpointA, endpointB, times[3]);
+    paint(nearA, fixtureWidth, sqThird, .62f);
+    paint(nearA, fixtureWidth, sqTwoThird, .43f);
+    paint(nearB, fixtureWidth, sqThird, .43f);
+    paint(nearB, fixtureWidth, sqTwoThird, .62f);
     const InterpolatedFrame nearDuplicate[]{{frame(nearA), times[1]}, {frame(nearB), times[3]}};
     test.expect(verify_interpolated_square(frame(nearA), endpointA, endpointB, times[1]) &&
         verify_interpolated_square(frame(nearB), endpointA, endpointB, times[3]) &&

@@ -5,7 +5,7 @@
 #include <vector>
 
 namespace nr::fg::qa {
-inline constexpr Square endpointA{64, 56, 32}, endpointB{192, 56, 32};
+inline constexpr Square endpointA{80, 90, 12}, endpointB{128, 90, 12};
 inline constexpr int fixtureWidth = 320, fixtureHeight = 192;
 
 struct TestRun {

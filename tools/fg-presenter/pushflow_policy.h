@@ -43,6 +43,8 @@ inline ModelFacts read_model_facts(const fs::path& model)
             auto& field = key == "align_corners" ? facts.alignCorners : facts.maskForFirst;
             if (field.has_value() || (value != "0" && value != "1")) facts.valid = false;
             else field = value == "1";
+        } else if (key == "padding_mode") {
+            if (value != "border") facts.valid = false;
         } else if (key == "pad") {
             unsigned n{};
             const auto end = value.data() + value.size();

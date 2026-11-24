@@ -184,7 +184,25 @@ def psnr(reference: NDArray[np.float32], actual: NDArray[np.floating]) -> float:
     return float(-10 * np.log10(max(mse, 1e-12)))
 
 
-def check_model(path: Path, align: int) -> bool:
+def probe_required_pad(path: Path) -> int:
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.add_free_dimension_override_by_name("batch", 1)
+    options.add_free_dimension_override_by_name("height", 192)
+    options.add_free_dimension_override_by_name("width", 320)
+    session = ort.InferenceSession(str(path), sess_options=options, providers=["CPUExecutionProvider"])
+    by_name = {o.name: o.shape for o in session.get_outputs()}
+    grid = by_name.get("pushflow_grid0")
+    if grid == [1, 256, 384, 2]:
+        return 128
+    if grid == [1, 192, 320, 2]:
+        return 64
+    raise ModelBuildError(f"Unexpected grid0 shape at 192x320 probe: {grid}")
+
+
+def check_model(path: Path, align: int) -> tuple[bool, int]:
+    required_pad = probe_required_pad(path)
     options = ort.SessionOptions()
     options.intra_op_num_threads = 2
     options.inter_op_num_threads = 1
@@ -212,8 +230,8 @@ def check_model(path: Path, align: int) -> bool:
     blend = psnr(middle, (first + second) / 2)
     if not np.isfinite([a, b, interpolation, blend]).all() or max(a, b) < 55 or interpolation <= blend:
         raise ModelBuildError(f"RIFE CPU check failed: moving {interpolation:.2f}, blend {blend:.2f}, rebuild {max(a, b):.2f} dB")
-    print(f"PASS {path.name}: moving {interpolation:.2f}, blend {blend:.2f}, rebuild {max(a, b):.2f} dB")
-    return a >= b
+    print(f"PASS {path.name}: moving {interpolation:.2f}, blend {blend:.2f}, rebuild {max(a, b):.2f} dB (pad={required_pad})")
+    return a >= b, required_pad
 
 
 def build(out: Path, archives: Path | None) -> None:
@@ -231,10 +249,10 @@ def build(out: Path, archives: Path | None) -> None:
                 target = workspace / f"pushflow-{pin.role}.onnx"
                 onnx.checker.check_model(original)
                 onnx.save(original, target)
-                mask_for_first = check_model(target, align)
+                mask_for_first, required_pad = check_model(target, align)
                 archive.write(target, f"models/{target.name}")
                 archive.writestr(f"models/{target.name}.txt",
-                                 f"align_corners={align}\nmask_for_first={int(mask_for_first)}\npad={padding}\n")
+                                 f"align_corners={align}\nmask_for_first={int(mask_for_first)}\npadding_mode={padding}\npad={required_pad}\n")
         digest = sha256(pack)
         checksum = pack.with_suffix(".sha256")
         checksum.write_text(f"{digest}  {pack.name}\n", encoding="ascii")
