@@ -144,8 +144,20 @@ void wait_log_token(const fs::path& logPath, std::string_view token, Controller&
 
 void pace_to(uint64_t targetNs)
 {
-    while (clock_ns() < targetNs) {
-        const auto rem = targetNs - clock_ns();
+    static thread_local struct HighResTimer {
+        HANDLE h{CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)};
+        ~HighResTimer() { if (h) CloseHandle(h); }
+    } timer;
+    for (;;) {
+        const uint64_t now = clock_ns();
+        if (now >= targetNs) return;
+        const auto rem = targetNs - now;
+        if (rem <= 300'000ULL) { YieldProcessor(); continue; }
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>((rem - 200'000ULL) / 100ULL);
+        if (timer.h && SetWaitableTimer(timer.h, &due, 0, nullptr, nullptr, FALSE) &&
+            WaitForSingleObject(timer.h, static_cast<DWORD>(rem / 1'000'000ULL + 2)) != WAIT_FAILED)
+            continue;
         if (rem > 2'000'000ULL) Sleep(1);
         else SwitchToThread();
     }
