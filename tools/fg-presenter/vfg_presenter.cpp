@@ -295,6 +295,10 @@ void frames(Feed& f)
             vfg = backend.get();
             break;
         case Backend::PushFlow: {
+            if (!f.view.pushflowRuntimeDir[0]) {
+                fprintf(f.log, "event=pushflow_runtime_missing_fallback_1x\n");
+                break;
+            }
             auto owner = std::make_unique<PushFlowBackend>();
             pushflowBackend = owner.get();
             backend = std::move(owner);

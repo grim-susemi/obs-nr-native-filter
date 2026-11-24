@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "fg_controller.h"
+#include "anr_dll_validator.h"
 #include "fg_monitor_text.h"
 #include "../obs_upscale_filter.h"
 #include "../obs_split_compare.h"
@@ -442,6 +443,10 @@ bool start(Tap& tap, bool off)
     std::lock_guard lock(tap.command);
     if (tap.detached.load() || tap.producer || (tap.controller && !tap.controller->exited()) ||
         (tap.retiredGeneration && ipc::Producer::generation_retained(tap.retiredGeneration))) return false;
+    if (tap.backend == Backend::AnrExperimental && !tap.experimentalAnrOptIn) {
+        blog(LOG_WARNING, "[vfg] presenter launch refused: %s", obs_module_text("VFG.Status.AnrOptInRequired"));
+        return false;
+    }
     try {
         LaunchOptions opts{};
         opts.multiplier = off ? 1u : std::clamp<uint32_t>(tap.multiplier, 2, max_multiplier);
@@ -501,6 +506,16 @@ void stop(void* data)
     }, queued, false);
 }
 
+std::wstring anr_path_from_settings(obs_data_t* settings)
+{
+    auto path = utf8_to_wide(obs_data_get_string(settings, "vfg_anr_dll_path"));
+    // OBS's Windows picker returns drive paths with forward slashes.
+    if (path.size() >= 3 && path[1] == L':' && (path[2] == L'/' || path[2] == L'\\') &&
+        ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')))
+        std::ranges::replace(path, L'/', L'\\');
+    return path;
+}
+
 void apply_settings(Tap& tap, obs_data_t* settings)
 {
     const auto mult = static_cast<uint32_t>(obs_data_get_int(settings, "vfg_multiplier"));
@@ -539,7 +554,7 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     }
     tap.pushflowTier = obs_data_get_int(settings, "vfg_pushflow_tier") == 1 ? PushFlowTier::Quality : PushFlowTier::Fast;
     tap.experimentalAnrOptIn = obs_data_get_bool(settings, "vfg_experimental_anr");
-    tap.anrDllPath = utf8_to_wide(obs_data_get_string(settings, "vfg_anr_dll_path"));
+    tap.anrDllPath = anr_path_from_settings(settings);
     tap.gpuShotChange = obs_data_get_bool(settings, "vfg_gpu_shot_change");
     tap.hudLock = obs_data_get_bool(settings, "vfg_hud_lock");
     tap.pacingRepair = obs_data_get_bool(settings, "vfg_pacing_repair");
@@ -656,10 +671,74 @@ void qa_update(void* opaque, obs_data_t* settings)
 }
 #endif
 
+bool refresh_backend_properties(obs_properties_t* properties, obs_property_t*, obs_data_t* settings)
+{
+    const auto backend = obs_data_get_int(settings, "vfg_backend");
+    const bool experimental = backend == static_cast<long long>(Backend::AnrExperimental);
+    const bool pushflow = backend == static_cast<long long>(Backend::PushFlow);
+    const bool optedIn = obs_data_get_bool(settings, "vfg_experimental_anr");
+    obs_property_set_visible(obs_properties_get(properties, "vfg_pushflow_tier"),
+        pushflow);
+    obs_property_set_visible(obs_properties_get(properties, "vfg_experimental_anr"), experimental);
+    obs_property_set_visible(obs_properties_get(properties, "vfg_anr_warning"), experimental);
+    obs_property_set_visible(obs_properties_get(properties, "vfg_anr_dll_path"),
+        experimental && optedIn);
+    auto* status = obs_properties_get(properties, "vfg_status");
+    const char* key;
+    if (pushflow) {
+        const bool quality = obs_data_get_int(settings, "vfg_pushflow_tier") == 1;
+        const auto tier = quality ? PushFlowTier::Quality : PushFlowTier::Fast;
+        const bool found = !Controller::find_pushflow_dir(tier).empty();
+        key = quality ? (found ? "VFG.Status.PushFlow.QualityFound" : "VFG.Status.PushFlow.QualityMissing")
+                      : (found ? "VFG.Status.PushFlow.FastFound" : "VFG.Status.PushFlow.FastMissing");
+    } else if (experimental) {
+        if (!optedIn)
+            key = "VFG.Status.AnrOptInRequired";
+        else if (const auto path = anr_path_from_settings(settings); path.empty())
+            key = "VFG.Status.ANR.Select";
+        else {
+            const auto result = anr::validate_addon(path, optedIn);
+            if (result.status == anr::ValidationStatus::Accepted)
+                key = "VFG.Status.ANR.Validated";
+            else if (result.status == anr::ValidationStatus::IncompleteAddonMissingCompanions)
+                key = "VFG.Status.ANR.Incomplete";
+            else
+                key = "VFG.Status.ANR.Invalid";
+        }
+    } else {
+        key = Controller::find_runtime_dir().empty() ? "VFG.Status.MissingRuntime" : "VFG.Status.Ready";
+    }
+    obs_property_set_description(status, obs_module_text(key));
+    return true;
+}
+
 obs_properties_t* properties(void* opaque)
 {
     auto* p = obs_properties_create();
     auto* coreGrp = obs_properties_create();
+    auto* backend = obs_properties_add_list(coreGrp, "vfg_backend", obs_module_text("VFG.Backend"),
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(backend, obs_module_text("VFG.Backend.Native"), static_cast<long long>(Backend::NativeVfg));
+    obs_property_list_add_int(backend, obs_module_text("VFG.Backend.PushFlow"), static_cast<long long>(Backend::PushFlow));
+    obs_property_list_add_int(backend, obs_module_text("VFG.Backend.ANR"), static_cast<long long>(Backend::AnrExperimental));
+    obs_property_set_long_description(backend, obs_module_text("VFG.Hint.Reopen"));
+    obs_property_set_modified_callback(backend, refresh_backend_properties);
+    auto* tier = obs_properties_add_list(coreGrp, "vfg_pushflow_tier", obs_module_text("VFG.PushFlowTier"),
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(tier, obs_module_text("VFG.PushFlowTier.Fast"), static_cast<long long>(PushFlowTier::Fast));
+    obs_property_list_add_int(tier, obs_module_text("VFG.PushFlowTier.Quality"), static_cast<long long>(PushFlowTier::Quality));
+    obs_property_set_long_description(tier, obs_module_text("VFG.Hint.Reopen"));
+    obs_property_set_modified_callback(tier, refresh_backend_properties);
+    auto* warning = obs_properties_add_text(coreGrp, "vfg_anr_warning", obs_module_text("VFG.AnrWarning"), OBS_TEXT_INFO);
+    obs_property_set_enabled(warning, false);
+    auto* optIn = obs_properties_add_bool(coreGrp, "vfg_experimental_anr", obs_module_text("VFG.ExperimentalANR"));
+    obs_property_set_long_description(optIn, obs_module_text("VFG.Hint.Reopen"));
+    obs_property_set_modified_callback(optIn, refresh_backend_properties);
+    auto* path = obs_properties_add_path(coreGrp, "vfg_anr_dll_path", obs_module_text("VFG.AnrDllPath"),
+        OBS_PATH_FILE, "nvngx_dlssg.dll (nvngx_dlssg.dll)", nullptr);
+    obs_property_set_long_description(path, obs_module_text("VFG.Hint.Reopen"));
+    obs_property_set_modified_callback(path, refresh_backend_properties);
+
     auto* mult = obs_properties_add_list(coreGrp, "vfg_multiplier", obs_module_text("VFG.Multiplier"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(mult, "2x (120fps)", 2);
@@ -695,17 +774,38 @@ obs_properties_t* properties(void* opaque)
     obs_property_set_long_description(gp, obs_module_text("VFG.Hint.GpuPriority"));
     obs_properties_add_group(p, "vfg_grp_core", obs_module_text("VFG.Group.Core"), OBS_GROUP_NORMAL, coreGrp);
 
+    auto* abGrp = obs_properties_create();
+    obs_properties_add_bool(abGrp, "vfg_hud_lock", obs_module_text("VFG.HudLock"));
+    auto* shot = obs_properties_add_bool(abGrp, "vfg_gpu_shot_change", obs_module_text("VFG.GpuShotChange"));
+    obs_property_set_long_description(shot, obs_module_text("VFG.Hint.GpuShotChange"));
+    obs_properties_add_bool(abGrp, "vfg_pacing_repair", obs_module_text("VFG.PacingRepair"));
+    auto* adaptive = obs_properties_add_bool(abGrp, "vfg_adaptive_fg", obs_module_text("VFG.AdaptiveFG"));
+    auto* target = obs_properties_add_list(abGrp, "vfg_adaptive_target_fps", obs_module_text("VFG.AdaptiveTargetFPS"),
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(target, obs_module_text("VFG.AdaptiveTargetFPS.Auto"), 0);
+    for (const int fps : {60, 120, 144, 165, 240})
+        obs_property_list_add_int(target, std::to_string(fps).c_str(), fps);
+    obs_property_set_modified_callback(adaptive, [](obs_properties_t* props, obs_property_t*, obs_data_t* settings) {
+        obs_property_set_visible(obs_properties_get(props, "vfg_adaptive_target_fps"),
+            obs_data_get_bool(settings, "vfg_adaptive_fg"));
+        return true;
+    });
+    obs_properties_add_group(p, "vfg_grp_ab", obs_module_text("VFG.Group.AB"), OBS_GROUP_NORMAL, abGrp);
+
     auto* ctrlGrp = obs_properties_create();
-    const bool rtFound = !Controller::find_runtime_dir().empty();
     bool running = false;
     if (opaque) {
         auto* tap = static_cast<Tap*>(opaque);
         std::lock_guard lock(tap->command);
         running = tap->controller && tap->controller->alive() && !tap->stopping;
     }
-    const char* statusKey = running ? "VFG.Status.Running" : (rtFound ? "VFG.Status.Ready" : "VFG.Status.MissingRuntime");
-    auto* st = obs_properties_add_text(ctrlGrp, "vfg_status", obs_module_text(statusKey), OBS_TEXT_INFO);
+    auto* st = obs_properties_add_text(ctrlGrp, "vfg_status", obs_module_text("VFG.Status.MissingRuntime"), OBS_TEXT_INFO);
     obs_property_set_enabled(st, false);
+    if (running) {
+        auto* active = obs_properties_add_text(ctrlGrp, "vfg_active_status",
+            obs_module_text("VFG.Status.ActivePreview"), OBS_TEXT_INFO);
+        obs_property_set_enabled(active, false);
+    }
 
     obs_properties_add_button2(ctrlGrp, "vfg_start", obs_module_text("VFG.Open"),
         [](obs_properties_t*, obs_property_t*, void* data) { return data && start(*static_cast<Tap*>(data), false); }, opaque);
@@ -747,6 +847,15 @@ extern "C" void nr_register_vfg_tap()
         obs_data_set_default_bool(settings, "vfg_gpu_priority", true);
         obs_data_set_default_bool(settings, "vfg_hide_from_capture", false);
         obs_data_set_default_bool(settings, "vfg_hide_source_canvas", false);
+        obs_data_set_default_int(settings, "vfg_backend", static_cast<long long>(Backend::NativeVfg));
+        obs_data_set_default_int(settings, "vfg_pushflow_tier", static_cast<long long>(PushFlowTier::Fast));
+        obs_data_set_default_bool(settings, "vfg_experimental_anr", false);
+        obs_data_set_default_string(settings, "vfg_anr_dll_path", "");
+        obs_data_set_default_bool(settings, "vfg_hud_lock", false);
+        obs_data_set_default_bool(settings, "vfg_gpu_shot_change", false);
+        obs_data_set_default_bool(settings, "vfg_pacing_repair", false);
+        obs_data_set_default_bool(settings, "vfg_adaptive_fg", false);
+        obs_data_set_default_int(settings, "vfg_adaptive_target_fps", 0);
         obs_upscale::defaults(settings);
         nr::split::defaults(settings);
         obs_data_set_default_bool(settings, "vfg_upscale", false);

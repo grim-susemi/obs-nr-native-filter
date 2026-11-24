@@ -276,6 +276,12 @@ if(NOT OBS_NR_VFG_QA_ACTION)
     "$<TARGET_FILE_DIR:OBS::libobs>/libobs-d3d11.dll" "${CMAKE_CURRENT_BINARY_DIR}/vfg_filter_output")
   set_tests_properties(vfg_filter_output PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE
     WORKING_DIRECTORY "$<TARGET_FILE_DIR:OBS::libobs>")
+  add_test(NAME vfg_filter_output_properties COMMAND vfg_filter_output_tests
+    $<TARGET_FILE:obs-nr-filter> "${CMAKE_CURRENT_SOURCE_DIR}/data" $<TARGET_FILE:obs-nr-fg-presenter>
+    "$<TARGET_FILE_DIR:OBS::libobs>/libobs-d3d11.dll" "${CMAKE_CURRENT_BINARY_DIR}/vfg_filter_output_properties"
+    properties)
+  set_tests_properties(vfg_filter_output_properties PROPERTIES TIMEOUT 20 RUN_SERIAL TRUE
+    WORKING_DIRECTORY "$<TARGET_FILE_DIR:OBS::libobs>")
   add_test(NAME vfg_anr_missing_companion_1x COMMAND vfg_filter_output_tests
     $<TARGET_FILE:obs-nr-filter> "${CMAKE_CURRENT_SOURCE_DIR}/data" $<TARGET_FILE:obs-nr-fg-presenter>
     "$<TARGET_FILE_DIR:OBS::libobs>/libobs-d3d11.dll" "${CMAKE_CURRENT_BINARY_DIR}/vfg_anr_missing_companion_1x"

@@ -84,9 +84,8 @@ Observations observe(const fs::path& log, std::string_view diagnostic)
 }
 } // namespace
 
-void vfg_anr_fallback_case(const fs::path& fixture, const fs::path& log, bool stageCompanions)
+fs::path vfg_stage_anr_addon(const fs::path& fixture, const fs::path& addon, bool stageCompanions)
 {
-    const auto addon = log.parent_path() / (stageCompanions ? L"missing-pack-anr" : L"standalone-anr");
     expect(fs::create_directory(addon), "create isolated addon directory");
     const auto dll = (addon / L"nvngx_dlssg.dll").make_preferred();
     fs::copy_file(fixture, dll);
@@ -102,6 +101,13 @@ void vfg_anr_fallback_case(const fs::path& fixture, const fs::path& log, bool st
             ordinary.close();
         }
     }
+    return dll;
+}
+
+void vfg_anr_fallback_case(const fs::path& fixture, const fs::path& log, bool stageCompanions)
+{
+    const auto addon = log.parent_path() / (stageCompanions ? L"missing-pack-anr" : L"standalone-anr");
+    const auto dll = vfg_stage_anr_addon(fixture, addon, stageCompanions);
     const auto diagnostic = std::string("event=anr_validation_fallback reason=incomplete_anr_addon_missing_companions missing=") +
         std::string(stageCompanions ? missingPack : "nr_fg.ini");
     const auto utf8 = dll.u8string();

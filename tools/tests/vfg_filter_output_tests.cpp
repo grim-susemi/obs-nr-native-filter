@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include <obs-module.h>
 #include <graphics/vec4.h>
+#include <util/text-lookup.h>
 #include <windows.h>
 #include <array>
 #include <atomic>
@@ -10,12 +11,17 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <regex>
 #include <stdexcept>
 #include <string>
+
+std::filesystem::path vfg_stage_anr_addon(const std::filesystem::path& fixture,
+    const std::filesystem::path& addon, bool stageCompanions);
 
 namespace {
 constexpr uint32_t width = 320, height = 180;
 std::atomic_uint32_t fixtureWidth{width};
+std::atomic_bool fixtureBlue{};
 constexpr char filterId[] = "susemi_fg_tap";
 using Pixels = std::array<uint8_t, 4>;
 constexpr Pixels red{255, 0, 0, 255}, blue{0, 0, 255, 255}, transparent{};
@@ -71,7 +77,7 @@ void quality_contract()
 void render_fixture(void*, gs_effect_t*)
 {
     auto* effect = obs_get_base_effect(OBS_EFFECT_SOLID);
-    const vec4 color{1.f, 0.f, 0.f, 1.f};
+    const vec4 color = fixtureBlue.load() ? vec4{0.f, 0.f, 1.f, 1.f} : vec4{1.f, 0.f, 0.f, 1.f};
     gs_effect_set_vec4(gs_effect_get_param_by_name(effect, "color"), &color);
     while (gs_effect_loop(effect, "Solid"))
         gs_draw_sprite(nullptr, 0, fixtureWidth.load(), height);
@@ -129,6 +135,17 @@ void canvas_contract(const std::filesystem::path& log)
         }
     }
     expect(publishing, "preview must receive originals while the canvas is hidden");
+    const auto activeProps = properties(filter.get());
+    auto* active = obs_properties_get(activeProps.get(), "vfg_active_status");
+    expect(active && std::string_view(obs_property_description(active)).find("next open") != std::string_view::npos,
+        "active preview is distinguished from selected next-open readiness");
+    auto nextOpen = settings();
+    obs_data_set_int(nextOpen.get(), "vfg_backend", 2);
+    auto* nextBackend = obs_properties_get(activeProps.get(), "vfg_backend");
+    auto* nextStatus = obs_properties_get(activeProps.get(), "vfg_status");
+    expect(obs_property_modified(nextBackend, nextOpen.get()) &&
+        std::string_view(obs_property_description(nextStatus)).find("requires explicit opt-in") != std::string_view::npos,
+        "editing next-open backend while active updates readiness");
     expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()), "stop preview");
     expect(probe(input.get(), blue, true) == red, "stopping preview restores source");
     obs_queue_task(OBS_TASK_GRAPHICS, [](void*) {}, nullptr, true);
@@ -147,6 +164,227 @@ std::string text_of(const fs::path& path)
 {
     std::ifstream f(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(f), {}};
+}
+
+void properties_contract(const fs::path& data, const fs::path& scratch, const fs::path& benign)
+{
+    quality_contract();
+    for (const bool legacy : {false, true}) {
+        auto values = settings();
+        if (legacy) obs_data_set_int(values.get(), "vfg_quality_mode", 1);
+        auto filter = source(filterId, values.get());
+        obs_source_load(filter.get());
+        const auto saved = std::unique_ptr<obs_data_t, decltype(&obs_data_release)>(
+            obs_source_get_settings(filter.get()), obs_data_release);
+        for (const auto& [key, expected] : std::initializer_list<std::pair<const char*, int>>{
+                 {"vfg_multiplier", 2}, {"vfg_quality_mode", 1}, {"vfg_fps_overlay", 1},
+                 {"vfg_backend", 0}, {"vfg_pushflow_tier", 0}, {"vfg_adaptive_target_fps", 0},
+                 {"cas_strength", 35}, {"scaling_backend", 0}, {"dlss_model", 1}, {"split_compare_position", 50}})
+            expect(obs_data_get_int(saved.get(), key) == expected, key);
+        for (const auto* key : {"vfg_low_latency", "vfg_gpu_priority"})
+            expect(obs_data_get_bool(saved.get(), key), key);
+        for (const auto* key : {"vfg_hide_from_capture", "vfg_hide_source_canvas", "vfg_upscale", "vfg_upscale_compare",
+                 "split_compare_enabled", "vfg_experimental_anr", "vfg_hud_lock", "vfg_gpu_shot_change",
+                 "vfg_pacing_repair", "vfg_adaptive_fg"})
+            expect(!obs_data_get_bool(saved.get(), key), key);
+        for (const auto* key : {"vfg_monitor", "dlss_runtime_path", "vfg_anr_dll_path"})
+            expect(std::string_view(obs_data_get_string(saved.get(), key)).empty(), key);
+    }
+
+    auto values = settings();
+    auto filter = source(filterId, values.get());
+    const auto props = properties(filter.get());
+    const auto get = [&](const char* key) {
+        auto* property = obs_properties_get(props.get(), key);
+        expect(property != nullptr, key);
+        return property;
+    };
+    auto* group = get("vfg_grp_core");
+    expect(obs_property_next(&group) && group == get("vfg_grp_ab"), "A/B group follows core");
+    auto* backend = get("vfg_backend");
+    auto* tier = get("vfg_pushflow_tier");
+    auto* optIn = get("vfg_experimental_anr");
+    auto* banner = get("vfg_anr_warning");
+    auto* path = get("vfg_anr_dll_path");
+    auto* adaptive = get("vfg_adaptive_fg");
+    auto* target = get("vfg_adaptive_target_fps");
+    auto* status = get("vfg_status");
+    const auto status_has = [](obs_property_t* property, std::string_view expected) {
+        const std::string_view observed = obs_property_description(property);
+        std::printf("status expected=%.*s actual=%s\n", static_cast<int>(expected.size()), expected.data(), observed.data());
+        expect(observed.find(expected) != std::string_view::npos, "selected backend readiness");
+    };
+    status_has(status, "NVIDIA VFG");
+    expect(obs_property_get_type(optIn) == OBS_PROPERTY_BOOL &&
+        obs_property_get_type(banner) == OBS_PROPERTY_TEXT && obs_property_text_type(banner) == OBS_TEXT_INFO &&
+        !obs_property_enabled(banner), "ANR opt-in and disabled information banner");
+    expect(obs_property_get_type(path) == OBS_PROPERTY_PATH && obs_property_path_type(path) == OBS_PATH_FILE &&
+        std::string_view(obs_property_path_filter(path)).find("(nvngx_dlssg.dll)") != std::string_view::npos,
+        "ANR B15 DLL file picker");
+    const auto list = [](obs_property_t* property, std::initializer_list<int> choices) {
+        expect(obs_property_get_type(property) == OBS_PROPERTY_LIST &&
+            obs_property_list_format(property) == OBS_COMBO_FORMAT_INT &&
+            obs_property_list_item_count(property) == choices.size(), obs_property_name(property));
+        size_t index = 0;
+        for (const auto choice : choices)
+            expect(obs_property_list_item_int(property, index++) == choice, obs_property_name(property));
+    };
+    list(backend, {0, 1, 2});
+    list(tier, {0, 1});
+    list(target, {0, 60, 120, 144, 165, 240});
+    const auto visibility = [&](int selected, bool allowed) {
+        expect(obs_property_visible(tier) == (selected == 1) &&
+            obs_property_visible(optIn) == (selected == 2) &&
+            obs_property_visible(banner) == (selected == 2) &&
+            obs_property_visible(path) == (selected == 2 && allowed), "backend and ANR path visibility");
+    };
+    visibility(0, false);
+    expect(!obs_property_visible(target), "adaptive target hidden by default");
+    for (const auto selected : {1, 2}) {
+        obs_data_set_int(values.get(), "vfg_backend", selected);
+        expect(obs_property_modified(backend, values.get()), "refresh backend properties");
+        visibility(selected, false);
+        status_has(status, selected == 1 ? "PushFlow Fast runtime files missing" : "Experimental ANR requires explicit opt-in");
+    }
+    for (const bool allowed : {true, false}) {
+        obs_data_set_bool(values.get(), "vfg_experimental_anr", allowed);
+        expect(obs_property_modified(optIn, values.get()), "refresh ANR opt-in");
+        visibility(2, allowed);
+        status_has(status, allowed ? "select nvngx_dlssg.dll" : "Experimental ANR requires explicit opt-in");
+        obs_data_set_bool(values.get(), "vfg_adaptive_fg", allowed);
+        expect(obs_property_modified(adaptive, values.get()) && obs_property_visible(target) == allowed,
+            "adaptive target follows toggle");
+    }
+    obs_data_set_bool(values.get(), "vfg_experimental_anr", true);
+    expect(obs_property_modified(optIn, values.get()), "enable ANR for path edits");
+    auto invalid = (scratch / L"nvngx_dlssg.dll").make_preferred();
+    std::ofstream(invalid) << "inert, invalid PE";
+    const auto invalidUtf8 = invalid.u8string();
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", reinterpret_cast<const char*>(invalidUtf8.c_str()));
+    expect(obs_property_modified(path, values.get()), "refresh ANR DLL path");
+    status_has(status, "ANR B15 validation failed");
+    const auto addon = scratch / L"inert-anr";
+    const auto stagedDll = vfg_stage_anr_addon(benign, addon, true);
+    const auto dll = stagedDll.u8string();
+    const std::string dllSetting(dll.begin(), dll.end());
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", dllSetting.c_str());
+    expect(obs_property_modified(path, values.get()), "refresh incomplete ANR addon");
+    status_has(status, "ANR B15 companion files are missing");
+    const auto lastPack = addon / L"programs/fg-lite-any-dp4a-srgb8/pack.nrx";
+    std::ofstream(lastPack) << "inert validation fixture";
+    expect(obs_property_modified(path, values.get()), "refresh complete ANR addon");
+    status_has(status, "companion files passed validation");
+    const auto pickerUtf8 = stagedDll.generic_u8string();
+    const std::string pickerPath(pickerUtf8.begin(), pickerUtf8.end());
+    expect(pickerPath.size() > 3 && pickerPath.substr(1, 2) == ":/" &&
+        pickerPath.find('\\') == std::string::npos, "OBS picker drive path uses forward slashes");
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", pickerPath.c_str());
+    expect(obs_property_modified(path, values.get()), "refresh picker-style ANR path");
+    const std::string_view stored = obs_data_get_string(values.get(), "vfg_anr_dll_path");
+    expect(stored == pickerPath, "property callback preserves the stored picker path");
+    std::printf("ANR native control=%s; stored OBS picker path=%s\n", dllSetting.c_str(), stored.data());
+    status_has(status, "companion files passed validation");
+    const auto dotPath = pickerPath.substr(0, pickerPath.rfind('/') + 1) + "./nvngx_dlssg.dll";
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", dotPath.c_str());
+    expect(obs_property_modified(path, values.get()), "refresh picker path with dot segment");
+    status_has(status, "ANR B15 validation failed");
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", pickerPath.c_str());
+
+    // Controller validates before attempting to spawn. An absent executable stops this
+    // fixture at that boundary even though the complete addon passes validation.
+    const auto missingPresenter = scratch / L"no-presenter-for-anr-validation.exe";
+    expect(!fs::exists(missingPresenter) &&
+        SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", missingPresenter.c_str()) != FALSE,
+        "isolate ANR launch before spawning a presenter");
+    auto launch = source(filterId, values.get());
+    const auto launchProps = properties(launch.get());
+    const auto savedLaunch = std::unique_ptr<obs_data_t, decltype(&obs_data_release)>(
+        obs_source_get_settings(launch.get()), obs_data_release);
+    expect(std::string_view(obs_data_get_string(savedLaunch.get(), "vfg_anr_dll_path")) == pickerPath,
+        "launch source preserves picker spelling");
+    expect(!obs_property_button_clicked(obs_properties_get(launchProps.get(), "vfg_start"), launch.get()),
+        "complete benign ANR validates but cannot spawn the absent presenter");
+    const auto validationLog = text_of(scratch / "canvas-presenter.log");
+    expect(validationLog.starts_with("event=anr_validated sha256=") &&
+        validationLog.find("event=session_started ") == std::string::npos,
+        "real launch validation passes before any presenter session");
+    std::printf("ANR picker launch stopped before spawn: %s", validationLog.c_str());
+    expect(fs::remove(lastPack), "remove inert companion after validation");
+    expect(obs_property_modified(path, values.get()), "refresh incomplete ANR addon again");
+    status_has(status, "ANR B15 companion files are missing");
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", "");
+    expect(obs_property_modified(path, values.get()), "refresh cleared ANR DLL path");
+    status_has(status, "select nvngx_dlssg.dll");
+    obs_data_set_int(values.get(), "vfg_backend", 1);
+    expect(obs_property_modified(backend, values.get()), "return to PushFlow");
+    const auto runtime = scratch / L"inert-pushflow";
+    expect(SetEnvironmentVariableW(L"OBS_NR_PUSHFLOW_RUNTIME", runtime.c_str()) != FALSE, "isolate PushFlow discovery");
+    obs_data_set_int(values.get(), "vfg_pushflow_tier", 1);
+    expect(obs_property_modified(tier, values.get()), "refresh Quality tier");
+    status_has(status, "PushFlow Quality runtime files missing");
+    fs::create_directories(runtime / L"models");
+    for (const auto* file : {L"onnxruntime.dll", L"DirectML.dll", L"models/pushflow-fast.onnx"})
+        std::ofstream(runtime / file) << "inert discovery fixture";
+    obs_data_set_int(values.get(), "vfg_pushflow_tier", 0);
+    expect(obs_property_modified(tier, values.get()), "refresh Fast tier");
+    status_has(status, "PushFlow Fast runtime files found");
+    obs_data_set_int(values.get(), "vfg_pushflow_tier", 1);
+    auto quality = source(filterId, values.get());
+    const auto qualityProps = properties(quality.get());
+    status_has(obs_properties_get(qualityProps.get(), "vfg_status"), "PushFlow Quality runtime files missing");
+    std::ofstream(runtime / L"models/pushflow-quality.onnx") << "inert discovery fixture";
+    expect(obs_property_modified(tier, values.get()), "refresh installed Quality tier");
+    status_has(status, "PushFlow Quality runtime files found");
+    obs_data_set_int(values.get(), "vfg_backend", 0);
+    expect(obs_property_modified(backend, values.get()), "return to Native");
+    status_has(status, "NVIDIA VFG");
+    obs_data_set_int(values.get(), "vfg_backend", 2);
+    obs_data_set_bool(values.get(), "vfg_experimental_anr", false);
+    obs_data_set_string(values.get(), "vfg_anr_dll_path", "nvngx_dlssg.dll");
+    auto blocked = source(filterId, values.get());
+    const auto blockedProps = properties(blocked.get());
+    status_has(obs_properties_get(blockedProps.get(), "vfg_status"), "Experimental ANR requires explicit opt-in");
+    expect(!obs_property_visible(obs_properties_get(blockedProps.get(), "vfg_anr_dll_path")),
+        "persisted DLL path stays hidden without opt-in");
+    struct RefusalLog {
+        log_handler_t prior{};
+        void* param{};
+        bool seen{};
+        ~RefusalLog() { base_set_log_handler(prior, param); }
+    } refusal;
+    base_get_log_handler(&refusal.prior, &refusal.param);
+    base_set_log_handler([](int level, const char* format, va_list args, void* opaque) {
+        auto& log = *static_cast<RefusalLog*>(opaque);
+        if (std::string_view(format) == "[vfg] presenter launch refused: %s") {
+            va_list copy;
+            va_copy(copy, args);
+            const auto* message = va_arg(copy, const char*);
+            va_end(copy);
+            log.seen = level == LOG_WARNING && std::string_view(message) ==
+                "Experimental ANR requires explicit opt-in before opening the preview.";
+        }
+        log.prior(level, format, args, log.param);
+    }, &refusal);
+    expect(!obs_property_button_clicked(obs_properties_get(blockedProps.get(), "vfg_start"), blocked.get()) &&
+        refusal.seen, "ANR start rejects opt-in OFF with explicit status");
+
+    const auto tap = text_of(data.parent_path() / "src" / "fg" / "fg_tap.cpp");
+    const std::regex localeKey(R"key("(VFG\.[A-Za-z0-9_.]+)")key");
+    const std::sregex_iterator first(tap.begin(), tap.end(), localeKey), end;
+    expect(first != end, "VFG locale references found");
+    for (const auto* locale : {"en-US.ini", "ko-KR.ini"}) {
+        const auto pathUtf8 = (data / "locale" / locale).u8string();
+        const auto lookup = std::unique_ptr<lookup_t, decltype(&text_lookup_destroy)>(
+            text_lookup_create(reinterpret_cast<const char*>(pathUtf8.c_str())), text_lookup_destroy);
+        expect(lookup != nullptr, locale);
+        for (auto it = first; it != end; ++it) {
+            const auto key = (*it)[1].str();
+            const char* translated{};
+            if (!text_lookup_getstr(lookup.get(), key.c_str(), &translated) || !*translated)
+                throw std::runtime_error(std::string(locale) + ": missing " + key);
+        }
+    }
+    std::puts("PASS VFG defaults, callbacks, selected readiness, explicit ANR refusal and en-US/ko-KR key parity");
 }
 
 template<class Predicate>
@@ -308,9 +546,12 @@ void recovery_case(const fs::path& scratch, const Scenario& s)
                 obs_data_set_bool(live.get(), "vfg_hud_lock", enabled);
                 obs_data_set_bool(live.get(), "vfg_pacing_repair", enabled);
                 obs_data_set_bool(live.get(), "vfg_adaptive_fg", enabled);
-                obs_data_set_int(live.get(), "vfg_adaptive_target_fps", enabled ? 90 : 0);
+                obs_data_set_int(live.get(), "vfg_adaptive_target_fps", enabled ? 120 : 0);
+                obs_data_set_bool(live.get(), "vfg_gpu_shot_change", enabled);
+                obs_data_set_int(live.get(), "vfg_pushflow_tier", enabled ? 1 : 0);
                 obs_source_update(filter.get(), live.get());
-                const auto wanted = enabled ? "hud_lock=1 shot_cut=0 pacing_repair=1 adaptive_fg=1 adaptive_target_fps=90" :
+                fixtureBlue.store(enabled);
+                const auto wanted = enabled ? "hud_lock=1 shot_cut=0 pacing_repair=1 adaptive_fg=1 adaptive_target_fps=120" :
                     "hud_lock=0 shot_cut=0 pacing_repair=0 adaptive_fg=0 adaptive_target_fps=0";
                 await([&] { return !event(text_of(log).substr(offset), "event=present_original ", wanted).empty(); },
                     "live settings reach the presenter without relaunch");
@@ -540,6 +781,10 @@ int run_host(int argc, wchar_t** argv)
         if (argc == 7) {
             SetEnvironmentVariableW(L"LOCALAPPDATA", scratch.c_str());
             const std::wstring_view scenario = argv[6];
+            if (scenario == L"properties") {
+                properties_contract(fs::path(argv[2]), scratch, fs::path(argv[0]).parent_path() / L"anr_benign_fixture.dll");
+                return 0;
+            }
             if (scenario == L"anr-missing-companion" || scenario == L"anr-missing-pack") {
                 vfg_anr_fallback_case(fs::path(argv[0]).parent_path() / L"anr_benign_fixture.dll", log,
                     scenario == L"anr-missing-pack");
@@ -552,9 +797,8 @@ int run_host(int argc, wchar_t** argv)
             }
             throw std::runtime_error("unknown recovery scenario");
         }
-        quality_contract();
         canvas_contract(log);
-        std::puts("PASS vfg_filter_output: stored quality, RGBA zero, scene blend, preview feed and restore");
+        std::puts("PASS vfg_filter_output: RGBA zero, scene blend, preview feed and restore");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL vfg_filter_output: %s\n", e.what());
