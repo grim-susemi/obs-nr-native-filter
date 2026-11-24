@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "native_vfg.h"
+#include "anr_fg_backend.h"
 #include "pushflow_backend.h"
 #include "vfg_adaptive_fg.h"
 #include "vfg_cadence.h"
@@ -225,7 +226,7 @@ void frames(Feed& f)
         check(E_INVALIDARG, "unsupported session offer");
     const auto requested = f.cliMultiplier <= 1 ? 1u :
         std::clamp<uint32_t>(f.view.multiplier ? f.view.multiplier : f.cliMultiplier, 2, max_multiplier);
-    const auto mult = f.previewMultiplier.effective(requested);
+    auto mult = f.previewMultiplier.effective(requested);
     fprintf(f.log, "event=offer mode=%ux size=%ux%u quality=%u generation=%llu luid=%08lx:%08lx hwnd=%p pid=%lu backend=%s epoch=%llu\n",
         mult, f.view.width, f.view.height, f.view.quality,
         static_cast<unsigned long long>(f.view.generation), static_cast<unsigned long>(f.view.adapter.HighPart),
@@ -234,7 +235,7 @@ void frames(Feed& f)
     set_gpu_process_priority(InterlockedCompareExchange(&f.view.gpuPriority, 0, 0) != 0, f.log);
     const bool split = f.view.splitCompare != 0;
     f.split.reset(split);
-    Gpu gpu(f.view, f.window, f.view.backend == Backend::AnrExperimental ? 1u : mult);
+    Gpu gpu(f.view, f.window, mult);
     ReflexContext reflex(f.view.backend == Backend::NativeVfg ? gpu.d3d_device() : nullptr,
         f.view.backend == Backend::NativeVfg ? gpu.drawQueue.Get() : nullptr, f.log);
     LONG lastReflex = -1;
@@ -261,6 +262,7 @@ void frames(Feed& f)
     FaultGuard innerFault{f.view};
     std::unique_ptr<IFgBackend> backend;
     PushFlowBackend* pushflowBackend{};
+    AnrFgBackend* anrBackend{};
     IFgBackend* vfg{};
     const auto userClosing = [&f] { return read_exit_reason(f.view) == ExitReason::UserClosed; };
     const auto drain_failure = [&] {
@@ -275,17 +277,17 @@ void frames(Feed& f)
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     };
     const auto work = [&] {
-    // PushFlow already preserves its owners through the generation shutdown.
-    // The other paths propagate work exceptions directly to the worker.
+    // External frame providers keep their owners through generation shutdown.
+    // Native work exceptions still propagate directly to the worker.
     struct HudUnwindGuard {
         const Gpu& gpu;
         const decltype(drain_failure)& fail;
-        bool pushflow;
+        bool preserveExternalOwner;
         ~HudUnwindGuard()
         {
-            if (!pushflow && std::uncaught_exceptions() > 0 && !gpu.drain_hud_on_unwind()) fail();
+            if (!preserveExternalOwner && std::uncaught_exceptions() > 0 && !gpu.drain_hud_on_unwind()) fail();
         }
-    } hudUnwind{gpu, drain_failure, f.view.backend == Backend::PushFlow};
+    } hudUnwind{gpu, drain_failure, f.view.backend != Backend::NativeVfg};
     if (mult > 1) {
         switch (f.view.backend) {
         case Backend::NativeVfg:
@@ -305,9 +307,16 @@ void frames(Feed& f)
                 f.pushflowActive.store(false);
             break;
         }
-        case Backend::AnrExperimental:
-            fprintf(f.log, "event=anr_runtime_unavailable_fallback_1x\n");
+        case Backend::AnrExperimental: {
+            auto owner = std::make_unique<AnrFgBackend>();
+            anrBackend = owner.get();
+            backend = std::move(owner);
+            if (anrBackend->open({gpu.d3d_device(), gpu.drawQueue.Get(), {f.view.width, f.view.height},
+                    f.view.generation, f.view.anrDllPath, f.view.experimentalAnrOptIn == 1, f.log, &gpu}))
+                vfg = anrBackend;
+            mult = std::min(mult, anrBackend->multiplier_limit());
             break;
+        }
         }
     }
     fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld\n",
@@ -589,8 +598,8 @@ void frames(Feed& f)
         reflex.marker(ReflexMarker::RenderSubmitStart, fid);
         if (interpolate && anchor && plan.originalNs) {
             const auto& a = anchor->frame;
-            const bool backendBusy = previousTicket &&
-                !vfg->subframe_ready(*previousTicket, previousTicket->lastSubmittedSub);
+            const bool backendBusy = previousTicket && (anrBackend ? !anrBackend->pair_complete(*previousTicket) :
+                !vfg->subframe_ready(*previousTicket, previousTicket->lastSubmittedSub));
             const auto stageStart = clock_ns();
             const bool pairLate = stageStart >= plan.synthetic_cutoff(activeMult - 1);
             const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult,
@@ -612,8 +621,19 @@ void frames(Feed& f)
                     const uint64_t waitStart = clock_ns();
                     const auto cutoff = plan.synthetic_cutoff(sub);
                     bool generatedReady = false;
+                    bool providerSuppressed = false;
                     while (f.active() && clock_ns() < cutoff) {
-                        if (vfg->subframe_ready(*ticket, sub)) { generatedReady = true; break; }
+                        if (anrBackend) {
+                            switch (anrBackend->output(*ticket, sub)) {
+                            case AnrFgBackend::Output::Ready: generatedReady = true; break;
+                            case AnrFgBackend::Output::Suppressed: providerSuppressed = true; break;
+                            case AnrFgBackend::Output::Pending: break;
+                            }
+                            if (generatedReady || providerSuppressed) break;
+                        } else if (vfg->subframe_ready(*ticket, sub)) {
+                            generatedReady = true;
+                            break;
+                        }
                         pace_until(std::min<uint64_t>(clock_ns() + 350000, cutoff), f, paceTimer.h);
                     }
                     const auto readyCheck = clock_ns();
@@ -636,12 +656,14 @@ void frames(Feed& f)
                         record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
                             pid.value_or(0), telemetry, genElapsed);
                     } else {
-                        record(f, "drop_vfg_subframe_late", b, &a, 0, telemetry,
+                        record(f, providerSuppressed ? "drop_vfg_provider_disabled" : "drop_vfg_subframe_late",
+                            b, &a, 0, telemetry,
                             readyCheck > cutoff ? readyCheck - cutoff : 0);
                     }
                 }
             } else {
                 reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
+                if (anrBackend && anrBackend->faulted()) telemetry.multiplier = 1;
                 record(f, backendBusy ? "drop_vfg_gpu_busy" :
                     pairLate ? "drop_vfg_pair_late" : "drop_vfg_stage_busy", b, &a, 0, telemetry);
             }
@@ -706,7 +728,7 @@ void frames(Feed& f)
         if (pushflowBackend) pushflowBackend->synchronize();
         drain(gpu.ipcQueue.Get(), 1);
         drain(gpu.drawQueue.Get(), 2);
-        if (vfg && !pushflowBackend) vfg->synchronize(); // Do not acknowledge a failed CUDA drain.
+        if (vfg && !pushflowBackend && !anrBackend) vfg->synchronize(); // Do not acknowledge a failed CUDA drain.
     } catch (const std::exception& error) {
         if (f.view.backend != Backend::PushFlow)
             fprintf(f.log, "event=error message=%s\n", error.what());
@@ -721,6 +743,7 @@ void frames(Feed& f)
     const bool pushflowFault = pushflowBackend && pushflowBackend->runtime_fault();
     try {
         if (pushflowBackend && !pushflowBackend->close()) drain_failure();
+        if (anrBackend && !anrBackend->close()) drain_failure();
     } catch (...) {
         drain_failure();
     }
@@ -737,7 +760,7 @@ void frames(Feed& f)
         check(E_FAIL, "PushFlow inference fault");
     return closed && f.view.backend == Backend::PushFlow;
     };
-    run_generation(work, shutdown, f.view.backend == Backend::PushFlow);
+    run_generation(work, shutdown, f.view.backend != Backend::NativeVfg);
 }
 } // namespace
 } // namespace nr::fg::vfg

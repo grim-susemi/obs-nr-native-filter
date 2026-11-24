@@ -36,6 +36,15 @@ add_custom_command(OUTPUT "${VFG_SHOT_HEADER}"
   DEPENDS "${VFG_SHOT_SHADER}" VERBATIM)
 set(VFG_CONTENT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_content_compare.hlsl")
 set(VFG_CONTENT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_content_compare_shader.h")
+set(ANR_BGRA_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/anr_rgba_to_bgra.hlsl")
+foreach(STAGE vs ps)
+  set(BGRA_HEADER "${CMAKE_CURRENT_BINARY_DIR}/anr_bgra_${STAGE}.h")
+  add_custom_command(OUTPUT "${BGRA_HEADER}"
+    COMMAND "${NR_FXC}" /nologo /WX /Ges /T "${STAGE}_5_0" /E "${STAGE}_main" /Fh "${BGRA_HEADER}"
+      /Vn "anr_bgra_${STAGE}" "${ANR_BGRA_SHADER}"
+    DEPENDS "${ANR_BGRA_SHADER}" VERBATIM)
+  list(APPEND ANR_BGRA_HEADERS "${BGRA_HEADER}")
+endforeach()
 add_custom_command(OUTPUT "${VFG_CONTENT_HEADER}"
   COMMAND "${NR_FXC}" /nologo /WX /Ges /T cs_5_0 /E main /Fh "${VFG_CONTENT_HEADER}"
     /Vn vfg_content_shader "${VFG_CONTENT_SHADER}"
@@ -59,13 +68,20 @@ add_custom_command(OUTPUT "${PUSHFLOW_RECONSTRUCT_HEADER}"
     -Vn pushflow_reconstruct_shader "${PUSHFLOW_RECONSTRUCT_SHADER}"
   DEPENDS "${PUSHFLOW_RECONSTRUCT_SHADER}" VERBATIM)
 add_custom_target(vfg_presenter_shaders DEPENDS
+  ${ANR_BGRA_HEADERS}
   "${VFG_CONTENT_HEADER}" "${VFG_SHOT_HEADER}" "${PUSHFLOW_PACK_HEADER}"
   "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}"
   "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_update_shader.h"
   "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_compose_shader.h")
 target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
   "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
-add_dependencies(obs-nr-fg-presenter vfg_presenter_shaders)
+add_dependencies(obs-nr-fg-presenter vfg_presenter_shaders nr_guides_shaders)
+set(ANR_BACKEND_SOURCES
+  tools/fg-presenter/anr_fg_backend.cpp tools/fg-presenter/anr_commands.cpp
+  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/anr_runtime.cpp)
+target_sources(obs-nr-fg-presenter PRIVATE ${ANR_BACKEND_SOURCES})
+target_include_directories(obs-nr-fg-presenter SYSTEM PRIVATE deps/ngx)
+target_link_libraries(obs-nr-fg-presenter PRIVATE nr_guides)
 target_compile_features(obs-nr-fg-presenter PRIVATE cxx_std_20)
 target_compile_definitions(obs-nr-fg-presenter PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(obs-nr-fg-presenter PRIVATE /W4 /WX /permissive-)
@@ -77,6 +93,28 @@ target_include_directories(obs-nr-fg-presenter SYSTEM PRIVATE "${CMAKE_CURRENT_S
 target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_HAVE_ONNXRUNTIME=1)
 target_link_libraries(obs-nr-fg-presenter PRIVATE fg_ipc d3d12 dxgi user32 winmm bcrypt)
 add_dependencies(obs-nr-filter obs-nr-fg-presenter)
+
+add_library(anr_mock_dll MODULE tools/tests/anr_mock_dll.cpp)
+target_compile_features(anr_mock_dll PRIVATE cxx_std_20)
+target_compile_options(anr_mock_dll PRIVATE /W4 /WX /permissive-)
+target_compile_definitions(anr_mock_dll PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(anr_mock_dll PRIVATE tools/fg-presenter)
+target_include_directories(anr_mock_dll SYSTEM PRIVATE deps/ngx)
+add_executable(anr_mock_dll_tests tools/tests/anr_mock_dll_tests.cpp tools/tests/anr_mock_ownership.cpp ${ANR_BACKEND_SOURCES}
+  tools/fg-presenter/vfg_gpu.cpp tools/fg-presenter/vfg_hud_lock.cpp
+  tools/fg-presenter/vfg_shot_change.cpp tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_options(anr_mock_dll_tests PRIVATE /W4 /WX /permissive-)
+target_compile_definitions(anr_mock_dll_tests PRIVATE OBS_NR_ANR_MOCK_TEST)
+target_include_directories(anr_mock_dll_tests PRIVATE tools/fg-presenter src/fg "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(anr_mock_dll_tests SYSTEM PRIVATE deps/ngx)
+target_link_libraries(anr_mock_dll_tests PRIVATE fg_control nr_guides user32 d3d12 dxgi)
+add_dependencies(anr_mock_dll_tests anr_mock_dll vfg_presenter_shaders nr_guides_shaders)
+add_custom_command(TARGET anr_mock_dll_tests POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${NR_GUIDES_SHADER}" "$<TARGET_FILE_DIR:anr_mock_dll_tests>/nr_guides.cso"
+  VERBATIM)
+add_test(NAME anr_mock_dll COMMAND anr_mock_dll_tests)
+set_tests_properties(anr_mock_dll PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS GPU
+  ENVIRONMENT "OBS_NR_GUIDES_SHADER=${NR_GUIDES_SHADER}")
 
 add_executable(vfg_shot_change_gpu_tests
   tools/tests/vfg_shot_change_gpu_tests.cpp
