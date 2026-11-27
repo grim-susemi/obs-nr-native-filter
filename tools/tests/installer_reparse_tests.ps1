@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-param([Parameter(Mandatory)][string]$Work,[Parameter(Mandatory)][string]$Evidence)
+param([Parameter(Mandatory)][string]$Work,[Parameter(Mandatory)][string]$Evidence,[switch]$XeFgOnly)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $checks=0;$results=@()
 $e=[IO.Path]::GetFullPath($Evidence).TrimEnd('\','/')
-$allowed=[IO.Path]::GetFullPath((Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-20/cpu-reparse-r1')).TrimEnd('\','/')
-if($e -cne $allowed){throw 'REPARSE_TEST_EXACT_EVIDENCE_REQUIRED'}
+if(-not $XeFgOnly){
+ $allowed=[IO.Path]::GetFullPath((Join-Path $Work '.omo/evidence/obs-nr-native-filter-20260930/task-20/cpu-reparse-r1')).TrimEnd('\','/')
+ if($e -cne $allowed){throw 'REPARSE_TEST_EXACT_EVIDENCE_REQUIRED'}
+}
 function Assert($value,$message){$script:checks++;if(!$value){throw ('REPARSE_ASSERT '+$message)}}
 function Hash($p){(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}
 function Proof($p){
@@ -38,6 +40,51 @@ function Refused($root){
  Assert ($message -and $message.Contains('NR_INSTALL_REPARSE_REFUSED')) ('unchanged actual entrypoint refusal '+$message)
  $message
 }
+function Invoke-XeFgReparse {
+ $installer=Join-Path $Work 'packaging/windows/install.ps1'
+ $tokens=$null;$errors=$null
+ $ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path $installer),[ref]$tokens,[ref]$errors)
+ if($errors.Count){throw $errors[0]}
+ foreach($f in $ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]},$true)){. ([scriptblock]::Create($f.Extent.Text))}
+ $script:StateDir=Join-Path $e 'state'
+ $script:Payload=Join-Path $e 'payload'
+ $script:L='en';$Version='test';$RuntimeRel='bin\64bit\nvngx_dlssnr.dll';$SrRel='bin\64bit\dlss\nvngx_dlss.dll'
+ $VfgDirRel='bin\64bit\nvidia-vfg';$VfgDlls=@()
+ $Yes=$true;$SkipOptional=$true;$RuntimeDecided=$false;$InstallXeFg=$false;$XeSsRuntimeDir='';$XeSsSdkZip=''
+ $DownloadOptional=$false;$DownloadPushFlow=$false;$SkipPushFlow=$true
+ $PushFlowRuntimeDir='';$PushFlowModelsDir='';$PushFlowModelZipUrl='';$PushFlowModelZipSha=''
+ $StageCleanupDir='';$ObsDir='';$Lang='en';$SrRuntime='';$VfgRuntimeDir='';$Runtime=''
+ function Say{}
+ function Show-Screen{}
+ New-Item -ItemType Directory -Force -Path $e|Out-Null
+ $root=OwnDirectory (Join-Path $e ('xefg-'+[Guid]::NewGuid().ToString('N')))
+ $target=OwnDirectory (Join-Path $root 'foreign-target')
+ $sentinel=Join-Path $target 'sentinel.txt';[IO.File]::WriteAllText($sentinel,'XESS_TARGET_KEEP')
+ $before=Proof $sentinel
+ $junction=Join-Path $root 'bin\64bit\xess-fg'
+ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $junction)|Out-Null
+ $link=Junction $junction $target
+ $assertRefusal=$null
+ try{Assert-XeFgPath $root 'bin\64bit\xess-fg\libxess_fg.dll'}catch{$assertRefusal=$_.Exception.Message}
+ Assert ($assertRefusal -and $assertRefusal.Contains('XeSS runtime path must not contain a reparse point')) 'Assert-XeFgPath must refuse the junction'
+ $source=OwnDirectory (Join-Path $root 'source')
+ foreach($n in 'libxess_fg.dll','libxell.dll','LICENSE.txt'){[IO.File]::WriteAllText((Join-Path $source $n),'fixture')}
+ $manifest=[ordered]@{}
+ $manifest['obs-plugins\64bit\obs-nr-filter.dll']='unused'
+ $installRefusal=$null
+ try{Install-Files $root '' '' '' $manifest @{runtime='';models=''} $source}catch{$installRefusal=$_.Exception.Message}
+ Assert ($installRefusal -and $installRefusal.Contains('XeSS runtime path must not contain a reparse point')) 'Install-Files must refuse the junction before hashing or copying'
+ Assert (!(Test-Path -LiteralPath (Join-Path $root 'obs-plugins\64bit\obs-nr-filter.dll'))) 'junction refusal must write no payload'
+ $state=[pscustomobject]@{obsDir=$root;ownedFiles=@([pscustomobject]@{relative='bin\64bit\xess-fg\libxess_fg.dll';hash='unused';backup=''})}
+ $removeRefusal=$null
+ try{Remove-Files $root $manifest $state}catch{$removeRefusal=$_.Exception.Message}
+ Assert ($removeRefusal -and $removeRefusal.Contains('XeSS runtime path must not contain a reparse point')) 'Remove-Files must refuse the junction'
+ $after=Proof $sentinel
+ Assert ($before.sha256 -ceq $after.sha256 -and $before.file_id -ceq $after.file_id) 'junction target sentinel bytes and FileID preserved'
+ @{schema=1;utc=[datetime]::UtcNow.ToString('o');checks=$checks;link=$link;assert_refusal=$assertRefusal;install_refusal=$installRefusal;remove_refusal=$removeRefusal;sentinel_before=$before;sentinel_after=$after;payload_absent=$true;GPU=$false;OBSLaunch=$false}|ConvertTo-Json -Depth 14|Set-Content -LiteralPath (Join-Path $e 'actual-xefg-reparse.json') -Encoding UTF8
+ Write-Output ('PASS actual XeSS junction checks='+$checks+' payload0 sentinelSameSHAandFileID GPU0 OBS0')
+}
+if($XeFgOnly){Invoke-XeFgReparse;exit 0}
 $sandbox=OwnDirectory (Join-Path $e ('sandboxes/run-'+[Guid]::NewGuid().ToString('N')))
 $target=OwnDirectory (Join-Path $sandbox 'root-target')
 $rootLink=Join-Path $sandbox 'root-junction'

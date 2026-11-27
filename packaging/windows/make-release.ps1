@@ -64,6 +64,7 @@ function Find-VeyraNrRuntime {
 function Assert-ReleaseArtifacts([string[]]$Entries, [string]$PluginPath, [string]$RuntimePath, [string]$Surface) {
     $pluginCount = 0
     $runtimeCount = 0
+    $forbiddenDlls = @('libxess_fg.dll', 'libxell.dll', 'mfgUnlocker.dll')
     foreach ($entry in $Entries) {
         # ZipFile may emit Windows separators; compare the full normalized path.
         $path = $entry.Replace('\', '/')
@@ -71,6 +72,10 @@ function Assert-ReleaseArtifacts([string[]]$Entries, [string]$PluginPath, [strin
             throw "$Surface contains forbidden release artifact: $entry"
         }
         if ($path -match '\.dll$') {
+            $leaf = [IO.Path]::GetFileName($path).ToLowerInvariant()
+            if ($forbiddenDlls -contains $leaf) {
+                throw "$Surface contains forbidden release artifact: $entry"
+            }
             if ($path -ceq $PluginPath) { $pluginCount++ }
             elseif ($RuntimePath -and $path -ceq $RuntimePath) { $runtimeCount++ }
             else { throw "$Surface contains forbidden release artifact: $entry" }
@@ -156,6 +161,8 @@ $extra = [ordered]@{
     'notices\NR-R3.md'    = Join-Path $repo 'provenance\source-notices\NR-R3.md'
     'notices\RenoDX-MIT.txt' = Join-Path $repo 'provenance\source-notices\RenoDX-MIT.txt'
     'notices\AMD-FidelityFX-CAS-MIT.txt' = Join-Path $repo 'provenance\source-notices\AMD-FidelityFX-CAS-MIT.txt'
+    'notices\Intel-XeSS-License.txt' = Join-Path $repo 'provenance\source-notices\Intel-XeSS-License.txt'
+    'notices\MFG-Unlocker-MIT.txt' = Join-Path $repo 'provenance\source-notices\MFG-Unlocker-MIT.txt'
 }
 foreach ($rel in $extra.Keys) {
     $dst = Join-Path $stage $rel

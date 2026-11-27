@@ -425,6 +425,188 @@ function Test-BundledNrRuntime {
     Write-Host 'PASS bundled third hash rejected and zero-runtime fallback retained'
 }
 
+function Test-XeFgRuntime {
+    $xroot = Join-Path $root 'xefg-runtime'
+    $obs = Join-Path $xroot 'obs'
+    $StateDir = Join-Path $xroot 'state'
+    $Payload = Join-Path $xroot 'payload'
+    $stage = Join-Path $xroot 'stage'
+    New-Item -ItemType Directory -Force -Path $Payload, $stage | Out-Null
+    Put (Join-Path $obs 'bin\64bit\obs64.exe') 'mock-obs'
+    $manifest = [ordered]@{}
+    Put (Join-Path $Payload $rel) 'fixture-plugin'
+    $manifest[$rel] = Get-Sha (Join-Path $Payload $rel)
+
+    $shaSdk = '88b8a373f30e33f3558a77a93e634f11b8132fc3047ea1a8edeead32b8471990'
+    $shaFg = 'ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27'
+    $shaXell = 'd2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7'
+    $fixture = Join-Path $xroot 'XeSS_SDK_3.0.2.zip'
+    function New-XeFgZip([string]$File) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::Open($File, 'Create')
+        try {
+            foreach ($member in @('bin/libxess_fg.dll', 'bin/libxell.dll', 'LICENSE.txt')) {
+                $writer = [IO.StreamWriter]::new($archive.CreateEntry($member).Open())
+                try { $writer.Write("fixture $member") } finally { $writer.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+    }
+    New-XeFgZip $fixture
+    $realSha = ${function:Get-Sha}
+    $script:xeFgBadFg = $false
+    function Get-Sha([string]$Path) {
+        $full = Get-FullPath $Path
+        $leaf = [IO.Path]::GetFileName($full)
+        if ($full -eq (Get-FullPath $fixture) -or $leaf -eq 'XeSS_SDK_3.0.2.zip') { return $shaSdk }
+        if ($script:xeFgBadFg -and $leaf -eq 'libxess_fg.dll') { return ('0' * 64) }
+        $text = ''
+        try { $text = [IO.File]::ReadAllText($full) } catch { return (& $realSha $Path) }
+        switch -CaseSensitive ($text) {
+            'fixture bin/libxess_fg.dll' { return $shaFg }
+            'fixture bin/libxell.dll' { return $shaXell }
+            'provided-fg' { return $shaFg }
+            'provided-xell' { return $shaXell }
+            default { return (& $realSha $Path) }
+        }
+    }
+    function Test-IntelSigned([string]$Path) { return $true }
+    function Get-HttpFile([string]$Url, [string]$Dest) {
+        Assert-Equal $Url 'https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip' 'XeSS download URL must stay pinned'
+        Copy-WithDir $fixture $Dest
+    }
+
+    Assert-Equal (Get-XeFgPaths).Count 3 'receipt allowlist must cover the two DLLs and the license'
+    foreach ($allowed in Get-XeFgPaths) { Assert-ReceiptFile $allowed '' }
+    Assert-Rejected { Assert-ReceiptFile 'bin\64bit\xess-fg\MFGUnlocker.dll' '' } 'Invalid installer receipt path'
+    Assert-Rejected { Assert-ReceiptFile 'bin\64bit\xess-fg\libxess_fg.dll' (Join-Path $xroot 'outside.dll') } 'Invalid installer backup path'
+
+    $InstallXeFg = $true; $XeSsRuntimeDir = ''; $XeSsSdkZip = ''; $Yes = $true; $SkipOptional = $false; $RuntimeDecided = $false
+    $source = Resolve-XeFgRuntime $obs $stage
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $source 'libxess_fg.dll')) $true 'extracted XeFG DLL'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $source 'libxell.dll')) $true 'extracted XeLL DLL'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $source 'LICENSE.txt')) $true 'extracted SDK license'
+
+    $foreignFg = Join-Path $obs 'bin\64bit\xess-fg\libxess_fg.dll'
+    Put $foreignFg 'foreign-fg'
+    Install-Files $obs '' '' '' $manifest @{} $source
+    Assert-Equal (Get-Sha (Join-Path $obs 'bin\64bit\xess-fg\libxess_fg.dll')) $shaFg 'XeFG DLL installed with pinned hash'
+    Assert-Equal (Get-Sha (Join-Path $obs 'bin\64bit\xess-fg\libxell.dll')) $shaXell 'XeLL DLL installed with pinned hash'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs 'bin\64bit\xess-fg\LICENSE.txt'))) 'fixture LICENSE.txt' 'SDK license installed unmodified'
+    $receipt = @((Read-State).ownedFiles | Where-Object { $_.relative -like 'bin\64bit\xess-fg\*' })
+    Assert-Equal $receipt.Count 3 'XeSS receipt owns exactly the two DLLs and the license'
+    Remove-Files $obs $manifest (Read-State)
+    Assert-Equal ([IO.File]::ReadAllText($foreignFg)) 'foreign-fg' 'uninstall must restore the pre-existing XeSS DLL'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $obs 'bin\64bit\xess-fg\libxell.dll')) $false 'uninstall must remove the owned XeLL DLL'
+    Write-Host 'PASS XeSS SDK fixture download, verified install, receipt, and uninstall restore'
+
+    $clean = Join-Path $xroot 'clean-obs'
+    Put (Join-Path $clean 'bin\64bit\obs64.exe') 'mock-obs'
+    Install-Files $clean '' '' '' $manifest @{} $source
+    Remove-Files $clean $manifest (Read-State)
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $clean 'bin\64bit\xess-fg')) $false 'clean uninstall must remove the empty xess-fg directory'
+    Write-Host 'PASS XeSS clean install and directory removal'
+
+    $provided = Join-Path $xroot 'provided-xess'
+    Put (Join-Path $provided 'libxess_fg.dll') 'provided-fg'
+    Put (Join-Path $provided 'libxell.dll') 'provided-xell'
+    Put (Join-Path $provided 'LICENSE.txt') 'provided license'
+    $InstallXeFg = $false; $XeSsRuntimeDir = $provided
+    $resolved = Resolve-XeFgRuntime $obs $stage
+    Assert-Equal (Get-FullPath $resolved) (Get-FullPath $provided) 'XeSsRuntimeDir must be reused without a download'
+    $XeSsRuntimeDir = ''
+    Write-Host 'PASS XeSsRuntimeDir staging path'
+
+    $InstallXeFg = $false; $XeSsRuntimeDir = ''; $XeSsSdkZip = ''; $Yes = $false; $SkipOptional = $false; $RuntimeDecided = $false
+    function Read-Host { return 'n' }
+    Assert-Equal (Resolve-XeFgRuntime $obs $stage) '' 'declining the XeSS prompt must skip the optional runtime'
+    $Yes = $true; $SkipOptional = $false
+    Write-Host 'PASS XeSS interactive prompt refusal'
+
+    $badFgDir = Join-Path $xroot 'bad-provided'
+    Put (Join-Path $badFgDir 'libxess_fg.dll') 'bad-fg'
+    Put (Join-Path $badFgDir 'libxell.dll') 'bad-xell'
+    Put (Join-Path $badFgDir 'LICENSE.txt') 'bad license'
+    $script:xeFgBadFg = $true; $XeSsRuntimeDir = $badFgDir
+    Assert-Rejected { Resolve-XeFgRuntime $obs $stage } 'XeSS runtime directory failed Intel signature or pinned SHA-256 verification'
+    $script:xeFgBadFg = $false; $XeSsRuntimeDir = ''
+    Write-Host 'PASS XeSS mismatched SHA-256 refused'
+
+    $InstallXeFg = $false; $XeSsRuntimeDir = ''; $XeSsSdkZip = $fixture
+    $script:xeFgBadFg = $true
+    $caught = $null
+    try { [void](Resolve-XeFgRuntime $obs $stage) } catch { $caught = $_.Exception.Message }
+    Assert-Equal ($caught -match 'XeSS runtime SHA-256 mismatch: libxess_fg\.dll') $true 'corrupt SDK DLL must abort'
+    $script:xeFgBadFg = $false
+    Write-Host 'PASS XeSS SDK DLL hash mismatch aborts before install'
+
+    $badZip = Join-Path $xroot 'bad-sdk.zip'
+    Put $badZip 'not a zip archive'
+    $XeSsSdkZip = $badZip
+    $badZipMessage = $null
+    try { [void](Resolve-XeFgRuntime $obs $stage) } catch { $badZipMessage = $_.Exception.Message }
+    Assert-Equal ($badZipMessage -match 'XeSS SDK archive SHA-256 mismatch') $true 'a non-pinned SDK archive must abort before extraction'
+    $XeSsSdkZip = ''
+    $XeSsRuntimeDir = Join-Path $xroot 'missing-xess'
+    $missingDirMessage = $null
+    try { [void](Resolve-XeFgRuntime $obs $stage) } catch { $missingDirMessage = $_.Exception.Message }
+    Assert-Equal ($missingDirMessage -match 'XeSS runtime directory not found') $true 'a missing XeSsRuntimeDir must abort'
+    $XeSsRuntimeDir = ''
+    Write-Host 'PASS malformed XeSS SDK zip and missing runtime directory abort'
+
+    $failObs = Join-Path $xroot 'fail-obs'
+    Put (Join-Path $failObs 'bin\64bit\obs64.exe') 'mock-obs'
+    Put (Join-Path $failObs 'bin\64bit\xess-fg\libxess_fg.dll') 'keep-fg'
+    $realCopy = ${function:Copy-WithDir}
+    function Copy-WithDir([string]$From, [string]$To) {
+        if ([IO.Path]::GetFileName($From) -eq 'libxell.dll') {
+            Put $To 'partial-xell'
+            throw 'injected XeSS copy failure'
+        }
+        & $realCopy $From $To
+    }
+    Assert-Rejected { Install-Files $failObs '' '' '' $manifest @{} $source } 'injected XeSS copy failure'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $failObs 'bin\64bit\xess-fg\libxess_fg.dll'))) 'keep-fg' 'mid-copy rollback must restore the foreign XeFG DLL'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $failObs 'bin\64bit\xess-fg\libxell.dll')) $false 'mid-copy rollback must remove the partial XeLL DLL'
+    Assert-Equal @(Get-ChildItem -LiteralPath $StateDir -Filter 'rollback-*').Count 0 'XeSS rollback must clean staging'
+    function Copy-WithDir([string]$From, [string]$To) { & $realCopy $From $To }
+    Write-Host 'PASS XeSS mid-copy rollback and directory cleanup'
+
+    $junctionObs = Join-Path $xroot 'junction-obs'
+    Put (Join-Path $junctionObs 'bin\64bit\obs64.exe') 'mock-obs'
+    $foreignTarget = Join-Path $xroot 'foreign-xess-target'
+    New-Item -ItemType Directory -Force -Path $foreignTarget | Out-Null
+    Put (Join-Path $foreignTarget 'sentinel.txt') 'FOREIGN_XESS_KEEP'
+    New-Item -ItemType Junction -Path (Join-Path $junctionObs 'bin\64bit\xess-fg') -Target $foreignTarget | Out-Null
+    $junctionMessage = $null
+    try { Install-Files $junctionObs '' '' '' $manifest @{} $source } catch { $junctionMessage = $_.Exception.Message }
+    Assert-Equal ($junctionMessage -match 'XeSS runtime path must not contain a reparse point') $true 'junction destination must be refused'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $junctionObs $rel)) $false 'junction refusal must write no payload'
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $foreignTarget 'sentinel.txt'))) 'FOREIGN_XESS_KEEP' 'junction refusal must leave the target untouched'
+    Write-Host 'PASS XeSS junction destination refused with zero writes'
+}
+
+function Test-XeFgElevation {
+    $dir = Join-Path $root 'OBS with spaces'
+    $xess = Join-Path $root 'xess stage with spaces'
+    $script:L = 'en'
+    $InstallXeFg = $true
+    $XeSsRuntimeDir = $xess
+    $Yes = $true; $NoPause = $true; $Uninstall = $false
+    function Show-Screen { }
+    function Start-Process($FilePath, $Verb, $ArgumentList, [switch]$Wait, [switch]$PassThru) {
+        Assert-Equal $Verb 'RunAs' 'actual elevation is never invoked in this fixture'
+        $joined = $ArgumentList -join ' '
+        if ($joined -notmatch ' -InstallXeFg(?: |$)') { throw 'InstallXeFg must reach the elevated child' }
+        $match = [regex]::Match($joined, ' -XeSsRuntimeDir "([^"]+)"')
+        if (-not $match.Success) { throw 'XeSsRuntimeDir must reach the elevated child' }
+        Assert-Equal $match.Groups[1].Value $xess 'XeSsRuntimeDir must reach the elevated child as one argument'
+        return @{ ExitCode = 23 }
+    }
+    $code = Invoke-Elevated $dir '' @{ xefg = $xess } ''
+    Assert-Equal $code 23 'mocked elevation must report its exit code'
+    Write-Host 'PASS XeSS UAC argument forwarding (mocked Start-Process)'
+}
+
 function Test-ReleasePackaging {
     $makeRelease = (Resolve-Path (Join-Path $PSScriptRoot '..\..\packaging\windows\make-release.ps1')).Path
     $tokens = $null; $errors = $null
@@ -437,11 +619,24 @@ function Test-ReleasePackaging {
     $runtime = 'files/bin/64bit/nvngx_dlssnr.dll'
     Assert-ReleaseArtifacts @($plugin, 'files/bin/64bit/nr_codec.dxil') $plugin '' 'zero-runtime fixture'
     Assert-ReleaseArtifacts @($plugin, $runtime) $plugin $runtime 'bundled fixture'
-    foreach ($bad in @('files/bin/64bit/other.dll', 'files/models/model.onnx', 'files/model.7z', 'files/model.lib')) {
+    foreach ($bad in @('files/bin/64bit/other.dll', 'files/models/model.onnx', 'files/model.7z', 'files/model.lib',
+            'files/bin/64bit/xess-fg/libxess_fg.dll', 'files/bin/64bit/xess-fg/libxell.dll',
+            'files/bin/64bit/MFGUnlocker.dll',
+            'obs-nr-native-filter-0.3.0-zero-windows-x64/files/bin/64bit/xess-fg/libxess_fg.dll')) {
         $message = $null
         try { Assert-ReleaseArtifacts @($plugin, $bad) $plugin '' 'fixture' } catch { $message = $_.Exception.Message }
         if ($message -notmatch 'forbidden release artifact') { throw "release allowlist must reject $bad (got '$message')" }
     }
+    $probe = Join-Path $root 'probe-stage'
+    Put (Join-Path $probe 'files\bin\64bit\xess-fg\libxess_fg.dll') 'dummy-xess'
+    Put (Join-Path $probe 'files\bin\64bit\MFGUnlocker.dll') 'dummy-mfg'
+    $probeEntries = @(Get-ChildItem -LiteralPath $probe -Recurse -File | ForEach-Object { $_.FullName.Substring($probe.Length + 1) })
+    foreach ($probeEntry in $probeEntries) {
+        $probeMessage = $null
+        try { Assert-ReleaseArtifacts @($plugin, $probeEntry) $plugin '' 'probe stage' } catch { $probeMessage = $_.Exception.Message }
+        Assert-Equal ($probeMessage -match 'forbidden release artifact') $true "probe stage must reject $probeEntry"
+    }
+    Write-Host 'PASS staged XeSS/MFGUnlocker DLLs rejected by Assert-ReleaseArtifacts'
     $message = $null
     try { Assert-ReleaseArtifacts @($plugin) $plugin $runtime 'fixture' } catch { $message = $_.Exception.Message }
     if ($message -notmatch 'exactly one') { throw "bundled mode must require its runtime (got '$message')" }
@@ -484,9 +679,16 @@ function Test-ReleasePackaging {
     $archive = [IO.Compression.ZipFile]::OpenRead($zeroZip)
     try { $names = @($archive.Entries.FullName) } finally { $archive.Dispose() }
     if (@($names | Where-Object { $_ -match 'nvngx_dlssnr\.dll$' }).Count) { throw 'zero-runtime zip must not contain nvngx_dlssnr.dll' }
+    foreach ($forbidden in 'libxess_fg\.dll$', 'libxell\.dll$', 'MFGUnlocker\.dll$') {
+        if (@($names | Where-Object { $_ -match $forbidden }).Count) { throw "zero-runtime zip must not contain $forbidden" }
+    }
+    Assert-Equal @($names | Where-Object { $_ -match '/notices/Intel-XeSS-License\.txt$' }).Count 1 'zero-runtime zip must ship the Intel XeSS notice'
+    Assert-Equal @($names | Where-Object { $_ -match '/notices/MFG-Unlocker-MIT\.txt$' }).Count 1 'zero-runtime zip must ship the MFGUnlocker MIT notice'
     $zeroExtract = Join-Path $zeroRoot 'extracted'
     [IO.Compression.ZipFile]::ExtractToDirectory($zeroZip, $zeroExtract)
     $zeroPkg = Join-Path $zeroExtract $zeroName
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $zeroPkg 'notices\Intel-XeSS-License.txt')) $true 'extracted package must ship the Intel XeSS notice'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $zeroPkg 'notices\MFG-Unlocker-MIT.txt')) $true 'extracted package must ship the MFGUnlocker MIT notice'
     $zeroObs = Join-Path $zeroRoot 'obs'
     Put (Join-Path $zeroObs 'bin\64bit\obs64.exe') 'fixture-obs'
     $zeroState = Join-Path $zeroRoot 'state'
@@ -535,6 +737,11 @@ function Test-ReleasePackaging {
         $names = @($archive.Entries.FullName | ForEach-Object { $_.Replace('\', '/') })
         Assert-Equal @($names | Where-Object { $_ -match '/files/bin/64bit/nvngx_dlssnr\.dll$' }).Count 1 'bundled zip must contain one NR runtime'
         Assert-Equal @($names | Where-Object { $_ -match '\.dll$' }).Count 2 'bundled zip must contain only the plugin and approved NR DLL'
+        foreach ($forbidden in 'libxess_fg\.dll$', 'libxell\.dll$', 'MFGUnlocker\.dll$') {
+            Assert-Equal @($names | Where-Object { $_ -match $forbidden }).Count 0 "bundled zip must not contain $forbidden"
+        }
+        Assert-Equal @($names | Where-Object { $_ -match '/notices/Intel-XeSS-License\.txt$' }).Count 1 'bundled zip must ship the Intel XeSS notice'
+        Assert-Equal @($names | Where-Object { $_ -match '/notices/MFG-Unlocker-MIT\.txt$' }).Count 1 'bundled zip must ship the MFGUnlocker MIT notice'
         $manifestEntry = @($archive.Entries | Where-Object { $_.FullName.Replace('\', '/') -match '/files/manifest\.sha256$' })[0]
         $reader = [IO.StreamReader]::new($manifestEntry.Open())
         try { $manifestText = $reader.ReadToEnd() } finally { $reader.Dispose() }
@@ -574,6 +781,8 @@ try {
     Test-PushFlowOwnership
     Test-PushFlowStaging
     Test-PushFlowElevation
+    Test-XeFgRuntime
+    Test-XeFgElevation
     Test-ReleasePackaging
     $target = Join-Path $dir $rel
     $src = Join-Path $Payload $rel
