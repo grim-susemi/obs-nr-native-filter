@@ -132,8 +132,17 @@ std::optional<FgPairTicket> XeMfgBackend::submit_pair(const FgPairDesc& pair, un
         if (pair.onStageQueued) pair.onStageQueued();
         const auto stageStart = clock_ns();
         bool ok = true;
-        if (!bank->previous || bank->lastSerial != pair.prevSerial)
+        if (!bank->previous || bank->lastSerial != pair.prevSerial) {
             ok = s.evaluate_frame(*bank, pair.prevTex, pair.prevSerial, 1, true, false);
+            // The seed is a complete single-frame job. Retire it before the
+            // current frame reaches the same bank: D3D12Guides refuses a second
+            // job while the first is uncollected (Busy), so the local-guide
+            // path would otherwise fail its first pair and latch 1x.
+            if (ok) {
+                s.drain(*bank);
+                bank->commands->recycle();
+            }
+        }
         if (ok) ok = s.evaluate_frame(*bank, pair.currTex, pair.currSerial, count, false,
             pair.shotCut || pair.flow.reset);
         if (s.gpu) s.gpu->mark_external_inputs_read(prevIndex, currIndex);

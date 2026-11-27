@@ -116,8 +116,10 @@ bool make_junction(const fs::path& link, const fs::path& target)
 
 uint32_t mock_color(unsigned index)
 {
-    const auto c0 = static_cast<uint32_t>(0.25f * static_cast<float>(index) * 255.f + 0.5f);
-    return 0xFF000000u | (0xBFu << 16) | (0x80u << 8) | c0;
+    // Exact UNORM8 encoding of the mock provider's clear colour; see the
+    // xemfg_mock_dll clear, which avoids a rounding tie that differs by one
+    // LSB between WARP and hardware adapters.
+    return 0xFF000000u | (0xC0u << 16) | (0x80u << 8) | (index * 64u);
 }
 
 struct Fixture {
@@ -417,6 +419,63 @@ void fault_and_relaunch(Fixture& fixture, const fs::path& scratch, const fs::pat
     }
 }
 
+// Local OFA is the only correct route when no NR pair backs the frame
+// (ConsumerFallback, or a legacy producer that states nothing). The seed frame
+// and the current frame are two complete guide jobs on one bank: the seed must
+// be collected before the current is submitted, or D3D12Guides answers Busy and
+// the backend latches the 1x fallback for the rest of the session.
+bool nvidia_adapter_available()
+{
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && desc.VendorId == 0x10de &&
+            !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) return true;
+        adapter.Reset();
+    }
+    return false;
+}
+
+void consumer_fallback(const fs::path& scratch, const fs::path& dll, const fs::path& xess)
+{
+    if (!nvidia_adapter_available()) {
+        std::puts("SKIP xemfg_backend case=consumer_fallback reason=no_nvidia_adapter");
+        return;
+    }
+    const auto log = scratch / L"consumer-fallback.log";
+    Log logFile(log);
+    Fixture fixture(false); // The local NVOF session only exists on the NVIDIA device.
+    XeMfgBackend backend;
+    open_backend(backend, options(fixture, dll, xess, 3, logFile.file), log, "open consumer fallback backend");
+    const auto fallback_pair = [&](unsigned serial) {
+        auto desc = fixture.pair(1, serial, 3);
+        desc.flow = {};
+        desc.flow.owner = nr::fg::ipc::FlowOwner::ConsumerFallback;
+        desc.flow.provenance = nr::fg::ipc::FlowProvenance::Unknown;
+        return desc;
+    };
+    const auto first = backend.try_submit_pair(fallback_pair(70), 0, 1);
+    require(first.has_value(), "consumer fallback first pair accepted");
+    require(!backend.faulted(), "consumer fallback first pair never faults the backend");
+    require(backend.multiplier_limit() == 4, "consumer fallback stays 3x/4x after its first pair");
+    require(backend.guide_stats().ofaExecutions >= 2, "consumer fallback runs local OFA for seed and current frames");
+    verify_pair(fixture, backend, *first);
+    backend.retire_pair(*first);
+    const auto second = backend.try_submit_pair(fallback_pair(71), 0, 1);
+    require(second && !backend.faulted(), "consumer fallback keeps admitting local pairs");
+    verify_pair(fixture, backend, *second);
+    backend.retire_pair(*second);
+    const auto ofaExecutions = backend.guide_stats().ofaExecutions;
+    require(read_bytes(log).find("reason=guides") == std::string::npos,
+        "consumer fallback never refuses its local guide job");
+    require(backend.close(), "consumer fallback close releases the local guides");
+    fixture.graphics.verify_debug();
+    std::printf("consumer_fallback: first_pair=accepted fault=0 limit=4 local_ofa=%llu pairs=2\n",
+        static_cast<unsigned long long>(ofaExecutions));
+}
+
 void teardown_refusals(Fixture& fixture, const fs::path& scratch, const fs::path& mock, const fs::path& xess)
 {
     {
@@ -557,6 +616,7 @@ int wmain(int argc, wchar_t** argv)
         happy(fixture, scratch.dir, mock, xess);
         capacity(fixture, scratch.dir, mock, xess);
         four_x_single_bank(fixture, scratch.dir, mock, xess);
+        consumer_fallback(scratch.dir, mock, xess);
         refusal(fixture, scratch.dir, mock, xess);
         capability(fixture, scratch.dir, mock, xess);
         validation(fixture, scratch.dir, mock, xess);

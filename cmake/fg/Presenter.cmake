@@ -211,9 +211,11 @@ add_custom_command(TARGET xemfg_backend_tests POST_BUILD
     "$<TARGET_FILE_DIR:xemfg_backend_tests>/xess-fg/libxell.dll"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:xemfg_mock_dll>"
     "$<TARGET_FILE_DIR:xemfg_backend_tests>/MFGUnlocker.dll"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${NR_GUIDES_SHADER}" "$<TARGET_FILE_DIR:xemfg_backend_tests>/nr_guides.cso"
   VERBATIM)
 add_test(NAME xemfg_backend COMMAND xemfg_backend_tests "$<TARGET_FILE:xemfg_mock_dll>")
-set_tests_properties(xemfg_backend PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE LABELS gpu)
+set_tests_properties(xemfg_backend PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE LABELS gpu
+  ENVIRONMENT "OBS_NR_GUIDES_SHADER=${NR_GUIDES_SHADER}")
 
 add_library(anr_mock_dll MODULE tools/tests/anr_mock_dll.cpp)
 target_compile_features(anr_mock_dll PRIVATE cxx_std_20)

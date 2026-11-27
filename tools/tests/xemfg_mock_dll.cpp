@@ -107,7 +107,10 @@ struct Feature {
         device->CopyDescriptorsSimple(1, copySlot, cpuSlot, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         ID3D12DescriptorHeap* heaps[]{gpu.Get()};
         list->SetDescriptorHeaps(1, heaps);
-        const float color[]{0.25f * static_cast<float>(index), 0.5f, 0.75f, 1.f};
+        // Exactly representable UNORM8 values: a float clear goes through the
+        // adapter's tie rule, and fractions of 255 land on x.5, so WARP and
+        // hardware disagree by one LSB on the shared fixture colour.
+        const float color[]{static_cast<float>(index) * (64.f / 255.f), 128.f / 255.f, 192.f / 255.f, 1.f};
         list->ClearUnorderedAccessViewFloat(shaderSlot, cpuSlot, output, color, 0, nullptr);
         ++cursor;
     }
