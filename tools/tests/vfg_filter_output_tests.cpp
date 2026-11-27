@@ -9,11 +9,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -37,6 +40,50 @@ void expect(bool ok, const char* why)
 {
     if (!ok) throw std::runtime_error(why);
 }
+
+struct TapLogCapture {
+    log_handler_t prior{};
+    void* param{};
+    mutable std::mutex guard;
+    std::vector<std::string> lines;
+    TapLogCapture()
+    {
+        base_get_log_handler(&prior, &param);
+        base_set_log_handler([](int level, const char* format, va_list args, void* opaque) {
+            auto& capture = *static_cast<TapLogCapture*>(opaque);
+            va_list copy;
+            va_copy(copy, args);
+            char text[1024]{};
+            const int written = vsnprintf(text, sizeof(text), format, copy);
+            va_end(copy);
+            if (written > 0) {
+                std::lock_guard lock(capture.guard);
+                capture.lines.emplace_back(text, std::min<size_t>(static_cast<size_t>(written), sizeof(text) - 1));
+            }
+            capture.prior(level, format, args, capture.param);
+        }, this);
+    }
+    ~TapLogCapture() { base_set_log_handler(prior, param); }
+    TapLogCapture(const TapLogCapture&) = delete;
+    TapLogCapture& operator=(const TapLogCapture&) = delete;
+    std::string last(const char* prefix) const
+    {
+        std::lock_guard lock(guard);
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it)
+            if (it->starts_with(prefix)) return *it;
+        return {};
+    }
+    std::vector<std::string> snapshot() const
+    {
+        std::lock_guard lock(guard);
+        return lines;
+    }
+    void clear()
+    {
+        std::lock_guard lock(guard);
+        lines.clear();
+    }
+};
 
 auto settings() { return std::unique_ptr<obs_data_t, decltype(&obs_data_release)>(obs_data_create(), obs_data_release); }
 auto properties(obs_source_t* source)
@@ -187,6 +234,19 @@ std::string text_of(const fs::path& path)
 void properties_contract(const fs::path& data, const fs::path& scratch, const fs::path& benign)
 {
     quality_contract();
+    const auto locale_lookup = [&](const char* locale) {
+        const auto pathUtf8 = (data / "locale" / locale).u8string();
+        return std::unique_ptr<lookup_t, decltype(&text_lookup_destroy)>(
+            text_lookup_create(reinterpret_cast<const char*>(pathUtf8.c_str())), text_lookup_destroy);
+    };
+    const auto en = locale_lookup("en-US.ini");
+    const auto ko = locale_lookup("ko-KR.ini");
+    expect(en && ko, "locale tables");
+    const auto text = [&](const char* key) {
+        const char* value{};
+        expect(text_lookup_getstr(en.get(), key, &value) && value && *value, key);
+        return std::string(value);
+    };
     for (const bool legacy : {false, true}) {
         auto values = settings();
         if (legacy) obs_data_set_int(values.get(), "vfg_quality_mode", 1);
@@ -195,11 +255,11 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
         const auto saved = std::unique_ptr<obs_data_t, decltype(&obs_data_release)>(
             obs_source_get_settings(filter.get()), obs_data_release);
         for (const auto& [key, expected] : std::initializer_list<std::pair<const char*, int>>{
-                 {"vfg_multiplier", 2}, {"vfg_quality_mode", 1}, {"vfg_fps_overlay", 1},
+                 {"vfg_multiplier", 2}, {"vfg_quality_mode", 1}, {"vfg_fps_overlay", 1}, {"vfg_dedup_mode", 1},
                  {"vfg_backend", 0}, {"vfg_pushflow_tier", 0}, {"vfg_adaptive_target_fps", 0},
                  {"cas_strength", 35}, {"scaling_backend", 0}, {"dlss_model", 1}, {"split_compare_position", 50}})
             expect(obs_data_get_int(saved.get(), key) == expected, key);
-        for (const auto* key : {"vfg_low_latency", "vfg_gpu_priority"})
+        for (const auto* key : {"vfg_low_latency", "vfg_gpu_priority", "vfg_live_anchor"})
             expect(obs_data_get_bool(saved.get(), key), key);
         for (const auto* key : {"vfg_hide_from_capture", "vfg_hide_source_canvas", "vfg_upscale", "vfg_upscale_compare",
                  "split_compare_enabled", "vfg_experimental_anr", "vfg_hud_lock", "vfg_gpu_shot_change",
@@ -250,6 +310,118 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
     list(backend, {0, 1, 2});
     list(tier, {0, 1});
     list(target, {0, 60, 120, 144, 165, 240});
+    auto* dedup = get("vfg_dedup_mode");
+    list(dedup, {0, 1, 5, 6});
+    expect(std::string_view(obs_property_list_item_name(dedup, 0)) == text("VFG.DedupMode.Off") &&
+        std::string_view(obs_property_list_item_name(dedup, 1)) == text("VFG.DedupMode.Auto") &&
+        std::string_view(obs_property_list_item_name(dedup, 2)) == text("VFG.DedupMode.Adaptive") &&
+        std::string_view(obs_property_list_item_name(dedup, 3)) == text("VFG.DedupMode.Fixed"),
+        "dedup choices use their locale labels");
+    auto* anchor = get("vfg_live_anchor");
+    expect(obs_property_get_type(anchor) == OBS_PROPERTY_BOOL &&
+        std::string_view(obs_property_description(anchor)) == text("VFG.LiveAnchor"), "live anchor bool label");
+    auto* qualityWarning = get("vfg_quality_warning");
+    expect(obs_property_get_type(qualityWarning) == OBS_PROPERTY_TEXT &&
+        obs_property_text_type(qualityWarning) == OBS_TEXT_INFO && !obs_property_enabled(qualityWarning) &&
+        std::string_view(obs_property_description(qualityWarning)) == text("VFG.QualityWarning"),
+        "quality warning is a read-only info hint with its locale text");
+    auto* qualityChoice = get("vfg_quality_mode");
+    expect(!obs_property_visible(qualityWarning), "quality warning hidden for the Balanced default");
+    obs_data_set_int(values.get(), "vfg_quality_mode", 0);
+    expect(obs_property_modified(qualityChoice, values.get()) && obs_property_visible(qualityWarning),
+        "Fast quality shows the warning");
+    obs_data_set_int(values.get(), "vfg_quality_mode", 2);
+    expect(obs_property_modified(qualityChoice, values.get()) && !obs_property_visible(qualityWarning),
+        "Best quality hides the warning");
+    obs_data_set_int(values.get(), "vfg_quality_mode", 1);
+    expect(obs_property_modified(qualityChoice, values.get()) && !obs_property_visible(qualityWarning),
+        "Balanced quality hides the warning");
+    std::printf("PASS VFG Veyra controls: dedup default=1 live_anchor default=true warning_gated_by_quality (label=%s)\n",
+        text("VFG.QualityWarning").c_str());
+    std::fflush(stdout);
+    {
+        const std::unique_ptr<obs_data_t, decltype(&obs_data_release)> nrDefaults(
+            obs_get_source_defaults("susemi_nr_filter"), obs_data_release);
+        expect(nrDefaults && !obs_data_get_bool(nrDefaults.get(), "nr_perf_model") &&
+            !obs_data_get_bool(nrDefaults.get(), "nr_dedup_reuse"),
+            "NR Model B and worker reuse stay opt-in by default");
+        std::printf("PASS NR defaults: perf_model=%d dedup_reuse=%d (Model B opt-in)\n",
+            obs_data_get_bool(nrDefaults.get(), "nr_perf_model") ? 1 : 0,
+            obs_data_get_bool(nrDefaults.get(), "nr_dedup_reuse") ? 1 : 0);
+        std::fflush(stdout);
+    }
+    {
+        const auto log = scratch / "live-controls-presenter.log";
+        fs::remove(log);
+        wchar_t previousLog[4096]{};
+        const auto previousLen = GetEnvironmentVariableW(L"OBS_NR_VFG_LOG", previousLog, ARRAYSIZE(previousLog));
+        struct RestoreLog {
+            std::wstring prior;
+            ~RestoreLog() { SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", prior.empty() ? nullptr : prior.c_str()); }
+        } restoreLog{previousLen && previousLen < ARRAYSIZE(previousLog) ?
+            std::wstring(previousLog, previousLen) : std::wstring{}};
+        SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+        TapLogCapture tapLog;
+        auto input = source("vfg_test_color");
+        auto liveData = settings();
+        auto liveFilter = source(filterId, liveData.get());
+        obs_source_filter_add(input.get(), liveFilter.get());
+        obs_set_output_source(0, input.get());
+        struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+        auto propsLive = properties(liveFilter.get());
+        const auto offset = text_of(log).size();
+        expect(obs_property_button_clicked(obs_properties_get(propsLive.get(), "vfg_off"), liveFilter.get()),
+            "start 1x preview for live dedup/anchor updates");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (text_of(log).substr(offset).find("event=present_original ") == std::string::npos) {
+            expect(std::chrono::steady_clock::now() < deadline, "live-control preview publishes originals");
+            Sleep(1);
+        }
+        tapLog.clear();
+        const auto wait_line = [&](const char* prefix) {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < limit) {
+                if (auto line = tapLog.last(prefix); !line.empty()) return line;
+                Sleep(1);
+            }
+            return std::string{};
+        };
+        auto update = settings();
+        obs_data_set_int(update.get(), "vfg_dedup_mode", 5);
+        obs_data_set_bool(update.get(), "vfg_live_anchor", false);
+        obs_source_update(liveFilter.get(), update.get());
+        const auto applied = wait_line("[vfg] live settings applied dedup_mode=5 live_anchor=0");
+        const auto saved = std::unique_ptr<obs_data_t, decltype(&obs_data_release)>(
+            obs_source_get_settings(liveFilter.get()), obs_data_release);
+        std::printf("live update saved_dedup=%lld saved_anchor=%d captured=%zu\n",
+            static_cast<long long>(obs_data_get_int(saved.get(), "vfg_dedup_mode")),
+            obs_data_get_bool(saved.get(), "vfg_live_anchor") ? 1 : 0, tapLog.snapshot().size());
+        for (const auto& line : tapLog.snapshot()) std::printf("live log: %s\n", line.c_str());
+        std::fflush(stdout);
+        expect(!applied.empty(), "live dedup/live anchor re-apply to the open session");
+        std::printf("live update: %s\n", applied.c_str());
+        std::fflush(stdout);
+
+        auto invalid = settings();
+        obs_data_set_int(invalid.get(), "vfg_dedup_mode", 99);
+        obs_data_set_bool(invalid.get(), "vfg_live_anchor", false);
+        tapLog.clear();
+        obs_source_update(liveFilter.get(), invalid.get());
+        const auto clamped = wait_line("[vfg] live settings applied dedup_mode=0 live_anchor=0");
+        const auto normalized = std::unique_ptr<obs_data_t, decltype(&obs_data_release)>(
+            obs_source_get_settings(liveFilter.get()), obs_data_release);
+        std::printf("live clamp saved_dedup=%lld captured=%zu\n",
+            static_cast<long long>(obs_data_get_int(normalized.get(), "vfg_dedup_mode")), tapLog.snapshot().size());
+        for (const auto& line : tapLog.snapshot()) std::printf("clamp log: %s\n", line.c_str());
+        expect(!clamped.empty(), "invalid dedup mode 99 clamps to Off/Exact live");
+        expect(obs_data_get_int(normalized.get(), "vfg_dedup_mode") == 0,
+            "invalid dedup mode is normalized in saved settings");
+        std::printf("live clamp: %s\n", clamped.c_str());
+        std::fflush(stdout);
+        expect(obs_property_button_clicked(obs_properties_get(propsLive.get(), "vfg_stop"), liveFilter.get()),
+            "stop live-control preview");
+        obs_source_filter_remove(input.get(), liveFilter.get());
+    }
     const auto visibility = [&](int selected, bool allowed) {
         expect(obs_property_visible(tier) == (selected == 1) &&
             obs_property_visible(optIn) == (selected == 2) &&
@@ -403,6 +575,35 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
         }
     }
     std::puts("PASS VFG defaults, callbacks, selected readiness, explicit ANR refusal and en-US/ko-KR key parity");
+
+    const std::regex scopedKey(R"(^((?:VFG|NR)\.[A-Za-z0-9_.]+)\s*=)");
+    const auto locale_keys = [&](const fs::path& path) {
+        std::set<std::string> keys;
+        std::ifstream stream(path);
+        for (std::string line; std::getline(stream, line);) {
+            std::smatch match;
+            if (std::regex_search(line, match, scopedKey)) keys.insert(match[1].str());
+        }
+        return keys;
+    };
+    const auto enKeys = locale_keys(data / "locale" / "en-US.ini");
+    const auto koKeys = locale_keys(data / "locale" / "ko-KR.ini");
+    std::string missing;
+    for (const auto& key : enKeys)
+        if (!koKeys.contains(key)) missing += " ko-KR:" + key;
+    for (const auto& key : koKeys)
+        if (!enKeys.contains(key)) missing += " en-US:" + key;
+    expect(enKeys.size() > 6 && missing.empty(), ("VFG/NR locale key parity" + missing).c_str());
+    for (const auto* key : {"NR.PerfModel", "NR.Hint.PerfModel", "NR.PerfModel.Unavailable",
+             "NR.DedupReuse", "NR.Hint.DedupReuse", "NR.RuntimeInfo"}) {
+        for (auto* table : {en.get(), ko.get()}) {
+            const char* value{};
+            expect(text_lookup_getstr(table, key, &value) && value && *value, key);
+        }
+    }
+    std::printf("PASS locale parity: %zu VFG/NR keys in en-US and ko-KR, NR Model B/Reuse/Runtime keys present\n",
+        enKeys.size());
+    std::fflush(stdout);
 }
 
 template<class Predicate>
@@ -1145,6 +1346,85 @@ void pacing_repair_ab_case(const fs::path& log)
     std::puts("PASS libobs_pacing_repair_ab");
 }
 
+void frame_interval_120_case(const fs::path& log, const std::string& graphics)
+{
+    obs_video_info video{};
+    video.graphics_module = graphics.c_str();
+    video.fps_num = 120;
+    video.fps_den = 1;
+    video.base_width = video.output_width = width;
+    video.base_height = video.output_height = height;
+    video.output_format = VIDEO_FORMAT_RGBA;
+    video.colorspace = VIDEO_CS_709;
+    video.range = VIDEO_RANGE_FULL;
+    expect(obs_reset_video(&video) == OBS_VIDEO_SUCCESS, "120/1 obs_reset_video");
+    const auto interval = obs_get_frame_interval_ns();
+    std::printf("120Hz obs_reset_video interval_ns=%llu\n", static_cast<unsigned long long>(interval));
+    expect(interval == 8333333ULL, "120/1 OBS video tick must be 8333333 ns");
+
+    TapLogCapture tapLog;
+    auto input = source("vfg_test_color");
+    auto data = settings();
+    auto filter = source(filterId, data.get());
+    obs_source_filter_add(input.get(), filter.get());
+    obs_set_output_source(0, input.get());
+    struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+    const auto offset = text_of(log).size();
+    const auto props = properties(filter.get());
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_off"), filter.get()),
+        "start 120Hz tap preview");
+    const auto opened = tapLog.last("[vfg] open request ");
+    expect(!opened.empty() && opened.find("transport_interval_ns=8333333") != std::string::npos &&
+        opened.find("dedup_mode=1") != std::string::npos &&
+        opened.find("live_anchor=1") != std::string::npos,
+        "120Hz open request carries interval, dedup and live anchor");
+    std::printf("120Hz open request: %s\n", opened.c_str());
+    std::fflush(stdout);
+
+    await([&] {
+        std::istringstream stream(text_of(log).substr(offset));
+        size_t count = 0;
+        for (std::string line; std::getline(stream, line);)
+            if (line.starts_with("event=present_original ")) ++count;
+        return count >= 24;
+    }, "120Hz presenter originals", 10000);
+
+    struct Sample { uint64_t tick, qpc; };
+    std::vector<Sample> samples;
+    std::istringstream stream(text_of(log).substr(offset));
+    for (std::string line; std::getline(stream, line);) {
+        if (!line.starts_with("event=present_original ")) continue;
+        const auto tick = field(line, "b_obs_tick=");
+        const auto qpc = field(line, "qpc_ns=");
+        if (!tick.empty() && !qpc.empty()) samples.push_back({std::stoull(tick), std::stoull(qpc)});
+    }
+    std::vector<int64_t> tickDeltas, qpcDeltas;
+    bool monotonic = true;
+    for (size_t i = 1; i < samples.size(); ++i) {
+        const auto tickDelta = static_cast<int64_t>(samples[i].tick) - static_cast<int64_t>(samples[i - 1].tick);
+        if (tickDelta <= 0) monotonic = false;
+        tickDeltas.push_back(tickDelta);
+        qpcDeltas.push_back(static_cast<int64_t>(samples[i].qpc) - static_cast<int64_t>(samples[i - 1].qpc));
+    }
+    std::sort(tickDeltas.begin(), tickDeltas.end());
+    std::sort(qpcDeltas.begin(), qpcDeltas.end());
+    const auto medianTick = tickDeltas[tickDeltas.size() / 2];
+    const auto medianQpc = qpcDeltas[qpcDeltas.size() / 2];
+    std::printf("120Hz delivery frames=%zu median_tick_delta_ns=%lld median_qpc_delta_ns=%lld\n",
+        samples.size(), static_cast<long long>(medianTick), static_cast<long long>(medianQpc));
+    std::fflush(stdout);
+    expect(monotonic, "120Hz OBS ticks strictly advance");
+    expect(medianTick >= 6'000'000 && medianTick <= 12'000'000, "120Hz OBS tick cadence near 8.33 ms");
+    expect(medianQpc >= 6'000'000 && medianQpc <= 12'000'000, "120Hz presenter cadence near 8.33 ms");
+    expect(std::llabs(medianTick - medianQpc) <= 2'000'000, "presenter follows the OBS 120Hz tick");
+
+    expect(obs_property_button_clicked(obs_properties_get(props.get(), "vfg_stop"), filter.get()),
+        "stop 120Hz tap preview");
+    obs_source_filter_remove(input.get(), filter.get());
+    obs_queue_task(OBS_TASK_GRAPHICS, [](void*) {}, nullptr, true);
+    std::puts("PASS 120Hz obs_reset_video tap delivery");
+}
+
 void run_isolated(wchar_t** argv, const Scenario& s)
 {
     std::printf("START %ls\n", s.name);
@@ -1290,6 +1570,7 @@ int run_host(int argc, wchar_t** argv)
             throw std::runtime_error("unknown recovery scenario");
         }
         canvas_contract(log);
+        frame_interval_120_case(log, graphics);
         std::puts("PASS vfg_filter_output: RGBA zero, scene blend, preview feed and restore");
         return 0;
     } catch (const std::exception& e) {

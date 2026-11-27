@@ -24,6 +24,9 @@ namespace {
 using Microsoft::WRL::ComPtr;
 constexpr char qualityKey[] = "vfg_quality_mode";
 constexpr char legacyQualityKey[] = "vfg_quality";
+constexpr char dedupModeKey[] = "vfg_dedup_mode";
+constexpr char liveAnchorKey[] = "vfg_live_anchor";
+constexpr char qualityWarningKey[] = "vfg_quality_warning";
 
 struct CaptureScope {
     gs_texrender_t* buffer;
@@ -62,6 +65,8 @@ struct Tap {
     bool activeSplit{};
     uint32_t multiplier{2};
     Quality quality{Quality::Medium};
+    uint32_t dedupMode{static_cast<uint32_t>(DedupMode::Auto)};
+    uint32_t liveAnchor{1};
     Backend backend{};
     PushFlowTier pushflowTier{};
     uint32_t gpuShotChange{}, experimentalAnrOptIn{}, hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{};
@@ -468,6 +473,9 @@ bool start(Tap& tap, bool off)
         LaunchOptions opts{};
         opts.multiplier = off ? 1u : std::clamp<uint32_t>(tap.multiplier, 2, max_multiplier);
         opts.quality = tap.quality;
+        opts.dedupMode = tap.dedupMode;
+        opts.liveAnchor = tap.liveAnchor;
+        opts.transportIntervalNs = obs_get_frame_interval_ns();
         opts.monitorId = utf8_to_wide(tap.monitorId);
         opts.fpsOverlay = std::min<uint32_t>(tap.fpsOverlay, 2);
         opts.lowLatency = tap.lowLatency ? 1u : 0u;
@@ -486,8 +494,9 @@ bool start(Tap& tap, bool off)
         tap.testCheckpointUsed = false;
         tap.stopping = false;
         tap.vfgActive.store(true, std::memory_order_release);
-        blog(LOG_INFO, "[vfg] open request mode=%ux quality=%u qpc_ns=%llu",
-            opts.multiplier, static_cast<unsigned>(opts.quality), static_cast<unsigned long long>(clock_ns()));
+        blog(LOG_INFO, "[vfg] open request mode=%ux quality=%u dedup_mode=%u live_anchor=%u transport_interval_ns=%llu qpc_ns=%llu",
+            opts.multiplier, static_cast<unsigned>(opts.quality), opts.dedupMode, opts.liveAnchor,
+            static_cast<unsigned long long>(opts.transportIntervalNs), static_cast<unsigned long long>(clock_ns()));
         return true;
     } catch (const std::exception& e) {
         blog(LOG_WARNING, "[vfg] presenter launch failed: %s", e.what());
@@ -546,6 +555,12 @@ void apply_settings(Tap& tap, obs_data_t* settings)
         obs_data_unset_user_value(settings, legacyQualityKey);
     }
     const auto quality = decode_quality(obs_data_get_int(settings, qualityKey));
+    const auto dedupRaw = obs_data_get_int(settings, dedupModeKey);
+    const bool dedupValid = is_valid_dedup_mode(static_cast<uint32_t>(dedupRaw));
+    // An out-of-range saved value (for example 99) must never reach the session header.
+    if (!dedupValid) obs_data_set_int(settings, dedupModeKey, static_cast<long long>(DedupMode::OffExact));
+    const auto dedup = dedupValid ? static_cast<uint32_t>(dedupRaw) : static_cast<uint32_t>(DedupMode::OffExact);
+    const uint32_t liveAnchor = obs_data_get_bool(settings, liveAnchorKey) ? 1u : 0u;
     const auto hud = static_cast<uint32_t>(std::clamp<long long>(obs_data_get_int(settings, "vfg_fps_overlay"), 0, 2));
     const uint32_t ll = obs_data_get_bool(settings, "vfg_low_latency") ? 1u : 0u;
     const uint32_t gp = obs_data_get_bool(settings, "vfg_gpu_priority") ? 1u : 0u;
@@ -558,8 +573,12 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     tap.splitSetting.update(settings);
     if (obs_upscale::update(tap.upscale, settings, enabled && !compare, enabled))
         tap.breakPair = true;
+    const auto previousDedup = tap.dedupMode;
+    const auto previousLiveAnchor = tap.liveAnchor;
     tap.multiplier = std::clamp<uint32_t>(mult ? mult : 2, 2, max_multiplier);
     tap.quality = quality;
+    tap.dedupMode = dedup;
+    tap.liveAnchor = liveAnchor;
     tap.fpsOverlay = hud;
     tap.lowLatency = ll;
     tap.gpuPriority = gp;
@@ -587,6 +606,10 @@ void apply_settings(Tap& tap, obs_data_t* settings)
         tap.controller->set_pacing_repair(tap.pacingRepair);
         tap.controller->set_adaptive_fg(tap.adaptiveFg);
         tap.controller->set_adaptive_target_fps(tap.adaptiveTargetFps);
+        tap.controller->set_dedup_mode(tap.dedupMode);
+        tap.controller->set_live_anchor(tap.liveAnchor);
+        if (tap.dedupMode != previousDedup || tap.liveAnchor != previousLiveAnchor)
+            blog(LOG_INFO, "[vfg] live settings applied dedup_mode=%u live_anchor=%u", tap.dedupMode, tap.liveAnchor);
     }
 }
 
@@ -688,6 +711,13 @@ void qa_update(void* opaque, obs_data_t* settings)
 }
 #endif
 
+bool refresh_quality_warning(obs_properties_t* properties, obs_property_t*, obs_data_t* settings)
+{
+    obs_property_set_visible(obs_properties_get(properties, qualityWarningKey),
+        obs_data_get_int(settings, qualityKey) == 0);
+    return true;
+}
+
 bool refresh_backend_properties(obs_properties_t* properties, obs_property_t*, obs_data_t* settings)
 {
     const auto backend = obs_data_get_int(settings, "vfg_backend");
@@ -769,6 +799,30 @@ obs_properties_t* properties(void* opaque)
     obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Balanced"), static_cast<long long>(Quality::Medium));
     obs_property_list_add_int(qual, obs_module_text("VFG.Quality.Best"), static_cast<long long>(Quality::High));
     obs_property_set_long_description(qual, obs_module_text("VFG.Hint.Reopen"));
+    auto* qualityWarning = obs_properties_add_text(coreGrp, qualityWarningKey,
+        obs_module_text("VFG.QualityWarning"), OBS_TEXT_INFO);
+    obs_property_set_enabled(qualityWarning, false);
+    bool fastQuality = false;
+    if (opaque) {
+        auto* tap = static_cast<Tap*>(opaque);
+        std::lock_guard lock(tap->command);
+        fastQuality = tap->quality == Quality::Low;
+    }
+    obs_property_set_visible(qualityWarning, fastQuality);
+    obs_property_set_modified_callback(qual, refresh_quality_warning);
+
+    auto* dedup = obs_properties_add_list(coreGrp, dedupModeKey, obs_module_text("VFG.DedupMode"),
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(dedup, obs_module_text("VFG.DedupMode.Off"), static_cast<long long>(DedupMode::OffExact));
+    obs_property_list_add_int(dedup, obs_module_text("VFG.DedupMode.Auto"), static_cast<long long>(DedupMode::Auto));
+    obs_property_list_add_int(dedup, obs_module_text("VFG.DedupMode.Adaptive"),
+        static_cast<long long>(DedupMode::Adaptive60To30));
+    obs_property_list_add_int(dedup, obs_module_text("VFG.DedupMode.Fixed"),
+        static_cast<long long>(DedupMode::Fixed60To30));
+    obs_property_set_long_description(dedup, obs_module_text("VFG.Hint.DedupMode"));
+
+    auto* liveAnchor = obs_properties_add_bool(coreGrp, liveAnchorKey, obs_module_text("VFG.LiveAnchor"));
+    obs_property_set_long_description(liveAnchor, obs_module_text("VFG.Hint.LiveAnchor"));
 
     auto* mon = obs_properties_add_list(coreGrp, "vfg_monitor", obs_module_text("VFG.Monitor"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -858,6 +912,8 @@ extern "C" void nr_register_vfg_tap()
     info.get_defaults = [](obs_data_t* settings) {
         obs_data_set_default_int(settings, "vfg_multiplier", 2);
         obs_data_set_default_int(settings, qualityKey, static_cast<long long>(Quality::Medium));
+        obs_data_set_default_int(settings, dedupModeKey, static_cast<long long>(DedupMode::Auto));
+        obs_data_set_default_bool(settings, liveAnchorKey, true);
         obs_data_set_default_string(settings, "vfg_monitor", "");
         obs_data_set_default_int(settings, "vfg_fps_overlay", 1);
         obs_data_set_default_bool(settings, "vfg_low_latency", true);
