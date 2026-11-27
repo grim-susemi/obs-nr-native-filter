@@ -411,7 +411,7 @@ void *create(obs_data_t *settings, obs_source_t *source)
             f->deterministicQa=obs_data_get_bool(settings,"nr_qa_deterministic");
             f->capacityEvidence=(f->deterministicQa || obs_data_get_bool(settings,"nr_qa_observe")) &&
                 obs_data_get_bool(settings,"nr_qa_capacity_evidence");
-            f->config.runtime={nr::properties::utf8_path(decoded.runtimePath),nr::properties::runtime_sha256};
+            f->config.runtime={nr::properties::utf8_path(decoded.runtimePath),decoded.runtimeSha256};
             f->config.driver=nr::runtime::resolve_driver().identity.canonicalPath;
             const auto dataRoot=*dataOverride?nr::properties::utf8_path(dataOverride):module_path(true,"runtime");
             if(dataRoot.empty())throw std::runtime_error("module configuration directory unavailable");
@@ -533,6 +533,17 @@ obs_properties_t *properties(void *opaque)
     labels.hintPass2=obs_module_text("NR.Hint.Pass2");
     labels.hintTemporal=obs_module_text("NR.Hint.Temporal");
     labels.hintHold=obs_module_text("NR.Hint.Hold");
+    std::string runtimeInfoText="not admitted";
+    bool perfModelAvailable=false;
+    if(opaque) {
+        const auto& identity=static_cast<Filter*>(opaque)->config.runtime;
+        if(const auto* variant=nr::runtime::runtime_variant(identity.sha256)) {
+            runtimeInfoText=std::string(variant->version)+(variant->supportsModelB?" / Model B available":" / Model A only");
+            perfModelAvailable=variant->supportsModelB;
+        }
+    }
+    labels.runtimeInfoText=runtimeInfoText.c_str();
+    labels.perfModelAvailable=perfModelAvailable;
     // Display only: public state/reason codes stay stable (host tests and QA read them); translate here.
     const auto localized=[](const char* prefix,std::string code)->std::string {
         struct Sentence{const char* text;const char* id;};
@@ -780,7 +791,8 @@ std::optional<nr::lifecycle::Observation> observe(Filter& f,uint64_t tick,bool f
     const nr::lifecycle::Observation observation{tick,f.sourceToken,f.deviceToken,validity,descriptor,
         {configured->revision,nr::properties::effective_enabled(configured->enabled,obs_source_enabled(f.source)),
          !control->reason.empty()?std::string{}:configured->runtimePath,configured->strength,configured->tuning,
-         configured->passes,configured->workScale,configured->pass2Tuning,configured->stabilize}};
+         configured->passes,configured->workScale,configured->pass2Tuning,configured->stabilize,
+         configured->perfModel,configured->dedupReuse}};
     const bool cut=f.cut.exchange(false);
     const bool signalled=f.callback->cut.exchange(false,std::memory_order_acq_rel);
     auto* parent=attached?obs_filter_get_parent(f.source):nullptr;

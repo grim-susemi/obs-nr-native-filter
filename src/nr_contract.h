@@ -58,6 +58,8 @@ struct Settings {
     const uint32_t passes=1, workScale=100;
     const std::optional<ModelTuning> pass2Tuning{};
     const StabilizeSettings stabilize{};
+    // 310.9.16.0 performance model switch and worker duplicate-frame reuse; off by default.
+    const bool perfModel=false, dedupReuse=false;
     bool valid() const { return revision.value != 0 && !runtimePath.empty() && strength.valid() && tuning.valid() &&
         (!pass2Tuning || pass2Tuning->valid()) && stabilize.valid() &&
         passes >= 1 && passes <= 2 && workScale >= 50 && workScale <= 100; }

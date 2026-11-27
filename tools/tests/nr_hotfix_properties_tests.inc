@@ -8,9 +8,12 @@ void nr_hotfix_properties(const std::string& runtime)
         obs_data_set_int(data,"nr_quick_preset",preset);
         expect(obs_property_modified(quick,data),"quick preset callback");
         const auto values=decode(data,default_runtime,runtime);
+        const float expectedHold=preset==1?0.80f:0.45f;
         expect(values.reason.empty() && values.strength.value==0.85f &&
-            values.stabilize.temporalStrength==0.45f && values.stabilize.holdStrength==0.45f &&
+            values.stabilize.temporalStrength==0.45f && values.stabilize.holdStrength==expectedHold &&
             values.stabilize.holdTolerance==0.02f,"built-in preset composition and anti-flicker");
+        expect(values.perfModel==(preset==1) && values.dedupReuse==(preset==1),
+            "performance model and dedup reuse are on only for the Veyra recommendation");
         expect(values.tuning.intensity==(preset==3?0.85f:1.0f),"built-in preset vendor intensity");
         if(preset==2)expect(values.pass2Tuning && values.pass2Tuning->intensity==1.0f,"combo pass2 intensity");
     }

@@ -9,7 +9,7 @@ struct NVSDK_NGX_Handle { uint64_t token=18; }; // opaque ABI handle owned by th
 using namespace nr;
 using namespace nr::runtime;
 static unsigned checks=0;
-static void check(bool v) { ++checks; if(!v) throw std::runtime_error("runtime assertion"); }
+static void check(bool v,const char* what="runtime assertion") { ++checks; if(!v) throw std::runtime_error(what); }
 struct Params final : NVSDK_NGX_Parameter {
     using Value=std::variant<unsigned long long,float,double,unsigned,int,ID3D11Resource*,ID3D12Resource*,void*>;
     std::map<std::string,Value> values;
@@ -46,6 +46,8 @@ static NVSDK_NGX_Result evaluate(ID3D12GraphicsCommandList*,const NVSDK_NGX_Hand
 }
 static NVSDK_NGX_Result release(NVSDK_NGX_Handle* h) { if(failRelease) return NVSDK_NGX_Result_Fail; check(handles.erase(h)==1); delete h; ++releases; order+='R'; return NVSDK_NGX_Result_Success; }
 static Settings settings() { return {{1},true,"C:/Program Files/obs-studio/bin/64bit/nvngx_dlssnr.dll",{1},{0,0,1,1,0,-1,true}}; }
+static Settings perfSettings(bool perf,uint32_t preset) { return {{1},true,settings().runtimePath,{1},{preset,0,1,1,0,-1,true},
+    1,100,std::nullopt,nr::StabilizeSettings{},perf,false}; }
 static JobContract job(uint64_t serial=1,uint64_t history=1) {
     return {{{1,1,serial},history,1,serial},{{1,1,serial},serial+1,serial,1,1,1,SourceValidity::Valid,
         {{1920,1080},{0,0,1920,1080},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80},settings()},serial+2};
@@ -140,6 +142,43 @@ static void adversarial() {
     check(!signaling.release() && releases==freed+1 && destroys==deleted);
     failDestroy=false; check(signaling.release() && releases==freed+1 && destroys==deleted+1);
     puts("adversarial: actual Pass fallback/direct/failure/history/cancel/independent maps PASS");
+}
+static void admissionTable() {
+    const auto variants=runtime::allowed_runtimes();
+    check(variants.size()==2,"two pinned NR runtimes");
+    check(variants[0].version=="310.8.0.0" && !variants[0].supportsModelB,"310.8.0.0 Model A entry");
+    check(variants[1].version=="310.9.16.0" && variants[1].supportsModelB,"310.9.16.0 Model B entry");
+    check(variants[0].sha256=="e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a" &&
+        variants[1].sha256=="cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed","pinned SHA-256 values");
+    check(!runtime::supports_model_b(variants[0].sha256) && runtime::supports_model_b(variants[1].sha256),"capability lookup");
+    check(!runtime::supports_model_b(std::string(64,'0')),"unknown SHA-256 has no capability");
+    check(runtime::model_b_preset==2u,"probe-verified Model B preset");
+    puts("admission: two pinned runtimes, capability lookup and probe-verified Model B preset PASS");
+}
+static void modelBSwitch() {
+    for(const bool supports:{false,true}) {
+        for(const bool perf:{false,true}) {
+            auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, supports);
+            Pass pass(module); auto created=std::make_shared<Completion>(Completion::Recorded);
+            const auto chosen=perfSettings(perf,3);
+            check(pass.prepare(chosen,chosen.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"perf prepare");
+            unsigned preset=99;
+            check(latest && latest->Get("DLSSNR.Hint.Render.Preset",&preset)==NVSDK_NGX_Result_Success,"preset parameter");
+            const auto expected=supports && perf?model_b_preset:3u;
+            check(preset==expected,"Model B only when enabled on a Model B runtime; 310.8 keeps the caller preset");
+            *created=Completion::Complete; check(pass.release(),"perf release");
+        }
+    }
+    auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, true);
+    auto created=std::make_shared<Completion>(Completion::Recorded); Pass first(module),second(module);
+    const auto chosen=perfSettings(true,1);
+    check(first.prepare(chosen,chosen.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"pass1 prepare");
+    unsigned preset=99; latest->Get("DLSSNR.Hint.Render.Preset",&preset); check(preset==model_b_preset,"pass1 Model B preset");
+    const ModelTuning pass2{0,2,1,1,0,-1,true};
+    check(second.prepare(chosen,pass2,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"pass2 prepare");
+    latest->Get("DLSSNR.Hint.Render.Preset",&preset); check(preset==model_b_preset,"pass2 Model B preset");
+    *created=Completion::Complete; check(first.release() && second.release(),"perf pair release");
+    puts("model_b: verified preset on both passes, Model A retained on 310.8 CPU PASS");
 }
 static void metadataTests() {
     std::vector<unsigned char> file(0x1400);
@@ -268,7 +307,7 @@ int main(int argc,char** argv) {
             check(r.accepted && !r.loaded); puts("owner canonical path/hash/PE64/direct exports PASS; not loaded");
         } else if(argc==2 && std::string(argv[1])=="close") ownedModuleRetry();
         else if(argc==2 && std::string(argv[1])=="trace") vendorTrace();
-        else if(argc==1) { happy(); refused(); adversarial(); workExtentTests(); metadataTests(); ownedModuleRetry(); vendorTrace(); }
+        else if(argc==1) { happy(); refused(); adversarial(); workExtentTests(); admissionTable(); modelBSwitch(); metadataTests(); ownedModuleRetry(); vendorTrace(); }
         else return 2;
         check(handles.empty() && allocations==destroys);
         printf("PASS runtime_contract: %u checks\n",checks); return 0;

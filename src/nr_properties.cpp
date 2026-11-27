@@ -33,6 +33,8 @@ void defaults(obs_data_t* data)
     obs_data_set_default_double(data,"nr_strength",0.85);
     obs_data_set_default_int(data,"nr_passes",1);
     obs_data_set_default_int(data,"nr_work_scale",100);
+    obs_data_set_default_bool(data,"nr_perf_model",false);
+    obs_data_set_default_bool(data,"nr_dedup_reuse",false);
     obs_data_set_default_int(data,"nr_preset",tuning.preset);
     obs_data_set_default_int(data,"nr_style",tuning.style);
     obs_data_set_default_double(data,"nr_intensity",tuning.intensity);
@@ -116,6 +118,8 @@ static Values read(obs_data_t* data)
     else if(!tuningValid || !pass2Valid || !stabValid)v.reason="invalidTuning";
     else if(!passesValid)v.reason="invalidPasses";
     else if(!scaleValid)v.reason="invalidWorkScale";
+    v.perfModel=obs_data_get_bool(data,"nr_perf_model");
+    v.dedupReuse=obs_data_get_bool(data,"nr_dedup_reuse");
     return v;
 }
 Values decode(obs_data_t* data,const std::string& admittedText,const std::string& immutableRuntime)
@@ -140,8 +144,21 @@ Values admit(obs_data_t* data,RuntimeInspector inspector,const std::filesystem::
             return v;
         }
         const auto canonical=std::filesystem::canonical(path);
-        const auto inspection=inspector({canonical,runtime_sha256});
-        if(!inspection.accepted) {if(v.reason.empty())v.reason=inspection.reason;return v;}
+        // One inspection, one digest read. The legacy identity is the expected hash;
+        // a 310.9.16.0 file reports hashMismatch but still carries its computed digest,
+        // which is matched against the same allowlist below. A digest equal to a pinned
+        // entry is the exact known-good bytes, so no second 276 MB hash is needed.
+        const auto candidates=runtime::allowed_runtimes();
+        const auto inspection=inspector({canonical,std::string(candidates.front().sha256)});
+        const auto* admitted=inspection.accepted && inspection.sha256.empty()?
+            &candidates.front():runtime::runtime_variant(inspection.sha256);
+        if(!admitted) {
+            const std::string reason=inspection.accepted || inspection.reason.empty()?"hashMismatch":inspection.reason;
+            if(v.reason.empty())v.reason=reason;
+            return v;
+        }
+        v.runtimeSha256=admitted->sha256;
+        v.runtimeSupportsModelB=admitted->supportsModelB;
         const auto text=canonical.generic_u8string();
         v.runtimePath.assign(reinterpret_cast<const char*>(text.data()),text.size());
     } catch(const std::exception&) {if(v.reason.empty())v.reason="runtimePathUnsupported";}
@@ -151,10 +168,10 @@ std::shared_ptr<const Settings> updated(const std::shared_ptr<const Settings>& o
 {
     if(old && old->enabled==v.enabled && old->runtimePath==v.runtimePath && old->tuning==v.tuning &&
        old->passes==v.passes && old->workScale==v.workScale && old->pass2Tuning==v.pass2Tuning &&
-       old->stabilize==v.stabilize &&
+       old->stabilize==v.stabilize && old->perfModel==v.perfModel && old->dedupReuse==v.dedupReuse &&
        (old->strength.value==v.strength.value || (std::isnan(old->strength.value) && std::isnan(v.strength.value))))return old;
     return std::make_shared<const Settings>(Settings{{old?old->revision.value+1:1},v.enabled,v.runtimePath,
-        v.strength,v.tuning,v.passes,v.workScale,v.pass2Tuning,v.stabilize});
+        v.strength,v.tuning,v.passes,v.workScale,v.pass2Tuning,v.stabilize,v.perfModel,v.dedupReuse});
 }
 bool effective_enabled(bool configured,bool sourceEnabled) {return configured && sourceEnabled;}
 StatusSnapshot status(Status state,Reason reason)
@@ -217,8 +234,10 @@ static bool on_nr_preset_or_layout_changed(obs_properties_t* props,obs_property_
             obs_data_set_bool(data,"nr_auto_mask",true);
             obs_data_set_double(data,"nr_temporal_stability",0.45);
             obs_data_set_bool(data,"nr_hold_enabled",true);
-            obs_data_set_double(data,"nr_hold_strength",0.45);
+            obs_data_set_double(data,"nr_hold_strength",preset==1?0.80:0.45);
             obs_data_set_double(data,"nr_hold_tolerance",0.020);
+            obs_data_set_bool(data,"nr_perf_model",preset==1);
+            obs_data_set_bool(data,"nr_dedup_reuse",preset==1);
             if(preset==1) {
                 obs_data_set_int(data,"nr_passes",1);
                 obs_data_set_int(data,"nr_work_scale",100);
@@ -280,6 +299,14 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     auto* pScale=obs_properties_add_int_slider(grpBasic,"nr_work_scale",labels.workScale,50,100,5);
     obs_property_int_set_suffix(pScale,"%");
     obs_property_set_long_description(pScale,labels.hintWorkScale);
+    auto* pPerf=obs_properties_add_bool(grpBasic,"nr_perf_model",labels.perfModel);
+    obs_property_set_long_description(pPerf,labels.hintPerfModel);
+    obs_property_set_enabled(pPerf,labels.perfModelAvailable);
+    auto* pDedup=obs_properties_add_bool(grpBasic,"nr_dedup_reuse",labels.dedupReuse);
+    obs_property_set_long_description(pDedup,labels.hintDedupReuse);
+    auto* pRuntime=obs_properties_add_text(grpBasic,"nr_runtime_info",
+        labels.runtimeInfoText?labels.runtimeInfoText:labels.runtimeInfo,OBS_TEXT_INFO);
+    obs_property_set_enabled(pRuntime,false);
     obs_properties_add_group(props,"nr_grp_basic",labels.groupBasic,OBS_GROUP_NORMAL,grpBasic);
 
     auto* grpPass1=obs_properties_create();

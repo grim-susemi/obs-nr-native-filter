@@ -13,8 +13,37 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
+#include <string_view>
 #include <vector>
 namespace nr::runtime {
+// The only executable NR builds admission accepts. Version and capability are
+// properties of the exact bytes, never of a filename or a caller-supplied flag.
+struct RuntimeVariant {
+    std::string_view version;
+    std::string_view sha256;
+    bool supportsModelB;
+};
+inline constexpr RuntimeVariant runtime_variants[]{
+    {"310.8.0.0","e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a",false},
+    {"310.9.16.0","cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed",true},
+};
+inline std::span<const RuntimeVariant> allowed_runtimes() { return runtime_variants; }
+inline const RuntimeVariant* runtime_variant(std::string_view sha256)
+{
+    for(const auto& variant:runtime_variants)if(variant.sha256==sha256)return &variant;
+    return nullptr;
+}
+inline bool supports_model_b(std::string_view sha256)
+{
+    const auto* variant=runtime_variant(sha256);
+    return variant && variant->supportsModelB;
+}
+// Verified by tools/tests/nr_model_b_probe_tests.cpp against the real 310.9.16.0
+// runtime: preset 1 builds the full-weights network (Model A), preset 2 builds
+// hnet-crazy-cuckoo-small-fp8 (Model B / CC_SMALL_FP8), presets 0 and 3 are not
+// available and fall back to preset 2. Never change without new probe evidence.
+inline constexpr uint32_t model_b_preset=2;
 struct RuntimeIdentity { std::filesystem::path canonicalPath; std::string sha256; };
 struct Inspection { bool accepted=false,loaded=false; std::string reason,sha256; std::vector<std::string> exports; };
 Inspection inspect(const RuntimeIdentity&); // Static read-only; never executes the DLL.
@@ -68,7 +97,8 @@ public:
         ID3D12Device*,const std::filesystem::path& privateDataPath,Route,lifecycle::VendorTrace* trace=nullptr);
     // Only external NGX/completion boundaries replaced, never the production Pass.
     static std::shared_ptr<Module> controlled(Dispatch,Dispatch,std::shared_ptr<void>,Route,
-        std::function<bool()> closeBoundary = {},RetirementControl = {});
+        std::function<bool()> closeBoundary = {},RetirementControl = {},bool supportsModelB = false);
+    bool supports_model_b() const;
 };
 enum class Completion { Recorded,Submitted,SignalFailed,Complete,Discarded };
 struct Recording {

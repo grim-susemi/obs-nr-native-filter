@@ -5,11 +5,14 @@
 #include <obs.h>
 namespace nr::properties {
 inline constexpr char default_runtime[]="";
+// The 310.8.0.0 owner identity stays the default resolver; nr::runtime::allowed_runtimes()
+// is the single admission table for both pinned builds.
 inline constexpr char runtime_sha256[]="e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a";
 // tuning is decoded from the seven nr_* model controls; ranges follow OptiScaler [DlssNr]
 // (preset 0..3, style 0..2, intensity/localStructure/localTone 0..2, skinStructure -1..2).
 struct Values { bool enabled;std::string runtimePath;CompositionStrength strength;std::string reason;ModelTuning tuning;
-    uint32_t passes=1,workScale=100;std::optional<ModelTuning> pass2Tuning{};StabilizeSettings stabilize{}; };
+    uint32_t passes=1,workScale=100;std::optional<ModelTuning> pass2Tuning{};StabilizeSettings stabilize{};
+    bool perfModel=false,dedupReuse=false;std::string runtimeSha256;bool runtimeSupportsModelB=false; };
 struct StatusSnapshot {std::string state,reason;};
 std::optional<unsigned> deadline_warning(uint32_t total,uint32_t late);
 struct DeadlineSnapshot {const uint64_t packed;const std::optional<unsigned> warning;const bool changed;};
@@ -35,6 +38,11 @@ struct Labels {
     const char* strength="Composition strength";
     const char* passes="NR passes";
     const char* workScale="NR working scale";
+    const char* perfModel="Use performance model (Model B, 310.9.16.0)";
+    const char* dedupReuse="Reuse duplicate frames in the NR worker";
+    const char* runtimeInfo="NR runtime";
+    const char* hintPerfModel="310.9.16.0 only: switches the NGX NR network from Model A full weights to the verified Model B small-FP8 preset. 310.8.0.0 keeps Model A.";
+    const char* hintDedupReuse="When consecutive source frames are identical, reuse the previous NR result instead of evaluating again.";
     const char* preset="NR model preset (0-3)";
     const char* style="NR style";
     const char* styleStandard="Standard";
@@ -86,6 +94,8 @@ struct Labels {
     const char* reasonText=nullptr;
     const char* deadlineText=nullptr;
     const char* passesText=nullptr;
+    const char* runtimeInfoText=nullptr; // admitted version/model capability, null = label only
+    bool perfModelAvailable=true;
     model::PassStatus passStatus{1,1,0,0};
 };
 void sync_visibility(obs_properties_t*,obs_data_t*);

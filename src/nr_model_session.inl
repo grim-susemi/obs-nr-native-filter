@@ -116,6 +116,7 @@ SessionKey session_key(ID3D12Device* device,const Config& config,const runtime::
     SessionKey key;
     checked(device->QueryInterface(IID_PPV_ARGS(&key.device)),"retained canonical device IUnknown");
     require(binding.signatureVerified && binding.identity.canonicalPath==config.driver,"verified session CORE key");
+    require(runtime::runtime_variant(config.runtime.sha256)!=nullptr,"allowlisted session NR identity");
     require(runtime::inspect(config.runtime).accepted,"verified session NR key");
     key.core=binding.identity;key.model=config.runtime;
     key.data=std::filesystem::canonical(config.data);

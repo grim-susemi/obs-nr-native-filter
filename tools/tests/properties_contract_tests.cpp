@@ -20,6 +20,66 @@ nr::runtime::Inspection accept_path(const nr::runtime::RuntimeIdentity&)
     result.accepted=true;
     return result;
 }
+nr::runtime::Inspection accept_310_9(const nr::runtime::RuntimeIdentity&)
+{
+    ++inspections;
+    nr::runtime::Inspection result{};
+    result.reason="hashMismatch";
+    result.sha256="cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed";
+    return result;
+}
+nr::runtime::Inspection reject_modified(const nr::runtime::RuntimeIdentity&)
+{
+    ++inspections;
+    nr::runtime::Inspection result{};
+    result.reason="hashMismatch";
+    result.sha256=std::string(64,'0');
+    return result;
+}
+void dual_runtime_admission(const std::filesystem::path& fixture)
+{
+    auto* data=obs_data_create();defaults(data);
+    obs_data_set_string(data,"nr_runtime_path",fixture.generic_string().c_str());
+    const auto before=inspections;
+    const auto modern=admit(data,accept_310_9);
+    expect(modern.reason.empty() && modern.runtimeSha256=="cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed" &&
+        modern.runtimeSupportsModelB,"310.9.16.0 digest accepted from the pinned table");
+    expect(inspections==before+1,"310.9.16.0 inspected exactly once");
+    const auto rejected=admit(data,reject_modified);
+    expect(rejected.reason=="hashMismatch" && rejected.runtimeSha256.empty() && !rejected.runtimeSupportsModelB,
+        "unnlisted/modified digest refused");
+    expect(inspections==before+2,"modified digest inspected exactly once");
+    std::puts("admission: 310.9.16.0 digest accepted, modified digest hashMismatch, one inspection each, zero load");
+    obs_data_release(data);
+}
+void model_b_controls(const std::shared_ptr<const nr::Settings>& initial)
+{
+    auto* data=obs_data_create();defaults(data);
+    expect(!obs_data_get_bool(data,"nr_perf_model") && !obs_data_get_bool(data,"nr_dedup_reuse"),
+        "performance model and dedup reuse default off");
+    obs_data_set_bool(data,"nr_perf_model",true);obs_data_set_bool(data,"nr_dedup_reuse",true);
+    const auto decoded=decode(data,default_runtime,initial->runtimePath);
+    expect(decoded.reason.empty() && decoded.perfModel && decoded.dedupReuse,"performance model decode");
+    const auto next=updated(initial,decoded);
+    expect(next->perfModel && next->dedupReuse && next->revision.value==initial->revision.value+1,
+        "performance model revision once");
+    expect(updated(next,decoded)==next,"performance model identity");
+    auto* props=controls({"priming","awaitingSample"});
+    for(const auto* key:{"nr_perf_model","nr_dedup_reuse"})
+        expect(obs_properties_get(props,key) && obs_property_get_type(obs_properties_get(props,key))==OBS_PROPERTY_BOOL,key);
+    auto* info=obs_properties_get(props,"nr_runtime_info");
+    expect(info && obs_property_get_type(info)==OBS_PROPERTY_TEXT && !obs_property_enabled(info),"read-only runtime info");
+    auto* row=obs_properties_get(props,"nr_work_scale");
+    expect(obs_property_next(&row) && std::string(obs_property_name(row))=="nr_perf_model" &&
+        obs_property_next(&row) && std::string(obs_property_name(row))=="nr_dedup_reuse" &&
+        obs_property_next(&row) && std::string(obs_property_name(row))=="nr_runtime_info","performance control order");
+    obs_properties_destroy(props);
+    Labels unavailable;unavailable.perfModelAvailable=false;
+    auto* gated=controls({},unavailable);
+    expect(!obs_property_enabled(obs_properties_get(gated,"nr_perf_model")),"310.8 Model B control disabled");
+    obs_properties_destroy(gated);
+    obs_data_release(data);
+}
 struct CpuProcessor final:nr::pipeline::Processor {
     nr::pipeline::Processed process(const nr::pipeline::Work& w,std::stop_token)override {return {w.job,false,{}};}
 };
@@ -305,8 +365,10 @@ int main(int argc,char** argv)
         }
         obs_properties_destroy(props);
         const auto installed=std::filesystem::canonical(argv[0]);
+        dual_runtime_admission(installed);
         const auto first=admit(data,accept_path,installed);
         expect(first.enabled && first.strength.value==0.85f && first.reason.empty() &&
+            first.runtimeSha256==runtime_sha256 && !first.runtimeSupportsModelB &&
             std::filesystem::equivalent(utf8_path(first.runtimePath),installed),"defaults resolve the installed runtime");
         expect(effective_enabled(true,true) && !effective_enabled(true,false) &&
                !effective_enabled(false,true) && !effective_enabled(false,false),"enable truth table");
@@ -320,6 +382,7 @@ int main(int argc,char** argv)
         expect(followed->tuning==chosen && followed->revision.value==9,"tuning follows decoded values");
         tuning_controls(a);
         multipass_controls(a);
+        model_b_controls(a);
         nr_hotfix_properties(a->runtimePath);
         passes_status_controls();
     {
@@ -364,9 +427,12 @@ int main(int argc,char** argv)
         obs_data_set_string(data,"nr_runtime_path","C:/nr-properties-contract-missing.dll");
         expect(admit(data,count_inspection).reason=="runtimeMissing","missing refused");
         obs_data_set_string(data,"nr_runtime_path","C:/Windows/System32/kernel32.dll");
+        const auto wrongBefore=inspections;
         expect(admit(data,count_inspection).reason=="hashMismatch","wrong runtime hash refused");
         const auto refused=nr::runtime::inspect({std::filesystem::canonical("C:/Windows/System32/kernel32.dll"),runtime_sha256});
         expect(!refused.accepted && !refused.loaded,"admission never loads DLL");
+        expect(inspections==wrongBefore+1,"wrong runtime inspected exactly once");
+        std::puts("admission fixture: wrong/modified DLL -> hashMismatch, inspections=1, loaded=false");
         // This executable is a fixture for path selection only. The actual
         // proprietary admission and evaluation are checked in isolated OBS.
         const auto fixture=installed.generic_string();

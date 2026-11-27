@@ -361,6 +361,7 @@ struct Module::Impl {
     decltype(&NVSDK_NGX_D3D12_Shutdown1) shutdown=nullptr;
     NVSDK_NGX_Parameter* capabilities=nullptr;
     bool initialized=false,controlled=false,attempted=false;
+    bool supportsModelB=false;
     bool initUnreturned=false,initFailed=false;
     RetirementControl retirement;
     std::function<bool()> closeBoundary;
@@ -465,9 +466,10 @@ Module::~Module() {
     }
 }
 std::shared_ptr<Module> Module::controlled(Dispatch driver,Dispatch direct,std::shared_ptr<void> lease,Route route,
-    std::function<bool()> closeBoundary,RetirementControl retirement) {
+    std::function<bool()> closeBoundary,RetirementControl retirement,bool supportsModelB) {
     if(!driver.valid() || !lease) return {};
     auto p=std::make_unique<Impl>(); p->driver=driver; p->direct=direct; p->lease=std::move(lease); p->route=route; p->controlled=true;
+    p->supportsModelB=supportsModelB;
     p->closeBoundary=std::move(closeBoundary);
     p->trace=retirement.trace;p->capabilities=retirement.capabilities;
     p->initialized=static_cast<bool>(retirement.shutdown);p->retirement=std::move(retirement);
@@ -481,10 +483,12 @@ std::shared_ptr<Module> Module::open(const RuntimeIdentity& id,Dispatch driver,s
     p->pinnedFile.handle=CreateFileW(id.canonicalPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(p->pinnedFile.handle==INVALID_HANDLE_VALUE || !inspect(id).accepted) return {};
     p->identity=id; p->driver=driver; p->lease=std::move(lease); p->device=device; p->dataPath=dataPath; p->route=route;
+    p->supportsModelB=runtime::supports_model_b(id.sha256);
     auto owner=std::shared_ptr<Module>(new Module(std::move(p)));
     if(route==Route::Direct && !owner->impl_->openDirect()) return {};
     return owner;
 }
+bool Module::supports_model_b() const { return impl_->supportsModelB; }
 struct Submission::Impl {
     Completion status=Completion::Recorded;
     ComPtr<ID3D12Fence> fence;
@@ -562,14 +566,22 @@ NVSDK_NGX_Result Pass::prepare(const Settings& settings,const ModelTuning& passT
     auto& p=*impl_; auto& m=*p.module->impl_; std::lock_guard lock(m.mutex);
     if(p.failed || p.retired || !settings.valid() || !passTuning.valid() || !settings.enabled || !size.width || !size.height || !history || !valid(recording) ||
         (!m.controlled && std::filesystem::path(settings.runtimePath)!=m.identity.canonicalPath)) return NVSDK_NGX_Result_Fail;
-    if(p.params) return p.settings==settings && p.passTuning==passTuning && p.extent==size && p.history==history?NVSDK_NGX_Result_Success:NVSDK_NGX_Result_Fail;
-    p.settings.emplace(settings); p.passTuning.emplace(passTuning); p.extent.emplace(size); p.history=history;
+    // The verified Model B preset replaces both pass tunings only on a runtime that
+    // advertises the capability; 310.8.0.0 keeps its caller preset (Model A) and
+    // names the refusal. With the toggle off the caller's preset is authoritative.
+    if(settings.perfModel && !m.supportsModelB)OutputDebugStringA("NR runtime: model_b_unavailable_on_310_8\n");
+    const uint32_t effectivePreset=settings.perfModel && m.supportsModelB?model_b_preset:passTuning.preset;
+    const ModelTuning effective{effectivePreset,
+        passTuning.style,passTuning.intensity,passTuning.localStructure,passTuning.localTone,
+        passTuning.skinStructure,passTuning.autoMask};
+    if(p.params) return p.settings==settings && p.passTuning==effective && p.extent==size && p.history==history?NVSDK_NGX_Result_Success:NVSDK_NGX_Result_Fail;
+    p.settings.emplace(settings); p.passTuning.emplace(effective); p.extent.emplace(size); p.history=history;
     auto result=m.driver.allocate(&p.params);
     if(result!=NVSDK_NGX_Result_Success || !p.params) { p.failed=true; return NVSDK_NGX_Result_Fail; }
     auto* params=p.params;
     params->Set("DLSSNR.Enabled",1u); params->Set("DLSSNR.Width",size.width); params->Set("DLSSNR.Height",size.height);
     params->Set("CreationNodeMask",1u); params->Set("VisibilityNodeMask",1u);
-    params->Set("DLSSNR.Hint.Render.Preset",passTuning.preset); tuning(params,passTuning);
+    params->Set("DLSSNR.Hint.Render.Preset",effective.preset); tuning(params,effective);
     params->Set("DLSSNR.UICorrection",1u);
     for(auto name:{"DLSSNR.ControlMask","DLSSNR.UI","DLSSNR.UIAlpha","DLSSNR.Backbuffer"})
         params->Set(name,static_cast<ID3D12Resource*>(nullptr));

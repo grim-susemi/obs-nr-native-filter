@@ -18,3 +18,10 @@ add_executable(runtime_contract ${CMAKE_CURRENT_LIST_DIR}/../../tools/tests/runt
 target_compile_options(runtime_contract PRIVATE /W4 /WX /permissive-)
 target_link_libraries(runtime_contract PRIVATE nr_runtime)
 add_test(NAME runtime_contract COMMAND runtime_contract)
+# The CTest name is properties_contract; expose the same build target name for scripts.
+add_custom_target(properties_contract)
+add_dependencies(properties_contract properties_contract_tests)
+# Hardware probe: requires the local 310.9.16.0 runtime through --require-runtime.
+add_executable(nr_model_b_probe_tests "${CMAKE_CURRENT_LIST_DIR}/../../tools/tests/nr_model_b_probe_tests.cpp")
+target_compile_options(nr_model_b_probe_tests PRIVATE /W4 /WX /permissive-)
+target_link_libraries(nr_model_b_probe_tests PRIVATE nr_runtime dxgi)
