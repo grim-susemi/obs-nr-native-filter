@@ -80,6 +80,9 @@ struct XeFgExports {
         xefg_swapchain_properties_t*) {};
     xefg_swapchain_result_t (*d3d12_get_initialization_parameters)(xefg_swapchain_handle_t,
         xefg_swapchain_d3d12_init_params_t*) {};
+    xefg_swapchain_result_t (*d3d12_init_from_swapchain)(xefg_swapchain_handle_t,
+        ID3D12CommandQueue*, const xefg_swapchain_d3d12_init_params_t*) {};
+    xefg_swapchain_result_t (*get_pipeline_build_status)(xefg_swapchain_handle_t) {};
     xefg_swapchain_result_t (*d3d12_update_external_heap)(xefg_swapchain_handle_t, ID3D12Heap*,
         uint64_t, ID3D12Heap*, uint64_t) {};
     xefg_swapchain_result_t (*enable_debug_feature)(xefg_swapchain_handle_t,

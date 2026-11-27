@@ -63,6 +63,14 @@ struct XeFgTagRequest {
     const char* name{};
 };
 
+// Latest XeSS present status, exposed for the real-device probe and telemetry.
+struct XeFgPresentStatus {
+    uint32_t framesPresented{};
+    int32_t result{};
+    uint32_t enabled{};
+    bool valid{};
+};
+
 class XeFgPresenter final : public IFgBackend {
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -85,6 +93,7 @@ public:
     bool close() noexcept override;
     bool owns_presentation() const noexcept override { return true; }
     std::optional<UINT> present_original(const FgOriginalDesc&) override;
+    [[nodiscard]] XeFgPresentStatus last_present_status() const noexcept;
 private:
     bool tag_resource(ID3D12GraphicsCommandList*, uint32_t presentId, const XeFgTagRequest&);
     [[nodiscard]] bool drain_draw_queue(DWORD timeoutMs);

@@ -471,8 +471,11 @@ void frames(Feed& f)
     const size_t backendCapacity = vfg ? vfg->max_in_flight_pairs() : 1;
     const size_t batchCapacity = mult == max_multiplier ? 1 : backendCapacity;
     const LONG reportedHudLock = hudLockSupported ? InterlockedCompareExchange(&f.view.hudLock, 0, 0) : 0;
+    // XeFgPresenter forces XeLL sleep on for every UI low-latency value; report
+    // the effective presenter state, not the session toggle that cannot apply.
+    const LONG reportedLowLatency = f.view.backend == Backend::XeFg ? 1 : lastReflex;
     fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld batch_capacity=%zu\n",
-        vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, lastReflex, f.view.gpuShotChange,
+        vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, reportedLowLatency, f.view.gpuShotChange,
         reportedHudLock, InterlockedCompareExchange(&f.view.pacingRepair, 0, 0),
         InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0), batchCapacity);
     f.beat();

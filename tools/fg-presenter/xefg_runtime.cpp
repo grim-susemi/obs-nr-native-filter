@@ -336,6 +336,10 @@ XeFgLoadStatus XeFgRuntime::open(std::wstring_view directory, FILE* log)
         "xefgSwapChainD3D12GetProperties");
     a.d3d12_get_initialization_parameters = resolve<decltype(a.d3d12_get_initialization_parameters)>(s.fg,
         "xefgSwapChainD3D12GetInitializationParameters");
+    a.d3d12_init_from_swapchain = resolve<decltype(a.d3d12_init_from_swapchain)>(s.fg,
+        "xefgSwapChainD3D12InitFromSwapChain");
+    a.get_pipeline_build_status = resolve<decltype(a.get_pipeline_build_status)>(s.fg,
+        "xefgSwapChainGetPipelineBuildStatus");
     a.d3d12_update_external_heap = resolve<decltype(a.d3d12_update_external_heap)>(s.fg,
         "xefgSwapChainD3D12UpdateExternalHeapOnResize");
     a.enable_debug_feature = resolve<decltype(a.enable_debug_feature)>(s.fg,

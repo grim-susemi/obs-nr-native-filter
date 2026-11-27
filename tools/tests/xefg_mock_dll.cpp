@@ -26,6 +26,22 @@ void log_line(const char* format, ...)
     fputc('\n', file);
     fclose(file);
 }
+bool sleep_unsupported()
+{
+    wchar_t value[8]{};
+    return GetEnvironmentVariableW(L"OBS_NR_TEST_XESS_SLEEP_UNSUPPORTED", value,
+               ARRAYSIZE(value)) == 1 && value[0] == L'1';
+}
+void record_sleep_mode(uint32_t low)
+{
+    SetEnvironmentVariableW(L"OBS_NR_TEST_XESS_LAST_SLEEP_LOW", low ? L"1" : L"0");
+}
+bool sleep_is_low()
+{
+    wchar_t value[8]{};
+    return GetEnvironmentVariableW(L"OBS_NR_TEST_XESS_LAST_SLEEP_LOW", value,
+               ARRAYSIZE(value)) == 1 && value[0] == L'1';
+}
 }
 
 #ifdef XEFG_MOCK_LIBRARY_FG
@@ -38,14 +54,7 @@ xefg_swapchain_handle_t fg_context()
 {
     return reinterpret_cast<xefg_swapchain_handle_t>(static_cast<uintptr_t>(0x58454746));
 }
-bool force_latency_unsupported()
-{
-    wchar_t value[8]{};
-    return GetEnvironmentVariableW(L"OBS_NR_TEST_XESS_FORCE_LATENCY_UNSUPPORTED", value,
-               ARRAYSIZE(value)) == 1 && value[0] == L'1';
-}
 Microsoft::WRL::ComPtr<IDXGISwapChain1> fg_swap;
-bool fg_latency_retried;
 }
 
 extern "C" {
@@ -75,9 +84,8 @@ XEFG_SWAPCHAIN_API xefg_swapchain_result_t xefgSwapChainDestroy(xefg_swapchain_h
 
 XEFG_SWAPCHAIN_API xefg_swapchain_result_t xefgSwapChainSetEnabled(xefg_swapchain_handle_t, uint32_t enable)
 {
-    if (force_latency_unsupported() && !fg_latency_retried) {
-        fg_latency_retried = true;
-        log_line("xefg_enabled latency_unsupported");
+    if (!sleep_is_low()) {
+        log_line("xefg_enabled latency_mismatch sleep_low=0");
         return XEFG_SWAPCHAIN_RESULT_ERROR_LATENCY_REDUCTION_UNSUPPORTED;
     }
     log_line("xefg_enabled enabled=%u", enable);
@@ -194,7 +202,13 @@ XELL_EXPORT xell_result_t xellD3D12CreateContext(ID3D12Device* device, xell_cont
 
 XELL_EXPORT xell_result_t xellSetSleepMode(xell_context_handle_t, const xell_sleep_params_t* parameters)
 {
-    log_line("xell_sleep_mode low_latency=%u", parameters ? parameters->bLowLatencyMode : 0u);
+    const uint32_t low = parameters ? parameters->bLowLatencyMode : 0u;
+    log_line("xell_sleep_mode low_latency=%u", low);
+    if (sleep_unsupported()) {
+        log_line("xell_sleep_unsupported");
+        return XELL_RESULT_ERROR_UNSUPPORTED;
+    }
+    record_sleep_mode(low);
     return XELL_RESULT_SUCCESS;
 }
 

@@ -264,10 +264,11 @@ struct XeFgPresenter::Impl {
     uint64_t pairId{};
     uint64_t presents{};
     uint64_t lastPresentNs{};
-    LONG lastLowLatency{-1};
+    xefg_swapchain_present_status_t lastPresent{};
     xefg_swapchain_result_t lastStatus{};
     uint32_t lastFrames{}, lastEnabled{};
     bool statusLogged{}, sleepFailureLogged{}, faulted{}, closed{}, initialized{}, latencyReduction{};
+    bool forcedNotice{};
 };
 
 XeFgPresenter::XeFgPresenter(Gpu& gpu, Session& session, FILE* log)
@@ -299,9 +300,17 @@ bool XeFgPresenter::open(std::unique_ptr<XeFgRuntime>&& runtime)
     };
     auto xellResult = a.xell_create(s.gpu.d3d_device(), &s.xell);
     if (xellResult != XELL_RESULT_SUCCESS) return fail("xell_create", xellResult);
+    // XeSS-FG 3.0.2's 2x path on the tested drivers requires XeLL sleep-on AND
+    // the latency-reduction link: sleep-off+link returns -15 from SetEnabled,
+    // and sleep-on without the link fails init with -15. XeFg therefore forces
+    // XeLL sleep for every UI low-latency value; the UI toggle cannot disable
+    // 2x silently, and the forced state is exposed in telemetry.
     xell_sleep_params_t sleep{};
-    sleep.bLowLatencyMode = InterlockedCompareExchange(&s.session.lowLatency, 0, 0) ? 1u : 0u;
-    s.lastLowLatency = sleep.bLowLatencyMode ? 1 : 0;
+    sleep.bLowLatencyMode = 1;
+    if (!InterlockedCompareExchange(&s.session.lowLatency, 0, 0) && s.log) {
+        s.forcedNotice = true;
+        fprintf(s.log, "event=xefg_low_latency_forced session=0\n");
+    }
     xellResult = a.xell_set_sleep_mode(s.xell, &sleep);
     if (xellResult != XELL_RESULT_SUCCESS) return fail("xell_set_sleep_mode", xellResult);
     auto result = a.d3d12_create_context(s.gpu.d3d_device(), &s.swapchain);
@@ -311,66 +320,46 @@ bool XeFgPresenter::open(std::unique_ptr<XeFgRuntime>&& runtime)
     if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) return fail("get_properties", result);
     const uint32_t interpolations = std::min<uint32_t>(1, properties.maxSupportedInterpolations);
     if (!interpolations) return fail("max_supported_interpolations", properties.maxSupportedInterpolations);
-    // Attempt 0 links XeLL latency reduction. A GPU/driver pair can support XeFG
-    // while rejecting XeLL (NVIDIA exposes no XeLL device), and the library
-    // refuses to enable frame generation after the link was made. Recreate the
-    // XeFG context without ever linking XeLL, then keep the official 2x path.
-    bool latency = true;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (attempt == 1) {
-            s.proxy.Reset();
-            (void)a.destroy(s.swapchain);
-            s.swapchain = nullptr;
-            result = a.d3d12_create_context(s.gpu.d3d_device(), &s.swapchain);
-            if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) return fail("d3d12_create_context_retry", result);
-        } else {
-            result = a.set_latency_reduction(s.swapchain, s.xell);
-            if (s.log) fprintf(s.log, "event=xefg_latency_reduction result=%d\n", static_cast<int>(result));
-        }
-        DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = s.session.width;
-        desc.Height = s.session.height;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 3;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        desc.Scaling = DXGI_SCALING_STRETCH;
-        xefg_swapchain_d3d12_init_params_t params{};
-        params.pApplicationSwapChain = nullptr;
-        params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
-        params.maxInterpolatedFrames = interpolations;
-        params.creationNodeMask = params.visibleNodeMask = 1;
-        params.uiMode = XEFG_SWAPCHAIN_UI_MODE_NONE;
-        result = a.d3d12_init_from_desc(s.swapchain, s.gpu.window(), &desc, nullptr,
-            s.gpu.drawQueue.Get(), s.gpu.dxgi_factory(), &params);
-        if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
-            return fail(attempt ? "d3d12_init_from_swapchain_desc_retry" : "d3d12_init_from_swapchain_desc",
-                result);
-        result = a.d3d12_get_swapchain_ptr(s.swapchain, IID_PPV_ARGS(&s.proxy));
-        if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
-            return fail(attempt ? "d3d12_get_swapchain_ptr_retry" : "d3d12_get_swapchain_ptr", result);
-        result = a.set_enabled(s.swapchain, 1);
-        if (result == XEFG_SWAPCHAIN_RESULT_ERROR_LATENCY_REDUCTION_UNSUPPORTED && attempt == 0) {
-            if (s.log) fprintf(s.log, "event=xefg_latency_reduction_unsupported fallback=disabled\n");
-            latency = false;
-            continue;
-        }
-        if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
-            return fail(attempt ? "set_enabled_retry" : "set_enabled", result);
-        break;
+    result = a.set_latency_reduction(s.swapchain, s.xell);
+    if (s.log) fprintf(s.log, "event=xefg_latency_reduction result=%d\n", static_cast<int>(result));
+    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) return fail("set_latency_reduction", result);
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = s.session.width;
+    desc.Height = s.session.height;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 3;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    xefg_swapchain_d3d12_init_params_t params{};
+    params.pApplicationSwapChain = nullptr;
+    params.initFlags = XEFG_SWAPCHAIN_INIT_FLAG_NONE;
+    params.maxInterpolatedFrames = interpolations;
+    params.creationNodeMask = params.visibleNodeMask = 1;
+    params.uiMode = XEFG_SWAPCHAIN_UI_MODE_NONE;
+    result = a.d3d12_init_from_desc(s.swapchain, s.gpu.window(), &desc, nullptr,
+        s.gpu.drawQueue.Get(), s.gpu.dxgi_factory(), &params);
+    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) return fail("d3d12_init_from_swapchain_desc", result);
+    result = a.d3d12_get_swapchain_ptr(s.swapchain, IID_PPV_ARGS(&s.proxy));
+    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) return fail("d3d12_get_swapchain_ptr", result);
+    s.latencyReduction = true;
+    result = a.set_enabled(s.swapchain, 1);
+    if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) {
+        if (result == XEFG_SWAPCHAIN_RESULT_ERROR_LATENCY_REDUCTION_UNSUPPORTED && s.log)
+            fprintf(s.log, "event=xefg_set_enabled_refused reason=latency_reduction\n");
+        return fail("set_enabled", result);
     }
-    s.latencyReduction = latency;
     s.initialized = true;
     if (s.log) {
         const auto version = s.runtime->swapchain_version();
         fprintf(s.log,
             "event=xefg_initialized version=%u.%u.%u max_interpolations=%u max_supported=%u ui_mode=%u "
-            "render=%ux%u draws=%p latency_reduction=%d\n",
+            "render=%ux%u draws=%p latency_reduction=%d low_latency=1 forced=%d\n",
             version.major, version.minor, version.patch, interpolations,
             properties.maxSupportedInterpolations, static_cast<unsigned>(XEFG_SWAPCHAIN_UI_MODE_NONE),
             s.session.width, s.session.height, static_cast<void*>(s.proxy.Get()),
-            s.latencyReduction ? 1 : 0);
+            s.latencyReduction ? 1 : 0, s.forcedNotice ? 1 : 0);
     }
     return true;
 }
@@ -466,6 +455,7 @@ void XeFgPresenter::log_present_status(uint32_t presentId)
     xefg_swapchain_present_status_t status{};
     if (s.runtime->api().get_last_present_status(s.swapchain, &status) != XEFG_SWAPCHAIN_RESULT_SUCCESS)
         return;
+    s.lastPresent = status;
     if (s.statusLogged && status.frameGenResult == s.lastStatus && status.framesPresented == s.lastFrames &&
         status.isFrameGenEnabled == s.lastEnabled)
         return;
@@ -476,6 +466,14 @@ void XeFgPresenter::log_present_status(uint32_t presentId)
     if (s.log) fprintf(s.log,
         "event=xefg_present_status present_id=%u frames=%u result=%d enabled=%u\n", presentId,
         status.framesPresented, static_cast<int>(status.frameGenResult), status.isFrameGenEnabled);
+}
+
+XeFgPresentStatus XeFgPresenter::last_present_status() const noexcept
+{
+    const auto& s = *impl_;
+    if (!s.statusLogged) return {};
+    return {s.lastPresent.framesPresented, static_cast<int32_t>(s.lastPresent.frameGenResult),
+        s.lastPresent.isFrameGenEnabled, true};
 }
 
 std::optional<UINT> XeFgPresenter::present_original(const FgOriginalDesc& original)
@@ -557,27 +555,26 @@ std::optional<UINT> XeFgPresenter::present_original(const FgOriginalDesc& origin
         throw ipc::Error(ipc::Status::ProtocolError, E_FAIL, failedCall);
     }
     auto& a = s.runtime->api();
-    const LONG lowLatency = InterlockedCompareExchange(&s.session.lowLatency, 0, 0) ? 1 : 0;
-    if (lowLatency != s.lastLowLatency) {
-        xell_sleep_params_t sleep{};
-        sleep.bLowLatencyMode = lowLatency ? 1u : 0u;
-        const auto result = a.xell_set_sleep_mode(s.xell, &sleep);
-        if (s.log) fprintf(s.log, "event=xefg_low_latency enabled=%ld result=%d\n", lowLatency,
-            static_cast<int>(result));
-        s.lastLowLatency = lowLatency;
+    // XeFgPresenter::open forces XeLL sleep on because the official 2x path
+    // requires it on the tested drivers. A live UI toggle to off must not turn
+    // sleep off and silently lose frame generation, so keep it on and expose
+    // the forced state once.
+    if (!s.forcedNotice && !InterlockedCompareExchange(&s.session.lowLatency, 0, 0)) {
+        s.forcedNotice = true;
+        if (s.log) fprintf(s.log, "event=xefg_low_latency_forced session=0\n");
     }
-    (void)a.xell_add_marker(s.xell, presentId, XELL_SIMULATION_START);
-    (void)a.xell_add_marker(s.xell, presentId, XELL_SIMULATION_END);
-    (void)a.xell_add_marker(s.xell, presentId, XELL_RENDERSUBMIT_START);
-    (void)a.xell_add_marker(s.xell, presentId, XELL_RENDERSUBMIT_END);
-    (void)a.xell_add_marker(s.xell, presentId, XELL_PRESENT_START);
-    if (lowLatency && s.latencyReduction) {
+    if (s.latencyReduction) {
         const auto result = a.xell_sleep(s.xell, presentId);
         if (result != XELL_RESULT_SUCCESS && !s.sleepFailureLogged && s.log) {
             s.sleepFailureLogged = true;
             fprintf(s.log, "event=xefg_sleep_failed result=%d\n", static_cast<int>(result));
         }
     }
+    (void)a.xell_add_marker(s.xell, presentId, XELL_SIMULATION_START);
+    (void)a.xell_add_marker(s.xell, presentId, XELL_SIMULATION_END);
+    (void)a.xell_add_marker(s.xell, presentId, XELL_RENDERSUBMIT_START);
+    (void)a.xell_add_marker(s.xell, presentId, XELL_RENDERSUBMIT_END);
+    (void)a.xell_add_marker(s.xell, presentId, XELL_PRESENT_START);
     const HRESULT present = s.proxy->Present(0, 0);
     (void)a.xell_add_marker(s.xell, presentId, XELL_PRESENT_END);
     if (FAILED(present)) {

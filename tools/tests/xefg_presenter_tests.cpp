@@ -168,7 +168,7 @@ struct TestWindow {
     HWND hwnd{};
     TestWindow()
     {
-        hwnd = CreateWindowExW(0, L"STATIC", L"xefg-presenter-test", WS_POPUP, 0, 0, 1280, 720,
+        hwnd = CreateWindowExW(0, L"STATIC", L"xefg-presenter-test", WS_OVERLAPPEDWINDOW, 0, 0, 1280, 720,
             nullptr, nullptr, nullptr, nullptr);
         expect(hwnd != nullptr, "hidden test window");
     }
@@ -335,48 +335,95 @@ void presenter_lifecycle(const fs::path& runtimeDir, const fs::path& scratch)
         "swapchain_less=1 owns_presentation=1\n");
 }
 
-void latency_fallback(const fs::path& runtimeDir, const fs::path& scratch)
+void forced_low_latency(const fs::path& runtimeDir, const fs::path& scratch)
 {
-    const auto callLog = scratch / L"latency-calls.log";
-    const auto presenterLog = scratch / L"latency.log";
+    const auto callLog = scratch / L"forced-low-latency-calls.log";
+    const auto presenterLog = scratch / L"forced-low-latency.log";
     std::error_code ignored;
     fs::remove(callLog, ignored);
     fs::remove(presenterLog, ignored);
     EnvScope env;
     trust_mock(env, runtimeDir, callLog.wstring());
-    env.set(L"OBS_NR_TEST_XESS_FORCE_LATENCY_UNSUPPORTED", L"1");
+    env.clear(L"OBS_NR_TEST_XESS_SLEEP_UNSUPPORTED");
+    env.clear(L"OBS_NR_TEST_XESS_LAST_SLEEP_LOW");
     auto device = make_d3d12_device();
     Session session = make_session(device.Get(), runtimeDir);
+    session.lowLatency = 0; // the UI vfg_low_latency unchecked case
     TestWindow window;
     Gpu gpu(session, window.hwnd, 2, false);
     FILE* file = nullptr;
     _wfopen_s(&file, presenterLog.c_str(), L"wb");
     struct File { FILE*& f; ~File() { if (f) fclose(f); } } close{file};
     auto runtime = std::make_unique<XeFgRuntime>();
-    expect(runtime->open(runtimeDir.wstring(), file) == XeFgLoadStatus::Ok, "latency runtime admitted");
+    expect(runtime->open(runtimeDir.wstring(), file) == XeFgLoadStatus::Ok, "forced latency runtime admitted");
     XeFgPresenter presenter(gpu, session, file);
     expect(presenter.open(std::move(runtime)),
-        "XeFG initializes after dropping unsupported XeLL latency reduction");
-    expect(presenter.close(), "latency fallback teardown");
+        "XeFG forces XeLL sleep so low-latency unchecked still enables 2x");
+    expect(presenter.close(), "forced low-latency teardown");
     if (file) {
         std::fclose(file);
         file = nullptr;
     }
     const auto calls = read_text(callLog);
-    expect(calls.find("xefg_enabled latency_unsupported") != std::string::npos,
-        "driver rejected XeLL latency reduction");
-    expect(count_occurrences(calls, "xefg_create_context") == 2,
-        "context is recreated without the XeLL link");
-    expect(count_occurrences(calls, "xefg_latency_reduction context=") == 1,
-        "latency reduction is linked only on the first context");
+    expect(calls.find("xell_sleep_mode low_latency=1") != std::string::npos,
+        "XeLL sleep is forced on despite Session.lowLatency=0");
+    expect(calls.find("xefg_latency_reduction context=") != std::string::npos,
+        "latency reduction is linked to the sleep-on context");
+    expect(calls.find("xefg_enabled latency_mismatch") == std::string::npos,
+        "the mock driver never sees a sleep/link mismatch");
     expect(count_occurrences(calls, "xefg_enabled enabled=1") == 1,
-        "2x enabled on the retry without latency reduction");
+        "2x is enabled with low latency unchecked");
+    expect(count_occurrences(calls, "xefg_create_context") == 1,
+        "one context, no recreate retry");
     const auto log = read_text(presenterLog);
-    expect(log.find("event=xefg_latency_reduction_unsupported fallback=disabled") != std::string::npos,
-        "fallback is logged");
-    expect(log.find("latency_reduction=0") != std::string::npos,
-        "initialized without XeLL latency reduction");
-    std::printf("PASS xefg_presenter: latency_fallback set_enabled=-15 -> xell link disabled -> 2x enabled\n");
+    expect(log.find("event=xefg_low_latency_forced session=0") != std::string::npos,
+        "forced low latency is logged");
+    expect(log.find("low_latency=1 forced=1") != std::string::npos,
+        "initialized reports the effective forced low-latency state");
+    expect(log.find("latency_reduction=1") != std::string::npos,
+        "initialized keeps the XeLL link");
+    std::printf("PASS xefg_presenter: forced_low_latency session=0 -> xell_sleep=1 + link -> "
+        "set_enabled=0 no_recreate\n");
+}
+
+void sleep_refusal_fallback(const fs::path& runtimeDir, const fs::path& scratch)
+{
+    const auto callLog = scratch / L"sleep-refusal-calls.log";
+    const auto presenterLog = scratch / L"sleep-refusal.log";
+    std::error_code ignored;
+    fs::remove(callLog, ignored);
+    fs::remove(presenterLog, ignored);
+    EnvScope env;
+    trust_mock(env, runtimeDir, callLog.wstring());
+    env.set(L"OBS_NR_TEST_XESS_SLEEP_UNSUPPORTED", L"1");
+    auto device = make_d3d12_device();
+    Session session = make_session(device.Get(), runtimeDir);
+    session.lowLatency = 1;
+    TestWindow window;
+    Gpu gpu(session, window.hwnd, 2, false);
+    FILE* file = nullptr;
+    _wfopen_s(&file, presenterLog.c_str(), L"wb");
+    struct File { FILE*& f; ~File() { if (f) fclose(f); } } close{file};
+    auto runtime = std::make_unique<XeFgRuntime>();
+    expect(runtime->open(runtimeDir.wstring(), file) == XeFgLoadStatus::Ok, "sleep refusal runtime admitted");
+    XeFgPresenter presenter(gpu, session, file);
+    expect(!presenter.open(std::move(runtime)),
+        "an unsupported XeLL sleep mode is a clean init failure, not a silent 1x");
+    expect(presenter.close(), "failed init releases the XeLL context cleanly");
+    if (file) {
+        std::fclose(file);
+        file = nullptr;
+    }
+    const auto calls = read_text(callLog);
+    expect(calls.find("xell_sleep_mode low_latency=1") != std::string::npos, "sleep-on was attempted");
+    expect(calls.find("xell_sleep_unsupported") != std::string::npos, "driver rejected sleep-on");
+    expect(calls.find("xefg_create_context") == std::string::npos,
+        "no XeFG context is created after the sleep refusal");
+    const auto log = read_text(presenterLog);
+    expect(log.find("event=xefg_init_failed stage=xell_set_sleep_mode result=-10") != std::string::npos,
+        "the true failure stage and result are recorded");
+    std::printf("PASS xefg_presenter: sleep_refusal -> stage=xell_set_sleep_mode result=-10 "
+        "no_context clean_close\n");
 }
 
 struct ProducerFixture {
@@ -739,41 +786,160 @@ void real_runtime_probe(const fs::path& scratch)
         "context_result=%d (device-dependent, not part of mock acceptance)\n", static_cast<int>(created));
 }
 
-void real_live_present(const fs::path& directory, const fs::path& scratch)
+ComPtr<ID3D12Resource> make_gpu_texture(Gpu& gpu, DXGI_FORMAT format, uint32_t width, uint32_t height)
 {
-    const auto logPath = scratch / L"real-live.log";
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = format;
+    ComPtr<ID3D12Resource> texture;
+    expect(SUCCEEDED(gpu.d3d_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture))), "live GPU texture");
+    return texture;
+}
+
+bool upload_gpu_texture(Gpu& gpu, ID3D12Resource* target, const std::vector<uint8_t>& bytes)
+{
+    auto* device = gpu.d3d_device();
+    const auto desc = target->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total{};
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> upload;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload))))
+        return false;
+    void* mapped{};
+    const D3D12_RANGE noRead{0, 0};
+    if (FAILED(upload->Map(0, &noRead, &mapped))) return false;
+    const size_t rowBytes = size_t{desc.Width} * 4;
+    for (uint32_t y = 0; y < desc.Height; ++y)
+        std::memcpy(static_cast<uint8_t*>(mapped) + size_t{y} * footprint.Footprint.RowPitch,
+            bytes.data() + size_t{y} * rowBytes, rowBytes);
+    upload->Unmap(0, nullptr);
+    const auto fence = gpu.record_draw([&](ID3D12GraphicsCommandList* cmd) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Transition = {target, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
+        cmd->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION destination{target, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+        D3D12_TEXTURE_COPY_LOCATION source{upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, footprint};
+        cmd->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd->ResourceBarrier(1, &barrier);
+    });
+    if (!fence) return false;
+    ComPtr<ID3D12Fence> done;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    const bool ok = SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done))) &&
+        SUCCEEDED(gpu.drawQueue->Signal(done.Get(), 1)) &&
+        SUCCEEDED(done->SetEventOnCompletion(1, event)) &&
+        WaitForSingleObject(event, 5000) == WAIT_OBJECT_0 && done->GetCompletedValue() == 1;
+    CloseHandle(event);
+    return ok;
+}
+
+void real_live_run(const fs::path& directory, const fs::path& scratch, LONG lowLatency, const char* tag)
+{
+    const auto logPath = scratch / (std::wstring(L"real-live-") + widen(tag) + L".log");
     FILE* file = nullptr;
     _wfopen_s(&file, logPath.c_str(), L"wb");
     struct File { FILE*& f; ~File() { if (f) fclose(f); } } close{file};
     auto device = make_d3d12_device();
     TestWindow window;
     Session session = make_session(device.Get(), directory);
+    session.lowLatency = lowLatency;
+    session.fpsOverlay = 0;
     Gpu gpu(session, window.hwnd, 2, false);
     auto runtime = std::make_unique<XeFgRuntime>();
-    if (runtime->open(directory.wstring(), file) != XeFgLoadStatus::Ok) {
-        std::printf("INFO xefg_presenter: real_live admission=%s\n", runtime->detail());
-        return;
-    }
+    expect(runtime->open(directory.wstring(), file) == XeFgLoadStatus::Ok,
+        "real live official runtime admitted");
     XeFgPresenter presenter(gpu, session, file);
-    if (!presenter.open(std::move(runtime))) {
-        std::printf("INFO xefg_presenter: real_live init_refused (see %s)\n", logPath.string().c_str());
+    expect(presenter.open(std::move(runtime)),
+        "real live XeFG init + forced XeLL sleep + set_enabled succeeds");
+    constexpr uint32_t width = 1280, height = 720;
+    std::vector<uint8_t> colorBytes(size_t{width} * height * 4);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x) {
+            auto* pixel = colorBytes.data() + (size_t{y} * width + x) * 4;
+            pixel[0] = static_cast<uint8_t>(x * 255 / width);
+            pixel[1] = static_cast<uint8_t>(y * 255 / height);
+            pixel[2] = static_cast<uint8_t>(64 + (x / 64) * 16);
+            pixel[3] = 255;
+        }
+    const std::vector<uint8_t> motionBytes(size_t{width} * height * 4, 0);
+    auto motion = make_gpu_texture(gpu, DXGI_FORMAT_R16G16_FLOAT, width, height);
+    expect(upload_gpu_texture(gpu, gpu.input[0].Get(), colorBytes), "real live color upload");
+    expect(upload_gpu_texture(gpu, motion.Get(), motionBytes), "real live zero-MV upload");
+    unsigned twoX = 0;
+    for (uint32_t frame = 1; frame <= 8; ++frame) {
+        FgOriginalDesc original{};
+        original.color = gpu.input[0].Get();
+        original.index = 0;
+        original.multiplier = 2;
+        original.discontinuity = frame == 1;
+        original.flow.owner = ipc::FlowOwner::NrOwned;
+        original.flow.provenance = ipc::FlowProvenance::Valid;
+        original.flow.motion = motion.Get();
+        original.flow.guideWidth = width;
+        original.flow.guideHeight = height;
+        original.flow.mvScaleX = 1.0f;
+        original.flow.mvScaleY = 1.0f;
+        std::optional<UINT> presented;
+        for (int attempt = 0; attempt < 100 && !presented; ++attempt) {
+            presented = presenter.present_original(original);
+            if (!presented) Sleep(2);
+        }
+        expect(presented.has_value(), "real live present submitted");
+        const auto status = presenter.last_present_status();
+        std::printf("INFO xefg_presenter: real_live low_latency=%ld frame=%u frames=%u result=%d enabled=%u\n",
+            lowLatency, frame, status.framesPresented, status.result, status.enabled);
+        if (frame >= 2 && status.valid && status.framesPresented == 2 && status.result == 0 &&
+            status.enabled == 1)
+            ++twoX;
+        Sleep(16);
+    }
+    expect(presenter.close(), "real live teardown");
+    ComPtr<ID3D12Fence> done;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    expect(event != nullptr, "real live drain event");
+    const bool drained = SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done))) &&
+        SUCCEEDED(gpu.drawQueue->Signal(done.Get(), 1)) &&
+        SUCCEEDED(done->SetEventOnCompletion(1, event)) &&
+        WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    expect(drained, "real live draw queue drain");
+    if (file) {
+        std::fclose(file);
+        file = nullptr;
+    }
+    expect(twoX >= 6, "real XeFG reports 2 presented frames with SUCCESS on at least 6 of 7 frames");
+    std::printf("PASS xefg_presenter: real_live low_latency=%ld two_x_frames=%u/7 framesPresented=2 "
+        "frameGenResult=0 isFrameGenEnabled=1\n", lowLatency, twoX);
+}
+
+void real_live_present(const fs::path& directory, const fs::path& scratch)
+{
+    if (!fs::exists(directory / L"libxess_fg.dll") || !fs::exists(directory / L"libxell.dll")) {
+        std::printf("SKIP xefg_presenter: real live XeSS runtime missing\n");
         return;
     }
-    FgOriginalDesc original{};
-    original.color = gpu.input[0].Get();
-    original.index = 0;
-    original.multiplier = 2;
-    original.discontinuity = true;
-    bool presented = false;
-    std::string error;
-    try {
-        presented = presenter.present_original(original).has_value();
-    } catch (const std::exception& failure) {
-        error = failure.what();
-    }
-    const auto teardown = presenter.close();
-    std::printf("INFO xefg_presenter: real_live init=1 present=%d teardown=%d error=%s\n",
-        presented ? 1 : 0, teardown ? 1 : 0, error.empty() ? "none" : error.c_str());
+    real_live_run(directory, scratch, 1, "on");
+    real_live_run(directory, scratch, 0, "off");
 }
 
 void run_all(const fs::path& runtimeDir, const fs::path& presenterExe, const fs::path& scratch)
@@ -786,7 +952,8 @@ void run_all(const fs::path& runtimeDir, const fs::path& presenterExe, const fs:
     loader_contract(runtimeDir, scratch);
     real_runtime_probe(scratch);
     presenter_lifecycle(runtimeDir, scratch);
-    latency_fallback(runtimeDir, scratch);
+    forced_low_latency(runtimeDir, scratch);
+    sleep_refusal_fallback(runtimeDir, scratch);
     happy_child(runtimeDir, presenterExe, scratch);
     watchdog_child(runtimeDir, presenterExe, scratch);
     refusal_child(runtimeDir, presenterExe, scratch, false);
