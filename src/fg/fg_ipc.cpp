@@ -487,7 +487,8 @@ CopyStep Consumer::copy_next(ID3D12Resource* destination,ID3D12Resource* before,
   slot.mvDestination.Get()==destination||(before&&(slot.destination.Get()==before||slot.before.Get()==before||
    slot.mvDestination.Get()==before))||(mv&&(slot.destination.Get()==mv||slot.before.Get()==mv||slot.mvDestination.Get()==mv));};
  if(!destination||destination->GetDesc().Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
-    (ticket->frame.shape.splitCompare&&(!before||before==destination))||mv==destination||mv==before||
+    (ticket->frame.shape.splitCompare&&(!before||before==destination))||
+    (mv&&(mv==destination||mv==before))||
     (previous&&aliases(impl_->slots[previous->slot]))){
   return sequence.record(*ticket,Status::InvalidFrame);
  }

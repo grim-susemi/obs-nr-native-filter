@@ -254,6 +254,22 @@ add_dependencies(anr_shared_flow_tests vfg_presenter_shaders nr_guides_shaders)
 add_test(NAME anr_shared_flow COMMAND anr_shared_flow_tests)
 set_tests_properties(anr_shared_flow PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS gpu)
 
+# Moving-bar MV sign/scale oracle: the +8 px/frame clip through the real SR
+# counter contract and the real Shared NVOF scale/sanitize pass for both the
+# native 1440p and 1080p->1440p arms, plus the interpolated midpoint verdict.
+add_executable(mv_sign_oracle_tests tools/tests/mv_sign_oracle_tests.cpp
+  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/shared_guides.cpp
+  tools/fg-presenter/vfg_gpu.cpp tools/fg-presenter/vfg_hud_lock.cpp
+  tools/fg-presenter/vfg_shot_change.cpp tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_features(mv_sign_oracle_tests PRIVATE cxx_std_20)
+target_compile_definitions(mv_sign_oracle_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(mv_sign_oracle_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(mv_sign_oracle_tests PRIVATE src src/fg tools/fg-presenter "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(mv_sign_oracle_tests PRIVATE fg_ipc nr_guides d3d12 dxgi user32 winmm)
+add_dependencies(mv_sign_oracle_tests vfg_presenter_shaders nr_guides_shaders)
+add_test(NAME mv_sign_oracle COMMAND mv_sign_oracle_tests)
+set_tests_properties(mv_sign_oracle PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS gpu)
+
 add_executable(vfg_shot_change_gpu_tests
   tools/tests/vfg_shot_change_gpu_tests.cpp
   tools/fg-presenter/vfg_gpu.cpp
