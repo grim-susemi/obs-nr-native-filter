@@ -150,15 +150,18 @@ void Gpu::init_compare()
     }
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
-    D3D12_ROOT_PARAMETER parameters[3]{};
+    D3D12_ROOT_PARAMETER parameters[4]{};
     for (UINT i = 0; i < 2; ++i) {
         ranges[i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, i, 0, 0};
         parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[i].DescriptorTable = {1, &ranges[i]};
     }
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[2].Descriptor = {0, 0};
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[3].Constants = {0, 0, 4};
     D3D12_ROOT_SIGNATURE_DESC signature{};
-    signature.NumParameters = 3;
+    signature.NumParameters = 4;
     signature.pParameters = parameters;
     ComPtr<ID3DBlob> serialized;
     check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
@@ -185,7 +188,7 @@ void Gpu::init_compare()
     allocate(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, compareFlags_);
     buffer.Flags = D3D12_RESOURCE_FLAG_NONE;
     allocate(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, compareZero_);
-    buffer.Width = compare_bytes + 256;
+    buffer.Width = compare_bytes + VfgShotChange::slot_count * VfgShotChange::slot_bytes;
     allocate(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, compareReadback_);
     void* mapped{};
     const D3D12_RANGE noRead{0, 0}, written{0, compare_bytes};
@@ -212,12 +215,15 @@ bool Gpu::commands_ready() const
     return completed != UINT64_MAX && completed >= ring_[ringIdx_].fenceVal;
 }
 
-bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
+bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready, uint32_t dedupMode,
+    uint32_t shotParity)
 {
     if (compareFence_ || !commands_ready()) return false;
     if (done_->GetCompletedValue() < discardedCompareFence_) return false;
     if (!compareRoot_) init_compare();
-    if (shotChange_ && done_->GetCompletedValue() < shotSlotFence_[compareParity_ ^ 1u]) return false;
+    const uint32_t shotSlot = shotParity == UINT32_MAX ? VfgShotChange::transient_slot : shotParity;
+    if (shotChange_ && shotSlot >= VfgShotChange::slot_count) return false;
+    if (shotChange_ && done_->GetCompletedValue() < shotSlotFence_[shotSlot]) return false;
     auto* cmd = begin_available();
     auto flagsToCopy = transition(compareFlags_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     cmd->ResourceBarrier(1, &flagsToCopy);
@@ -232,19 +238,21 @@ bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(compareRoot_.Get());
     cmd->SetPipelineState(comparePipeline_.Get());
-    auto view = compareViews_->GetGPUDescriptorHandleForHeapStart();
-    const auto base = view.ptr;
-    view.ptr = base + UINT64{compareViewStride_} * previous;
-    cmd->SetComputeRootDescriptorTable(0, view);
-    view.ptr = base + UINT64{compareViewStride_} * current;
-    cmd->SetComputeRootDescriptorTable(1, view);
+    const auto base = compareViews_->GetGPUDescriptorHandleForHeapStart().ptr;
+    D3D12_GPU_DESCRIPTOR_HANDLE previousView{};
+    previousView.ptr = base + UINT64{compareViewStride_} * previous;
+    D3D12_GPU_DESCRIPTOR_HANDLE currentView{};
+    currentView.ptr = base + UINT64{compareViewStride_} * current;
+    cmd->SetComputeRootDescriptorTable(0, previousView);
+    cmd->SetComputeRootDescriptorTable(1, currentView);
     cmd->SetComputeRootUnorderedAccessView(2, compareFlags_->GetGPUVirtualAddress());
+    const UINT constants[]{dedupMode ? 1u : 0u, content_band_steps,
+        content_over_budget(static_cast<unsigned>(desc_.Width), static_cast<unsigned>(desc_.Height)), 0};
+    cmd->SetComputeRoot32BitConstants(3, 4, constants, 0);
     cmd->Dispatch(static_cast<UINT>((desc_.Width + 63) / 64), (desc_.Height + 15) / 16, 1);
     if (shotChange_) {
-        compareParity_ ^= 1u;
-        auto previousView = view;
-        previousView.ptr = base + UINT64{compareViewStride_} * previous;
-        shotChange_->record(cmd, {previousView, view, static_cast<uint32_t>(desc_.Width), desc_.Height,
+        compareParity_ = shotSlot;
+        shotChange_->record(cmd, {previousView, currentView, static_cast<uint32_t>(desc_.Width), desc_.Height,
             compareParity_, 1}, compareReadback_.Get());
     }
     for (unsigned i = 0; i < 2; ++i)
@@ -255,6 +263,7 @@ bool Gpu::begin_compare(unsigned previous, unsigned current, HANDLE ready)
     flagsToCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     flagsToCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     cmd->ResourceBarrier(1, &flagsToCopy);
+    compareDedupMode_ = dedupMode ? 1u : 0u;
     compareFence_ = finish(false);
     if (shotChange_) shotSlotFence_[compareParity_] = compareFence_;
     mark_inputs_read(previous, current, compareFence_);
@@ -268,13 +277,18 @@ std::optional<Gpu::CompareResult> Gpu::compare_result()
     if (completed == UINT64_MAX) check(device_->GetDeviceRemovedReason(), "content compare device removed");
     if (!compareFence_ || completed == UINT64_MAX || completed < compareFence_) return {};
     void* mapped{};
-    const D3D12_RANGE readRange{0, compare_bytes + (shotChange_ ? 256 : 0)}, noWrite{0, 0};
+    const D3D12_RANGE readRange{0, compare_bytes +
+        (shotChange_ ? VfgShotChange::slot_count * VfgShotChange::slot_bytes : 0)}, noWrite{0, 0};
     check(compareReadback_->Map(0, &readRange, &mapped), "content compare result map");
     const auto* flags = static_cast<const uint32_t*>(mapped);
-    const bool same = std::all_of(flags, flags + compare_bytes / sizeof(*flags), [](uint32_t x) { return x == 0; });
+    const bool same = compareDedupMode_ == 0
+        ? std::all_of(flags, flags + compare_bytes / sizeof(*flags), [](uint32_t x) { return x == 0; })
+        : flags[0] <= content_over_budget(static_cast<unsigned>(desc_.Width),
+            static_cast<unsigned>(desc_.Height));
     const auto* shot = flags + compare_bytes / sizeof(*flags);
-    const CompareResult result{same, shotChange_ && shot[compareParity_ * 2] != 0,
-        shotChange_ && shot[7 + compareParity_ * 4] != 0, compareParity_};
+    const CompareResult result{same,
+        shotChange_ && shot[VfgShotChange::cut_word(compareParity_)] != 0,
+        shotChange_ && shot[VfgShotChange::flash_word(compareParity_)] != 0, compareParity_};
     compareReadback_->Unmap(0, &noWrite);
     compareFence_ = 0;
     return result;
@@ -483,7 +497,7 @@ ID3D12Resource* Gpu::record_synthetic_display(ID3D12GraphicsCommandList* cmd, co
     frame.resolve(cmd);
     auto* display = frame.texture;
     if (frame.hudLock) {
-        hudLock_->compose(cmd, frame.subframe, frame.prevIndex);
+        hudLock_->compose(cmd, frame.slotParity * (max_multiplier - 1) + frame.subframe, frame.prevIndex);
         ring_[ringIdx_].hudUse = hudLock_; // Also protects scratch through cut copy and the present copy.
         display = hudLock_->output();
     }

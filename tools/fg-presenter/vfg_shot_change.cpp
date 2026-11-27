@@ -8,6 +8,9 @@
 
 namespace nr::fg::vfg {
 namespace {
+constexpr uint32_t results_bytes = VfgShotChange::slot_count * VfgShotChange::slot_bytes;
+constexpr uint64_t readback_base = 256; // Content-compare flags precede the windows.
+
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
     D3D12_RESOURCE_STATES after)
 {
@@ -44,7 +47,7 @@ VfgShotChange::VfgShotChange(ID3D12Device* device)
 
     D3D12_RESOURCE_DESC buffer{};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = 256;
+    buffer.Width = results_bytes;
     buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
     buffer.SampleDesc.Count = 1;
     buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -59,35 +62,39 @@ VfgShotChange::VfgShotChange(ID3D12Device* device)
     check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr, IID_PPV_ARGS(&zero_)), "shot change zero upload");
     void* mapped{};
-    const D3D12_RANGE noRead{0, 0}, written{0, 256};
+    const D3D12_RANGE noRead{0, 0}, written{0, results_bytes};
     check(zero_->Map(0, &noRead, &mapped), "shot change zero map");
-    std::memset(mapped, 0, 256);
+    std::memset(mapped, 0, results_bytes);
     zero_->Unmap(0, &written);
 }
 
 void VfgShotChange::record(ID3D12GraphicsCommandList* cmd, const Pair& pair, ID3D12Resource* readback)
 {
+    if (pair.parity >= slot_count) return;
     if (!initialized_) {
         auto barrier = transition(results_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cmd->ResourceBarrier(1, &barrier);
-        cmd->CopyBufferRegion(results_.Get(), 0, zero_.Get(), 0, 256);
+        cmd->CopyBufferRegion(results_.Get(), 0, zero_.Get(), 0, results_bytes);
         barrier = transition(results_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         cmd->ResourceBarrier(1, &barrier);
         initialized_ = true;
     }
+    const uint32_t offset = predicate_offset(pair.parity);
     auto barrier = transition(results_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     cmd->ResourceBarrier(1, &barrier);
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetPipelineState(pipeline_.Get());
     cmd->SetComputeRootDescriptorTable(0, pair.previous);
     cmd->SetComputeRootDescriptorTable(1, pair.current);
-    cmd->SetComputeRootUnorderedAccessView(2, results_->GetGPUVirtualAddress());
-    const uint32_t constants[]{pair.width, pair.height, pair.parity, pair.compare};
+    cmd->SetComputeRootUnorderedAccessView(2, results_->GetGPUVirtualAddress() + offset);
+    // The shader writes its predicate and diagnostic vector at the head of the
+    // window it is bound to, so the parity constant is always zero here.
+    const uint32_t constants[]{pair.width, pair.height, 0, pair.compare};
     cmd->SetComputeRoot32BitConstants(3, 4, constants, 0);
     cmd->Dispatch(1, 1, 1);
     barrier = transition(results_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     cmd->ResourceBarrier(1, &barrier);
-    cmd->CopyBufferRegion(readback, 256, results_.Get(), 0, 256);
+    cmd->CopyBufferRegion(readback, readback_base + offset, results_.Get(), offset, slot_bytes);
     barrier = transition(results_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     cmd->ResourceBarrier(1, &barrier);
 }
@@ -95,13 +102,14 @@ void VfgShotChange::record(ID3D12GraphicsCommandList* cmd, const Pair& pair, ID3
 void VfgShotChange::replace_on_cut(ID3D12GraphicsCommandList* cmd, ID3D12Resource* display,
     ID3D12Resource* current, uint32_t parity) const
 {
+    if (parity >= slot_count) return;
     D3D12_RESOURCE_BARRIER barriers[]{
         transition(results_.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION),
         transition(display, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
         transition(current, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)
     };
     cmd->ResourceBarrier(3, barriers);
-    cmd->SetPredication(results_.Get(), uint64_t{parity} * 8, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    cmd->SetPredication(results_.Get(), predicate_offset(parity), D3D12_PREDICATION_OP_EQUAL_ZERO);
     cmd->CopyResource(display, current);
     cmd->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
     for (auto& barrier : barriers)

@@ -293,10 +293,12 @@ void pinned_selection()
     const std::array<unsigned, 1> pin0{0}, pin2{2};
     const std::array<unsigned, 2> pin01{0, 1};
     const std::array<unsigned, 3> pin012{0, 1, 2};
+    const std::array<unsigned, 4> pin0123{0, 1, 2, 3};
     require(history.input_index() == 0, "fresh history starts at slot zero");
     require(history.input_index(pin0) == 1, "pinned slot zero is skipped");
-    require(history.input_index(pin01) == 2, "two pinned slots leave the last slot");
-    require(history.input_index(pin012) == content_input_count, "all pinned slots are exhausted");
+    require(history.input_index(pin01) == 2, "two pinned slots leave the next slot");
+    require(history.input_index(pin012) == 3, "three pinned slots leave the fourth");
+    require(history.input_index(pin0123) == content_input_count, "all pinned slots are exhausted");
 
     const auto first = frame(1, 1'000'000'000);
     const auto second = frame(2, first.timestampNs + 16'666'667);
@@ -311,14 +313,15 @@ void pinned_selection()
     require(history.latest_admitted()->index == transportSlot && history.latest_admitted()->frame.serial == 2,
         "latest admitted advances with the transport");
     require(history.anchor()->frame.serial == 1, "presented anchor waits for retain");
-    require(history.input_index() == 2, "two live slots leave one free destination");
+    require(history.input_index() == 2, "two live slots leave two free destinations");
     require(history.input_index(pin0) == 2, "pinning an already-reserved slot changes nothing");
-    require(history.input_index(pin012) == content_input_count, "three reservations exhaust the ring");
+    require(history.input_index(pin012) == 3, "three reservations leave the fourth slot");
+    require(history.input_index(pin0123) == content_input_count, "four reservations exhaust the ring");
 
     require(history.observe(2, first, true).stale, "rewound serial is stale");
     require(history.latest_admitted()->frame.serial == 2 && history.latest_admitted()->index == 1,
         "a stale copy cannot rewind the admitted transport");
-    require(history.input_index(pin012) == content_input_count, "a stale copy releases no pinned slot");
+    require(history.input_index(pin0123) == content_input_count, "a stale copy releases no pinned slot");
 
     history.invalidate();
     require(!history.can_compare(), "invalidate drops the pair anchor");
@@ -326,7 +329,8 @@ void pinned_selection()
         "the admitted transport survives invalidation");
     require(history.input_index() == 0, "dropping the anchor frees its slot");
     require(history.input_index(pin2) == 0, "the pin still reserves its own slot");
-    std::puts("PASS pinned_index anchor=0 transport=1 free=2 latest=2 exhausted=3 stale_serial=1");
+    std::printf("PASS pinned_index anchor=0 transport=1 free=2 latest=2 exhausted=%u stale_serial=1\n",
+        content_input_count);
 }
 } // namespace
 

@@ -80,7 +80,8 @@ class Gpu final {
     std::unique_ptr<VfgShotChange> shotChange_;
     std::shared_ptr<VfgHudLock> hudLock_;
     uint32_t compareParity_{};
-    std::array<uint64_t, 2> shotSlotFence_{};
+    uint32_t compareDedupMode_{};
+    std::array<uint64_t, VfgShotChange::slot_count> shotSlotFence_{};
     void init_compare();
     ID3D12GraphicsCommandList* begin();
     ID3D12GraphicsCommandList* begin_available();
@@ -96,6 +97,7 @@ public:
         uint32_t shotParity;
         bool hudLock;
         unsigned subframe;
+        unsigned slotParity = 0;
     };
     struct CompareResult {
         bool same, cut, flash;
@@ -111,7 +113,7 @@ public:
     ComPtr<ID3D12CommandQueue> ipcQueue, drawQueue;
     std::array<ComPtr<ID3D12Resource>, content_input_count> input;
     std::array<ComPtr<ID3D12Resource>, content_input_count> before;
-    std::array<ComPtr<ID3D12Resource>, max_multiplier - 1> syntheticTex;
+    std::array<ComPtr<ID3D12Resource>, 2 * (max_multiplier - 1)> syntheticTex;
     ID3D12Device* d3d_device() const noexcept { return device_.Get(); }
     [[nodiscard]] const PushFlowShaderBytecodeSet& pushflow_shader_bytecode() const noexcept
     {
@@ -125,7 +127,12 @@ public:
     // The caller queues the exact IPC copy dependency before comparison and
     // retains both inputs until the result arrives. No CPU fence wait or Map
     // occurs on submission, and polling never maps an unfinished readback.
-    [[nodiscard]] bool begin_compare(unsigned previous, unsigned current, HANDLE ready);
+    // dedupMode 0 compares bytes exactly; any other value tolerates
+    // content_band_steps LSB per RGB component up to content_over_budget().
+    // shotParity selects the VfgShotChange bank; UINT32_MAX records into the
+    // transient slot so repeat frames never clobber an active pair.
+    [[nodiscard]] bool begin_compare(unsigned previous, unsigned current, HANDLE ready,
+        uint32_t dedupMode = 0, uint32_t shotParity = UINT32_MAX);
     [[nodiscard]] std::optional<CompareResult> compare_result();
     // Drop the result now, but keep its readback unavailable until GPU completion.
     void discard_compare() noexcept;

@@ -18,7 +18,7 @@ struct PushFlowBackend::Impl {
     Gpu* const gpu;
     ComPtr<ID3D12CommandQueue> queue;
     std::array<ComPtr<ID3D12Resource>, content_input_count> retainedInputs;
-    std::array<ComPtr<ID3D12Resource>, subframes> retainedOutputs;
+    std::array<ComPtr<ID3D12Resource>, 2 * subframes> retainedOutputs;
     std::optional<pf::Compute> compute;
     std::array<pf::Command, subframes> packs, resolves;
     ComPtr<ID3D12Fence> done;

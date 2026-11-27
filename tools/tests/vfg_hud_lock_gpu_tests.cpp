@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
+// allow: SIZE_OK - one D3D12 WARP fixture and its cases share this translation unit; the CMake target admits no second file.
 #include "../fg-presenter/vfg_gpu.h"
 #include <dxgi1_4.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -123,9 +125,9 @@ struct Fixture {
     std::vector<uint8_t> image(ID3D12Resource* r) { return read(r, DXGI_FORMAT_R8G8B8A8_UNORM, rgbaPitch); }
     std::vector<uint8_t> state() { return read(gpu->hud_lock().lock()->state(), DXGI_FORMAT_R16G16B16A16_FLOAT, statePitch); }
     void update(unsigned current, unsigned previous, bool reset) { gpu->update_hud_lock(current, previous, reset); drain(); }
-    Gpu::CompareResult compare(unsigned a, unsigned b)
+    Gpu::CompareResult compare(unsigned a, unsigned b, uint32_t dedupMode = 0, uint32_t shotParity = UINT32_MAX)
     {
-        require(gpu->begin_compare(a, b, compareEvent.h), "compare not submitted");
+        require(gpu->begin_compare(a, b, compareEvent.h, dedupMode, shotParity), "compare not submitted");
         if (WaitForSingleObject(compareEvent.h, 30000) != WAIT_OBJECT_0) {
             std::fputs("comparison timed out; preserving in-flight resources\n", stderr);
             TerminateProcess(GetCurrentProcess(), 2);
@@ -133,12 +135,13 @@ struct Fixture {
         auto result = gpu->compare_result(); require(result.has_value(), "comparison result unavailable");
         drain(); return *result;
     }
-    ID3D12Resource* display(unsigned subframe, unsigned a, unsigned b, bool enabled, bool compared, unsigned parity)
+    ID3D12Resource* display(unsigned subframe, unsigned a, unsigned b, bool enabled, bool compared, unsigned parity,
+        unsigned slotParity = 0)
     {
         ID3D12Resource* out{};
         record([&](ID3D12GraphicsCommandList* cmd) {
-            Gpu::SyntheticFrame frame{gpu->syntheticTex[subframe].Get(), [](ID3D12GraphicsCommandList*) {},
-                a, b, compared, parity, enabled, subframe};
+            Gpu::SyntheticFrame frame{gpu->syntheticTex[slotParity * (max_multiplier - 1) + subframe].Get(),
+                [](ID3D12GraphicsCommandList*) {}, a, b, compared, parity, enabled, subframe, slotParity};
             out = gpu->record_synthetic_display(cmd, frame);
         });
         require(out != nullptr, "display recorder returned null");
@@ -166,6 +169,82 @@ void all_zero(const std::vector<uint8_t>& data, const char* name)
     for (size_t i = 0; i < data.size(); ++i) if (data[i] != 0) {
         std::fprintf(stderr, "%s byte %zu = %02x\n", name, i, data[i]); throw std::runtime_error(name);
     }
+}
+
+// 4 input slots and 6 synthetic textures: every bank/subframe pair composes
+// from its own generated texture through the fourth held slot.
+void check_parity_and_banks(Fixture& f, const Image& learned)
+{
+    Image bank1{};
+    bank1.fill(0xff3d7f21u);
+    for (unsigned i = 0; i < max_multiplier - 1; ++i) f.upload(f.gpu->syntheticTex[max_multiplier - 1 + i].Get(), bank1);
+    Image held = learned;
+    held[10 * width + 32] = 0xff7788aau;
+    f.upload(f.gpu->input[3].Get(), held);
+    for (unsigned sub = 0; sub < max_multiplier - 1; ++sub) {
+        const auto composed = f.image(f.display(sub, 3, 3, true, false, 0, 1));
+        pixel(composed, 32, 10, 0xff7788aau, "bank 1 compose held slot 3");
+        pixel(composed, 4, 10, 0xff3d7f21u, "bank 1 compose generated texture");
+        const auto bank0 = f.image(f.display(sub, 3, 3, true, false, 0, 0));
+        pixel(bank0, 32, 10, 0xff7788aau, "bank 0 compose held slot 3");
+        pixel(bank0, 4, 10, 0xff5234c7u, "bank 0 compose generated texture");
+    }
+    std::puts("4x6 banks: held=slot3 ff7788aa bank0=ff5234c7 bank1=ff3d7f21 subframes=0..2 PASS");
+}
+
+// Repeat frames reach begin_compare unpinned: they must land on the transient
+// window and leave both active pair banks' predication untouched.
+void check_shot_parity(Fixture& f)
+{
+    Image black{}, white{};
+    black.fill(gray(0));
+    white.fill(gray(255));
+    f.upload(f.gpu->input[0].Get(), black);
+    f.upload(f.gpu->input[1].Get(), white);
+    f.upload(f.gpu->input[2].Get(), white);
+    const auto pairA = f.compare(0, 1, 0, 0);
+    require(pairA.cut && !pairA.flash && pairA.parity == 0, "pair A shot parity");
+    const auto pairB = f.compare(1, 2, 0, 1);
+    require(pairB.same && !pairB.cut && pairB.parity == 1, "pair B shot parity");
+    const auto repeatSame = f.compare(1, 2, 1);
+    require(repeatSame.same && !repeatSame.cut && repeatSame.parity == VfgShotChange::transient_slot,
+        "unpinned repeat slot");
+    const auto repeatCut = f.compare(0, 1, 1);
+    require(!repeatCut.same && repeatCut.parity == VfgShotChange::transient_slot, "unpinned cut slot");
+    const auto bank0 = f.image(f.gpu->syntheticTex[0].Get());
+    uint32_t generated{};
+    std::memcpy(&generated, bank0.data() + (10 * width + 4) * 4, 4);
+    const auto cut = f.image(f.display(2, 0, 1, true, true, 0));
+    equal_image(cut, white, "pair A cut predication was clobbered");
+    pixel(f.image(f.display(0, 1, 2, true, true, 1)), 4, 10, generated, "pair B non-cut predication was clobbered");
+    std::puts("shot parity: pairA=slot0 cut=1 pairB=slot1 cut=0 repeat=slot4 pair slots intact PASS");
+}
+
+void check_dedup_mode1(Fixture& f)
+{
+    Image base{}, block{}, noise{};
+    for (unsigned y = 0; y < height; ++y)
+        for (unsigned x = 0; x < width; ++x) {
+            const auto value = 16 + static_cast<int>((x * 3 + y * 5) % 200);
+            base[y * width + x] = gray(static_cast<uint32_t>(value));
+            noise[y * width + x] = gray(static_cast<uint32_t>(value + (((x + y) & 1) ? 2 : -2)));
+            block[y * width + x] = gray(static_cast<uint32_t>(value));
+        }
+    for (unsigned y = 8; y < 24; ++y)
+        for (unsigned x = 8; x < 24; ++x)
+            block[y * width + x] = gray(static_cast<uint32_t>(16 +
+                static_cast<int>((x * 3 + y * 5) % 200) + 6));
+    f.upload(f.gpu->input[0].Get(), base);
+    f.upload(f.gpu->input[1].Get(), block);
+    const auto changed = f.compare(0, 1, 1, 0);
+    require(!changed.same && changed.parity == 0, "band mode must flag the +/-6 motion block");
+    f.upload(f.gpu->input[1].Get(), noise);
+    const auto tolerated = f.compare(0, 1, 1, 1);
+    require(tolerated.same && tolerated.parity == 1, "band mode must tolerate +/-2 LSB noise");
+    const auto exact = f.compare(0, 1, 0, 0);
+    require(!exact.same, "exact mode must flag +/-2 LSB noise");
+    std::printf("dedup mode1: block=16x16 +/-6 over=%u budget=%u changed=1, +/-2 tolerated=1, exact +/-2 same=0 PASS\n",
+        16u * 16u * 3u, content_over_budget(width, height));
 }
 #include "vfg_hud_lock_regressions.h"
 }
@@ -229,6 +308,7 @@ int main()
             f.image(f.gpu->input[2].Get()) == clean2 && f.image(f.gpu->syntheticTex[2].Get()) == cleanSynthetic,
             "overlay modified clean resource");
         check_held_slots(f, frames[0]);
+        check_parity_and_banks(f, frames[0]);
         Image moved = frames[1]; moved[10 * width + 32] = gray(0);
         f.upload(f.gpu->input[2].Get(), moved);
         f.update(2, 1, false);
@@ -240,15 +320,12 @@ int main()
         all_zero(f.state(), "reset state");
         equal_image(f.image(f.display(1, 1, 2, true, false, 0)), generated, "reset passthrough");
         Image black{}, white{}; black.fill(gray(0)); white.fill(gray(255)); f.upload(f.gpu->input[0].Get(), black); f.upload(f.gpu->input[1].Get(), white);
-        auto cut = f.compare(0, 1);
-        require(cut.cut && !cut.flash, "black-white comparison was not a real cut");
-        auto* finalCut = f.display(2, 0, 1, true, true, cut.parity);
-        require(finalCut == f.gpu->hud_lock().lock()->output(), "cut did not target scratch");
-        equal_image(f.image(finalCut), white, "cut final scratch");
+        check_shot_parity(f);
+        check_dedup_mode1(f);
         check_hud_retirement(f, generated);
         check_original_only_repeat();
         check_abandoned_hud_compare();
-        std::printf("PASS WARP: OFF HUD textures=0 (absent owner), updates=72, slots=3, stroke=ffffffff/ff000000, background=ff5234c7, overlay pixels=4, motion confidence=0000, reset zero bytes=%u, cut B bytes=%zu\n",
+        std::printf("PASS WARP: OFF HUD textures=0 (absent owner), updates=72, inputs=4, banks=6, stroke=ffffffff/ff000000, background=ff5234c7, overlay pixels=4, motion confidence=0000, reset zero bytes=%u, cut B bytes=%zu\n",
             statePitch * height, sizeof(white));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());

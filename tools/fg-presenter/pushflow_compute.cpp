@@ -9,8 +9,9 @@ namespace {
 constexpr auto shaderRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr auto unordered = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 constexpr auto common = D3D12_RESOURCE_STATE_COMMON;
-constexpr UINT textures = static_cast<UINT>(content_input_count);
-constexpr UINT clearIndex = textures + max_multiplier - 1;
+constexpr unsigned textures = static_cast<UINT>(content_input_count);
+constexpr unsigned synthetic_count = 2 * (max_multiplier - 1);
+constexpr UINT clearIndex = textures + synthetic_count;
 constexpr UINT nullInput = clearIndex + 1;
 
 enum Root : UINT { Constants, Previous, Current, Buffer0, Buffer1, Buffer2, MotionOutput, Count };
@@ -179,7 +180,8 @@ void Compute::pack(ID3D12GraphicsCommandList* cmd, const Dispatch& work) const
 void Compute::resolve(ID3D12GraphicsCommandList* cmd, const Dispatch& work) const
 {
     const auto* source = input_reads(ort_.shader, work.sub).resolve ? &work.ticket : nullptr;
-    auto* target = gpu_.syntheticTex[work.sub - 1].Get();
+    const unsigned bank = work.ticket.slotParity * (max_multiplier - 1) + (work.sub - 1);
+    auto* target = gpu_.syntheticTex[bank].Get();
     const auto count = source ? 3u : 1u, first = source ? 2u : 1u;
     setup(cmd, resolve_.Get(), source);
     for (UINT i = 0; i < count; ++i) {
@@ -195,7 +197,7 @@ void Compute::resolve(ID3D12GraphicsCommandList* cmd, const Dispatch& work) cons
     const UINT data[]{g.srcW, g.srcH, g.padW, g.padH, g.modelW, g.modelH, 0,
         facts_.alignCorners.value_or(false), facts_.maskForFirst.value_or(false), 0, 0, 0};
     cmd->SetComputeRoot32BitConstants(Constants, ARRAYSIZE(data), data, 0);
-    cmd->SetComputeRootDescriptorTable(source ? MotionOutput : Buffer1, view(textures + work.sub - 1));
+    cmd->SetComputeRootDescriptorTable(source ? MotionOutput : Buffer1, view(textures + bank));
     cmd->Dispatch((g.srcW + 15) / 16, (g.srcH + 15) / 16, 1);
     const auto toCommon = transition(target, unordered, common);
     cmd->ResourceBarrier(1, &toCommon);

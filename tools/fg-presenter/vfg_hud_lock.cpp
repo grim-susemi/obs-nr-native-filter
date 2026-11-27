@@ -8,9 +8,13 @@
 namespace nr::fg::vfg {
 namespace {
 constexpr unsigned descriptors_per_table = 5;
-constexpr unsigned tables_per_pass = content_input_count * content_input_count;
-constexpr unsigned descriptors_per_pass = tables_per_pass * descriptors_per_table;
-static_assert(content_input_count == 3 && max_multiplier - 1 == 3);
+constexpr unsigned generated_count = 2 * (max_multiplier - 1);
+constexpr unsigned update_tables = content_input_count * content_input_count;
+constexpr unsigned compose_tables = generated_count * content_input_count;
+constexpr unsigned update_descriptors = update_tables * descriptors_per_table;
+static_assert(content_input_count == 4 && max_multiplier - 1 == 3);
+// update 4x4 = 80 plus compose 6x4 = 120 descriptors, one heap for both passes.
+static_assert((update_tables + compose_tables) * descriptors_per_table == 200);
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES from,
     D3D12_RESOURCE_STATES to)
@@ -21,8 +25,8 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 }
 }
 
-VfgHudLock::VfgHudLock(ID3D12Device* device, const std::array<Resource, 3>& inputs,
-    const std::array<Resource, 3>& generated) : inputs_(inputs), generated_(generated)
+VfgHudLock::VfgHudLock(ID3D12Device* device, const std::array<Resource, content_input_count>& inputs,
+    const std::array<Resource, generated_count>& generated) : inputs_(inputs), generated_(generated)
 {
     const auto inputDesc = inputs_[0]->GetDesc();
     width_ = static_cast<UINT>(inputDesc.Width);
@@ -67,32 +71,35 @@ VfgHudLock::VfgHudLock(ID3D12Device* device, const std::array<Resource, 3>& inpu
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
     check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&share_)), "HUD dummy texture");
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 * descriptors_per_pass,
-        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        (update_tables + compose_tables) * descriptors_per_table, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&views_)), "HUD visible descriptors");
     DescriptorStager staging(device);
     stride_ = device->GetDescriptorHandleIncrementSize(hd.Type);
     auto dest = views_->GetCPUDescriptorHandleForHeapStart();
     // Every table is written once, before submission. It stays immutable for
     // the lifetime of this generation, including while input content rotates.
-    for (const bool composing : {false, true}) {
-        for (unsigned first = 0; first < inputs_.size(); ++first) {
-            if (composing && !generated_[first]) {
-                // An original-only Gpu has no synthetic images or compose consumers.
-                dest.ptr += SIZE_T{content_input_count * descriptors_per_table} * stride_;
-                continue;
-            }
-            for (unsigned second = 0; second < inputs_.size(); ++second) {
-                ID3D12Resource* resources[]{composing ? generated_[first].Get() : inputs_[first].Get(),
-                    inputs_[second].Get(), composing ? state_.Get() : share_.Get(), share_.Get()};
-                for (auto* resource : resources) {
-                    staging.write_srv(resource, nullptr, dest);
-                    dest.ptr += stride_;
-                }
-                staging.write_uav(composing ? scratch_.Get() : state_.Get(), dest);
-                dest.ptr += stride_;
-            }
+    const auto write_table = [&](ID3D12Resource* first, ID3D12Resource* second, ID3D12Resource* third,
+        ID3D12Resource* fourth, ID3D12Resource* target) {
+        ID3D12Resource* resources[]{first, second, third, fourth};
+        for (auto* resource : resources) {
+            staging.write_srv(resource, nullptr, dest);
+            dest.ptr += stride_;
         }
+        staging.write_uav(target, dest);
+        dest.ptr += stride_;
+    };
+    for (unsigned current = 0; current < inputs_.size(); ++current)
+        for (unsigned previous = 0; previous < inputs_.size(); ++previous)
+            write_table(inputs_[current].Get(), inputs_[previous].Get(), share_.Get(), share_.Get(), state_.Get());
+    for (unsigned bank = 0; bank < generated_.size(); ++bank) {
+        if (!generated_[bank]) {
+            // An original-only Gpu has no synthetic images or compose consumers.
+            dest.ptr += SIZE_T{content_input_count * descriptors_per_table} * stride_;
+            continue;
+        }
+        for (unsigned held = 0; held < inputs_.size(); ++held)
+            write_table(generated_[bank].Get(), inputs_[held].Get(), state_.Get(), share_.Get(), scratch_.Get());
     }
 }
 
@@ -138,7 +145,8 @@ void VfgHudLock::compose(ID3D12GraphicsCommandList* cmd, unsigned generated, uns
     cmd->SetDescriptorHeaps(1, heaps);
     cmd->SetComputeRootSignature(root_.Get());
     cmd->SetPipelineState(compose_.Get());
-    const unsigned base = descriptors_per_pass + (generated * content_input_count + held) * descriptors_per_table;
+    const unsigned base = update_descriptors +
+        (generated * content_input_count + held) * descriptors_per_table;
     for (unsigned i = 0; i < descriptors_per_table; ++i) cmd->SetComputeRootDescriptorTable(i, table(base + i));
     const UINT constants[]{width_, height_, 0, 1, 0, 0, 0, 0};
     cmd->SetComputeRoot32BitConstants(5, 8, constants, 0);

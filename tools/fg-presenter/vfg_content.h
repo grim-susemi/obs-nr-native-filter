@@ -4,7 +4,7 @@
 #include <span>
 
 namespace nr::fg::vfg {
-inline constexpr unsigned content_input_count = 3;
+inline constexpr unsigned content_input_count = 4;
 
 struct ContentFrame {
     ipc::Frame frame;
@@ -19,7 +19,9 @@ struct ContentStep {
 // Veyra parity: up to five over-band RGB components per million count as
 // unchanged. The floor keeps one component of slack on frames whose fractional
 // budget rounds below one. Over-band components are produced by
-// vfg_content_compare_band.hlsl, which measures 8-bit LSB steps.
+// vfg_content_compare.hlsl, which measures 8-bit LSB steps.
+inline constexpr uint32_t content_band_steps = 3;
+
 [[nodiscard]] inline unsigned content_over_budget(unsigned width, unsigned height) noexcept
 {
     const uint64_t over = static_cast<uint64_t>(width) * height * 3ULL * 5ULL / 1'000'000ULL;
