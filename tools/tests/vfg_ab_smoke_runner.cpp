@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -175,6 +176,18 @@ struct GpuFixture {
         std::fill(boxScratch.begin(), boxScratch.end(), fg);
         const D3D11_BOX box{boxX, shape.height / 2 - 32, 0, boxX + 64, shape.height / 2 + 32, 1};
         ctx->UpdateSubresource(tex.Get(), 0, &box, boxScratch.data(), 64 * 4, 0);
+    }
+
+    // Matrix clip: a 160x120 bar moving by the requested pixels per frame. The
+    // clip is synthetic and deterministic so the same motion reaches every arm.
+    void fill_bar(uint32_t bg, uint32_t fg, uint32_t barX)
+    {
+        std::fill(scratch.begin(), scratch.end(), bg);
+        const uint32_t top = shape.height / 2 - 60;
+        for (uint32_t y = top; y < top + 120 && y < shape.height; ++y)
+            for (uint32_t x = barX; x < barX + 160 && x < shape.width; ++x)
+                scratch[static_cast<size_t>(y) * shape.width + x] = fg;
+        ctx->UpdateSubresource(tex.Get(), 0, nullptr, scratch.data(), shape.width * 4, 0);
     }
 };
 
@@ -2047,12 +2060,139 @@ void run_pair_probe(const std::wstring& presenter, const fs::path& log, const st
             size_t(std::count(originals.begin(), originals.end(), true)), size_t(std::count(repeats.begin(), repeats.end(), true)), size_t(std::count(skipped.begin(), skipped.end(), true)));
     }
 }
+// Matrix arm: one presenter launch on the real backend with the deterministic
+// moving-bar clip. Emits one JSON status line the PowerShell matrix consumes;
+// a fallback, fault or missing runtime is BLOCKED, never a PASS.
+void run_matrix_arm(const std::wstring& presenter, const fs::path& logDir, const std::wstring& monId,
+    const std::wstring& arm, uint32_t mult, double stepPx, uint32_t frames, uint32_t trial)
+{
+    struct Spec {
+        Backend backend;
+        const char* name;
+        const char* expected;
+        bool hud;
+    } spec{};
+    if (arm == L"control") spec = {Backend::NativeVfg, "control", "original", false};
+    else if (arm == L"native") spec = {Backend::NativeVfg, "native", "nvidia-vfg-native", true};
+    else if (arm == L"pushflow") spec = {Backend::PushFlow, "pushflow", "pushflow", true};
+    else if (arm == L"xefg") spec = {Backend::XeFg, "xefg", "xefg", true};
+    else if (arm == L"xemfg") spec = {Backend::XeMfg, "xemfg", "xemfg", true};
+    else throw std::runtime_error("unknown matrix arm");
+
+    auto env = [](const wchar_t* key) {
+        wchar_t buf[1024]{};
+        const auto n = GetEnvironmentVariableW(key, buf, ARRAYSIZE(buf));
+        return (n && n < ARRAYSIZE(buf)) ? std::wstring(buf, n) : std::wstring{};
+    };
+    const auto xess = env(L"OBS_NR_XESS_RUNTIME");
+    const auto xemfg = env(L"OBS_NR_TEST_XEMFG_DLL");
+    const auto pushflow = env(L"OBS_NR_PUSHFLOW_RUNTIME");
+    const auto exists = [](const fs::path& path) {
+        std::error_code ec;
+        return fs::exists(path, ec) && !ec;
+    };
+    const auto blocked = [&](const char* reason) {
+        std::printf("MATRIX_ARM {\"arm\":\"%s\",\"backend\":\"%s\",\"mult\":%u,\"stepPx\":%.2f,"
+                    "\"frames\":%u,\"trial\":%u,\"status\":\"BLOCKED\",\"reason\":\"%s\",\"published\":0}\n",
+            spec.name, spec.expected, mult, stepPx, frames, trial, reason);
+    };
+    if (spec.backend == Backend::XeFg || spec.backend == Backend::XeMfg) {
+        if (xess.empty() || !exists(fs::path(xess) / L"libxess_fg.dll") || !exists(fs::path(xess) / L"libxell.dll"))
+            return blocked("external-xess-runtime-absent");
+    }
+    if (spec.backend == Backend::XeMfg && (xemfg.empty() || !exists(xemfg))) return blocked("external-xemfg-dll-absent");
+    if (spec.backend == Backend::PushFlow &&
+        (pushflow.empty() || !exists(fs::path(pushflow) / L"onnxruntime.dll") ||
+            !exists(fs::path(pushflow) / L"DirectML.dll") ||
+            !exists(fs::path(pushflow) / L"models" / L"pushflow-fast.onnx")))
+        return blocked("pushflow-runtime-models-absent");
+
+    const auto log = logDir / ("matrix-" + std::string(spec.name) + "-" + std::to_string(mult) + "x-t" +
+        std::to_string(trial) + ".log");
+    fs::remove(log);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    GpuFixture gfx(2560, 1440);
+    ipc::Producer producer(gfx.dev.Get(), unique_mapping(L"matrix"), gfx.shape);
+    LaunchOptions opts{};
+    opts.multiplier = mult;
+    opts.backend = spec.backend;
+    opts.gpuShotChange = 1;
+    opts.monitorId = monId;
+    opts.xessRuntimeDir = xess;
+    opts.xemfgDllPath = xemfg;
+    opts.experimentalXeMfgOptIn = spec.backend == Backend::XeMfg ? 1u : 0u;
+    opts.sharedNvofEnabled = 1;
+    opts.hudLock = spec.hud ? 1u : 0u;
+    opts.pushflowRuntimeDir = pushflow;
+    opts.pushflowTier = PushFlowTier::Fast;
+    Controller controller(opts);
+    const auto offer = producer.connect(controller.peer());
+    expect(controller.offer(offer, gfx.shape, gfx.luid), "matrix arm offer");
+    expect(WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "matrix arm handshake");
+
+    const std::string initToken = std::string("event=initialized backend=") + spec.expected;
+    const auto initDeadline = clock_ns() + 20'000'000'000ULL;
+    while (clock_ns() < initDeadline && read_text(log).find(initToken) == std::string::npos) {
+        if (!controller.alive()) break;
+        Sleep(10);
+    }
+    const auto start = clock_ns();
+    const uint32_t span = gfx.shape.width > 240 ? gfx.shape.width - 200 : 1;
+    uint32_t published = 0;
+    for (uint32_t frame = 0; frame < frames; ++frame) {
+        const auto ts = start + uint64_t{frame} * 1'000'000'000ULL / 60;
+        pace_to(ts);
+        const auto barX = static_cast<uint32_t>(std::lround(40.0 + frame * stepPx)) % span;
+        gfx.fill_bar(0xFF101010u, 0xFFFFFFFFu, barX);
+        ipc::Status pub = ipc::Status::Pending;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            pub = producer.publish(gfx.tex.Get(), ts, clock_ns(), false, 0, nullptr, 50);
+            if (pub == ipc::Status::Ok || pub == ipc::Status::Dropped) break;
+            if (pub != ipc::Status::Pending && pub != ipc::Status::PeerBusy) break;
+            Sleep(2);
+        }
+        if (pub == ipc::Status::Ok) ++published;
+        else if (pub != ipc::Status::Dropped) {
+            std::fprintf(stderr, "matrix arm publish status=%d alive=%d exit=%ld\n", static_cast<int>(pub),
+                controller.alive() ? 1 : 0, static_cast<LONG>(controller.exit_reason()));
+            throw std::runtime_error("matrix arm publish");
+        }
+    }
+    Sleep(300);
+    wait_controller_exit(controller);
+    expect(producer.retire() == ipc::Status::Ok, "matrix arm retire");
+
+    const auto content = read_text(log);
+    std::string fallback;
+    for (const char* token : {"xefg_unavailable_fallback_1x", "xefg_init_failed_fallback_fault",
+             "xemfg_unavailable_fallback_1x", "pushflow_runtime_missing_fallback_1x", "backend_fault_fallback_1x"}) {
+        if (content.find(token) != std::string::npos) {
+            fallback = token;
+            break;
+        }
+    }
+    if (fallback.empty() && content.find(initToken) == std::string::npos)
+        fallback = content.find("event=error") != std::string::npos ? "backend-error" : "backend-not-initialized";
+    if (!fallback.empty()) return blocked(fallback.c_str());
+
+    std::string logPath = log.generic_string();
+    std::string escaped;
+    for (const char ch : logPath) {
+        if (ch == '\\') escaped += "\\\\";
+        else escaped += ch;
+    }
+    std::printf("MATRIX_ARM {\"arm\":\"%s\",\"backend\":\"%s\",\"mult\":%u,\"stepPx\":%.2f,"
+                "\"frames\":%u,\"trial\":%u,\"status\":\"RAN\",\"reason\":\"\",\"published\":%u,"
+                "\"log\":\"%s\"}\n",
+        spec.name, spec.expected, mult, stepPx, frames, trial, published, escaped.c_str());
 }
+} // namespace
 
 int wmain(int argc, wchar_t** argv)
 {
     try {
-        expect(argc == 4, "usage: vfg_ab_smoke_runner <presenter.exe> <log_dir> <mode>");
+        expect(argc >= 4, "usage: vfg_ab_smoke_runner <presenter.exe> <log_dir> <mode> [args]");
         const std::wstring presenter = argv[1];
         const fs::path logDir = argv[2];
         const std::wstring_view mode = argv[3];
@@ -2136,6 +2276,11 @@ int wmain(int argc, wchar_t** argv)
             const auto dll = readEnv(L"OBS_NR_TEST_ANR_MOCK_DLL");
             expect(!dll.empty(), "OBS_NR_TEST_ANR_MOCK_DLL required for anr-ab");
             run_anr_ab(presenter, logDir, monId, dll);
+        } else if (mode == L"matrix-arm") {
+            expect(argc == 9, "usage: ... matrix-arm <arm> <mult> <stepPx> <frames> <trial>");
+            run_matrix_arm(presenter, logDir, monId, argv[4], static_cast<uint32_t>(std::stoul(argv[5])),
+                std::stod(argv[6]), static_cast<uint32_t>(std::stoul(argv[7])),
+                static_cast<uint32_t>(std::stoul(argv[8])));
         } else throw std::runtime_error("unknown mode");
         return 0;
     } catch (const std::exception& e) {
