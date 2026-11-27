@@ -269,7 +269,16 @@ try {
 } finally {
     Remove-Item Env:OBS_NR_PUSHFLOW_RUNTIME -ErrorAction SilentlyContinue
 }
-Invoke-Checked 'ab-pushflow-empty' { & $abRunner $modPresenter $LogDir pushflow-empty }
+$skippedChecks = @()
+$discoveredPushflow = @(
+    (Join-Path $modBin 'pushflow')
+) | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'models/pushflow-fast.onnx') -PathType Leaf }
+if ($discoveredPushflow) {
+    $skippedChecks += 'ab-pushflow-empty: a PushFlow runtime sits next to the build (Release/pushflow), so the controller discovery fallback initializes PushFlow and the missing-runtime premise is not reproducible'
+    Write-Host "SKIP ab-pushflow-empty: $($skippedChecks[-1])"
+} else {
+    Invoke-Checked 'ab-pushflow-empty' { & $abRunner $modPresenter $LogDir pushflow-empty }
+}
 
 # (f2) Real libobs vfg_filter_output_tests (all 17 close/recovery scenarios + immediate Esc reopen + render tick < 5 ms)
 Invoke-Checked 'libobs-vfg-filter-output' {
@@ -441,6 +450,23 @@ if (-not ($oracleCases -match 'native-1440p') -or -not ($oracleCases -match '108
     throw 'MV sign oracle did not report both extents'
 }
 $hitRates = @($oracleCases | ForEach-Object { if ($_ -match 'hit_rate=([0-9.]+)') { [double]$Matches[1] } })
+$oracleCounters = @()
+foreach ($line in $oracleCases) {
+    $caseName = if ($line -match '^PASS mv_sign_oracle (\S+)') { $Matches[1] } else { 'unknown' }
+    $oracleCounters += [pscustomobject]@{
+        case = $caseName
+        sr_ofa_exec_count = $(if ($line -match 'sr_ofa_exec_count=(\d+)') { [int]$Matches[1] } else { $null })
+        fg_ofa_exec_count = $(if ($line -match 'fg_ofa_exec_count=(\d+)') { [int]$Matches[1] } else { $null })
+        shared_mv_hit_rate = $(if ($line -match 'hit_rate=([0-9.]+)') { [double]$Matches[1] } else { $null })
+    }
+}
+$activeCases = @($oracleCounters | Where-Object { $_.case -in @('native-1440p', '1080p-to-1440p') })
+$activeSr = @($activeCases | ForEach-Object { $_.sr_ofa_exec_count })
+$activeFg = @($activeCases | ForEach-Object { $_.fg_ofa_exec_count })
+$sharedSr = $(if ($activeCases.Count -eq 2 -and @($activeSr | Where-Object { $null -eq $_ }).Count -eq 0) { ($activeSr | Measure-Object -Maximum).Maximum } else { $null })
+$sharedFg = $(if ($activeCases.Count -eq 2 -and @($activeFg | Where-Object { $null -eq $_ }).Count -eq 0) { ($activeFg | Measure-Object -Maximum).Maximum } else { $null })
+$nrOffCase = $oracleCounters | Where-Object { $_.case -eq 'nr-off' } | Select-Object -First 1
+$oracleCountersMeasured = $(if ($activeCases.Count -eq 2 -and $null -ne $sharedSr -and $null -ne $sharedFg -and $null -ne $nrOffCase -and $null -ne $nrOffCase.sr_ofa_exec_count -and $null -ne $nrOffCase.fg_ofa_exec_count) { $true } else { $false })
 $env:OBS_NR_TEST_INVERT_MV = '1'
 try { $invert = Invoke-Bounded $oracle @() 120 } finally { Remove-Item Env:OBS_NR_TEST_INVERT_MV -ErrorAction SilentlyContinue }
 if ($invert.ExitCode -eq 0 -or ($invert.Out + $invert.Err) -notmatch 'midpoint mismatch') {
@@ -464,6 +490,17 @@ if ($nr.admitP95Ms -gt 16.67) { throw "NR admit->done p95 $($nr.admitP95Ms) ms >
 if ($nr.deadlineMiss -ne 0 -or $nr.applied -lt 0.99 -or $nr.dedupP95Ms -ge 0.2) { throw 'NR lane budget/quality gate failed' }
 $nr1080 = Invoke-Bounded $nrTests @('--1080p') 240
 if ($nr1080.ExitCode -ne 0) { throw "nr_model_pipeline --1080p failed: $($nr1080.Err)" }
+# Direct 1080p-source admit lane: same 3-trial median perf lane as --1440p, with
+# both the OBS video frame and the NR source at 1920x1080. SR upscales to 1440p
+# in the display arms; this row measures NR admission itself.
+$nr1080Perf = Invoke-Bounded $nrTests @('--1080p-perf') 300
+if ($nr1080Perf.ExitCode -ne 0) { throw "nr_model_pipeline --1080p-perf failed: $($nr1080Perf.Err)" }
+$nr1080Line = @($nr1080Perf.Out -split "`n" | Where-Object { $_ -match '^NR_PERF_LANE ' -and $_ -match '"scale":100,' } | Select-Object -First 1)
+if (-not $nr1080Line) { throw 'NR_PERF_LANE missing from the 1080p perf lane' }
+$nr1080Data = ($nr1080Line -replace '^NR_PERF_LANE ', '') | ConvertFrom-Json
+$nr1080Max = ($nr1080Perf.Out -split "`n" | Where-Object { $_ -match '^NR_PERF_TRIAL ' } | ForEach-Object {
+    if ($_ -match '"admitMaxMs":([0-9.]+)') { [double]$Matches[1] }
+} | Measure-Object -Maximum).Maximum
 
 # Arms: 1x control, 2x group (NativeVfg, PushFlow, official XeFG) and the 3x/4x
 # group (NativeVfg vs opt-in XeMFG), at both upstream extents, interleaved.
@@ -504,20 +541,30 @@ function Parse-ArmLog([string]$Path, [int]$Mult) {
             if ($line -match '\bshot_cut=(\d+)\b' -and [int]$Matches[1] -ne 0) { $shot++ }
         }
     }
-    $intervals = [System.Collections.Generic.List[double]]::new()
+    $allIntervals = [System.Collections.Generic.List[double]]::new()
+    $cadenceIntervals = [System.Collections.Generic.List[double]]::new()
+    $longIntervals = [System.Collections.Generic.List[double]]::new()
     $sorted = @($presented.ToArray() | Sort-Object)
     for ($i = 1; $i -lt $sorted.Count; $i++) {
         $dt = $sorted[$i] - $sorted[$i - 1]
-        if ($dt -gt 0 -and $dt -lt 100) { $intervals.Add($dt) }
+        if ($dt -le 0) { continue }
+        $allIntervals.Add($dt)
+        if ($dt -lt 100) { $cadenceIntervals.Add($dt) } else { $longIntervals.Add($dt) }
     }
-    $sortedI = @($intervals.ToArray() | Sort-Object)
+    $sortedAll = @($allIntervals.ToArray() | Sort-Object)
+    $sortedCadence = @($cadenceIntervals.ToArray() | Sort-Object)
     return [pscustomobject]@{
         initialized = ($init.Count -gt 0); backend = $(if ($init.Count) { ($init[0] -replace '.*backend=([^ ]+).*', '$1') } else { '' })
         originals = $orig; subframes = $sub; errors = $errors
         origRate = $orig / 120.0; effMult = $eff; hudLock = $hud; shotCuts = $shot; luid = $luid
-        p50 = $(if ($sortedI.Count) { Get-Quantile $sortedI 0.50 } else { $null })
-        p95 = $(if ($sortedI.Count) { Get-Quantile $sortedI 0.95 } else { $null })
-        p99 = $(if ($sortedI.Count) { Get-Quantile $sortedI 0.99 } else { $null })
+        intervalCount = $sortedAll.Count; maxInterval = $(if ($sortedAll.Count) { $sortedAll[$sortedAll.Count - 1] } else { $null })
+        p50 = $(if ($sortedAll.Count) { Get-Quantile $sortedAll 0.50 } else { $null })
+        p95 = $(if ($sortedAll.Count) { Get-Quantile $sortedAll 0.95 } else { $null })
+        p99 = $(if ($sortedAll.Count) { Get-Quantile $sortedAll 0.99 } else { $null })
+        cadenceP50 = $(if ($sortedCadence.Count) { Get-Quantile $sortedCadence 0.50 } else { $null })
+        cadenceP95 = $(if ($sortedCadence.Count) { Get-Quantile $sortedCadence 0.95 } else { $null })
+        cadenceP99 = $(if ($sortedCadence.Count) { Get-Quantile $sortedCadence 0.99 } else { $null })
+        longIntervals = $longIntervals.ToArray()
     }
 }
 
@@ -582,6 +629,17 @@ try {
                 trials = $trials.Count; ranTrials = $ran.Count
                 displayIntervalMs = [ordered]@{
                     target = $targetsMs[$def.mult]; p50 = $p50; p95 = $p95; p99 = $p99
+                    count = [int](Get-MedianMetric @($ran | ForEach-Object { $_.parsed }) 'intervalCount')
+                    maxMs = (@($ran | ForEach-Object { $_.parsed.maxInterval } | Measure-Object -Maximum).Maximum)
+                    cadence = [ordered]@{
+                        thresholdMs = 100; p50 = (Get-MedianMetric @($ran | ForEach-Object { $_.parsed }) 'cadenceP50')
+                        p95 = (Get-MedianMetric @($ran | ForEach-Object { $_.parsed }) 'cadenceP95'); p99 = (Get-MedianMetric @($ran | ForEach-Object { $_.parsed }) 'cadenceP99')
+                    }
+                    longIntervalsMs = [ordered]@{
+                        count = @($ran | ForEach-Object { $_.parsed.longIntervals } | Where-Object { $null -ne $_ }).Count
+                        values = @($ran | ForEach-Object { $_.parsed.longIntervals } | Sort-Object | Select-Object -First 50)
+                        truncated = (@($ran | ForEach-Object { $_.parsed.longIntervals } | Where-Object { $null -ne $_ }).Count -gt 50)
+                    }
                     observable = ($def.arm -ne 'xefg')
                     source = $(if ($def.arm -eq 'xefg') { 'originals-only: the XeFG proxy swapchain presents interpolated frames internally; the presenter logs one Present per input frame' } else { 'present_original + present_vfg_subframe cadence from the presenter log' })
                 }
@@ -608,6 +666,17 @@ $hudLockCuts = 0
 foreach ($line in @($hudLockOut)) { if ("$line" -match 'cuts=(\d+)') { $hudLockCuts = [int]$Matches[1] } }
 $pushflowCuts = 0
 foreach ($line in @($pushflowSmokeOut)) { if ("$line" -match '^PASS ab_pushflow mult=2x .*cuts=(\d+)') { $pushflowCuts = [int]$Matches[1]; break } }
+$trackedList = @(& git -C $ModifiedRoot ls-files)
+$trackedBinaryMatches = @($trackedList | Where-Object { $_ -match '\.(dll|lib|exe|zip|7z|pdb)$' })
+$manifestText = ($trackedList -join "`n")
+$manifestSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($manifestText))) -replace '-', '').ToLowerInvariant()
+$trackedBinaries = [ordered]@{
+    command = "git -C <ModifiedRoot> ls-files | Select-String '\\.(dll|lib|exe|zip|7z|pdb)$'"
+    trackedFileCount = $trackedList.Count
+    binaryMatchCount = $trackedBinaryMatches.Count
+    binaryMatches = $trackedBinaryMatches
+    manifestSha256 = $manifestSha
+}
 
 $oracleSummary = [ordered]@{
     native1440p = ($oracleCases -match 'native-1440p'); scaled1080pTo1440p = ($oracleCases -match '1080p-to-1440p')
@@ -618,16 +687,21 @@ $summary = [ordered]@{
     profile = $MatrixProfile
     generatedUtc = (Get-Date).ToUniversalTime().ToString('o')
     pins = $pins
+    trackedBinaries = $trackedBinaries
+    skipped = $skippedChecks
     oracle = $oracleSummary
     sharedFlow = [ordered]@{
         source = 'mv_sign_oracle_tests: real Shared NVOF scale/sanitize pass + SR single-owner counters'
-        sr_ofa_exec_count = 0; fg_ofa_exec_count = 0; shared_mv_hit_rate = $(if ($hitRates.Count) { ($hitRates | Measure-Object -Minimum).Minimum } else { $null })
-        nrOff = [ordered]@{ sr_ofa_exec_count = 4; fg_ofa_exec_count = 4; expected = 'ConsumerFallback runs local OFA' }
+        measured = $oracleCountersMeasured
+        sr_ofa_exec_count = $sharedSr; fg_ofa_exec_count = $sharedFg
+        shared_mv_hit_rate = $(if ($hitRates.Count) { ($hitRates | Measure-Object -Minimum).Minimum } else { $null })
+        perCase = $oracleCounters
+        nrOff = [ordered]@{ sr_ofa_exec_count = $(if ($nrOffCase) { $nrOffCase.sr_ofa_exec_count } else { $null }); fg_ofa_exec_count = $(if ($nrOffCase) { $nrOffCase.fg_ofa_exec_count } else { $null }); expected = 'ConsumerFallback runs local OFA' }
         presenterArms = [ordered]@{ status = 'BLOCKED'; reason = 'presenter-only lane has no NR producer; fg stats live in the oracle and filter-output lanes' }
     }
     nr = [ordered]@{
         native1440p = [ordered]@{ status = 'MEASURED'; p50Ms = $nr.admitP50Ms; p95Ms = $nr.admitP95Ms; p99Ms = $nr.admitP99Ms; maxMs = $nrMax; deadlineMiss = $nr.deadlineMiss; applied = $nr.applied; dedupP95Ms = $nr.dedupP95Ms; mode = $nr.model; scale = $nr.scale }
-        scaled1080pTo1440p = [ordered]@{ status = 'UPPER_BOUND'; sourceLane = 'nr_model_pipeline --1440p'; reason = 'no 1080p-source admit telemetry; the 1440p source is the stricter bound'; '1080pLane' = $(if ($nr1080.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }) }
+        scaled1080pTo1440p = [ordered]@{ status = 'MEASURED'; sourceLane = 'nr_model_pipeline_tests --1080p-perf'; source = $nr1080Data.source; srOutput = '2560x1440'; p50Ms = $nr1080Data.admitP50Ms; p95Ms = $nr1080Data.admitP95Ms; p99Ms = $nr1080Data.admitP99Ms; maxMs = $nr1080Max; deadlineMiss = $nr1080Data.deadlineMiss; applied = $nr1080Data.applied; dedupP95Ms = $nr1080Data.dedupP95Ms; mode = $nr1080Data.model; scale = $nr1080Data.scale }
     }
     displayArms = $allRows
     cadenceNotes = 'Each arm interval is measured from present_original/present_vfg_subframe in the presenter log over b=17..136. The XeFG arm is originals-only: XeFG''s proxy swapchain presents interpolated frames internally and logs one Present per input frame, so its p50 tracks the 60 Hz input cadence and not the 2x display cadence; PresentMon/ETW is unavailable here. Interval targets are therefore reported, not gated.'
@@ -639,14 +713,15 @@ $summary = [ordered]@{
     }
     xemfg_live_status = $(if ($xemfgAvailable) { 'UNVERIFIED_NOT_RUN' } else { 'BLOCKED' })
     xemfg_reason = $(if ($xemfgAvailable) { 'external DLL supplied but no live MFGUnlocker contract run in this unit' } else { 'no user-supplied MFGUnlocker.dll (-XeMfgDllPath / OBS_NR_TEST_XEMFG_DLL)' })
-    blocked = @($allRows | Where-Object { $_.status -eq 'BLOCKED' } | ForEach-Object { "$($_.arm) [$($_.extent)]: $($_.reason)" })
+    blocked = @(@($allRows | Where-Object { $_.status -eq 'BLOCKED' } | ForEach-Object { "$($_.arm) [$($_.extent)]: $($_.reason)" }) + @('etw-presentmon: PresentMon not installed; ETW kernel providers require elevation and this session is not administrator'))
     peakVramDeltaBytes = $(if (@($allRows | Where-Object { $null -ne $_.peakVramDeltaBytes }).Count) { (@($allRows | ForEach-Object { $_.peakVramDeltaBytes } | Where-Object { $null -ne $_ }) | Measure-Object -Maximum).Maximum } else { $null })
     peakVramNote = 'per-arm peak sampled through Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory during trial 1; system-wide dedicated usage'
-    etwPresentMon = [ordered]@{ status = $(if (Get-Command presentmon.exe -ErrorAction SilentlyContinue) { 'AVAILABLE_NOT_RUN' } else { 'UNAVAILABLE' }); reason = 'framesPresented/qpc_ns cross-check only; PresentMon/ETW requires elevation and is not installed' }
+    etwPresentMon = [ordered]@{ status = 'BLOCKED'; reason = 'PresentMon not installed; ETW kernel providers require elevation and this session is not administrator' }
     gates = [ordered]@{
         oracle = 'PASS'; nrAdmitP95Le1667 = ($nr.admitP95Ms -le 16.67); nrDeadlineMissZero = ($nr.deadlineMiss -eq 0); nrAppliedGe099 = ($nr.applied -ge 0.99)
         sharedMvHitRateGe095 = $(if ($hitRates.Count) { ($hitRates | Measure-Object -Minimum).Minimum -ge 0.95 } else { $false }); origPresentRateGe095 = (@($allRows | Where-Object { $_.status -eq 'RAN' -and $_.origPresentRate -lt 0.95 }).Count -eq 0)
         eventErrorsZero = (@($allRows | Where-Object { $_.status -eq 'RAN' -and $_.eventErrors -ne 0 }).Count -eq 0)
+        nr1080AdmitP95Le1667 = ($nr1080Data.admitP95Ms -le 16.67); nr1080DeadlineMissZero = ($nr1080Data.deadlineMiss -eq 0); nr1080AppliedGe099 = ($nr1080Data.applied -ge 0.99)
     }
 }
 $summaryPath = Join-Path $LogDir 'ab-matrix-summary.json'
