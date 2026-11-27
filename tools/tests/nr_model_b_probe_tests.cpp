@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Real hardware probe: the admitted 310.9.16.0 NR runtime must select Model B
-// (CC_SMALL_FP8) for exactly one DLSSNR.Hint.Render.Preset integer. This binary
-// records that integer as evidence; it never runs the OBS filter or a game.
+// Real hardware probe: on the admitted 310.9.16.0 NR runtime Pass::prepare is
+// authoritative for the network, so Settings::perfModel off must evaluate the
+// Model A preset 1 full-weights network and on must evaluate the Model B preset 2
+// CC_SMALL_FP8 network. This binary records both evaluations; it never runs the
+// OBS filter or a game.
+// allow: SIZE_OK — one real-hardware NR probe: the D3D12 rig, NGX core loader, leased module and
+// pass driver are a single executable, and this todo may change only this file (no CMake split).
 #include "nr_runtime.h"
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <windows.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -119,19 +126,26 @@ struct Core {
 struct Leased {
     std::shared_ptr<int> lease=std::make_shared<int>(18);
     std::shared_ptr<runtime::Module> module;
+    std::filesystem::path runtime;
     std::vector<std::unique_ptr<runtime::Pass>> passes;
     ~Leased(){passes.clear();if(module)(void)module->close();}
 };
-static Settings settings_for(const fs::path& runtime,unsigned preset)
+// Network selection is the perfModel toggle, not the caller preset: on a Model B
+// runtime Pass::prepare maps off -> preset 1 (full weights) and on -> preset 2.
+struct Request { unsigned callerPreset; bool perfModel; };
+struct Expectation { Request request; unsigned preset; bool modelB; };
+struct Observation { unsigned preset=0; bool modelB=false,fullWeights=false,fallback=false; std::string line; };
+static Settings settings_for(const fs::path& runtime,Request request)
 {
-    return {{1},true,runtime.generic_string(),{1.0f},{preset,0,1.0f,1.0f,0.0f,-1.0f,true}};
+    return {{1},true,runtime.generic_string(),{1.0f},
+        {request.callerPreset,0,1.0f,1.0f,0.0f,-1.0f,true},1,100,std::nullopt,{},request.perfModel};
 }
-static bool evaluate_preset(Leased& owner,const fs::path& runtime,unsigned preset,Gpu& gpu)
+static bool evaluate_preset(Leased& owner,Request request,Gpu& gpu)
 {
-    const auto settings=settings_for(runtime,preset);
+    const auto settings=settings_for(owner.runtime,request);
     auto pass=std::make_unique<runtime::Pass>(owner.module);
     auto complete=[] {return runtime::Completion::Complete;};
-    const auto creationEpoch=10u+preset*2u;
+    const auto creationEpoch=10u+request.callerPreset*2u;
     gpu.reset();
     const auto prepared=pass->prepare(settings,settings.tuning,{1920,1080},1,
         {gpu.list.Get(),creationEpoch,owner.lease,complete});
@@ -169,6 +183,26 @@ static std::string nr_log(const fs::path& directory)
         if(entry.path().filename().wstring().starts_with(L"nvngx_dlssnr_"))return text(entry.path());
     return {};
 }
+// Reads the vendor's own "Created feature" line: its preset= integer and network
+// name are the evidence, never the probe's exit code alone.
+static Observation observe(const fs::path& directory,std::size_t before)
+{
+    const auto slice=nr_log(directory).substr(before);
+    const auto at=slice.rfind("DLSSNR: Created feature");
+    check(at!=std::string::npos,"NGX feature log line");
+    const auto end=slice.find('\n',at);
+    Observation seen;
+    seen.line=slice.substr(at,end==std::string::npos?std::string::npos:end-at);
+    const auto marker=seen.line.find("preset=");
+    const auto digits=marker==std::string::npos?seen.line.size():marker+7;
+    check(digits<seen.line.size() && std::isdigit(static_cast<unsigned char>(seen.line[digits])),
+        "NVIDIA log names the selected preset");
+    seen.preset=static_cast<unsigned>(std::strtoul(seen.line.c_str()+digits,nullptr,10));
+    seen.modelB=seen.line.find("hnet-crazy-cuckoo-small-fp8")!=std::string::npos;
+    seen.fullWeights=seen.line.find("CC_Control_History")!=std::string::npos;
+    seen.fallback=slice.find("falling back")!=std::string::npos;
+    return seen;
+}
 static void set_logging(const fs::path& directory)
 {
     SetEnvironmentVariableW(L"__NGX_ENABLE_OVERRIDE_LOG_PATH",L"1");
@@ -190,9 +224,13 @@ int main(int argc,char** argv)
         const auto inspection=runtime::inspect({runtime,sha});
         const auto hashMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
         check(inspection.accepted && inspection.sha256==variant.sha256,"real inspect accepts 310.9.16.0");
+        check(fs::file_size(runtime)==276162560,"310.9.16.0 is 276162560 bytes");
         check(inspection.exports.size()>=5,"PE64 export table");
         const auto cross=runtime::inspect({runtime,older});
-        check(!cross.accepted && cross.reason=="hashMismatch" && cross.sha256==variant.sha256,"single-hash mismatch isolated");
+        check(!cross.accepted && !cross.loaded && cross.reason=="hashMismatch" && cross.sha256==variant.sha256,
+            "single-hash mismatch isolated without a load");
+        std::printf("admission: modified digest reason=%s loaded=%d sha256=%s\n",
+            cross.reason.c_str(),cross.loaded?1:0,cross.sha256.c_str());
         std::printf("inspect: sha256=%s bytes=276162560 hash_ms=%.1f exports=%zu\n",inspection.sha256.c_str(),hashMs,
             inspection.exports.size());
         for(const auto& name:inspection.exports)std::printf("export: %s\n",name.c_str());
@@ -210,40 +248,49 @@ int main(int argc,char** argv)
         Core core(binding.identity.canonicalPath,emptyDir,gpu.device.Get(),dataDir);
         std::printf("core: path=%s sha256=%s\n",binding.identity.canonicalPath.string().c_str(),binding.identity.sha256.c_str());
         Leased owner;
+        owner.runtime=runtime;
         owner.module=runtime::Module::open({runtime,sha},core.dispatch,owner.lease,gpu.device.Get(),
             dataDir,runtime::Route::DriverFallback);
         check(owner.module!=nullptr,"Module::open 310.9.16.0");
         std::printf("module: driver+openDirect fallback opened; 5-export PE64 and find_path_imports IAT check accepted\n");
-        int modelA=-1,modelB=-1;std::string weight;
-        for(unsigned preset=0;preset<=3;++preset) {
+        const Expectation expectations[]{
+            {{0,false},1,false}, // toggle off rewrites caller preset 0 to Model A preset 1
+            {{1,false},1,false}, // toggle off keeps Model A preset 1 for caller preset 1
+            {{0,true},2,true},   // toggle on selects Model B preset 2 from caller preset 0
+            {{3,false},1,false}, // toggle off after Model B must not reuse the cached tuning
+        };
+        int modelA=-1,modelB=-1;const char* modelBWeight="";
+        for(const auto& expected:expectations) {
             const auto before=nr_log(dataDir).size();
-            check(evaluate_preset(owner,runtime,preset,gpu),"prepare/evaluate");
-            const auto slice=nr_log(dataDir).substr(before);
-            const auto at=slice.rfind("DLSSNR: Created feature");
-            check(at!=std::string::npos,"NGX feature log line");
-            const auto end=slice.find('\n',at);
-            const auto line=slice.substr(at,end==std::string::npos?std::string::npos:end-at);
-            const bool fallbackLine=slice.find("falling back")!=std::string::npos;
-            const bool modelBNetwork=slice.find("BuildActiveNetwork config=hnet-crazy-cuckoo-small-fp8")!=std::string::npos;
-            const bool modelANetwork=slice.find("BuildActiveNetwork config=CC_Control_History")!=std::string::npos;
-            check(modelBNetwork!=modelANetwork,"one NR network per preset");
-            std::printf("preset=%u evaluate=ok fallback=%d network=%s log=%s\n",preset,fallbackLine?1:0,
-                modelBNetwork?"small-fp8":"full-weights",line.c_str());
-            if(!fallbackLine && modelBNetwork) {check(modelB<0,"unique directly available Model B preset");modelB=static_cast<int>(preset);weight="hnet-crazy-cuckoo-small-fp8";}
-            if(!fallbackLine && modelANetwork) {check(modelA<0,"unique directly available Model A preset");modelA=static_cast<int>(preset);}
+            check(evaluate_preset(owner,expected.request,gpu),"prepare/evaluate");
+            const auto seen=observe(dataDir,before);
+            check(seen.preset==expected.preset,"Pass::prepare selects the probe-verified preset");
+            check(seen.modelB!=seen.fullWeights,"exactly one NR network per evaluation");
+            check(expected.modelB?seen.modelB:seen.fullWeights,"evaluation builds the expected NR network");
+            check(!seen.fallback,"the verified preset needs no fallback");
+            std::printf("toggle=%s caller_preset=%u preset=%u network=%s log=%s\n",
+                expected.request.perfModel?"on":"off",expected.request.callerPreset,seen.preset,
+                seen.modelB?"hnet-crazy-cuckoo-small-fp8 (CC_SMALL_FP8)":"CC_Control_History full-weights",
+                seen.line.c_str());
+            if(seen.modelB && modelB<0) {modelB=static_cast<int>(seen.preset);modelBWeight="hnet-crazy-cuckoo-small-fp8";}
+            if(seen.fullWeights && modelA<0)modelA=static_cast<int>(seen.preset);
         }
-        check(modelA==1 && modelB==2,"verified 310.9.16.0 mapping: preset 1 Model A, preset 2 Model B");
-        std::printf("verified: model_api=0x%X model_a_preset=%d model_b_preset=%d model_b_weight=%s\n",0x15,modelA,modelB,weight.c_str());
+        check(modelA==1 && modelB==2,"verified 310.9.16.0 mapping: Model A preset 1, Model B preset 2");
+        check(modelA==static_cast<int>(runtime::model_a_preset) && modelB==static_cast<int>(runtime::model_b_preset),
+            "toggle-selected presets match the pinned Model A/B constants");
+        std::printf("verified: model_api=0x%X model_a_preset=%d model_b_preset=%d model_a_network=CC_Control_History model_b_weight=%s\n",
+            0x15,modelA,modelB,modelBWeight);
         owner.passes.clear();
         check(owner.module->close(),"direct module close");
         owner.module.reset();
         core.close();
         Core driverCore(binding.identity.canonicalPath,runtime.parent_path(),gpu.device.Get(),dataDir);
         Leased driver;
+        driver.runtime=runtime;
         driver.module=runtime::Module::open({runtime,sha},driverCore.dispatch,driver.lease,gpu.device.Get(),
             dataDir,runtime::Route::Driver);
         check(driver.module!=nullptr,"Module::open driver route");
-        const bool driverEvaluated=evaluate_preset(driver,runtime,static_cast<unsigned>(modelB),gpu);
+        const bool driverEvaluated=evaluate_preset(driver,{static_cast<unsigned>(modelB),true},gpu);
         const auto coreLog=text(dataDir/"nvngx.log");
         const bool unsignedRefusal=coreLog.find("nvLoadSignedLibraryW() failed")!=std::string::npos;
         if(driverEvaluated) std::printf("driver_route: prepare/evaluate=ok preset=%d\n",modelB);
