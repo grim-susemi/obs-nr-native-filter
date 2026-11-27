@@ -2,8 +2,10 @@
 // Adapted from PushFPS PushPacingRepair.h; port modified 2026-11-21. Copyright (C) 2026 DosukaSOL and the PushFPS contributors.
 // Original source: https://github.com/DosukaSOL/PushFPS/blob/4e5c0491d0f5f7c01f1c4718e2b156857573abcd/include/veyra/engine/PushPacingRepair.h
 #pragma once
+#include "vfg_cadence.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstddef>
@@ -196,22 +198,16 @@ struct RepairedTimes {
 class TransportIntervalEstimator {
 public:
     static constexpr unsigned kWindow = 9;
-    static constexpr int64_t kMinimumNs = 8'000'000;
-    static constexpr int64_t kMaximumNs = 35'000'000;
+    static constexpr int64_t kMinimumNs = 4'000'000;
+    static constexpr int64_t kMaximumNs = 50'000'000;
     static constexpr int64_t kDefaultNs = 16'666'667;
 
     [[nodiscard]] int64_t observe(int64_t sample)
     {
-        if (haveLast_ && sample <= last_) {
-            reset();
-            last_ = sample;
-            haveLast_ = true;
-            return kDefaultNs;
-        }
+        if (haveLast_ && (sample <= last_ ||
+            (last_ <= INT64_MAX - clock_stall_ns && sample > last_ + clock_stall_ns))) reset();
         if (haveLast_) {
-            const int64_t elapsed = last_ < 0 && sample > INT64_MAX + last_
-                ? INT64_MAX : sample - last_;
-            deltas_[next_] = (std::clamp)(elapsed, kMinimumNs, kMaximumNs);
+            deltas_[next_] = (std::clamp)(sample - last_, kMinimumNs, kMaximumNs);
             next_ = (next_ + 1) % kWindow;
             count_ = (std::min)(count_ + 1, kWindow);
         }

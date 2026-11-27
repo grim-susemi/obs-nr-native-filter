@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "../fg-presenter/vfg_adaptive_fg.h"
 #include "../fg-presenter/vfg_cadence.h"
+#include "../fg-presenter/vfg_live_anchor.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -131,13 +132,97 @@ void adaptive_cadence()
     }
     const auto boundary = plan_cadence_adaptive(1'000'000'000, 0, 28'985'507, 4);
     expect(boundary.multiplier == 4, "planner honors applied 4x at 34.5 FPS");
-    expect(plan_cadence_adaptive(1'000'000'000, 0, 8'333'332, 3).multiplier == 0 &&
-        plan_cadence_adaptive(1'000'000'000, 0, 8'333'333, 3).multiplier == 3 &&
+    expect(plan_cadence_adaptive(1'000'000'000, 0, 7'499'999, 3).multiplier == 0 &&
+        plan_cadence_adaptive(1'000'000'000, 0, 7'500'000, 3).multiplier == 3 &&
         plan_cadence_adaptive(1'000'000'000, 0, 50'000'000, 4).multiplier == 4 &&
         plan_cadence_adaptive(1'000'000'000, 0, 50'000'001, 4).multiplier == 0 &&
         plan_cadence_adaptive(1'000'000'000, 0, 5'000'000, 4).multiplier == 0 &&
         plan_cadence_adaptive(1'000'000'000, 0, 100'000'000, 4).multiplier == 0,
-        "period bounds are inclusive at 8.333333-50 ms");
+        "period bounds are inclusive at 7.5-50 ms");
+}
+void high_rate_reacquisition()
+{
+    ContentRateTracker rate;
+    uint64_t pts = 0;
+    for (uint64_t frame = 0; frame <= 180; ++frame) {
+        pts = frame * 1'000'000'000 / 120;
+        (void)rate.observe(pts, frame, false);
+        (void)rate.observe(pts + 4'166'667, frame, false); // 240 Hz transport, repeated image
+    }
+    const auto fps = rate.fps();
+    const auto mult = adaptive_multiplier(AdaptiveBackend::NativeVfg, 4, fps, 240);
+    std::printf("adaptive content_fps=%.6f multiplier=%u presented_fps=%.6f\n", fps, mult, fps * mult);
+    expect(std::abs(fps - 120) < 0.000001 && mult == 2, "120 unique FPS on a 240 Hz display selects exactly 2x");
+    expect(rate.observe(pts + 4'166'667, 180, false) == fps,
+        "a repeated callback with the same PTS and ordinal is not a new content sample");
+    expect(rate.observe(pts + 4'166'667 + 500'000'001, 181, false) == 0 && rate.size() == 1,
+        "a half-second callback stall starts a fresh content-rate window");
+}
+void real_release_on_persistent_reject()
+{
+    LiveAnchorClock clock;
+    const auto at = [&](uint64_t qpc, bool accepted) {
+        (void)clock.observe({qpc, qpc}, period_50hz);
+        return clock.resolve_fg(accepted);
+    };
+    unsigned earlyHolds = 0;
+    for (uint64_t ms = 0; ms <= 1600; ms += 10)
+        earlyHolds += at(ms * 1'000'000, ms == 600).fgHeld; // one success interrupts the first run
+    constexpr uint64_t threshold = 1'610'000'000; // first uninterrupted rejection was at 610 ms
+    const auto before = at(threshold - 1, false);
+    const auto onArrival = clock.observe({threshold, threshold}, period_50hz), release = clock.resolve_fg(false);
+    const auto pending = clock.observe({threshold + 10'000'000, threshold + 10'000'000}, period_24hz);
+    const auto recovered = clock.resolve_fg(true);
+    std::printf("fg_release early_holds=%u before_held=%d held=%d rejected_ns=%llu release_qpc_ns=%llu "
+        "real_target_ns=%llu next_held=%d recovery_held=%d recovery_target_ns=%llu\n", earlyHolds, before.fgHeld,
+        release.fgHeld, release.realTargetNs - 610'000'000, threshold, release.realTargetNs, pending.fgHeld,
+        recovered.fgHeld, recovered.realTargetNs);
+    expect(!earlyHolds && !before.fgHeld && before.realTargetNs == threshold - 1 + period_50hz &&
+        onArrival.realTargetNs == threshold && release.fgHeld && release.realTargetNs == threshold,
+        "real frame bypasses phase at exactly one second, not before");
+    expect(pending.fgHeld && pending.realTargetNs == threshold + 10'000'000 && !recovered.fgHeld &&
+        recovered.realTargetNs == threshold + 10'000'000 + period_24hz,
+        "held originals are immediate until admission restores the current phase");
+}
+void anchor_discards_invalid_epochs()
+{
+    constexpr uint64_t end = 1'200'000'000;
+    LiveAnchorClock history;
+    for (uint64_t t = 0; t <= end; t += period_50hz) {
+        (void)history.observe({t, t}, period_50hz);
+        (void)history.resolve_fg(false);
+    }
+    const auto baseline = history.resolve_fg(false);
+    expect(baseline.locked && baseline.fgHeld && baseline.snaps == 0, "failure injection begins phase locked and held");
+    auto limit = history;
+    expect(limit.observe({end + 500'000'000, end + 500'000'000}, period_50hz).snaps == 0,
+        "an exactly 500 ms gap on both clocks retains the epoch");
+    auto spike = history;
+    const auto jitter = spike.observe({end + period_50hz, end + 24'000'000}, period_50hz);
+    expect(jitter.callbackJitterMs > 0 && jitter.callbackJitterMs < jitter.callbackMinusAnchorMs &&
+        jitter.deadline_extra_ns() > 0 && jitter.deadline_extra_ns() < 1'000'000,
+        "a single late callback increases jitter slack gradually instead of adopting the raw phase error");
+    struct Cut { const char* name; uint64_t pts, qpc; };
+    for (const auto [name, pts, qpc] : {Cut{"qpc-duplicate", end + period_50hz, end},
+            {"qpc-backwards", end + period_50hz, end - 1}, {"pts-backwards", end - 1, end + period_50hz},
+            {"pts-duplicate", end, end + period_50hz}, {"qpc-stall", end + period_50hz, end + 500'000'001},
+            {"both-stalled", end + 500'000'001, end + 500'000'001}, {"phase-step", end + period_50hz, end + 90'000'000}}) {
+        auto clock = history;
+        const auto cut = clock.observe({pts, qpc}, period_50hz);
+        const auto firstReject = clock.resolve_fg(false);
+        unsigned mislocks = 0;
+        for (uint64_t i = 1; i < 13; ++i)
+            mislocks += clock.observe({pts + i * period_50hz, qpc + i * period_50hz}, period_50hz).locked;
+        const auto resumed = clock.observe({pts + 260'000'000, qpc + 260'000'000}, period_50hz);
+        std::printf("anchor_cut=%s qpc_ns=%llu anchor_ns=%llu snaps=%llu locked=%d fgHeld=%d early_locks=%u "
+            "relocked=%d ppm=%.6f\n", name, qpc, cut.anchorNs, cut.snaps, cut.locked, cut.fgHeld, mislocks,
+            resumed.locked, resumed.clockDriftPpm);
+        expect(cut.snaps == 1 && !cut.locked && !cut.fgHeld && cut.anchorNs == qpc && cut.realTargetNs == qpc + period_50hz &&
+            cut.callbackMinusAnchorMs == 0 && cut.callbackJitterMs == 0 && cut.deadline_extra_ns() == 0 &&
+            cut.clockDriftPpm == 0 && !firstReject.fgHeld, "discontinuity clears timing and the rejection streak");
+        expect(!mislocks && resumed.locked && resumed.snaps == 1 && resumed.clockDriftPpm == 0 &&
+            resumed.anchorNs == qpc + 260'000'000, "only the new epoch participates in reacquisition");
+    }
 }
 void monitor_query()
 {
@@ -154,6 +239,9 @@ int main()
     tracker();
     still_hold_resume();
     adaptive_cadence();
+    high_rate_reacquisition();
+    real_release_on_persistent_reject();
+    anchor_discards_invalid_epochs();
     monitor_query();
     std::printf("%s vfg_adaptive_fg (%u failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;

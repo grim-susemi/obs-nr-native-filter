@@ -153,55 +153,88 @@ void content_boundaries(){
 }
 
 void cadence_rates(){
- for(const auto expected:{period_30hz,period_40hz,period_60hz}){
+ struct Band{uint64_t expected,tolerance;};
+ for(const auto [expected,tolerance]:{Band{8'333'333,1'200'000},{16'666'667,2'750'000},{20'000'000,300'000},
+     {25'000'000,2'750'000},{33'333'333,2'750'000},{41'666'667,2'000'000}}){
   UniqueCadence cadence;
-  uint64_t now=1'000'000'000;
+  uint64_t now=0,locked=0,maxInterval=0;
   expect(cadence.observe(now)==0,"one original does not establish cadence");
   for(unsigned i=0;i<12;++i){
    // At 40 Hz sampled by OBS at 60 Hz, one and two ticks alternate.
-   now+=expected==period_40hz?(i%2==0?period_60hz:period_30hz):expected;
-   expect(cadence.observe(now)==(i<3?0:expected),"30, 40 and 60 Hz acquisition");
+   const auto interval=expected==period_40hz?(i%2==0?period_60hz:period_30hz):
+    expected==41'666'667?(i%2==0?expected+340'000:expected-340'000):expected;
+   now+=interval;
+   maxInterval=(std::max)(maxInterval,interval);
+   locked=cadence.observe(now);
+   if(i==3) std::printf("cadence input_ns=%llu lock_ns=%llu max_interval_ns=%llu\n",expected,locked,maxInterval);
+   expect(locked==(i<3?0:expected),"canonical period locks after four unique intervals");
   }
-  expect(cadence.observe(now+100'000'000)==0,"a stall reseeds without pairing stale content");
+  for(const uint64_t boundary:{now,now-1,now+500'000'001}){
+   auto cut=cadence;
+   expect(cut.observe(boundary)==0,"a duplicate, reversal or stall immediately loses the lock");
+   for(unsigned i=1;i<=4;++i)
+    expect(cut.observe(boundary+i*expected)==(i==4?expected:0),"relock uses only post-boundary intervals");
+  }
   cadence.reset();
   expect(cadence.observe(now)==0,"session boundary clears cadence");
+  for(const auto interval:{expected-tolerance-1,expected-tolerance,expected+tolerance,expected+tolerance+1}){
+   UniqueCadence edge;
+   for(unsigned i=0;i<4;++i) (void)edge.observe(i*interval);
+   expect(edge.observe(4*interval)==(interval<expected-tolerance||interval>expected+tolerance?0:expected),
+    "one nanosecond distinguishes an unsupported neighbor from each inclusive cadence band");
+  }
  }
  UniqueCadence unsupported;
- uint64_t now=1'000'000'000;
+ uint64_t now=1'000'000'000,mislocks=0;
  for(unsigned i=0;i<10;++i,now+=20'500'000)
-  expect(unsupported.observe(now)==0,"unsupported cadence is not folded into a target");
+  mislocks+=unsupported.observe(now)!=0;
+ std::printf("unsupported interval_ns=20500000 mislocks=%llu\n",mislocks);
+ expect(mislocks==0,"48.78 Hz is not folded into 50 Hz");
  expect(provisional_60hz(now,now+period_60hz,false),
   "confirmed 60 Hz content can interpolate before the estimator locks");
  expect(!provisional_60hz(now,now+period_60hz,true) &&
   !provisional_60hz(now,now+period_30hz,false),
   "a repeated input or a slow pair must acquire cadence normally");
+ expect(provisional_120hz(now,now+7'000'000,false)&&provisional_120hz(now,now+9'600'000,false)&&
+  !provisional_120hz(now,now+6'999'999,false)&&!provisional_120hz(now,now+9'600'001,false)&&
+  !provisional_120hz(now,now-1,false)&&!provisional_120hz(now,now+period_120hz,true),
+  "only unrepeated forward pairs in the inclusive 7.0-9.6 ms band start early");
 }
 
 void cadence_schedule(){
- for(const auto period:{period_30hz,period_40hz,period_60hz}){
+ constexpr uint64_t start=1'000'000'000;
+ for(const auto period:{period_120hz,period_60hz,period_50hz,period_40hz,period_30hz,period_24hz}){
+  const auto lead=period==period_40hz?period/3:period==period_60hz?5'000'000:0;
   for(uint32_t mult=2;mult<=4;++mult){
-   for(unsigned phase=0;phase<2;++phase){
-    uint64_t arrival=1'000'000'000;
-    uint64_t previous=0;
+   for(unsigned phase=0;phase<(period==period_40hz?3u:1u);++phase){
+    uint64_t arrival=start,previous=0;
     for(unsigned i=0;i<12;++i){
      const auto plan=plan_cadence(arrival,previous,period,mult);
-     expect(plan.target(1)>=arrival&&plan.target(mult)==plan.originalNs,
-      "synthetics start at or after arrival and the last slot is the original");
-     if(previous) expect(plan.originalNs-previous==period,"pacing phase survives both sampled 40 Hz rhythms");
-     for(uint32_t slot=2;slot<=mult;++slot){
-      const auto spacing=plan.target(slot)-plan.target(slot-1);
-      expect(spacing==period/mult||spacing==period/mult+1,"even synthetic spacing");
+     const auto originalDue=previous?previous+period:arrival+lead+period;
+     expect(plan.periodNs==period&&plan.originalNs==originalDue&&plan.target(1)>=arrival,
+      "OFF baseline keeps canonical phase and never schedules before arrival");
+     for(uint32_t slot=0;slot<=mult;++slot){
+      const auto due=slot?originalDue-period+period*slot/mult:0,next=originalDue-period+period*(slot+1)/mult;
+      const auto cutoff=!slot||slot==mult?0:period==period_120hz?next-150'000:
+       period==period_60hz&&mult==4?next-250'000:(std::min)(due+3'000'000,next);
+      expect(plan.target(slot)==due&&plan.synthetic_cutoff(slot)==cutoff,"even slots and exact readiness guards");
      }
      previous=plan.originalNs;
-     arrival+=period==period_40hz?((i+phase)%2==0?period_60hz:period_30hz):period;
+     arrival+=period==period_40hz&&phase<2?((i+phase)%2==0?period_60hz:period_30hz):period;
     }
     expect(plan_cadence(arrival+90'000'000,previous,period,mult).target(1)>arrival,
      "after a stall the schedule moves forward");
    }
   }
  }
- expect(!plan_cadence(1'000'000'000,0,0,4).target(1),"unacquired cadence creates no synthetic slot");
- const auto tight=plan_cadence(1'000'000'000,0,period_60hz,4);
+ expect(!plan_cadence(start,0,0,4).target(1)&&!plan_cadence(start,0,20'500'000,4).target(1),
+  "unacquired or unsupported cadence creates no synthetic slot");
+ const auto tight=plan_cadence(start,0,period_60hz,4);
+ constexpr std::array<uint64_t,5> targets{0,1'009'166'666,1'013'333'333,1'017'500'000,1'021'666'667};
+ constexpr std::array<uint64_t,5> cutoffs{0,1'013'083'333,1'017'250'000,1'021'416'667,0};
+ for(uint32_t slot=0;slot<=4;++slot)
+  expect(tight.target(slot)==targets[slot]&&tight.synthetic_cutoff(slot)==cutoffs[slot],
+   "OFF 60 Hz 4x tuple matches frozen expected values");
  for(uint32_t slot=1;slot<4;++slot){
   expect(tight.synthetic_cutoff(slot)>tight.target(slot)+3'500'000,
    "a subframe ready 3.5 ms after its 240 Hz target still fits");
@@ -224,7 +257,7 @@ int main(){
   fence_values();std::puts("PASS fence_values prior exact later device_lost");
   retained_unique();std::puts("PASS retained_unique duplicate transport gap and stale copy");
   content_boundaries();std::puts("PASS content_boundaries cuts generations clocks shape and invalidation");
-  cadence_rates();std::puts("PASS cadence_rates 30/40/60 acquisition, stall and unsupported rate");
+  cadence_rates();std::puts("PASS cadence_rates 24/30/40/50/60/120 acquisition, stall and unsupported rate");
   cadence_schedule();std::puts("PASS cadence_schedule 2x/3x/4x intervals and both 40 Hz phases");
   return 0;
  }catch(const std::exception& error){std::fprintf(stderr,"FAIL fg_ipc_sequence: %s\n",error.what());return 1;}

@@ -2,17 +2,26 @@
 #pragma once
 #include <array>
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace nr::fg::vfg {
-inline constexpr uint64_t period_30hz = 33'333'333, period_40hz = 25'000'000, period_60hz = 16'666'667;
+inline constexpr uint64_t period_120hz = 8'333'333, period_60hz = 16'666'667, period_50hz = 20'000'000,
+    period_40hz = 25'000'000, period_30hz = 33'333'333, period_24hz = 41'666'667;
+inline constexpr int64_t clock_stall_ns = 500'000'000;
+namespace detail {
+struct CadenceBand { uint64_t periodNs, toleranceNs; };
+inline constexpr std::array<CadenceBand, 6> cadence_bands{{
+    {period_120hz, 1'200'000}, {period_60hz, 2'750'000}, {period_50hz, 300'000},
+    {period_40hz, 2'750'000}, {period_30hz, 2'750'000}, {period_24hz, 2'000'000}}};
+} // namespace detail
 
 class UniqueCadence {
     std::array<uint64_t, 8> intervals_{};
     std::size_t count_{}, next_{};
-    uint64_t last_{}, total_{};
+    std::optional<uint64_t> last_;
+    uint64_t total_{};
 public:
     void reset() noexcept { *this = {}; }
 
@@ -22,23 +31,23 @@ public:
     // alternating ~17/33 ms intervals, so use the mean rather than the median.
     [[nodiscard]] uint64_t observe(uint64_t timestampNs) noexcept
     {
-        if (!last_ || timestampNs <= last_ || timestampNs - last_ > 42'000'000 ||
-            timestampNs - last_ < 12'000'000) {
+        if (!last_ || timestampNs <= *last_ || timestampNs - *last_ > 50'000'000 ||
+            timestampNs - *last_ < 6'000'000) {
             reset();
             last_ = timestampNs;
             return 0;
         }
         if (count_ == intervals_.size()) total_ -= intervals_[next_];
         else ++count_;
-        intervals_[next_] = timestampNs - last_;
+        intervals_[next_] = timestampNs - *last_;
         total_ += intervals_[next_];
         next_ = (next_ + 1) % intervals_.size();
         last_ = timestampNs;
         if (count_ < 4) return 0;
         const auto mean = total_ / count_;
-        for (const auto period : {period_60hz, period_40hz, period_30hz}) {
+        for (const auto [period, tolerance] : detail::cadence_bands) {
             const auto error = mean > period ? mean - period : period - mean;
-            if (error <= 2'750'000) return period;
+            if (error <= tolerance) return period;
         }
         return 0;
     }
@@ -58,16 +67,20 @@ struct CadencePlan {
         if (!slot || slot >= multiplier) return 0;
         const auto due = target(slot);
         const auto next = target(slot + 1);
-        // At 60 Hz x4, use the rest of the short slot, but reserve 0.25 ms
-        // before the next frame. Keep the existing tolerance at other rates.
+        if (periodNs == period_120hz) return next - 150'000;
         if (periodNs == period_60hz && multiplier == 4)
             return next - 250'000;
         return due + 3'000'000 < next ? due + 3'000'000 : next;
     }
 };
 
-// A confirmed unique pair one 60 Hz tick apart does not need to wait four
+// A confirmed unique pair one native tick apart does not need to wait four
 // intervals. A repeat disarms this fallback until the estimator locks again.
+[[nodiscard]] inline bool provisional_120hz(uint64_t a, uint64_t b, bool sawRepeat) noexcept
+{
+    return !sawRepeat && b > a && b - a >= 7'000'000 && b - a <= 9'600'000;
+}
+
 [[nodiscard]] inline bool provisional_60hz(uint64_t a, uint64_t b, bool sawRepeat) noexcept
 {
     return !sawRepeat && b > a && b - a >= 14'000'000 && b - a <= 19'000'000;
@@ -76,7 +89,8 @@ struct CadencePlan {
 [[nodiscard]] inline CadencePlan plan_cadence(uint64_t arrivalNs, uint64_t previousOriginalTargetNs,
     uint64_t periodNs, uint32_t multiplier) noexcept
 {
-    if ((periodNs != period_30hz && periodNs != period_40hz && periodNs != period_60hz) ||
+    if (std::none_of(detail::cadence_bands.begin(), detail::cadence_bands.end(),
+            [periodNs](detail::CadenceBand band) { return periodNs == band.periodNs; }) ||
         multiplier < 2 || multiplier > 4 || arrivalNs > UINT64_MAX - 2 * periodNs)
         return {};
     // Preserve phase across the 40 Hz source's non-uniform transport ticks.
@@ -97,7 +111,7 @@ struct CadencePlan {
 [[nodiscard]] inline CadencePlan plan_cadence_adaptive(uint64_t arrivalNs,
     uint64_t previousOriginalTargetNs, uint64_t contentPeriodNs, uint32_t effectiveMult) noexcept
 {
-    if (contentPeriodNs < 8'333'333 || contentPeriodNs > 50'000'000 ||
+    if (contentPeriodNs < 7'500'000 || contentPeriodNs > 50'000'000 ||
         effectiveMult < 2 || effectiveMult > 4 || arrivalNs > UINT64_MAX - 2 * contentPeriodNs)
         return {};
     if (previousOriginalTargetNs && previousOriginalTargetNs <= UINT64_MAX - contentPeriodNs) {

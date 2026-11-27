@@ -2,6 +2,7 @@
 // Copyright (C) 2026 DosukaSOL and the PushFPS contributors.
 // PushFPS §5(a): This work is based on PushFPS, licensed under GPL-3.0-or-later; port modified 2026-11-21.
 #pragma once
+#include "vfg_cadence.h"
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -106,7 +107,8 @@ public:
     // cannot distinguish a long still from ordinary cadence repeats.
     [[nodiscard]] double observe(uint64_t timestampNs, uint64_t ordinal, bool staticHold) noexcept
     {
-        if (haveNow_ && timestampNs < lastNowNs_) reset();
+        if (haveNow_ && (timestampNs < lastNowNs_ || timestampNs - lastNowNs_ > clock_stall_ns ||
+            (timestampNs == lastNowNs_ && haveOrdinal_ && ordinal != lastOrdinal_))) reset();
         lastNowNs_ = timestampNs;
         haveNow_ = true;
         while (count_ && timestampNs - samples_[head_].timestampNs > windowNs) {
@@ -123,12 +125,7 @@ public:
             staticHoldActive_ = false;
         }
         if (haveOrdinal_ && ordinal == lastOrdinal_) return fps();
-        if ((haveOrdinal_ && ordinal < lastOrdinal_) ||
-            (count_ && (timestampNs <= samples_[(head_ + count_ - 1) % capacity].timestampNs ||
-                ordinal <= samples_[(head_ + count_ - 1) % capacity].ordinal))) {
-            head_ = count_ = 0;
-            haveOrdinal_ = false;
-        }
+        if (haveOrdinal_ && ordinal < lastOrdinal_) clear_samples();
         lastOrdinal_ = ordinal;
         haveOrdinal_ = true;
         if (count_ == capacity) {

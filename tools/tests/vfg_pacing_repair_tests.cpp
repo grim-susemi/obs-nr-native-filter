@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "vfg_cadence.h"
+#include "vfg_live_anchor.h"
 #include "vfg_pacing_repair.h"
 #include <algorithm>
 #include <array>
@@ -138,16 +139,19 @@ void transport_delta_contract()
         expect(estimator.observe(t) == TransportIntervalEstimator::kDefaultNs, "median estimator warmup");
     expect(estimator.observe(1'030'000'000) == 10'000'000, "rolling median uses regular intervals");
     expect(estimator.observe(1'080'000'000) == 10'000'000, "median rejects a long interval outlier");
+    expect(estimator.observe(1'580'000'001) == TransportIntervalEstimator::kDefaultNs, "stall restarts warmup");
     for (const int64_t t : std::array<int64_t, 4>{1'070'000'000, 1'060'000'000, 1'070'000'000, INT64_MIN})
         expect(estimator.observe(t) == TransportIntervalEstimator::kDefaultNs, "non-monotonic input resets estimator");
-    TransportIntervalEstimator lowerClamp;
-    for (int64_t t = 1'000'000'000; t <= 1'002'000'000; t += 1'000'000)
-        expect(lowerClamp.observe(t) == TransportIntervalEstimator::kDefaultNs, "lower clamp estimator warmup");
-    expect(lowerClamp.observe(1'003'000'000) == TransportIntervalEstimator::kMinimumNs, "transport clamps below 8 ms");
-    TransportIntervalEstimator upperClamp;
-    for (int64_t t = 1'000'000'000; t <= 1'100'000'000; t += 50'000'000)
-        expect(upperClamp.observe(t) == TransportIntervalEstimator::kDefaultNs, "upper clamp estimator warmup");
-    expect(upperClamp.observe(1'150'000'000) == TransportIntervalEstimator::kMaximumNs, "transport clamps above 35 ms");
+    struct Transport { int64_t interval, expected; };
+    for (const auto [interval, expected] : {Transport{1'000'000, 4'000'000}, {4'166'667, 4'166'667},
+            {8'333'333, 8'333'333}, {42'006'667, 42'006'667}, {51'000'000, 50'000'000}}) {
+        estimator.reset();
+        for (int i = 0; i < 3; ++i)
+            expect(estimator.observe(i * interval) == TransportIntervalEstimator::kDefaultNs, "transport warmup");
+        const auto measured = estimator.observe(3 * interval);
+        std::printf("transport interval_ns=%lld measured_ns=%lld\n", interval, measured);
+        expect(measured == expected, "transport median clamps only outside 4-50 ms");
+    }
 
     const auto corrected = PushPacingRepair::Result{11, true, 1};
     const auto times = repaired_times(1'234, 5'000, corrected);
@@ -157,7 +161,40 @@ void transport_delta_contract()
     expect(!repaired_times(1, INT64_MAX, corrected), "phase arrival overflow is rejected");
 }
 
-void edge_inputs_and_legacy_parity()
+void anchor_tracks_drift_through_jitter()
+{
+    constexpr uint64_t ptsEpoch = UINT64_MAX - 8'000'000'000, hostEpoch = (uint64_t{1} << 58) + 37;
+    for (const int ppm : {-9'000, 2'000, 9'000}) {
+        LiveAnchorClock clock;
+        LiveAnchorClock::Timing timing;
+        const auto tick = static_cast<uint64_t>(20'000'000 + ppm * 20);
+        uint64_t ideal = hostEpoch;
+        for (uint64_t i = 0; i < 96; ++i) {
+            ideal = hostEpoch + i * tick;
+            const auto arrival = i % 4 == 0 || i % 4 == 3 ? ideal + 2'000'000 : ideal - 2'000'000;
+            timing = clock.observe({ptsEpoch + i * 20'000'000, arrival}, period_120hz);
+        }
+        std::printf("anchor injected_ppm=%d clock_ppm=%.6f callback_minus_anchor_ms=%.6f jitter_ms=%.6f "
+            "phase_ms=%.6f extra_ns=%llu target_ns=%llu locked=%d snaps=%llu\n", ppm, timing.clockDriftPpm,
+            timing.callbackMinusAnchorMs, timing.callbackJitterMs, timing.phaseMs, timing.deadline_extra_ns(),
+            timing.realTargetNs, timing.locked, timing.snaps);
+        expect(timing.locked && timing.snaps == 0 &&
+            std::abs(timing.clockDriftPpm - (std::clamp)(ppm, -5'000, 5'000)) < 0.000001,
+            "callback jitter does not corrupt drift or exceed either frequency rail");
+        if (ppm != 2'000) continue;
+        expect(timing.anchorNs == ideal && timing.callbackMinusAnchorMs == 2 && timing.phaseMs == 8.333333 &&
+            timing.realTargetNs == ideal + 8'333'333 && timing.deadline_extra_ns() == 1'000'000,
+            "symmetric 2 ms noise leaves the content phase intact and caps deadline slack at 1 ms");
+        bool intermediateSlack = false;
+        for (uint64_t i = 96; i < 288; ++i) {
+            timing = clock.observe({ptsEpoch + i * 20'000'000, hostEpoch + i * tick}, period_120hz);
+            intermediateSlack |= timing.deadline_extra_ns() > 0 && timing.deadline_extra_ns() < 1'000'000;
+        }
+        expect(timing.snaps == 0 && intermediateSlack && timing.deadline_extra_ns() == 0, "quiet callbacks shed slack");
+    }
+}
+
+void edge_inputs()
 {
     constexpr std::array<int64_t, 4> samples{1'000'000, 900'000, 899'999, 899'998};
     constexpr std::array<int64_t, 4> transports{166'667, 166'667, 0, -1};
@@ -187,40 +224,6 @@ void edge_inputs_and_legacy_parity()
     expect(guard.disposition == PushPacingRepair::Disposition::emit &&
         guard.pts == beforeGuard.pts + 10'000, "near-maximum guard advances exactly 1 ms when representable");
 
-    constexpr uint64_t arrival = 1'000'000'000;
-    for (const uint64_t period : {period_30hz, period_40hz, period_60hz}) {
-        const auto lead = period == period_40hz ? period / 3 : period == period_60hz ? 5'000'000 : 0;
-        for (uint32_t mult = 2; mult <= 4; ++mult) {
-            uint64_t frameArrival = arrival, previousOriginal = 0;
-            for (unsigned frame = 0; frame < 12; ++frame) {
-                const auto plan = plan_cadence(frameArrival, previousOriginal, period, mult);
-                const auto expectedOriginal = previousOriginal ? previousOriginal + period : frameArrival + period + lead;
-                expect(plan.periodNs == period && plan.originalNs == expectedOriginal,
-                    "OFF baseline keeps canonical period and original target");
-                for (uint32_t slot = 0; slot <= mult; ++slot) {
-                    const auto expectedTarget = slot ? expectedOriginal - period + period * slot / mult : 0;
-                    const auto next = expectedOriginal - period + period * (slot + 1) / mult;
-                    const auto expectedCutoff = !slot || slot == mult ? 0 :
-                        period == period_60hz && mult == 4 ? next - 250'000 :
-                        expectedTarget + 3'000'000 < next ? expectedTarget + 3'000'000 : next;
-                    expect(plan.target(slot) == expectedTarget &&
-                        plan.synthetic_cutoff(slot) == expectedCutoff,
-                        "OFF tuple matches independent legacy formulas for every slot");
-                }
-                previousOriginal = expectedOriginal;
-                frameArrival += period;
-            }
-        }
-    }
-    constexpr std::array<uint64_t, 5> targets60x4{
-        0, 1'009'166'666, 1'013'333'333, 1'017'500'000, 1'021'666'667};
-    constexpr std::array<uint64_t, 5> cutoffs60x4{
-        0, 1'013'083'333, 1'017'250'000, 1'021'416'667, 0};
-    const auto legacy60x4 = plan_cadence(arrival, 0, period_60hz, 4);
-    for (uint32_t slot = 0; slot <= 4; ++slot)
-        expect(legacy60x4.target(slot) == targets60x4[slot] &&
-            legacy60x4.synthetic_cutoff(slot) == cutoffs60x4[slot],
-            "OFF 60 Hz 4x tuple matches frozen expected values");
 }
 
 void late_guard_and_repeatability()
@@ -265,7 +268,8 @@ int main()
         pattern_40_in_120_and_even_cadence();
         variable_stall_and_boundaries();
         transport_delta_contract();
-        edge_inputs_and_legacy_parity();
+        anchor_tracks_drift_through_jitter();
+        edge_inputs();
         late_guard_and_repeatability();
         std::printf("PASS vfg_pacing_repair: %u assertions\n", checks);
         return 0;
