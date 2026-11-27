@@ -54,9 +54,8 @@ struct DiskEntry final : OpenedEntry {
         return ReadFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr) && got == bytes.size();
     }
 };
-struct DiskSource final : FileSource {
-    OpenResult open(const std::wstring& path, EntryKind kind) const override
-    {
+OpenResult open_disk(const std::wstring& path, EntryKind kind)
+{
         wchar_t root[]{path[4], L':', L'\\', L'\0'};
         const auto driveType = GetDriveTypeW(root);
         if (driveType != DRIVE_FIXED && driveType != DRIVE_REMOVABLE && driveType != DRIVE_RAMDISK)
@@ -85,8 +84,7 @@ struct DiskSource final : FileSource {
             entry->finalPath.resize(n);
         }
         return {OpenStatus::Opened, std::move(entry)};
-    }
-};
+}
 template<class T> bool read(Bytes bytes, size_t offset, T& out)
 {
     if (offset > bytes.size() || sizeof(out) > bytes.size() - offset) return false;
@@ -95,7 +93,12 @@ template<class T> bool read(Bytes bytes, size_t offset, T& out)
 }
 } // namespace
 
-ValidationStatus inspect_exports(Bytes bytes)
+OpenResult DiskSource::open(const std::wstring& path, EntryKind kind) const
+{
+    return open_disk(path, kind);
+}
+
+ValidationStatus inspect_exports(Bytes bytes, std::span<const std::string_view> wanted)
 {
     IMAGE_DOS_HEADER dos{};
     IMAGE_NT_HEADERS64 nt{};
@@ -136,16 +139,15 @@ ValidationStatus inspect_exports(Bytes bytes)
     const auto directory = region(dir.VirtualAddress);
     IMAGE_EXPORT_DIRECTORY table{};
     if (dir.Size < sizeof(table) || dir.Size > directory.size() || !read(directory, 0, table)) return Status::InvalidPe;
-    const auto names = region(table.AddressOfNames), ordinals = region(table.AddressOfNameOrdinals);
-    const auto functions = region(table.AddressOfFunctions);
-    if (table.NumberOfNames > names.size() / sizeof(DWORD) || table.NumberOfNames > ordinals.size() / sizeof(WORD) ||
+    const auto nameTable = region(table.AddressOfNames), ordinals = region(table.AddressOfNameOrdinals), functions = region(table.AddressOfFunctions);
+    if (table.NumberOfNames > nameTable.size() / sizeof(DWORD) || table.NumberOfNames > ordinals.size() / sizeof(WORD) ||
         table.NumberOfFunctions > functions.size() / sizeof(DWORD)) return Status::InvalidPe;
-    std::array<bool, std::size(exports)> found{};
+    std::vector<bool> found(wanted.size());
     std::string_view previous;
     for (size_t i = 0; i < table.NumberOfNames; ++i) {
         DWORD name{}, fn{};
         WORD ordinal{};
-        if (!read(names, i * sizeof(name), name) || !read(ordinals, i * sizeof(ordinal), ordinal) ||
+        if (!read(nameTable, i * sizeof(name), name) || !read(ordinals, i * sizeof(ordinal), ordinal) ||
             ordinal >= table.NumberOfFunctions || !read(functions, ordinal * sizeof(fn), fn)) return Status::InvalidPe;
         const auto nameBytes = region(name);
         if (nameBytes.empty()) return Status::InvalidPe;
@@ -155,13 +157,18 @@ ValidationStatus inspect_exports(Bytes bytes)
         const std::string_view key(chars, static_cast<size_t>(terminator - chars));
         if (!previous.empty() && previous >= key) return Status::InvalidPe;
         previous = key;
-        const auto match = std::ranges::find(exports, key);
-        if (match == std::end(exports)) continue;
+        const auto match = std::ranges::find(wanted, key);
+        if (match == wanted.end()) continue;
         if ((fn >= dir.VirtualAddress && fn - dir.VirtualAddress < dir.Size) || region(fn, true).empty())
             return Status::InvalidExport;
-        found[static_cast<size_t>(match - std::begin(exports))] = true;
+        found[static_cast<size_t>(match - wanted.begin())] = true;
     }
     return std::ranges::all_of(found, [](bool value) { return value; }) ? Status::Accepted : Status::MissingExport;
+}
+
+ValidationStatus inspect_exports(Bytes bytes)
+{
+    return inspect_exports(bytes, exports);
 }
 
 const char* status_name(Status status) noexcept
