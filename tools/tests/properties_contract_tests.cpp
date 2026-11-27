@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "nr_properties.h"
 #include "nr_core.h"
+#include "fg_monitor_text.h"
 #include <obs-module.h>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -403,6 +405,95 @@ void deadline_windows()
     const auto settingsOnly=waiting.observe(5000000001ull,awaiting);
     expect(settingsOnly && settingsOnly->packed==0 && !settingsOnly->warning,"settings-only window has no denominator");
 }
+void vfg_ui_contract()
+{
+    using namespace nr::fg::vfg::ui;
+    const auto& uiDefaults=nr::fg::vfg::ui::defaults;
+    expect(uiDefaults.backend==backend_native_vfg && uiDefaults.multiplier==2 && uiDefaults.low_latency &&
+        !uiDefaults.xemfg_opt_in && uiDefaults.shared_nvof,"VFG UI defaults");
+    const auto xefg4=policy(Selection{backend_xefg,4,false,false,true,true});
+    expect(xefg4.multiplier_limit==2 && xefg4.effective_multiplier==2 && xefg4.can_launch,
+        "XeFG caps a requested 4x to 2x");
+    expect(!xefg4.split_compare_enabled && xefg4.split_reason_key &&
+        !xefg4.hud_lock_enabled && xefg4.hud_lock_reason_key,"XeFG gates split compare and HUD lock");
+    expect(xefg4.low_latency_reason_key && xefg4.reported_low_latency==1,
+        "XeFG discloses forced low latency");
+    expect(xefg4.multiplier_reason_key,"XeFG explains the 2x cap");
+    const auto xefgOff=policy(Selection{backend_xefg,1,false,false,true,true});
+    expect(xefgOff.effective_multiplier==1 && xefgOff.reported_low_latency==0,
+        "XeFG 1x preview never reports low_latency=1");
+    const auto xefgMissing=policy(Selection{backend_xefg,2,false,false,false,true});
+    expect(xefgMissing.reported_low_latency==0 && xefgMissing.low_latency_reason_key,
+        "XeFG without the runtime reports no running low latency");
+    const auto xemfgOptOut=policy(Selection{backend_xemfg,4,false,false,true,true});
+    expect(!xemfgOptOut.can_launch && xemfgOptOut.refusal==Refusal::xemfg_opt_in && xemfgOptOut.refusal_key &&
+        xemfgOptOut.reported_low_latency==0,"XeMFG refuses without opt-in and never reports running low latency");
+    expect(xemfgOptOut.multiplier_limit==4,"XeMFG keeps the 3x/4x ceiling");
+    const auto xemfgNoPath=policy(Selection{backend_xemfg,4,true,false,true,true});
+    expect(!xemfgNoPath.can_launch && xemfgNoPath.refusal==Refusal::xemfg_path && xemfgNoPath.refusal_key,
+        "XeMFG refuses an empty DLL path");
+    const auto xemfgReady=policy(Selection{backend_xemfg,4,true,true,true,false});
+    expect(xemfgReady.can_launch && xemfgReady.effective_multiplier==4 && xemfgReady.split_compare_enabled &&
+        xemfgReady.hud_lock_enabled && xemfgReady.reported_low_latency==0,
+        "XeMFG 4x keeps split compare, HUD lock, and the UI low-latency value");
+    const auto native=policy(Selection{backend_native_vfg,3,false,false,false,true});
+    expect(native.multiplier_limit==4 && native.effective_multiplier==3 && native.can_launch &&
+        native.split_compare_enabled && native.hud_lock_enabled && native.reported_low_latency==1 &&
+        !native.low_latency_reason_key,"NativeVfg controls remain unchanged");
+    expect(std::string(backend_key(backend_xefg))=="VFG.Backend.XeFg" &&
+        std::string(backend_key(backend_xemfg))=="VFG.Backend.XeMfg" &&
+        std::string(status_state_key(false,true))=="VFG.Status.Refused","VFG backend/status keys");
+    expect(shared_nvof_state({false,true,true,true,1,1})==SharedNvofState::unavailable &&
+        shared_nvof_state({true,false,true,true,1,1})==SharedNvofState::local_fallback &&
+        shared_nvof_state({true,true,false,false,1,1})==SharedNvofState::local_fallback &&
+        shared_nvof_state({true,true,true,true,4,4})==SharedNvofState::shared_from_nr &&
+        shared_nvof_state({true,true,true,true,4,0})==SharedNvofState::nr_owned_waiting,
+        "Shared NVOF ownership state table");
+    std::puts("vfg_ui_contract: defaults, XeFG 2x/clamp/split/HUD/forced low latency, XeMFG opt-in/path refusal/4x, Shared NVOF states");
+}
+void vfg_locale_parity()
+{
+    const auto dir=locale_dir();
+    if(dir.empty()) {
+        std::puts("SKIP VFG locale parity: data/locale not reachable from the test working directory");
+        return;
+    }
+    const auto read=[](const std::filesystem::path& path) {
+        std::map<std::string,std::string> out;
+        std::ifstream file(path);
+        for(std::string line;std::getline(file,line);) {
+            if(!line.empty() && line.back()=='\r') line.pop_back();
+            if(line.empty() || line.front()==';' || line.front()=='#') continue;
+            const auto eq=line.find('=');
+            if(eq==std::string::npos) continue;
+            auto key=line.substr(0,eq),value=line.substr(eq+1);
+            while(!key.empty() && (key.back()==' ' || key.back()=='\t')) key.pop_back();
+            while(!value.empty() && (value.back()==' ' || value.back()=='\t')) value.pop_back();
+            out[key]=value;
+        }
+        return out;
+    };
+    const auto en=read(dir/"en-US.ini"),ko=read(dir/"ko-KR.ini");
+    expect(!en.empty() && en.size()==ko.size(),"VFG locale key count parity");
+    for(const auto& [key,value]:en) expect(ko.contains(key) && !value.empty() && !ko.at(key).empty(),key.c_str());
+    for(const auto& [key,value]:ko) expect(en.contains(key) && !value.empty(),key.c_str());
+    for(const char* key:{"VFG.Backend.XeFg","VFG.Backend.XeMfg","VFG.XeMfg.OptIn","VFG.XeMfg.DllPath",
+            "VFG.XeMfg.Warning","VFG.SharedNvof","VFG.SharedNvof.Status","VFG.SharedNvof.FromNr",
+            "VFG.SharedNvof.LocalFallback","VFG.SharedNvof.Unavailable","VFG.SharedNvof.Pending",
+            "VFG.XessRuntimeInfo","VFG.Status.XeFg.Ready","VFG.Status.XeFg.RuntimeMissing",
+            "VFG.Status.XeMfg.OptInRequired","VFG.Status.XeMfg.Select","VFG.Status.XeMfg.Missing",
+            "VFG.Status.XeMfg.InvalidPath",
+            "VFG.Status.XeMfg.Ready","VFG.Status.SplitCompareXeFg","VFG.Status.HudLockXeFg",
+            "VFG.Status.MultiplierCapped","VFG.Status.LowLatencyForced","VFG.Status.NextOpen",
+            "VFG.Status.PreviewOpen","VFG.Status.Refused","VFG.Status.Requested","VFG.Status.FallbackNote",
+            "VFG.Status.NoPresenterAbove1x","VFG.Hint.MultiplierXeFg","VFG.Hint.LowLatencyXeFg"})
+        expect(en.contains(key) && !en.at(key).empty() && ko.contains(key) && !ko.at(key).empty(),key);
+    expect(en.at("VFG.SharedNvof.FromNr")=="\"Shared from NR (OFA 0 local)\"" &&
+        en.at("VFG.SharedNvof.LocalFallback")=="\"Local NVOF fallback\"" &&
+        en.at("VFG.Backend.XeFg")=="\"XeFG (Intel 3.0.2, 2x)\"" &&
+        en.at("VFG.Backend.XeMfg")=="\"XeMFG (3x/4x Opt-in)\"","VFG English status strings are exact");
+    std::puts("vfg_locale_parity: en-US/ko-KR 1:1 key parity, exact XeFG/XeMFG/Shared NVOF strings");
+}
 int main(int argc,char** argv)
 {
     try {
@@ -410,6 +501,7 @@ int main(int argc,char** argv)
             throw std::runtime_error("unknown properties contract invocation");
         deadline_controls();deadline_windows();
         if(argc==2) {std::puts("deadline_contract: PASS thresholds actual OBS rows synthetic clock exclusions instances on-off transitions");return 0;}
+        vfg_ui_contract();vfg_locale_parity();
         auto* data=obs_data_create();
         const std::u8string utf8=u8"C:/owned/\uD14C\uC2A4\uD2B8/runtime.dll";
         expect(utf8_path(std::string(reinterpret_cast<const char*>(utf8.data()),utf8.size())).generic_u8string()==utf8,"UTF8 path roundtrip");

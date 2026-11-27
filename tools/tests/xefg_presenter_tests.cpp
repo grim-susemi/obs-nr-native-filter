@@ -164,6 +164,17 @@ void wait_initialized(const fs::path& log, const Controller& controller, const c
         "presenter initialization", &controller);
 }
 
+void expect_initialized_low_latency(const std::string& log, const char* backend, long expected)
+{
+    const auto at = log.find(std::string("event=initialized backend=") + backend);
+    expect(at != std::string::npos, "initialized line");
+    const auto end = log.find('\n', at);
+    const auto line = log.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    expect(line.find("low_latency=" + std::to_string(expected)) != std::string::npos,
+        "initialized low_latency report");
+    std::printf("INFO xefg_presenter: initialized backend=%s low_latency=%ld\n", backend, expected);
+}
+
 struct TestWindow {
     HWND hwnd{};
     TestWindow()
@@ -578,6 +589,7 @@ void happy_child(const fs::path& runtimeDir, const fs::path& presenterExe, const
 
     const auto log = read_text(presenterLog);
     const auto calls = read_text(callLog);
+    expect_initialized_low_latency(log, "xefg", 1);
     expect(count_occurrences(log, "event=offer mode=2x") == 4, "four 2x offers");
     expect(count_occurrences(log, "event=initialized backend=xefg") == 4, "four XeFG generations");
     expect(count_occurrences(log, "event=resize_drained") == 3, "three resize drains");
@@ -686,6 +698,7 @@ void watchdog_child(const fs::path& runtimeDir, const fs::path& presenterExe, co
     wait_for_log(presenterLog, "event=initialized backend=original", 1, 15000,
         "1x recovery preview initialized", &controller);
     const auto log = read_text(presenterLog);
+    expect_initialized_low_latency(log, "original", 0);
     expect(log.find("event=watchdog_timeout") != std::string::npos, "watchdog stamped");
     expect(log.find("event=controller_auto_fallback_1x_relaunch") != std::string::npos,
         "controller relaunched at 1x");
@@ -746,6 +759,7 @@ void refusal_child(const fs::path& runtimeDir, const fs::path& presenterExe, con
     expect(fixture.producer->retire() == ipc::Status::Ok, "refusal producer retire");
     const auto log = read_text(presenterLog);
     const auto calls = read_text(callLog);
+    expect_initialized_low_latency(log, "original", 0);
     expect(log.find(wrongHash ? "reason=hash_mismatch" : "reason=signature_rejected") !=
         std::string::npos, wrongHash ? "wrong hash reported" : "unsigned runtime reported");
     expect(log.find("gate=libxess_fg") != std::string::npos, "refusal names the refused library");
