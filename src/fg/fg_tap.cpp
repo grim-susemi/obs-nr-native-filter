@@ -7,6 +7,7 @@
 #include "../obs_upscale_filter.h"
 #include "../obs_split_compare.h"
 #include "../obs_quality_trace.h"
+#include "sr_display.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
 #include <d3d11_4.h>
@@ -97,6 +98,8 @@ struct Tap {
     uint32_t activeGuidesWidth{}, activeGuidesHeight{};
     uint64_t flowFrames{}, flowHits{};
     uint32_t flowLoggedOwner{0xffffffffu};
+    uint64_t srPathGeneration{};
+    int srPathChoice{-1};
     const nr::FlowBroker* flowCacheBroker{};
     uint64_t flowCacheGeneration{};
     std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 4> flowMotion;
@@ -145,6 +148,25 @@ std::optional<UpstreamNr> upstream_nr(obs_source_t* parent, obs_source_t* self)
         if (sample_nr(child, nr)) p.found = nr;
     }, &probe);
     return probe.found;
+}
+
+// Reads the SR filter's read-only per-draw telemetry. The handler is registered
+// by obs_upscale::create on the source that owns the integrated SR; a draw with
+// no SR at all leaves `answered` false and the extent fallback in charge.
+SrPresentSignal sample_sr(obs_source_t* source)
+{
+    SrPresentSignal signal;
+    if (!source) return signal;
+    calldata_t data;
+    calldata_init(&data);
+    struct Free { calldata_t* value; ~Free() { calldata_free(value); } } free{&data};
+    if (!proc_handler_call(obs_source_get_proc_handler(source), "sr_flow_snapshot", &data)) return signal;
+    signal.answered = true;
+    calldata_get_bool(&data, "temporal", &signal.temporal);
+    calldata_get_bool(&data, "upscaled", &signal.upscaled);
+    signal.presentTick = static_cast<uint64_t>(std::max<int64_t>(0, calldata_int(&data, "present_tick")));
+    signal.capturedTick = static_cast<uint64_t>(std::max<int64_t>(0, calldata_int(&data, "captured_tick")));
+    return signal;
 }
 
 const char* flow_owner_name(nr::FlowOwnerPolicy owner)
@@ -230,6 +252,7 @@ void disconnect(Tap& tap, const char* cause, bool userStop = false) noexcept
     tap.activeHeight = 0;
     tap.resizing = false;
     tap.rejectedSinceNs = 0;
+    tap.srPathChoice = -1;
     tap.stopping = true;
     tap.vfgActive.store(false, std::memory_order_release);
 }
@@ -459,6 +482,22 @@ FlowPublish resolve_flow(Tap& tap, uint64_t displayTick, const FlowRequest& requ
     return out;
 }
 
+// The chosen delay path is logged once per NR generation (and whenever it
+// changes) so a fallback is never silently in charge.
+void log_sr_path(Tap& tap, const SrDisplayDecision& display, const SrPresentSignal& signal)
+{
+    const int choice = static_cast<int>(display.path);
+    if (tap.srPathChoice == choice && tap.srPathGeneration == tap.nrGeneration) return;
+    tap.srPathChoice = choice;
+    tap.srPathGeneration = tap.nrGeneration;
+    blog(LOG_INFO, "[vfg-sr] generation=%llu path=%s delayed=%d shift=%llu display_tick=%llu upscaled=%d temporal=%d present_ns=%llu captured_ns=%llu",
+        static_cast<unsigned long long>(tap.nrGeneration),
+        display.path == SrDelayPath::Snapshot ? "snapshot" : "extent_fallback",
+        display.shift ? 1 : 0, static_cast<unsigned long long>(display.shift),
+        static_cast<unsigned long long>(display.displayTick), signal.upscaled ? 1 : 0, signal.temporal ? 1 : 0,
+        static_cast<unsigned long long>(signal.presentTick), static_cast<unsigned long long>(signal.capturedTick));
+}
+
 void draw_sdr(gs_texture_t* texture, Extent size, gs_blend_type destBlend)
 {
     auto* effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
@@ -537,14 +576,6 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
     }
     const uint32_t guideWidth = tap.nrPresent ? tap.nrWidth : 0;
     const uint32_t guideHeight = tap.nrPresent ? tap.nrHeight : 0;
-    // The tap's integrated SR displays the previous OBS tick on both the
-    // temporal and spatial branches when adjacent, so its colour identity is
-    // one tick behind the publish tick. NR's own 1-tick delay is already part of
-    // the broker's displayed provenance.
-    const Extent inputExtent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
-    const bool srDelayed = tap.upscale &&
-        (output.width != inputExtent.width || output.height != inputExtent.height);
-    const uint64_t displayTick = srDelayed && tick > 1 ? tick - 1 : tick;
     auto* kind = obs_source_get_unversioned_id(parent);
     const gs_color_space wanted[]{GS_CS_SRGB};
     const uint32_t w = output.width, h = output.height;
@@ -682,7 +713,17 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             return texture;
         }
         const auto arrival = clock_ns();
-        auto flow = resolve_flow(tap, displayTick, {output, tap.breakPair});
+        // The SR renders inside this capture, so its snapshot is the authoritative
+        // colour delay: DLSS presents the previous capture even at 1:1, while a
+        // bilinear resize changes extent without ever delaying. The extent
+        // comparison is only the fallback when no SR telemetry answers at all.
+        const Extent inputExtent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
+        const SrDraw draw{tick, obs_get_frame_interval_ns(),
+            output.width != inputExtent.width || output.height != inputExtent.height};
+        const auto srSignal = sample_sr(tap.source);
+        const auto display = sr_display_decision(draw, srSignal);
+        log_sr_path(tap, display, srSignal);
+        auto flow = resolve_flow(tap, display.displayTick, {output, tap.breakPair});
         if (tap.nrPresent && tap.nrEnabled) {
             ++tap.flowFrames;
             if (flow.bundle.pair.hasSharedMv) ++tap.flowHits;
@@ -692,13 +733,13 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
                 blog(LOG_INFO, "[vfg-shared] generation=%llu owner=%s provenance=%s guides=%ux%u output=%ux%u display_tick=%llu shared=%d",
                     static_cast<unsigned long long>(tap.nrGeneration), flow_owner_name(static_cast<nr::FlowOwnerPolicy>(owner)),
                     flow_provenance_name(static_cast<nr::FlowProvenance>(static_cast<uint32_t>(flow.bundle.pair.provenance))),
-                    guideWidth, guideHeight, w, h, static_cast<unsigned long long>(displayTick),
+                    guideWidth, guideHeight, w, h, static_cast<unsigned long long>(display.displayTick),
                     flow.bundle.pair.hasSharedMv ? 1 : 0);
             }
         } else if (tap.flowLoggedOwner != static_cast<uint32_t>(ipc::FlowOwner::ConsumerFallback)) {
             tap.flowLoggedOwner = static_cast<uint32_t>(ipc::FlowOwner::ConsumerFallback);
             blog(LOG_INFO, "[vfg-shared] owner=consumer_fallback provenance=unknown reason=no_upstream_nr output=%ux%u display_tick=%llu",
-                w, h, static_cast<unsigned long long>(displayTick));
+                w, h, static_cast<unsigned long long>(display.displayTick));
         }
         const auto result = tap.producer->publish(texture ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(texture)) : nullptr,
             captureQpc, arrival, tap.breakPair, tick,
