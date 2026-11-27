@@ -1,7 +1,7 @@
-# OBS 원클릭 설치 — 0.2.12
+# OBS 원클릭 설치 — 0.3.0
 
 1. `SHA256SUMS.txt`로 ZIP을 확인하고 **모두 압축 해제**합니다. OBS를 종료한 뒤 `install.bat`을 더블클릭합니다. 포터블 OBS가 목록에 없으면 `bin\64bit\obs64.exe`가 들어 있는 OBS 최상위 폴더를 지정합니다.
-2. 설치기는 현재 질문만 표시합니다. DLSS와 VFG는 각각 **Y 또는 Enter**로 설치하고 **N**으로 건너뜁니다. Native NR용 `nvngx_dlssnr.dll`은 **310.8.0.0** (`e67dee20…c989a`)과 **310.9.16.0 Model B** (`cdfa6c1e…bf3ed`) 두 판을 지원합니다. OBS에 파일이 없고 로컬 Veyra(`%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`)에 검증된 `310.9.16.0` 파일이 있으면 자동으로 재사용합니다. 직접 지정하려면 모델 질문에서 끌어다 놓거나 `-Runtime <경로>`를 전달하세요. 그냥 Enter를 누르면 모델만 건너뜁니다. 자세한 준비 사항은 [설치 안내](INSTALL.md)를 참고하세요.
+2. 설치기는 현재 질문만 표시합니다. 이 ZIP에는 Native NR용 `nvngx_dlssnr.dll` **310.9.16.0 Model B** (`cdfa6c1e…bf3ed`)가 `files\bin\64bit`에 동봉되어 있어, 별도 질문·수동 입력·로컬 Veyra 탐색 없이 SHA-256 검증 후 OBS `bin\64bit`에 바로 설치됩니다. **310.8.0.0** (`e67dee20…c989a`)도 계속 허용됩니다. 경량 패키지(미동봉)라면 OBS에 파일이 없을 때 로컬 Veyra(`%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`)의 검증된 `310.9.16.0` 파일을 자동 재사용하고, 아니면 모델 질문에서 직접 지정하거나 `-Runtime <경로>`를 전달하거나 Enter로 건너뜁니다. DLSS와 VFG는 각각 **Y 또는 Enter**로 설치하고 **N**으로 건너뜁니다. 자세한 준비 사항은 [설치 안내](INSTALL.md)를 참고하세요.
 
 ![격리 환경의 실제 DLSS 설치 질문](oneclick/dlss-prompt.png)
 

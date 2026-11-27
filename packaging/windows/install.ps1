@@ -24,7 +24,7 @@ param(
     [string]$StateDir = ''
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.12'
+$Version = '0.3.0'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 function Get-AllowedRuntimeShas {
     return @{
@@ -71,10 +71,11 @@ $Text = @{
         adminFail  = '관리자 권한을 받지 못해 중단했습니다.'
         adminDone  = '관리자 창에서 진행했습니다. 결과는 그 창에 표시됐습니다 (종료 코드 {0}).'
         rtOk       = '확인됨 ({1}): {0}'
+        rtBundled  = '동봉된 NR 모델({1})을 확인했습니다. 설치합니다: {0}'
         rtLocal    = '로컬 Veyra NR 모델({0})을 재사용합니다: {1}'
         rtMissing  = 'OBS에 NR 모델 파일(nvngx_dlssnr.dll)이 없습니다.'
         rtWrong    = 'OBS에 있는 nvngx_dlssnr.dll은 이 필터가 받는 판이 아닙니다 (SHA-256 {0}…). 이대로는 NR이 동작하지 않습니다.'
-        rtNeed     = 'Native NR용 모델: nvngx_dlssnr.dll 310.8.0.0 (SHA-256 e67dee20…c989a) 또는 310.9.16.0 Model B (SHA-256 cdfa6c1e…bf3ed) (이 패키지에는 없음). 독립 CAS에는 필요하지 않습니다.'
+        rtNeed     = 'Native NR용 모델: nvngx_dlssnr.dll 310.8.0.0 (SHA-256 e67dee20…c989a) 또는 310.9.16.0 Model B (SHA-256 cdfa6c1e…bf3ed) (이 경량 패키지에는 없음). 독립 CAS에는 필요하지 않습니다.'
         rtAsk      = 'nvngx_dlssnr.dll을 끌어놓고 Enter (건너뛰기: 그냥 Enter)'
         rtNotFound = '파일이 없습니다: {0}'
         rtBadHash  = '이 파일은 허용된 판이 아닙니다 (SHA-256 {0}…). 310.8.0.0 또는 310.9.16.0 Model B만 사용할 수 있습니다.'
@@ -139,10 +140,11 @@ $Text = @{
         adminFail  = 'Did not get admin rights, stopped.'
         adminDone  = 'Finished in the admin window, which showed the result (exit code {0}).'
         rtOk       = 'OK ({1}): {0}'
+        rtBundled  = 'Bundled NR model verified ({1}), installing: {0}'
         rtLocal    = 'Reusing local Veyra NR model ({0}): {1}'
         rtMissing  = 'The NR model file (nvngx_dlssnr.dll) is not in this OBS.'
         rtWrong    = 'The nvngx_dlssnr.dll in this OBS is a different build (SHA-256 {0}...). NR will not run with it.'
-        rtNeed     = 'Native NR model: nvngx_dlssnr.dll 310.8.0.0 (SHA-256 e67dee20...c989a) or 310.9.16.0 Model B (SHA-256 cdfa6c1e...bf3ed) (not bundled). Standalone CAS does not need it.'
+        rtNeed     = 'Native NR model: nvngx_dlssnr.dll 310.8.0.0 (SHA-256 e67dee20...c989a) or 310.9.16.0 Model B (SHA-256 cdfa6c1e...bf3ed) (not bundled in this lightweight package). Standalone CAS does not need it.'
         rtAsk      = 'Drag your nvngx_dlssnr.dll into this window and press Enter (Enter alone skips)'
         rtNotFound = 'File not found: {0}'
         rtBadHash  = 'That file is not an allowed build (SHA-256 {0}...). Expected 310.8.0.0 or 310.9.16.0 Model B.'
@@ -222,7 +224,7 @@ function Say([string]$Key, [object[]]$Arg = @(), [string]$Color = 'Gray') {
     $message = T $Key $Arg
     if ($Key -in 'copy','backup','error','srFail','vfgFail' -or $script:SingleScreen) { $script:LogDetails.Add($message) }
     $status = switch ($Key) {
-        {$_ -in 'done','uDone','payloadOk','rtOk','rtLocal','srOk','vfgOk','vfgLocal','srSigOk','uRestored'} { 'OK' }
+        {$_ -in 'done','uDone','payloadOk','rtOk','rtBundled','rtLocal','srOk','vfgOk','vfgLocal','srSigOk','uRestored'} { 'OK' }
         {$_ -in 'rtSkipped','srFail','vfgFail','uChanged','cancelled','uNoState'} { '-' }
         {$_ -in 'error','adminFail','obsInvalid','obsOld','obsRunning','rtWrong','rtNotFound','rtBadHash','rolledBack'} { '!' }
         {$_ -in 'admin','srDown','vfgDown','vfgVerify','rtWillCopy'} { '>' }
@@ -231,7 +233,7 @@ function Say([string]$Key, [object[]]$Arg = @(), [string]$Color = 'Gray') {
     $ko = $script:L -eq 'ko'
     switch ($Key) {
         'rtSkipped' { $message = if ($ko) {'NR 모델 건너뜀'} else {'NR model skipped'} }
-        'rtNeed' { $message = if ($ko) {'Native NR 모델: 310.8.0.0 또는 310.9.16.0 Model B (ZIP 미포함)'} else {'Native NR model: 310.8.0.0 or 310.9.16.0 Model B (not in ZIP)'} }
+        'rtNeed' { $message = if ($ko) {'Native NR 모델: 310.8.0.0 또는 310.9.16.0 Model B (이 ZIP 미포함)'} else {'Native NR model: 310.8.0.0 or 310.9.16.0 Model B (not in this ZIP)'} }
         'srFail' { $message = if ($ko) {'DLSS 설치 건너뜀. 이중선형과 CAS는 사용 가능.'} else {'DLSS skipped. Bilinear and CAS still work.'} }
         'vfgFail' { $message = if ($ko) {'VFG 설치 건너뜀. NR과 업스케일은 사용 가능.'} else {'VFG skipped. NR and upscale still work.'} }
         'error' {
@@ -278,7 +280,7 @@ function Get-PackagePaths {
         'bin\64bit\nr_interop_vertex.cso', 'bin\64bit\nr_interop_pixel.cso')
 }
 function Test-PackagePath([string]$Relative) {
-    return $Relative -in (Get-PackagePaths)
+    return $Relative -in (Get-PackagePaths) -or $Relative -eq $RuntimeRel
 }
 function Test-PushFlowModelName([string]$Name) {
     return $Name -match '\A[A-Za-z0-9._-]+\.onnx(?:\.txt)?\z' -and -not $Name.Contains('..') -and
@@ -366,6 +368,13 @@ function Get-Manifest {
         $src = Join-Path $Payload $rel
         if (-not $m.Contains($rel) -or -not (Test-Path -LiteralPath $src -PathType Leaf) -or (Get-Sha $src) -ne $m[$rel]) {
             throw (T 'payloadBad' @($rel))
+        }
+    }
+    if ($m.Contains($RuntimeRel)) {
+        if (-not (Get-AllowedRuntimeShas).ContainsKey($m[$RuntimeRel])) { throw (T 'payloadBad' @($RuntimeRel)) }
+        $src = Join-Path $Payload $RuntimeRel
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf) -or (Get-Sha $src) -ne $m[$RuntimeRel]) {
+            throw (T 'payloadBad' @($RuntimeRel))
         }
     }
     return $m
@@ -522,7 +531,7 @@ function Find-LocalVeyraNrRuntime {
     return ''
 }
 
-function Resolve-Runtime([string]$Dir) {
+function Resolve-Runtime([string]$Dir, $Manifest = $null) {
     $allowed = Get-AllowedRuntimeShas
     $target = Join-Path $Dir $RuntimeRel
     if ($Runtime) {
@@ -533,6 +542,13 @@ function Resolve-Runtime([string]$Dir) {
         if (Test-SamePath $p $target) { Say 'rtOk' @($target, $allowed[$h]) 'Green'; return '' }
         Say 'rtWillCopy' @($p, $allowed[$h]) 'Green'
         return $p
+    }
+    if ($Manifest -and $Manifest.Contains($RuntimeRel)) {
+        $bundled = Join-Path $Payload $RuntimeRel
+        $h = [string]$Manifest[$RuntimeRel]
+        if (-not $allowed.ContainsKey($h)) { throw ((T 'rtBadHash' @($h.Substring(0, 16))) + ' ' + (T 'rtNeed')) }
+        Say 'rtBundled' @($target, $allowed[$h]) 'Green'
+        return $bundled
     }
     if (Test-Path -LiteralPath $target -PathType Leaf) {
         $h = Get-Sha $target
@@ -1075,7 +1091,7 @@ function Invoke-Install {
     Show-ObsVersion $dir
     Wait-ObsClosed $dir
     Write-Step 3 5 (T 'sRuntime')
-    $runtimeSource = Resolve-Runtime $dir
+    $runtimeSource = Resolve-Runtime $dir $manifest
     Write-Step 4 5 (T 'sOpt')
     $stageDir = Join-Path $env:TEMP ('obs-nr-stage-' + [guid]::NewGuid().ToString('N'))
     try {

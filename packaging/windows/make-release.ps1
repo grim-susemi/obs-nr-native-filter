@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Builds the Windows release zip and SHA256SUMS.txt from a CMake build tree.
+# The full package bundles a hash-pinned nvngx_dlssnr.dll when one is found
+# (or supplied with -BundleNrDll) so install.bat works fully offline.
 # Example: .\packaging\windows\make-release.ps1 -BuildDir out\build\windows-x64-release
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [string]$OutDir = '',
-    [string]$Version = '0.2.12',
-    [string]$Configuration = 'Release'
+    [string]$Version = '0.3.0',
+    [string]$Configuration = 'Release',
+    [string]$BundleNrDll = '',
+    [switch]$NoBundleNrDll
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -17,21 +21,92 @@ $OutDir = (Resolve-Path $OutDir).Path
 $name = "obs-nr-native-filter-$Version-windows-x64"
 $stage = Join-Path $OutDir $name
 $zip = Join-Path $OutDir "$name.zip"
+$RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
 
-function Assert-ReleaseArtifacts([string[]]$Entries, [string]$PluginPath, [string]$Surface) {
+function Get-AllowedNrRuntimeShas {
+    return @{
+        'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a' = '310.8.0.0'
+        'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed' = '310.9.16.0 (Model B)'
+    }
+}
+
+function Get-NrRuntimeSha([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Find-VeyraNrRuntime {
+    if (-not $env:LOCALAPPDATA) { return '' }
+    $versionsDir = Join-Path $env:LOCALAPPDATA 'Programs\Veyra (NVIDIA)\versions'
+    if (-not (Test-Path -LiteralPath $versionsDir -PathType Container)) { return '' }
+    $allowed = Get-AllowedNrRuntimeShas
+    $candidates = Get-ChildItem -LiteralPath $versionsDir -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $parts = [string[]]$_.Name.Split('.')
+            if ($parts.Count -ge 1 -and $parts.Count -le 4 -and @($parts | Where-Object { $_ -notmatch '^\d+$' }).Count -eq 0) {
+                $padded = [uint64[]]@(0, 0, 0, 0)
+                for ($i = 0; $i -lt $parts.Count; $i++) { $padded[$i] = [uint64]$parts[$i] }
+                [pscustomobject]@{
+                    SortKey = '{0:D20}.{1:D20}.{2:D20}.{3:D20}' -f $padded[0], $padded[1], $padded[2], $padded[3]
+                    Path    = Join-Path $_.FullName 'runtime\experimental\nr-ampere\nvngx_dlssnr.dll'
+                }
+            }
+        } |
+        Sort-Object SortKey -Descending
+    foreach ($cand in $candidates) {
+        if ((Test-Path -LiteralPath $cand.Path -PathType Leaf) -and
+                $allowed.ContainsKey((Get-NrRuntimeSha $cand.Path))) {
+            return $cand.Path
+        }
+    }
+    return ''
+}
+
+function Assert-ReleaseArtifacts([string[]]$Entries, [string]$PluginPath, [string]$RuntimePath, [string]$Surface) {
     $pluginCount = 0
+    $runtimeCount = 0
     foreach ($entry in $Entries) {
         # ZipFile may emit Windows separators; compare the full normalized path.
         $path = $entry.Replace('\', '/')
-        switch -Regex ($path) {
-            '\.dll$' {
-                if ($path -cne $PluginPath) { throw "$Surface contains forbidden release artifact: $entry" }
-                $pluginCount++
-            }
-            '\.(onnx|nrx|7z|nupkg|lib)$' { throw "$Surface contains forbidden release artifact: $entry" }
+        if ($path -match '\.(onnx|nrx|7z|nupkg|lib)$') {
+            throw "$Surface contains forbidden release artifact: $entry"
+        }
+        if ($path -match '\.dll$') {
+            if ($path -ceq $PluginPath) { $pluginCount++ }
+            elseif ($RuntimePath -and $path -ceq $RuntimePath) { $runtimeCount++ }
+            else { throw "$Surface contains forbidden release artifact: $entry" }
         }
     }
     if ($pluginCount -ne 1) { throw "$Surface must contain exactly one $PluginPath (found $pluginCount)." }
+    if ($RuntimePath) {
+        if ($runtimeCount -ne 1) {
+            throw "$Surface must contain exactly one $RuntimePath (found $runtimeCount)."
+        }
+    } elseif ($runtimeCount -ne 0) {
+        throw "$Surface contains an unexpected nvngx_dlssnr.dll."
+    }
+}
+
+if ($NoBundleNrDll -and $BundleNrDll) { throw 'Use either -BundleNrDll or -NoBundleNrDll.' }
+$runtimeSource = ''
+$runtimeSha = ''
+if (-not $NoBundleNrDll) {
+    $candidate = $BundleNrDll
+    if (-not $candidate) { $candidate = Find-VeyraNrRuntime }
+    if ($candidate) {
+        $candidate = (Resolve-Path -LiteralPath $candidate).Path
+        if ((Split-Path -Leaf $candidate) -cne 'nvngx_dlssnr.dll') {
+            throw "The bundled NR runtime must be named nvngx_dlssnr.dll: $candidate"
+        }
+        $runtimeSha = Get-NrRuntimeSha $candidate
+        $allowed = Get-AllowedNrRuntimeShas
+        if (-not $allowed.ContainsKey($runtimeSha)) {
+            throw "Refusing to bundle an unapproved nvngx_dlssnr.dll (SHA-256 $runtimeSha): $candidate"
+        }
+        $runtimeSource = $candidate
+        Write-Host "nr     $runtimeSource ($($allowed[$runtimeSha]))"
+    } else {
+        Write-Host 'nr     not bundled (no verified local Veyra copy; pass -BundleNrDll <path> to bundle one)'
+    }
 }
 
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
@@ -44,6 +119,7 @@ $payload = [ordered]@{
     'data\obs-plugins\obs-nr-filter\locale\en-US.ini' = Join-Path $repo 'data\locale\en-US.ini'
     'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini' = Join-Path $repo 'data\locale\ko-KR.ini'
 }
+if ($runtimeSource) { $payload[$RuntimeRel] = $runtimeSource }
 foreach ($shader in 'nr_codec.dxil', 'nr_color.dxil', 'nr_stabilize.dxil', 'nr_cas.dxil', 'nr_guides.cso', 'nr_interop_vertex.cso', 'nr_interop_pixel.cso', 'nr_obs_analysis.cso') {
     $payload["bin\64bit\$shader"] = Join-Path $BuildDir $shader
 }
@@ -52,7 +128,11 @@ foreach ($rel in $payload.Keys) {
     $dst = Join-Path $stage "files\$rel"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dst) | Out-Null
     Copy-Item -LiteralPath $payload[$rel] -Destination $dst
-    $lines += ('{0}  {1}' -f (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash.ToLowerInvariant(), $rel)
+    $hash = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($rel -eq $RuntimeRel -and $hash -ne $runtimeSha) {
+        throw "Copied NR runtime hash mismatch: $rel"
+    }
+    $lines += ('{0}  {1}' -f $hash, $rel)
 }
 [IO.File]::WriteAllLines((Join-Path $stage 'files\manifest.sha256'), [string[]]$lines)
 
@@ -89,17 +169,31 @@ foreach ($rel in $extra.Keys) {
 }
 
 $pluginPath = 'files/obs-plugins/64bit/obs-nr-filter.dll'
+$runtimePath = if ($runtimeSource) { 'files/bin/64bit/nvngx_dlssnr.dll' } else { '' }
 $stageEntries = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force |
     ForEach-Object { $_.FullName.Substring($stage.Length + 1) })
-Assert-ReleaseArtifacts $stageEntries $pluginPath 'Staging directory'
+Assert-ReleaseArtifacts $stageEntries $pluginPath $runtimePath 'Staging directory'
 
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $candidate = Join-Path $OutDir "$name.$([guid]::NewGuid().ToString('N')).tmp"
 try {
-    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $candidate, [IO.Compression.CompressionLevel]::Optimal, $true)
+    # Write forward-slash entry names: ZipFile.CreateFromDirectory emits backslashes
+    # on .NET Framework, which non-Windows unzip tools treat as literal characters.
+    $archive = [IO.Compression.ZipFile]::Open($candidate, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force) {
+            $entryName = "$name/" + $file.FullName.Substring($stage.Length + 1).Replace('\', '/')
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $archive, $file.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally {
+        $archive.Dispose()
+    }
     $archive = [IO.Compression.ZipFile]::OpenRead($candidate)
     try {
-        Assert-ReleaseArtifacts @($archive.Entries.FullName) "$name/$pluginPath" 'ZIP'
+        $zipRuntimePath = if ($runtimeSource) { "$name/$runtimePath" } else { '' }
+        Assert-ReleaseArtifacts @($archive.Entries.FullName) "$name/$pluginPath" $zipRuntimePath 'ZIP'
     } finally {
         $archive.Dispose()
     }
@@ -111,4 +205,5 @@ $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant
 [IO.File]::WriteAllLines((Join-Path $OutDir 'SHA256SUMS.txt'), [string[]]@("$hash  $name.zip"))
 Write-Host "zip    $zip"
 Write-Host "sha256 $hash"
+if ($runtimeSource) { Write-Host "nr     bundled $RuntimeRel" } else { Write-Host 'nr     not bundled' }
 foreach ($line in $lines) { Write-Host "  $line" }

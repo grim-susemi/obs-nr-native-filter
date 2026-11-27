@@ -343,11 +343,238 @@ function Test-NrRuntimeAdmission {
     Write-Host 'PASS NR rollback and stale-state rerun verified'
 }
 
+function Test-BundledNrRuntime {
+    $sha3109 = 'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed'
+    $shaThird = '1111111111111111111111111111111111111111111111111111111111111111'
+    $nrRoot = Join-Path $root 'bundled-admission'
+    $obs = Join-Path $nrRoot 'obs'
+    $StateDir = Join-Path $nrRoot 'state'
+    $Payload = Join-Path $nrRoot 'payload'
+    $localApp = Join-Path $nrRoot 'localappdata'
+    $veyra = Join-Path $localApp 'Programs\Veyra (NVIDIA)\versions\2.2.1\runtime\experimental\nr-ampere\nvngx_dlssnr.dll'
+    $manifestFile = Join-Path $Payload 'manifest.sha256'
+    Put (Join-Path $obs 'bin\64bit\obs64.exe') 'mock-obs'
+    foreach ($rel in @(Get-PackagePaths)) { Put (Join-Path $Payload $rel) "fixture-$rel" }
+    Put (Join-Path $Payload $RuntimeRel) 'fixture-bundled-310.9'
+    Put $veyra 'veyra-310.9'
+
+    $realSha = ${function:Get-Sha}
+    $shaOverrides = @{
+        (Get-FullPath (Join-Path $Payload $RuntimeRel)) = $sha3109
+        (Get-FullPath $veyra) = $sha3109
+    }
+    function Get-Sha([string]$Path) {
+        $full = Get-FullPath $Path
+        if ($shaOverrides.ContainsKey($full)) { return $shaOverrides[$full] }
+        if ([IO.File]::ReadAllText($full) -eq 'fixture-bundled-310.9') { return $sha3109 }
+        return (& $realSha $Path)
+    }
+    function Write-FixtureManifest([bool]$withRuntime, [string]$runtimeHash = 'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed') {
+        $rels = @(Get-PackagePaths)
+        if ($withRuntime) { $rels += $RuntimeRel }
+        $lines = foreach ($rel in $rels) { (Get-Sha (Join-Path $Payload $rel)) + '  ' + $rel }
+        if ($withRuntime -and $runtimeHash -ne $sha3109) {
+            $lines = @($lines | Where-Object { -not $_.EndsWith("  $RuntimeRel") })
+            $lines += "$runtimeHash  $RuntimeRel"
+        }
+        [IO.File]::WriteAllLines($manifestFile, [string[]]$lines)
+    }
+    function Read-Host { throw 'bundled runtime must not prompt' }
+
+    Assert-Equal (Test-PackagePath $RuntimeRel) $true 'bundled runtime is an allowed package path'
+    Assert-Equal (Test-PackagePath 'bin\64bit\unapproved.dll') $false 'unapproved DLL is not a package path'
+
+    Write-FixtureManifest $true
+    $m = Get-Manifest
+    Assert-Equal ([string]$m[$RuntimeRel]) $sha3109 'bundled runtime hash must come from the manifest'
+
+    $prevLocalApp = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $localApp
+        $Runtime = ''; $Yes = $false; $RuntimeDecided = $false
+        $resolved = Resolve-Runtime $obs $m
+        Assert-Equal (Get-FullPath $resolved) (Get-FullPath (Join-Path $Payload $RuntimeRel)) 'bundled runtime must win over local Veyra with no prompt'
+    } finally { $env:LOCALAPPDATA = $prevLocalApp }
+
+    Put (Join-Path $obs $RuntimeRel) 'foreign-nr'
+    Install-Files $obs $resolved '' '' $m @{}
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs $RuntimeRel))) 'fixture-bundled-310.9' 'bundled runtime bytes must be installed'
+    $receipt = @((Read-State).ownedFiles | Where-Object { $_.relative -eq $RuntimeRel })[0]
+    Assert-Equal ([string]$receipt.hash) $sha3109 'receipt must record the bundled hash'
+    Remove-Files $obs $m (Read-State)
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $obs $RuntimeRel))) 'foreign-nr' 'uninstall must restore the foreign NR runtime'
+    Write-Host 'PASS bundled runtime selected, installed, and restored on uninstall'
+
+    Write-FixtureManifest $true $shaThird
+    $failure = $null
+    try { [void](Get-Manifest) } catch { $failure = $_.Exception.Message }
+    if ($failure -notmatch 'payloadBad') { throw "third bundled hash must be rejected as payloadBad, got '$failure'" }
+    Write-FixtureManifest $false
+    $m2 = Get-Manifest
+    Assert-Equal $m2.Contains($RuntimeRel) $false 'lightweight manifest must not contain the runtime'
+    $obsZero = Join-Path $nrRoot 'obs-zero'
+    Put (Join-Path $obsZero 'bin\64bit\obs64.exe') 'mock-obs'
+    $emptyLocal = Join-Path $nrRoot 'empty-localappdata'
+    New-Item -ItemType Directory -Force -Path $emptyLocal | Out-Null
+    $prevLocalApp = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $emptyLocal
+        $Runtime = ''; $Yes = $true; $RuntimeDecided = $false
+        Assert-Equal (Resolve-Runtime $obsZero $m2) '' 'lightweight package without a local runtime must skip it'
+    } finally { $env:LOCALAPPDATA = $prevLocalApp }
+    Write-Host 'PASS bundled third hash rejected and zero-runtime fallback retained'
+}
+
+function Test-ReleasePackaging {
+    $makeRelease = (Resolve-Path (Join-Path $PSScriptRoot '..\..\packaging\windows\make-release.ps1')).Path
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($makeRelease, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw $errors[0] }
+    foreach ($f in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        . ([scriptblock]::Create($f.Extent.Text))
+    }
+    $plugin = 'files/obs-plugins/64bit/obs-nr-filter.dll'
+    $runtime = 'files/bin/64bit/nvngx_dlssnr.dll'
+    Assert-ReleaseArtifacts @($plugin, 'files/bin/64bit/nr_codec.dxil') $plugin '' 'zero-runtime fixture'
+    Assert-ReleaseArtifacts @($plugin, $runtime) $plugin $runtime 'bundled fixture'
+    foreach ($bad in @('files/bin/64bit/other.dll', 'files/models/model.onnx', 'files/model.7z', 'files/model.lib')) {
+        $message = $null
+        try { Assert-ReleaseArtifacts @($plugin, $bad) $plugin '' 'fixture' } catch { $message = $_.Exception.Message }
+        if ($message -notmatch 'forbidden release artifact') { throw "release allowlist must reject $bad (got '$message')" }
+    }
+    $message = $null
+    try { Assert-ReleaseArtifacts @($plugin) $plugin $runtime 'fixture' } catch { $message = $_.Exception.Message }
+    if ($message -notmatch 'exactly one') { throw "bundled mode must require its runtime (got '$message')" }
+    $message = $null
+    try { Assert-ReleaseArtifacts @($plugin, $runtime) $plugin '' 'fixture' } catch { $message = $_.Exception.Message }
+    if ($message -notmatch 'forbidden release artifact') { throw "zero-runtime mode must reject a stray runtime (got '$message')" }
+    Write-Host 'PASS release artifact allowlist (plugin plus approved runtime only)'
+
+    function New-FakeBuild([string]$buildDir) {
+        Put (Join-Path $buildDir 'Release\obs-nr-filter.dll') 'fixture-plugin'
+        Put (Join-Path $buildDir 'Release\obs-nr-fg-presenter.exe') 'fixture-presenter'
+        foreach ($shader in 'nr_codec.dxil', 'nr_color.dxil', 'nr_stabilize.dxil', 'nr_cas.dxil', 'nr_guides.cso', 'nr_interop_vertex.cso', 'nr_interop_pixel.cso', 'nr_obs_analysis.cso') {
+            Put (Join-Path $buildDir $shader) "fixture-$shader"
+        }
+    }
+    function Invoke-MakeRelease([string[]]$ExtraArgs) {
+        $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $makeRelease) + $ExtraArgs
+        & powershell.exe @argsList
+        if ($LASTEXITCODE -ne 0) { throw "make-release failed with exit code $LASTEXITCODE" }
+    }
+    function Install-Package([string]$packageRoot, [string]$obs, [string]$state, [switch]$Uninstall) {
+        $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $packageRoot 'scripts\install.ps1'),
+            '-ObsDir', $obs, '-StateDir', $state, '-Lang', 'en', '-Yes', '-NoPause', '-SkipOptional', '-SkipPushFlow')
+        if ($Uninstall) { $argsList += '-Uninstall' }
+        & powershell.exe @argsList
+        if ($LASTEXITCODE -ne 0) { throw "packaged installer failed with exit code $LASTEXITCODE" }
+    }
+
+    $zeroRoot = Join-Path $root 'package-zero'
+    $zeroBuild = Join-Path $zeroRoot 'build'
+    $zeroOut = Join-Path $zeroRoot 'out'
+    New-FakeBuild $zeroBuild
+    Invoke-MakeRelease @('-BuildDir', $zeroBuild, '-OutDir', $zeroOut, '-Version', '0.3.0-zero', '-NoBundleNrDll')
+    $zeroName = 'obs-nr-native-filter-0.3.0-zero-windows-x64'
+    $zeroZip = Join-Path $zeroOut "$zeroName.zip"
+    Assert-Equal (Test-Path -LiteralPath $zeroZip) $true 'zero-runtime zip must exist'
+    $zeroSums = [IO.File]::ReadAllText((Join-Path $zeroOut 'SHA256SUMS.txt'))
+    if ($zeroSums -notmatch [regex]::Escape("$((Get-Sha $zeroZip))  $zeroName.zip")) { throw 'SHA256SUMS must pin the zero-runtime zip' }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($zeroZip)
+    try { $names = @($archive.Entries.FullName) } finally { $archive.Dispose() }
+    if (@($names | Where-Object { $_ -match 'nvngx_dlssnr\.dll$' }).Count) { throw 'zero-runtime zip must not contain nvngx_dlssnr.dll' }
+    $zeroExtract = Join-Path $zeroRoot 'extracted'
+    [IO.Compression.ZipFile]::ExtractToDirectory($zeroZip, $zeroExtract)
+    $zeroPkg = Join-Path $zeroExtract $zeroName
+    $zeroObs = Join-Path $zeroRoot 'obs'
+    Put (Join-Path $zeroObs 'bin\64bit\obs64.exe') 'fixture-obs'
+    $zeroState = Join-Path $zeroRoot 'state'
+    $emptyLocal = Join-Path $zeroRoot 'empty-localappdata'
+    New-Item -ItemType Directory -Force -Path $emptyLocal | Out-Null
+    $prevLocalApp = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $emptyLocal
+        Install-Package $zeroPkg $zeroObs $zeroState
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $zeroObs 'obs-plugins\64bit\obs-nr-filter.dll')) $true 'zero-runtime package must install the plugin'
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $zeroObs 'bin\64bit\nvngx_dlssnr.dll')) $false 'zero-runtime package must leave the NR runtime absent'
+        Install-Package $zeroPkg $zeroObs $zeroState -Uninstall
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $zeroObs 'obs-plugins\64bit\obs-nr-filter.dll')) $false 'zero-runtime uninstall must remove the plugin'
+    } finally { $env:LOCALAPPDATA = $prevLocalApp }
+    Write-Host 'PASS zero-runtime ZIP generation, install, and uninstall'
+
+    $badDll = Join-Path $root 'bad-runtime\nvngx_dlssnr.dll'
+    Put $badDll 'unapproved-nr-runtime'
+    $badRejected = $false
+    try {
+        Invoke-MakeRelease @('-BuildDir', $zeroBuild, '-OutDir', (Join-Path $zeroRoot 'bad-out'), '-Version', '0.3.0-bad', '-BundleNrDll', $badDll)
+    } catch { $badRejected = $true }
+    Assert-Equal $badRejected $true 'make-release must reject an unapproved NR runtime hash'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $zeroRoot 'bad-out\obs-nr-native-filter-0.3.0-bad-windows-x64.zip')) $false 'rejected runtime must produce no ZIP'
+    Write-Host 'PASS unapproved bundled runtime rejected before staging'
+
+    $realNr = Find-VeyraNrRuntime
+    if (-not $realNr) {
+        Write-Host 'SKIP bundled ZIP roundtrip (no verified local Veyra nvngx_dlssnr.dll)'
+        return
+    }
+    $realNrSha = Get-NrRuntimeSha $realNr
+    $bundleRoot = Join-Path $root 'package-bundled'
+    $bundleBuild = Join-Path $bundleRoot 'build'
+    $bundleOut = Join-Path $bundleRoot 'out'
+    New-FakeBuild $bundleBuild
+    Invoke-MakeRelease @('-BuildDir', $bundleBuild, '-OutDir', $bundleOut, '-Version', '0.3.0-bundle', '-BundleNrDll', $realNr)
+    $bundleName = 'obs-nr-native-filter-0.3.0-bundle-windows-x64'
+    $bundleZip = Join-Path $bundleOut "$bundleName.zip"
+    Assert-Equal (Test-Path -LiteralPath $bundleZip) $true 'bundled zip must exist'
+    $bundleSums = [IO.File]::ReadAllText((Join-Path $bundleOut 'SHA256SUMS.txt'))
+    if ($bundleSums -notmatch [regex]::Escape("$((Get-Sha $bundleZip))  $bundleName.zip")) { throw 'SHA256SUMS must pin the bundled zip' }
+    $manifestText = ''
+    $archive = [IO.Compression.ZipFile]::OpenRead($bundleZip)
+    try {
+        $names = @($archive.Entries.FullName | ForEach-Object { $_.Replace('\', '/') })
+        Assert-Equal @($names | Where-Object { $_ -match '/files/bin/64bit/nvngx_dlssnr\.dll$' }).Count 1 'bundled zip must contain one NR runtime'
+        Assert-Equal @($names | Where-Object { $_ -match '\.dll$' }).Count 2 'bundled zip must contain only the plugin and approved NR DLL'
+        $manifestEntry = @($archive.Entries | Where-Object { $_.FullName.Replace('\', '/') -match '/files/manifest\.sha256$' })[0]
+        $reader = [IO.StreamReader]::new($manifestEntry.Open())
+        try { $manifestText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $archive.Dispose() }
+    $runtimeLine = @($manifestText -split "`r?`n" | Where-Object { $_ -eq "$realNrSha  bin\64bit\nvngx_dlssnr.dll" })
+    Assert-Equal $runtimeLine.Count 1 'bundled manifest must pin the NR runtime hash'
+    $bundleExtract = Join-Path $bundleRoot 'extracted'
+    [IO.Compression.ZipFile]::ExtractToDirectory($bundleZip, $bundleExtract)
+    $bundlePkg = Join-Path $bundleExtract $bundleName
+    $emptyLocal = Join-Path $bundleRoot 'empty-localappdata'
+    New-Item -ItemType Directory -Force -Path $emptyLocal | Out-Null
+    $prevLocalApp = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $emptyLocal
+        $obsForeign = Join-Path $bundleRoot 'obs-foreign'
+        Put (Join-Path $obsForeign 'bin\64bit\obs64.exe') 'fixture-obs'
+        Put (Join-Path $obsForeign 'bin\64bit\nvngx_dlssnr.dll') 'foreign-nr'
+        $stateForeign = Join-Path $bundleRoot 'state-foreign'
+        Install-Package $bundlePkg $obsForeign $stateForeign
+        Assert-Equal (Get-Sha (Join-Path $obsForeign 'bin\64bit\nvngx_dlssnr.dll')) $realNrSha 'bundled install must write the pinned NR runtime'
+        Install-Package $bundlePkg $obsForeign $stateForeign -Uninstall
+        Assert-Equal ([IO.File]::ReadAllText((Join-Path $obsForeign 'bin\64bit\nvngx_dlssnr.dll'))) 'foreign-nr' 'bundled uninstall must restore the foreign runtime'
+        $obsClean = Join-Path $bundleRoot 'obs-clean'
+        Put (Join-Path $obsClean 'bin\64bit\obs64.exe') 'fixture-obs'
+        $stateClean = Join-Path $bundleRoot 'state-clean'
+        Install-Package $bundlePkg $obsClean $stateClean
+        Assert-Equal (Get-Sha (Join-Path $obsClean 'bin\64bit\nvngx_dlssnr.dll')) $realNrSha 'bundled install must write the runtime on a clean OBS'
+        Install-Package $bundlePkg $obsClean $stateClean -Uninstall
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $obsClean 'bin\64bit\nvngx_dlssnr.dll')) $false 'bundled uninstall must remove the runtime it copied'
+    } finally { $env:LOCALAPPDATA = $prevLocalApp }
+    Write-Host "PASS bundled ZIP generation, hash install, and uninstall ($realNrSha)"
+}
+
 try {
     Test-NrRuntimeAdmission
+    Test-BundledNrRuntime
     Test-PushFlowOwnership
     Test-PushFlowStaging
     Test-PushFlowElevation
+    Test-ReleasePackaging
     $target = Join-Path $dir $rel
     $src = Join-Path $Payload $rel
     $failures = @()

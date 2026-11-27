@@ -19,7 +19,11 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 </div>
 
 > [!NOTE]
-> Community project, not affiliated with NVIDIA or the OBS Project. NVIDIA runtime DLLs are **not redistributed** inside this repository or release zip. `install.bat` guides you through placing `nvngx_dlssnr.dll` and can automatically download & verify the official NVIDIA-signed DLSS 4.5 SR and NVIDIA VFG runtimes from NVIDIA's servers.
+> Community project, not affiliated with NVIDIA or the OBS Project. The full Windows release ZIP bundles the hash-pinned `nvngx_dlssnr.dll` model (310.9.16.0 Model B) so a clean machine can install Native NR offline; `install.bat` verifies it before copying. The optional DLSS 4.5 SR and NVIDIA VFG runtimes are **not** bundled and are downloaded & verified by `install.bat` from NVIDIA's official servers.
+
+## What's new in 0.3.0
+
+- **Offline one-click Native NR:** the full Windows ZIP now bundles `bin\64bit\nvngx_dlssnr.dll` (310.9.16.0 Model B, SHA-256 `cdfa6c1e...bf3ed`). `install.bat` verifies the SHA-256 and installs it without a prompt, manual file pick, or local Veyra lookup, so Native NR works on a clean offline machine. Lightweight packages without the DLL keep the local-Veyra/manual path.
 
 ## What's new in 0.2.12
 
@@ -75,16 +79,18 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 | OS | Windows 10 or 11, 64-bit |
 | OBS Studio | 32.x, Direct3D 11 renderer (the default). Built and tested with 32.2.2 |
 | GPU | NVIDIA RTX 20, 30, 40 or 50 series (NVIDIA VFG preview requires RTX 40/50) |
-| NR model file | `nvngx_dlssnr.dll` 310.8.0.0 compatibility build, **not included** ([details](#the-nr-model-file)) |
+| NR model file | `nvngx_dlssnr.dll` 310.9.16.0 Model B — **bundled in the full ZIP** and SHA-256 verified on install; 310.8.0.0 also accepted ([details](#the-nr-model-file)) |
 | Optional runtimes | `nvngx_dlss.dll` (DLSS 4.5 SR) & NVIDIA VFG 1.3.0 DLLs — **auto-installed from official NVIDIA sources by `install.bat`** |
 
 Tested on an RTX 4090 with driver 617.14 on Windows 11. Other RTX cards should work with the same NR model file.
 
 ### The NR model file
 
-The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`), which supports RTX 20, 30, 40 and 50 cards.
+The full 0.3.0 Windows ZIP bundles `nvngx_dlssnr.dll` **310.9.16.0 Model B** (SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`). `install.bat` verifies the bundled file and installs it to `bin\64bit` with no prompt, so a clean offline machine needs no separate download. The 310.8.0.0 compatibility build (165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`) is also accepted, and both support RTX 20, 30, 40 and 50 cards.
 
-**How to get it**
+**Lightweight packages without the bundle**
+
+If the ZIP does not contain `files\bin\64bit\nvngx_dlssnr.dll`, the installer reuses a verified local Veyra 310.9.16.0 copy or asks for the file. You can supply it with `-Runtime <path>` or download the 310.8.0.0 compatibility build from the RenoDX Discord:
 
 1. Join the RenoDX Discord: https://discord.gg/F6AUTeWJHM
 2. Open this channel: https://discord.com/channels/1408098019194310818/1543975158937821315
@@ -92,11 +98,11 @@ The NR filter accepts the 310.8.0.0 compatibility build of `nvngx_dlssnr.dll` (1
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.2.12-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.12 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.12).
+1. Download `obs-nr-native-filter-0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0).
 2. Close OBS completely (including tray icon).
 3. Extract the entire zip and double-click **`install.bat`**.
 4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
-5. Drag your `nvngx_dlssnr.dll` into the window (or press Enter to skip and add later).
+5. The bundled `nvngx_dlssnr.dll` (310.9.16.0 Model B) is SHA-256 verified and installed automatically; lightweight packages ask for the file instead.
 6. Choose **Y** when prompted to automatically download and verify **DLSS 4.5 SR** (`nvngx_dlss.dll`, ~56 MB) and **NVIDIA VFG** (5 official signed DLLs, RTX 40/50), then approve the Windows Admin prompt.
 7. Start OBS, right-click your source > **Filters** > **Effect Filters** > **+**. Choose **Video Upscale & Frame Generation** for SDR scaling or frame generation, or **Native NR** for denoising.
 
@@ -155,10 +161,10 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 
 **설치 방법 (원클릭)**
 
-1. [v0.2.12 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.12)에서 `obs-nr-native-filter-0.2.12-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
+1. [v0.3.0 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0)에서 `obs-nr-native-filter-0.3.0-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
 2. OBS를 완전히 끕니다.
 3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
-4. `nvngx_dlssnr.dll`(310.8.0.0 호환판, SHA-256 `e67dee20…c989a`)이 OBS에 없으면 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)
+4. `nvngx_dlssnr.dll`(310.9.16.0 Model B)은 ZIP에 동봉되어 있어 SHA-256 검증 후 자동 설치됩니다. 동봉되지 않은 경량 패키지에서만 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)
 5. **DLSS 4.5 SR(`nvngx_dlss.dll`)** 과 **NVIDIA VFG(5개 DLL)** 자동 다운로드 안내가 나오면 Enter(Y)를 누르세요. 설치기가 NVIDIA 공식 서버에서 직접 받아 서명·SHA-256 검증까지 끝내고 OBS에 배치합니다.
 6. 관리자 권한 창에서 **예**를 누르면 설치가 끝납니다.
 7. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터 [+]**에서 **영상 업스케일 및 프레임 생성** 또는 **Native NR**을 선택합니다. 이중선형 확대와 CAS만 쓰려면 모델과 선택 런타임 설치를 건너뛰어도 됩니다.

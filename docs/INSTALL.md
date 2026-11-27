@@ -1,6 +1,6 @@
 # Install guide
 
-How to install OBS Native NR 0.2.12 into OBS Studio on Windows. Start with the [illustrated quick guide](INSTALL-ONECLICK.md). The filters automatically find installed runtimes.
+How to install OBS Native NR 0.3.0 into OBS Studio on Windows. Start with the [illustrated quick guide](INSTALL-ONECLICK.md). The filters automatically find installed runtimes.
 
 [한국어 설치 안내는 아래에 있습니다](#한국어-설치-안내)
 
@@ -8,22 +8,19 @@ How to install OBS Native NR 0.2.12 into OBS Studio on Windows. Start with the [
 
 - **OBS Studio 32.x, 64-bit** (built and tested with 32.2.2) with the **Direct3D 11 renderer**.
 - **NVIDIA RTX 20, 30, 40 or 50 series** with a current driver (NVIDIA VFG preview requires RTX 40 or 50).
-- **For Native NR only:** `nvngx_dlssnr.dll` — either:
-  - **310.8.0.0** compatibility build (165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`, Model A), or
-  - **310.9.16.0** build (SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`, enables **Model B** small-FP8 performance mode). If OBS does not have `nvngx_dlssnr.dll` yet and a verified 310.9.16.0 copy exists under `%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`, `install.bat` automatically reuses it.
-  It is not included in the zip; you can also get it from the RenoDX Discord or pass `-Runtime <path>`:
+- **For Native NR only:** `nvngx_dlssnr.dll` — the full ZIP bundles the **310.9.16.0 Model B** build (SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`), which `install.bat` verifies and installs automatically with no prompt. The **310.8.0.0** compatibility build (165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`, Model A) is also accepted. A lightweight package without the bundled file reuses a verified local Veyra 310.9.16.0 copy when OBS lacks the DLL, or you can pass `-Runtime <path>`. If you need the file separately, get it from the RenoDX Discord:
   1. Join: https://discord.gg/F6AUTeWJHM
   2. Channel: https://discord.com/channels/1408098019194310818/1543975158937821315
 - **Optional DLSS 4.5 SR & NVIDIA VFG runtimes**: `install.bat` automatically offers to download and verify them directly from NVIDIA's official repositories (`github.com/NVIDIA/DLSS` and `pypi.nvidia.com/nvidia-vfx/`).
 
 ## One-click install
 
-1. Download `obs-nr-native-filter-0.2.12-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.2.12 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.12) and verify the checksum.
+1. Download `obs-nr-native-filter-0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0) and verify the checksum.
 2. Close OBS completely, including the tray icon.
 3. Extract the whole zip into a folder and double-click `install.bat`. The console replaces each question with the next one.
    - **Language**: Enter for Korean, `2` for English.
    - **OBS folder**: press Enter to confirm the detected OBS path.
-   - **NR model file**: if OBS lacks `nvngx_dlssnr.dll`, a verified local Veyra `310.9.16.0` copy is reused automatically; otherwise drag `nvngx_dlssnr.dll` (`310.8.0.0` or `310.9.16.0`) into the window and press Enter (or Enter alone to skip).
+   - **NR model file**: the bundled 310.9.16.0 Model B DLL is verified and installed automatically. A lightweight package instead reuses a verified local Veyra copy, or asks you to drag `nvngx_dlssnr.dll` (`310.8.0.0` or `310.9.16.0`) into the window.
    - **DLSS 4.5 SR (~56 MB)**: press Enter (Y) to download & signature-verify official `nvngx_dlss.dll` into `bin\64bit\dlss\nvngx_dlss.dll`.
    - **NVIDIA VFG (~415 MB wheel -> 5 DLLs)**: press Enter (Y) to download, verify SHA-256, and extract the 5 signed NVIDIA VFG DLLs into `bin\64bit\nvidia-vfg\` (reused locally if Veyra is already installed).
    - **Admin prompt**: choose **Yes**.
@@ -43,7 +40,7 @@ Logs are saved under `%LOCALAPPDATA%\obs-nr-native-filter`.
 | `obs-nr-fg-presenter.exe` | `bin\64bit` |
 | `en-US.ini`, `ko-KR.ini` | `data\obs-plugins\obs-nr-filter\locale` |
 | `nr_codec.dxil`, `nr_color.dxil`, `nr_stabilize.dxil`, `nr_cas.dxil`, `nr_guides.cso`, `nr_interop_vertex.cso`, `nr_interop_pixel.cso`, `nr_obs_analysis.cso` | `bin\64bit` |
-| `nvngx_dlssnr.dll` (only if supplied) | `bin\64bit` |
+| `nvngx_dlssnr.dll` (bundled in the full ZIP; SHA-256 verified on install) | `bin\64bit` |
 | `nvngx_dlss.dll` (optional, downloaded from NVIDIA) | `bin\64bit\dlss` |
 | `cudart64_12.dll`, `NVCVImage.dll`, `nvngxruntime.dll`, `NVVideoEffects.dll`, `nvVFXVideoFrameGeneration.dll` (optional, from NVIDIA) | `bin\64bit\nvidia-vfg` |
 
@@ -61,26 +58,23 @@ Close OBS and double-click `uninstall.bat`. It restores any backed-up files and 
 
 ## 한국어 설치 안내
 
-OBS Native NR 0.2.12를 Windows OBS Studio에 설치하는 방법입니다. [화면이 포함된 원클릭 안내](INSTALL-ONECLICK.md)부터 보세요. 설치된 런타임은 효과가 자동으로 찾습니다.
+OBS Native NR 0.3.0을 Windows OBS Studio에 설치하는 방법입니다. [화면이 포함된 원클릭 안내](INSTALL-ONECLICK.md)부터 보세요. 설치된 런타임은 효과가 자동으로 찾습니다.
 
 ### 준비
 
 - **OBS Studio 32.x 64비트** (32.2.2에서 시험), 렌더러는 **Direct3D 11** (기본값).
 - **NVIDIA RTX 20~50 시리즈** (NVIDIA VFG 2x~4x 미리보기는 RTX 40/50 전용).
-- **Native NR에만 필요한 모델 파일** `nvngx_dlssnr.dll` — 아래 두 판 중 하나를 사용합니다:
-  - **310.8.0.0** 호환판 (165,840,496바이트, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`, Model A)
-  - **310.9.16.0** 판 (SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`, **Model B** 지원). OBS에 `nvngx_dlssnr.dll`이 없고 로컬 Veyra(`%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`)에 검증된 `310.9.16.0` 파일이 있으면 `install.bat`이 자동으로 재사용합니다.
-  릴리즈에 들어 있지 않으며, RenoDX 디스코드(https://discord.gg/F6AUTeWJHM)에서 받거나 `-Runtime <경로>`로 직접 지정할 수 있습니다.
+- **Native NR에만 필요한 모델 파일** `nvngx_dlssnr.dll` — 전체 ZIP에는 **310.9.16.0 Model B**판(SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`)이 동봉되어 있어 `install.bat`이 SHA-256을 검증한 뒤 별도 질문 없이 자동 설치합니다. **310.8.0.0** 호환판(165,840,496바이트, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`, Model A)도 계속 허용됩니다. 동봉되지 않은 경량 패키지라면 OBS에 파일이 없을 때 로컬 Veyra(`%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`)의 검증된 `310.9.16.0` 파일을 자동 재사용하거나 `-Runtime <경로>`로 직접 지정할 수 있습니다. 파일을 따로 받아야 하면 RenoDX 디스코드에서 받으세요: https://discord.gg/F6AUTeWJHM
 - **DLSS 4.5 SR · NVIDIA VFG 런타임**: 별도로 찾아 받을 필요 없이 `install.bat`이 NVIDIA 공식 서버에서 직접 내려받아 서명·SHA-256을 검증한 뒤 자동 설치해 줍니다.
 
 ### 원클릭 설치 순서
 
-1. [v0.2.12 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.2.12)에서 `obs-nr-native-filter-0.2.12-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
+1. [v0.3.0 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0)에서 `obs-nr-native-filter-0.3.0-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
 2. OBS를 완전히 끕니다(트레이 아이콘 포함).
 3. 압축 푼 폴더의 `install.bat`을 더블클릭합니다.
    - **언어**: 그냥 Enter를 누르면 한국어입니다.
    - **OBS 폴더**: 찾은 경로가 맞으면 Enter.
-   - **NR 모델 파일**: `bin\64bit\nvngx_dlssnr.dll`이 없으면 로컬 Veyra의 `310.9.16.0` 파일을 자동 재사용하거나, 직접 파일을 창에 끌어다 놓고 Enter (`310.8.0.0` 또는 `310.9.16.0` 허용, Enter만 누르면 건너뜀).
+   - **NR 모델 파일**: 동봉된 310.9.16.0 Model B 파일의 SHA-256이 검증되어 자동 설치됩니다. 동봉되지 않은 경량 패키지라면 로컬 Veyra의 `310.9.16.0` 파일을 자동 재사용하거나, 직접 파일을 창에 끌어다 놓고 Enter를 누릅니다 (`310.8.0.0` 또는 `310.9.16.0` 허용, Enter만 누르면 건너뜀).
    - **DLSS 4.5 SR / NVIDIA VFG**: 자동 설치 여부를 묻는 곳에서 그냥 Enter(Y)를 누르면 공식 NVIDIA 파일이 자동 설치됩니다.
    - **관리자 권한 창**: **예**를 누릅니다.
 4. OBS를 실행해 소스 우클릭 > **필터** > **효과 필터 [+]**에서 필요한 효과를 선택합니다.

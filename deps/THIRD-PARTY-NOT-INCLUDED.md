@@ -32,7 +32,10 @@ from the same official Optical Flow SDK 5.0.7 archive as the D3D12 header.
 The header is a build input only; the installed NVIDIA driver supplies the runtime.
 
 The `nvsdk_ngx_d.lib` entry above is historical. The current OBS plugin does
-not link an NVIDIA NGX SDK library. It uses the installed NVIDIA driver
-and separately installed runtime files; neither ships in the ZIP.
+not link an NVIDIA NGX SDK library. It uses the installed NVIDIA driver, and the
+full 0.3.0 release ZIP bundles the hash-pinned 310.9.16.0 Model B
+`nvngx_dlssnr.dll` (SHA-256
+`cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`). Other
+runtime files are installed separately and do not ship in the ZIP.
 
 한국어: NVIDIA SDK 파일은 저장소와 전체 기록에서 제외했습니다. 빌드하려면 위 경로에 공식 배포본을 직접 받아 넣어야 합니다.

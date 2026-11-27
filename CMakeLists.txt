@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28...3.30)
-project(obs-nr-filter VERSION 0.2.12 LANGUAGES C CXX)
+project(obs-nr-filter VERSION 0.3.0 LANGUAGES C CXX)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # D2: the closure gate reads CodeView/COFF sections of every object, so whole-program
 # optimization (/GL IL objects) and /LTCG are forbidden in every configuration, for both
@@ -24,7 +24,7 @@ target_compile_definitions(nr-qa-host PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 enable_testing()
 add_test(NAME release_installer COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/release_installer_tests.ps1")
-set_tests_properties(release_installer PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+set_tests_properties(release_installer PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 include(cmake/nr/Runtime.cmake)
 include(cmake/nr/Core.cmake)
 include(cmake/nr/Interop.cmake)

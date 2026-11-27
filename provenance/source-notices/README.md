@@ -22,8 +22,11 @@ provenance/source-lock.json. It is a notice index, not a source or model copy.
 
 - MFG unlock: MIT (ImDreamt / Michael Robles dashdogy), excluded by default and separate from NR;
   it is not in the reuse set.
-- Proprietary runtime: nvngx_dlssnr.dll is owner/self-supplied and NOT redistributable or bundled;
-  no runtime binary is copied, hashed or referenced as project source by this lock.
+- Proprietary runtime: nvngx_dlssnr.dll is not part of this source lock and is not copied into the
+  repository. Since the 0.3.0 Windows release, the owner-selected 310.9.16.0 Model B build
+  (SHA-256 cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed) is bundled into the
+  full release ZIP by make-release.ps1 after hash verification; the 310.8.0.0 build is not
+  redistributed. No runtime binary is referenced as project source by this lock.
 - AGNYA material: comparison-only; its terms remain UNKNOWN/unresolved and NO AGNYA content is
   selected or copied. This is a scope statement, not a claim about absent files.
 - Generated shader artifacts (.cso, generated *_Shader.h, .spv) are build outputs, not authored
@@ -47,4 +50,6 @@ hashes remain in source-lock.json. CREDITS.md now also records OBS additions.
 - [RIFE-MIT.txt](RIFE-MIT.txt): MIT text from [hzwer/ECCV2022-RIFE](https://github.com/hzwer/ECCV2022-RIFE/blob/19b903effb008cefbffaea2c4a0b877beaece6b1/LICENSE). [AmusementClub/vs-mlrt](https://github.com/AmusementClub/vs-mlrt) distributes the optional RIFE ONNX exports separately.
 
 See [CREDITS.md](CREDITS.md) for the attribution chain. These notices do not
-imply that the ZIP contains any third-party runtime, model, or addon.
+imply that the ZIP contains any third-party model or addon. The only third-party
+runtime in the full 0.3.0 ZIP is the owner-selected, hash-pinned nvngx_dlssnr.dll
+described above.
