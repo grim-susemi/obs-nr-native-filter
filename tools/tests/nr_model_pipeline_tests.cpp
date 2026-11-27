@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
+// allow: SIZE_OK - one live GPU pipeline fixture drives both the default 64x64 and the --1080p 60/120
+// scenarios; a second translation unit would duplicate Host/Pipeline/prime and needs CMake outside this task.
 #include "obs_native_output.h"
 #include <obs.h>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <wrl/wrappers/corewrappers.h>
 
@@ -14,7 +17,18 @@ using Microsoft::WRL::ComPtr;
 using namespace std::chrono_literals;
 namespace fs=std::filesystem;
 using Clock=std::chrono::steady_clock;
-constexpr UINT w=640,h=384;
+constexpr UINT w=640,h=384; // NR buffer (native extent) shared by both modes.
+constexpr UINT videoW=1920,videoH=1080; // 1080p mode OBS video frame; the NR buffer stays w x h.
+constexpr uint64_t frame60Ns=16'666'667,frame120Ns=8'333'333;
+struct JitterTiming {
+    uint64_t intervalNs;
+    int64_t shortNs,longNs;
+    double shortLimitMs,longLimitMs;
+    bool gated;
+    const char* label;
+};
+constexpr JitterTiming jitter60{frame60Ns,9'000'000,24'000'000,12.5,20.0,true,"9ms/24ms"};
+constexpr JitterTiming jitter120{frame120Ns,8'333'333,16'666'667,12.5,10.0,false,"8.33ms/16.67ms"};
 const fs::path install=L"C:/Program Files/obs-studio/bin/64bit";
 void expect(bool ok,const char* message) { if(!ok)throw std::runtime_error(message); }
 void check(HRESULT hr) { if(FAILED(hr))throw interop::HResultError(hr,"pipeline test hardware"); }
@@ -27,12 +41,12 @@ std::vector<std::byte> shader(const fs::path& path) {
 }
 struct Host {
     const fs::path data=fs::temp_directory_path()/("nr-model-pipeline-"+std::to_string(GetCurrentProcessId()));
-    Host() {
+    explicit Host(UINT width=64,UINT height=64,UINT fps=60) {
         expect(fs::create_directory(data),"private test profile");
         expect(obs_startup("en-US",data.string().c_str(),nullptr),"standalone libobs clock");
         obs_video_info video{};const auto module=(install/"libobs-d3d11.dll").string();
-        video.graphics_module=module.c_str();video.fps_num=60;video.fps_den=1;
-        video.base_width=video.output_width=64;video.base_height=video.output_height=64;
+        video.graphics_module=module.c_str();video.fps_num=fps;video.fps_den=1;
+        video.base_width=video.output_width=width;video.base_height=video.output_height=height;
         video.output_format=VIDEO_FORMAT_RGBA;video.colorspace=VIDEO_CS_709;video.range=VIDEO_RANGE_FULL;
         const auto cwd=fs::current_path();fs::current_path(install); // libobs reads ../../data/libobs/*.effect
         const auto result=obs_reset_video(&video);fs::current_path(cwd);
@@ -170,7 +184,19 @@ void reuse_and_refusal(Pipeline& p) {
     expect(WaitForSingleObject(stuck->observed,5000)==WAIT_OBJECT_0 && stuck->ready,"original notification");
     stuck.reset();p.close();
 }
-void jitter(Pipeline& p) {
+void dedup_proof(Pipeline& p) {
+    const auto ordinary=p.current();
+    const auto first=p.arrive();p.ready();
+    expect(first.kind==OutputKind::DelayedNr && p.output.selected_job()==ordinary,"1080p publish real ordinary result");
+    const auto pixels=p.presented();const auto duplicate=p.current();
+    expect(duplicate->reused && duplicate->eligible && !duplicate->evaluated && !duplicate->flow,
+        "1080p duplicate bypassed both engines");
+    expect(p.arrive().kind==OutputKind::DelayedNr && p.output.selected_job()==duplicate && p.presented()==pixels,
+        "1080p pixel-identical published duplicate");p.ready();
+    expect(p.current()->reused && !pixels.empty(),"1080p consecutive duplicate and identical pixels");
+    std::printf("dedup nr_reused=%u pixels_identical=%zu passes_skipped=2 reset=0 0xe002=0\n",2u,pixels.size());
+}
+void jitter(Pipeline& p,const JitterTiming& timing) {
     prime(p);const auto history=p.current()->contract.key.historyEpoch;
     // Withhold the *real D3D11 producer*, not the model marker. A CPU producer
     // wait cannot return this dispatch while its GPU input still hasn't arrived.
@@ -189,25 +215,38 @@ void jitter(Pipeline& p) {
         expect(early && incomplete && p.current()->eligible,"producer wait blocked the model worker");
         std::puts("producer_gpu_wait=1 dispatch_returned_before_producer=1");
     }
-    const auto start=p.jobs.size();ComPtr<ID3D12Fence> gate;
-    check(p.output.context()->device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)));
-    check(p.output.context()->queue()->Wait(gate.Get(),1)); // Real, unfinished GPU work at the next short cutoff.
-    auto deadline=Clock::now();p.pattern(61);p.arrive();
-    expect(p.faults->returned.wait_for(1s)==std::future_status::ready && !p.current()->ready,"gated model submission");
-    const auto held=p.output.held_frames();const auto previousPixels=p.presented();
-    std::stop_source stopped;stopped.request_stop();
-    const auto before=Clock::now();
-    expect(!p.current()->ready_for_arrival(stopped.get_token(),16'666'667) && Clock::now()-before<8ms &&
-        !p.current()->ready,"stopped healthy owner must not wait or become ready");
-    deadline+=9ms;std::this_thread::sleep_until(deadline);p.pattern(81);
-    const auto selected=p.arrive();auto late=p.current();
-    std::this_thread::sleep_for(3ms);check(gate->Signal(1));
-    expect(selected.reason==Reason::DeadlineMiss && !selected.resetTemporal && p.output.held_frames()==held+1 &&
-        p.presented()==previousPixels,
-        "short-tick hold of last NR target");
-    for(unsigned n=1;n<20;++n) {
-        deadline+=n%2?24ms:9ms;std::this_thread::sleep_until(deadline);
-        p.pattern(81+n*11);p.arrive();(void)p.current();
+    const auto start=p.jobs.size();
+    const auto shortStep=std::chrono::nanoseconds(timing.shortNs),longStep=std::chrono::nanoseconds(timing.longNs);
+    auto deadline=Clock::now();
+    std::shared_ptr<model::Job> late;size_t shortHold=0;
+    if(timing.gated) {
+        ComPtr<ID3D12Fence> gate;
+        check(p.output.context()->device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)));
+        check(p.output.context()->queue()->Wait(gate.Get(),1)); // Real, unfinished GPU work at the next short cutoff.
+        p.pattern(61);p.arrive();
+        expect(p.faults->returned.wait_for(1s)==std::future_status::ready && !p.current()->ready,"gated model submission");
+        const auto held=p.output.held_frames();const auto previousPixels=p.presented();
+        std::stop_source stopped;stopped.request_stop();
+        const auto before=Clock::now();
+        expect(!p.current()->ready_for_arrival(stopped.get_token(),timing.intervalNs) && Clock::now()-before<8ms &&
+            !p.current()->ready,"stopped healthy owner must not wait or become ready");
+        deadline+=shortStep;std::this_thread::sleep_until(deadline);p.pattern(81);
+        const auto selected=p.arrive();late=p.current();
+        std::this_thread::sleep_for(3ms);check(gate->Signal(1));
+        expect(selected.reason==Reason::DeadlineMiss && !selected.resetTemporal && p.output.held_frames()==held+1 &&
+            p.presented()==previousPixels,
+            "short-tick hold of last NR target");
+        shortHold=previousPixels.size();
+        for(unsigned n=1;n<20;++n) {
+            deadline+=n%2?longStep:shortStep;std::this_thread::sleep_until(deadline);
+            p.pattern(81+n*11);p.arrive();(void)p.current();
+        }
+    } else {
+        deadline+=shortStep;std::this_thread::sleep_until(deadline);p.pattern(97);p.arrive();(void)p.current();
+        for(unsigned n=1;n<21;++n) {
+            deadline+=n%2?shortStep:longStep;std::this_thread::sleep_until(deadline);
+            p.pattern(97+n*11);p.arrive();(void)p.current();if(n==1)late=p.current();
+        }
     }
     p.ready();size_t misses=0;std::array<double,2> gaps{};int64_t prior=0;
     for(size_t n=start;n<p.jobs.size();++n) {
@@ -221,22 +260,45 @@ void jitter(Pipeline& p) {
     }
     LARGE_INTEGER hz{};QueryPerformanceFrequency(&hz);
     const double settle=1000.0*double(late->timeline->settleEnd-late->chronology[0])/double(hz.QuadPart);
-    expect(settle>=1 && gaps[0]/10<12.5 && gaps[1]/10>20,"observed short/long arrivals and real settlement");
-    std::printf("jitter=9ms/24ms observed_ms=%.2f/%.2f intervals=20 frames=%zu 0xe002=%zu history_resets=0 short_hold_pixels=%zu gated_settle_ms=%.3f stopped_wait_bypassed=1\n",
-        gaps[0]/10,gaps[1]/10,p.jobs.size()-start,misses,previousPixels.size(),settle);
-    expect(!misses && p.jobs.size()-start==21,"deadline reset during jitter");late.reset();p.close();
+    if(timing.gated)
+        std::printf("jitter=%s observed_ms=%.2f/%.2f intervals=20 frames=%zu 0xe002=%zu history_resets=0 short_hold_pixels=%zu gated_settle_ms=%.3f stopped_wait_bypassed=1\n",
+            timing.label,gaps[0]/10,gaps[1]/10,p.jobs.size()-start,misses,shortHold,settle);
+    else
+        std::printf("jitter=%s observed_ms=%.2f/%.2f intervals=20 frames=%zu 0xe002=%zu history_resets=0 settle_ms=%.3f\n",
+            timing.label,gaps[0]/10,gaps[1]/10,p.jobs.size()-start,misses,settle);
+    expect((!timing.gated || settle>=1) && gaps[0]/10<timing.shortLimitMs && gaps[1]/10>timing.longLimitMs,"observed short/long arrivals and real settlement");
+    expect(!misses && p.jobs.size()-start==21,"deadline reset during jitter");
+    late.reset();p.close();
 }
+void jitter(Pipeline& p) { jitter(p,jitter60); }
 }
-int main() try {
+model::Config config(const Host& host,const fs::path& assets,uint64_t intervalNs) {
+    model::Config c;c.runtime={fs::canonical(install/"nvngx_dlssnr.dll"),std::string(runtime::allowed_runtimes()[0].sha256)};
+    c.driver=runtime::resolve_driver().identity.canonicalPath;c.data=fs::canonical(host.data);
+    c.codec=shader(assets/"nr_codec.dxil");c.color=shader(assets/"nr_color.dxil");c.guides=shader(assets/"nr_guides.cso");
+    c.frameIntervalNs=intervalNs;return c;
+}
+int main(int argc,char** argv) try {
     std::setvbuf(stdout,nullptr,_IONBF,0);expect(_putenv_s("OBS_NR_JOB_TIMELINE","1")==0,"timeline environment");
     std::array<wchar_t,32768> exe{};expect(GetModuleFileNameW(nullptr,exe.data(),DWORD(exe.size()))!=0,"test location");
     const auto assets=fs::path(exe.data()).parent_path().parent_path();
-    Host host;model::Config c;c.runtime={fs::canonical(install/"nvngx_dlssnr.dll"),std::string(runtime::allowed_runtimes()[0].sha256)};
-    c.driver=runtime::resolve_driver().identity.canonicalPath;c.data=fs::canonical(host.data);
-    c.codec=shader(assets/"nr_codec.dxil");c.color=shader(assets/"nr_color.dxil");c.guides=shader(assets/"nr_guides.cso");
-    c.frameIntervalNs=16'666'667;
-    {Pipeline p(c,assets,false);jitter(p);}
-    {Pipeline p(c,assets,true);reuse_and_refusal(p);}
+    const bool mode1080p=argc>1 && std::string(argv[1])=="--1080p";
+    if(mode1080p) {
+        // Real 1920x1080 OBS video frame with the NR buffer fixed at 640x384.
+        for(const unsigned fps: {60u,120u}) {
+            Host host(videoW,videoH,fps);
+            const auto timing=fps==60u?jitter60:jitter120;
+            const auto c=config(host,assets,timing.intervalNs);
+            {Pipeline p(c,assets,false);jitter(p,timing);}
+            {Pipeline p(c,assets,true);prime(p);dedup_proof(p);p.close();}
+            std::printf("mode=1080p%u video=%ux%u nr=%ux%u transport_interval_ns=%llu 0xe002=0 history_resets=0\n",
+                fps,videoW,videoH,w,h,static_cast<unsigned long long>(timing.intervalNs));
+        }
+    } else {
+        Host host;const auto c=config(host,assets,frame60Ns);
+        {Pipeline p(c,assets,false);jitter(p);}
+        {Pipeline p(c,assets,true);reuse_and_refusal(p);}
+    }
     std::puts("PASS nr_model_pipeline");
     return 0;
 } catch(const std::exception& e) {std::fprintf(stderr,"FAIL nr_model_pipeline: %s\n",e.what());return 1;}
