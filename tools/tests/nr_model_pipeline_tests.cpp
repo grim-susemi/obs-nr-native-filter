@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// allow: SIZE_OK - one live GPU pipeline fixture drives both the default 64x64 and the --1080p 60/120
-// scenarios; a second translation unit would duplicate Host/Pipeline/prime and needs CMake outside this task.
+// allow: SIZE_OK - one live GPU pipeline fixture drives the default 64x64, the --1080p 60/120
+// scenarios, the --1080p-perf direct 1080p-source admit lane, and the --1440p 60/75/85/100
+// Model A/B lanes; a second translation unit would duplicate Host/Pipeline/prime and needs CMake
+// outside this task.
 #include "obs_native_output.h"
 #include <obs.h>
 #include <algorithm>
@@ -425,15 +427,16 @@ struct PerfTrial {
     size_t samples=0,dedupSamples=0,considered=0,misses=0,code2=0,evaluated=0,reused=0,eligible=0,published=0;
 };
 double median3(std::array<double,3> v) {std::sort(v.begin(),v.end());return v[1];}
-// Real 1440p NR+Model B lane with an explicit duplicate burst. Three independent
-// steady bursts are summarised by their median (the project's benchmark rule); every
-// trial still reports its own p95, applied denominator, and evaluated count, so no
-// trial may hide dropped NR frames. The loaded audit keeps one job outstanding so the
+// Real NR+Model B lane with an explicit duplicate burst, at the requested source extent.
+// Three independent steady bursts are summarised by their median (the project's benchmark
+// rule); every trial still reports its own p95, applied denominator, and evaluated count, so
+// no trial may hide dropped NR frames. The loaded audit keeps one job outstanding so the
 // settle/display cadence is visible; the gate drives one complete frame per interval.
-void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kase) {
+void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kase,
+    UINT width=2560,UINT height=1440) {
     constexpr int frames=48,trials=3;
     constexpr int duplicateFirst=20,duplicateLast=23;
-    Pipeline p(c,assets,true,kase.stabilize,kase.scale,kase.modelB,2560,1440);
+    Pipeline p(c,assets,true,kase.stabilize,kase.scale,kase.modelB,width,height);
     prime(p);
     // One discarded full-length trial so clocks, driver caches and the slab pool are
     // steady before the three measured trials; the plan gates the median of those 3.
@@ -510,12 +513,12 @@ void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kas
         r.ofaBoot=stageN?ofaBoot/stageN:-1.0;r.ofaRefine=stageN?ofaRefine/stageN:-1.0;
         r.guides=stageN?guidesMs/stageN:-1.0;r.ngx=stageN?ngxMs/stageN:-1.0;
         r.colorPrep=stageN?prepMs/stageN:-1.0;r.stab=stageN?stabMs/stageN:-1.0;
-        std::printf("NR_PERF_TRIAL {\"scale\":%u,\"stabilize\":%s,\"model\":\"%s\",\"trial\":%d,"
+        std::printf("NR_PERF_TRIAL {\"source\":\"%ux%u\",\"scale\":%u,\"stabilize\":%s,\"model\":\"%s\",\"trial\":%d,"
             "\"admitP50Ms\":%.3f,\"admitP95Ms\":%.3f,\"admitP99Ms\":%.3f,\"admitMaxMs\":%.3f,"
             "\"workerP95Ms\":%.3f,\"queueP95Ms\":%.3f,\"settleP95Ms\":%.3f,\"dedupSamples\":%zu,\"dedupP95Ms\":%.3f,\"dedupMaxMs\":%.3f,"
             "\"deadlineMiss\":%zu,\"code0xe002\":%zu,\"evaluated\":%zu,\"reused\":%zu,"
             "\"eligible\":%zu,\"published\":%zu,\"applied\":%.4f}\n",
-            kase.scale,kase.stabilize?"true":"false",kase.modelB?"B":"A",trial,
+            width,height,kase.scale,kase.stabilize?"true":"false",kase.modelB?"B":"A",trial,
             r.p50,r.p95,r.p99,r.max,r.workerP95,r.queueP95,r.settleP95,r.samples,r.dedupP95,r.dedupMax,
             r.misses,r.code2,r.evaluated,r.reused,r.eligible,r.published,r.applied);
         measured.clear();selections.clear();p.jobs.clear();
@@ -533,7 +536,7 @@ void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kas
         minEval=std::min(minEval,t.evaluated);maxReuse=std::max(maxReuse,t.reused);
         minSamples=std::min(minSamples,t.samples);maxCode2=std::max(maxCode2,t.code2);
     }
-    std::printf("NR_PERF_LANE {\"scale\":%u,\"stabilize\":%s,\"model\":\"%s\",\"runtime\":\"%s\","
+    std::printf("NR_PERF_LANE {\"source\":\"%ux%u\",\"scale\":%u,\"stabilize\":%s,\"model\":\"%s\",\"runtime\":\"%s\","
         "\"trials\":%d,\"frames\":%d,\"considered\":%zu,\"moving\":%d,"
         "\"admitP50Ms\":%.3f,\"admitP95Ms\":%.3f,\"admitP99Ms\":%.3f,"
         "\"workerP95Ms\":%.3f,\"queueP95Ms\":%.3f,"
@@ -543,7 +546,7 @@ void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kas
         "\"evaluated\":%zu,\"reused\":%zu,\"applied\":%.4f,\"gpuMeanMs\":%.3f,"
         "\"ofaBootstrapMs\":%.3f,\"ofaRefineMs\":%.3f,\"guidesShaderMs\":%.3f,\"ngxPassMs\":%.3f,"
         "\"colorPrepMs\":%.3f,\"stabilizeMs\":%.3f}\n",
-        kase.scale,kase.stabilize?"true":"false",kase.modelB?"B":"A",runtime,trials,frames,
+        width,height,kase.scale,kase.stabilize?"true":"false",kase.modelB?"B":"A",runtime,trials,frames,
         results[0].considered,moving,p50,p95,p99,worker,med([](const PerfTrial& t){return t.queueP95;}),
         results[0].p95,results[1].p95,results[2].p95,
         results[0].misses,results[1].misses,results[2].misses,
@@ -561,7 +564,7 @@ void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kas
         // Plan metric: the median of the three trials' admit->done p95. Individual
         // trials may carry host scheduling noise; the plan's rule is the 3-trial
         // median. worker/queue remain printed diagnostics, not the gate.
-        expect(p95<=16.67,"1440p admit->done median p95 over one frame interval");
+        expect(p95<=16.67,"admit->done median p95 over one frame interval");
         expect(minSamples>=2,"dedup path not exercised");
         expect(dedup<0.2,"dedup readback stalled the worker");
         expect(misses==0,"deadline miss census");
@@ -616,6 +619,19 @@ int main(int argc,char** argv) try {
         }
         if(!enforce) std::puts("NR_PERF_BASELINE_ONLY budgets not asserted");
         std::puts("PASS nr_model_pipeline 1440p Model B");
+        return 0;
+    }
+    const bool mode1080pPerf=mode=="--1080p-perf";
+    if(mode1080pPerf) {
+        // Direct 1080p-source NR lane: the same 3-trial median perf lane as --1440p,
+        // with both the OBS video frame and the NR source at 1920x1080. SR then
+        // upscales to 1440p in the display arms; this row measures NR admission itself.
+        Host host(videoW,videoH,60);
+        const auto c=config(host,assets,frame60Ns);
+        if(!runtime::supports_model_b(c.runtime.sha256)) throw std::runtime_error("installed NR runtime cannot select Model B");
+        for(const auto scale:{100u,75u})
+            perf_lane(c,assets,PerfCase{scale,false,true,true,false},videoW,videoH);
+        std::puts("PASS nr_model_pipeline 1080p perf lane");
         return 0;
     }
     if(mode1080p) {
