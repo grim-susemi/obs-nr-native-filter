@@ -2,6 +2,7 @@
 // Driver ABI and Feature18 use R2 / tests/nr_compatibility/HardwareSmoke.cpp.
 #include "nr_model.h"
 #include "nr_model_layout.h"
+#include "nr_flow_broker.h"
 #include "nr_stabilize.h"
 #include "nr_dedup_compare.h"
 #include <wrl/wrappers/corewrappers.h>
@@ -929,6 +930,11 @@ struct Processor::Impl {
     PassChain chain;
     std::atomic<uint64_t> passStatus{pack_pass_status({})};
     std::unique_ptr<D3D12Guides> guides;
+    // Shared MV ring owned with the guides: same device/queue, same analysis
+    // extent, recreated when either changes. Null means export is unavailable
+    // and NR still runs; a failed export never blocks or fails admission.
+    std::shared_ptr<FlowBroker> flowBroker;
+    std::string flowBrokerDiagnostic, flowBrokerReported;
     std::future<PreparedGuides> guidePreparation;
     std::optional<Settings> settings;
     std::optional<Extent> extent;
@@ -1358,6 +1364,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         }
         if(adapterChanged && p.guides) {
             require(p.guides->close(),"old generation guides close"); p.guides.reset();
+            p.flowBroker.reset();
         }
         p.settings.emplace(work.job.input.settings);p.extent.emplace(size);p.generation=work.job.key.resourceGeneration;
         p.chain.reset(work.job.input.settings.passes);
@@ -1491,6 +1498,13 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(p.config.qaPreparation && !p.preparation.load(std::memory_order_relaxed))
         p.preparation.store(std::make_shared<const GuidePreparation>(GuidePreparation{
             work.job.key,p.guides->observation_descriptors(),p.guides->grid_size()}),std::memory_order_release);
+    if(!p.flowBroker) {
+        p.flowBroker=FlowBroker::create({device,p.context->queue(),d.allocation,p.instance},&p.flowBrokerDiagnostic);
+        if(!p.flowBroker && p.flowBrokerDiagnostic!=p.flowBrokerReported) {
+            p.flowBrokerReported=p.flowBrokerDiagnostic;
+            OutputDebugStringA(("NR shared flow ring unavailable: "+p.flowBrokerDiagnostic+"\n").c_str());
+        }
+    }
     const int64_t tGuide0=stamp();
     if(t)t->guideSubmit=tGuide0;
     const FlowImage current{work.job.key,job->frame->analysis.Get(),producer};
@@ -1536,6 +1550,16 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const int64_t tAlloc1=stamp();
     if(t) { t->allocEnd=tAlloc1;t->recordBegin=tAlloc1; }
     auto* list=view->commands;
+    // The ring copy is ordered after FlowResult::complete and copied here,
+    // BEFORE the next collect() retires the private guide texture. A full ring
+    // drops this export instead of stalling the worker.
+    if(p.flowBroker && !reset && previous) {
+        const FlowExport flowExport{{work.job.key,work.job.input.canonicalTick},
+            FlowFrameRef{previous->key,work.job.input.precedingCanonicalTick},guide->motion,
+            SharedFlowSlot{d.allocation.width,d.allocation.height,d.active.x,d.active.y,
+                d.active.width,d.active.height,1.0f,1.0f,false,false}};
+        (void)p.flowBroker->record_export(list,flowExport);
+    }
     ID3D12QueryHeap* const stampHeap=p.timer.heap();
     const UINT stampBase=job->gpuSlot?job->gpuSlot->base:0;
     const auto stampAt=[&](UINT index) {
@@ -1602,6 +1626,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->evaluated=result.evaluated; job->composed=result.composed; job->code=result.error;
     job->completedPasses=result.passes;job->failedPass=result.failedPass;job->passError=result.passError;
     if(result.state!=CoreState::Recorded || job->fault==Fault::Submission) {
+        if(p.flowBroker) p.flowBroker->abandon_export(); // the list is never submitted
         if(job->gpuSlot) job->gpuSlot->stages=0; // discarded worker list: no stage resolves execute
         if(t)t->recordEnd=stamp();
         require(r.submission->discard(),"unsubmitted evaluation discard");
@@ -1722,6 +1747,10 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->chronology[4]=stamp();
     if(job->submitted) job->submitted=r.submission->submitted(p.context->queue());
     job->chronology[5]=stamp();
+    if(p.flowBroker) {
+        if(job->submitted) p.flowBroker->commit_export(p.context->queue());
+        else p.flowBroker->abandon_export();
+    }
     p.reset=!job->submitted; p.lastResetSetter="submission-result";
     if(stabDispatched && job->submitted) { p.stabilizeValid=true; p.stabilizeIndex=stabCur^1u; }
     else p.stabilizeValid=false;
@@ -1731,6 +1760,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     return {work.job,job->submitted,job};
     } catch(const std::exception& error) {
         job->diagnostic=error.what(); job->code=0xefff; p.reset=true; p.lastResetSetter="process-exception";
+        if(p.flowBroker) p.flowBroker->abandon_export();
         if(job->gpuSlot) job->gpuSlot->stages=0;
         p.diagExc.fetch_add(1);if(!p.diagWhatSet.load()){{const char* m=error.what();size_t i=0;for(;m[i]&&i+1<p.diagWhat.size();++i)p.diagWhat[i]=m[i];p.diagWhat[i]=0;}p.diagWhatSet.store(true,std::memory_order_release);}p.diag_fail(0xefff,*job);
         // No recording/resources means no feature submission occurred. All other
@@ -1783,6 +1813,7 @@ void Processor::worker_stopping() noexcept {
                 }
                 if(p.guides && !p.guides->close())return false;
                 p.guides.reset();
+                p.flowBroker.reset(); // unresolved ring ownership is parked, never freed
                 return true;
             case 3:
                 return !p.session || close_session_module(sessions(),p.session,proof);
