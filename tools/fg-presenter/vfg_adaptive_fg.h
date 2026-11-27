@@ -11,7 +11,7 @@
 #include <windows.h>
 
 namespace nr::fg::vfg {
-enum class AdaptiveBackend : uint8_t { NativeVfg, PushFlow, AnrExperimental };
+enum class AdaptiveBackend : uint8_t { NativeVfg, PushFlow, AnrExperimental, XeFg = 3, XeMfg = 4 };
 
 [[nodiscard]] constexpr bool selectable_multiplier(AdaptiveBackend backend, uint32_t multiplier) noexcept
 {
@@ -19,6 +19,12 @@ enum class AdaptiveBackend : uint8_t { NativeVfg, PushFlow, AnrExperimental };
     case AdaptiveBackend::NativeVfg:
     case AdaptiveBackend::PushFlow:
     case AdaptiveBackend::AnrExperimental:
+        return multiplier >= 2 && multiplier <= 4;
+    // The official XeSS 2D presenter owns the proxy swapchain and only exposes the
+    // documented 2x mode; extended 3x/4x cadence stays on the opt-in XeMFG backend.
+    case AdaptiveBackend::XeFg:
+        return multiplier == 2;
+    case AdaptiveBackend::XeMfg:
         return multiplier >= 2 && multiplier <= 4;
     }
     return false;

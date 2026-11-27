@@ -20,8 +20,20 @@ CopyStep CopySequence::record(const CopyTicket& ticket,Status result){
   const auto& a=previous_->frame;
   const auto& x=a.shape;const auto& y=b.shape;
   if(b.serial-a.serial==1&&b.timestampNs>a.timestampNs&&x.width==y.width&&x.height==y.height&&
-   x.format==y.format&&x.colorSpace==y.colorSpace&&x.sourceMonitor==y.sourceMonitor&&x.displayCapture==y.displayCapture){
+   x.format==y.format&&x.colorSpace==y.colorSpace&&x.sourceMonitor==y.sourceMonitor&&x.displayCapture==y.displayCapture&&
+   x.splitCompare==y.splitCompare&&x.guides==y.guides){
    step.previous=previous_;
+   // Both colour identities must agree on the same NrOwned+Valid analysis pair,
+   // and each guide endpoint must be keyed to the matching colour slot: a
+   // self-consistent guide pair for other displayed frames is still withheld.
+   const bool currentMv=b.flow.hasSharedMv&&b.flow.owner==FlowOwner::NrOwned&&b.flow.provenance==FlowProvenance::Valid&&
+    b.flow.pairCurrTick&&b.flow.pairPrevTick;
+   const bool previousMv=a.flow.hasSharedMv&&a.flow.owner==FlowOwner::NrOwned&&a.flow.provenance==FlowProvenance::Valid&&
+    a.flow.pairCurrTick&&a.flow.pairPrevTick;
+   const bool keyed=b.key!=a.key&&b.flow.currColor==b.key&&a.flow.currColor==a.key&&
+    b.flow.prevColor==a.key;
+   step.hasValidSharedMv=currentMv&&previousMv&&keyed&&a.flow.pairCurrTick==b.flow.pairPrevTick&&
+    a.flow.pairCurrTick!=b.flow.pairCurrTick;
   }
  }
  high_=b.serial;previous_=ticket;

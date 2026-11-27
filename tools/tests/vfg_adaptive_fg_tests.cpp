@@ -34,6 +34,20 @@ void selection_matrix()
         "34.5 FPS selector retains the log-distance choice");
     expect(adaptive_multiplier(AdaptiveBackend::NativeVfg, 1, 30, 120) == 1 &&
         adaptive_multiplier(AdaptiveBackend::NativeVfg, 2, 30, 120) == 2, "low ceiling bypass");
+    expect(!selectable_multiplier(AdaptiveBackend::XeFg, 1) && selectable_multiplier(AdaptiveBackend::XeFg, 2) &&
+        !selectable_multiplier(AdaptiveBackend::XeFg, 3) && !selectable_multiplier(AdaptiveBackend::XeFg, 4),
+        "official XeFG exposes only the documented 2x multiplier");
+    expect(!selectable_multiplier(AdaptiveBackend::XeMfg, 1) && selectable_multiplier(AdaptiveBackend::XeMfg, 2) &&
+        selectable_multiplier(AdaptiveBackend::XeMfg, 3) && selectable_multiplier(AdaptiveBackend::XeMfg, 4) &&
+        !selectable_multiplier(AdaptiveBackend::XeMfg, 5), "opt-in XeMFG keeps the 2..4 ceiling");
+    expect(adaptive_multiplier(AdaptiveBackend::XeFg, 4, 60, 120) == 2 &&
+        adaptive_multiplier(AdaptiveBackend::XeFg, 4, 30, 120) == 2 &&
+        adaptive_multiplier(AdaptiveBackend::XeFg, 4, 30, 240) == 2,
+        "XeFG selection collapses to 2x regardless of target");
+    expect(adaptive_multiplier(AdaptiveBackend::XeMfg, 4, 30, 120) == 4 &&
+        adaptive_multiplier(AdaptiveBackend::XeMfg, 3, 30, 90) == 3 &&
+        adaptive_multiplier(AdaptiveBackend::XeFg, 1, 30, 120) == 1,
+        "XeMFG reaches its ceiling while a 1x ceiling stays original");
     const double nan = std::numeric_limits<double>::quiet_NaN();
     expect(adaptive_multiplier(AdaptiveBackend::NativeVfg, 4, 0, 120) == 4 &&
         adaptive_multiplier(AdaptiveBackend::NativeVfg, 4, 30, 0) == 4 &&

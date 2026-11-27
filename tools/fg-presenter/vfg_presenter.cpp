@@ -384,6 +384,15 @@ void frames(Feed& f)
             mult = std::min(mult, anrBackend->multiplier_limit());
             break;
         }
+        case Backend::XeFg:
+            // Todo 6 installs the official XeFG presenter; until then a XeFG
+            // session must degrade to the original frame instead of a null backend.
+            fprintf(f.log, "event=xefg_backend_unavailable_fallback_1x\n");
+            break;
+        case Backend::XeMfg:
+            // Todo 7 installs the opt-in XeMFG backend; same safe 1x contract.
+            fprintf(f.log, "event=xemfg_backend_unavailable_fallback_1x\n");
+            break;
         }
     }
     // A 4x pair's three subframes share one 60 Hz period, leaving ~4.2 ms per
