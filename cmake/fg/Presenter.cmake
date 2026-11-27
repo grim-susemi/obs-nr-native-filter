@@ -328,7 +328,7 @@ target_compile_features(vfg_monitor_text_tests PRIVATE cxx_std_20)
 target_compile_definitions(vfg_monitor_text_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(vfg_monitor_text_tests PRIVATE /W4 /WX /permissive-)
 target_include_directories(vfg_monitor_text_tests PRIVATE src/fg)
-add_test(NAME vfg_monitor_text COMMAND vfg_monitor_text_tests)
+add_test(NAME vfg_monitor_text COMMAND vfg_monitor_text_tests "${CMAKE_CURRENT_SOURCE_DIR}/data/locale")
 
 add_executable(vfg_session_controller_tests tools/tests/vfg_session_controller_tests.cpp)
 target_compile_features(vfg_session_controller_tests PRIVATE cxx_std_20)

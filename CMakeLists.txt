@@ -250,7 +250,9 @@ target_compile_definitions(device_reset_tests PRIVATE NOMINMAX WIN32_LEAN_AND_ME
 target_compile_options(device_reset_tests PRIVATE /W4 /WX /permissive-)
 add_test(NAME device_reset COMMAND device_reset_tests)
 add_executable(properties_contract_tests tools/tests/properties_contract_tests.cpp src/nr_properties.cpp)
+target_include_directories(properties_contract_tests PRIVATE src/fg)
 target_link_libraries(properties_contract_tests PRIVATE OBS::libobs nr_runtime nr_lifecycle)
+target_compile_definitions(properties_contract_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(properties_contract_tests PRIVATE /W4 /WX /permissive-)
 add_test(NAME properties_contract COMMAND properties_contract_tests)
 set_tests_properties(properties_contract PROPERTIES

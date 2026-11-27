@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -77,6 +78,12 @@ struct Tap {
     PushFlowTier pushflowTier{};
     uint32_t gpuShotChange{}, experimentalAnrOptIn{}, hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{};
     std::wstring anrDllPath;
+    bool xemfgOptIn{};
+    std::wstring xemfgDllPath;
+    bool sharedNvof{true};
+    // Locale key of the last refused launch; cleared by the next settings apply
+    // or successful launch so a stale refusal never masquerades as current.
+    std::string lastRefusal;
     uint32_t fpsOverlay{1};
     uint32_t lowLatency{1};
     uint32_t gpuPriority{1};
@@ -804,6 +811,12 @@ void render(void* data, gs_effect_t*)
     draw_sdr(texture, size, GS_BLEND_INVSRCALPHA);
 }
 
+Backend decode_backend(long long value);
+std::wstring path_from_settings(obs_data_t* settings, const char* key);
+std::wstring xess_runtime_directory(bool& ready);
+ui::Selection selection_from(const Tap& tap, bool xess_ready);
+ui::Selection selection_from(obs_data_t* settings, bool xess_ready);
+
 bool start(Tap& tap, bool off)
 {
     if (obs_in_task_thread(OBS_TASK_GRAPHICS)) return false;
@@ -814,18 +827,37 @@ bool start(Tap& tap, bool off)
         blog(LOG_WARNING, "[vfg] presenter launch refused: %s", obs_module_text("VFG.Status.AnrOptInRequired"));
         return false;
     }
+    bool xessReady = false;
+    const auto xessDir = xess_runtime_directory(xessReady);
+    const auto uiPolicy = ui::policy(selection_from(tap, xessReady));
+    if (!off && tap.backend == Backend::XeMfg && !uiPolicy.can_launch) {
+        tap.lastRefusal = uiPolicy.refusal_key ? uiPolicy.refusal_key : "VFG.Status.XeMfg.OptInRequired";
+        blog(LOG_WARNING, "[vfg] presenter launch refused: %s", obs_module_text(tap.lastRefusal.c_str()));
+        return false;
+    }
+    if (!off && tap.backend == Backend::XeMfg && tap.xemfgDllPath.size() >= std::size(Session{}.xemfgDllPath)) {
+        tap.lastRefusal = "VFG.Status.XeMfg.InvalidPath";
+        blog(LOG_WARNING, "[vfg] presenter launch refused: %s", obs_module_text(tap.lastRefusal.c_str()));
+        return false;
+    }
+    if (!off && (tap.backend == Backend::XeFg || tap.backend == Backend::XeMfg) && xessDir.empty()) {
+        tap.lastRefusal = "VFG.Status.XeFg.RuntimeMissing";
+        blog(LOG_WARNING, "[vfg] presenter launch refused: %s", obs_module_text(tap.lastRefusal.c_str()));
+        return false;
+    }
+    tap.lastRefusal.clear();
     // Settle any exited Controller's observer/marker cleanup before creating the next session.
     tap.controller.reset();
     try {
         LaunchOptions opts{};
-        opts.multiplier = off ? 1u : std::clamp<uint32_t>(tap.multiplier, 2, max_multiplier);
+        opts.multiplier = off ? 1u : uiPolicy.effective_multiplier;
         opts.quality = tap.quality;
         opts.dedupMode = tap.dedupMode;
         opts.liveAnchor = tap.liveAnchor;
         opts.transportIntervalNs = obs_get_frame_interval_ns();
         opts.monitorId = utf8_to_wide(tap.monitorId);
         opts.fpsOverlay = std::min<uint32_t>(tap.fpsOverlay, 2);
-        opts.lowLatency = tap.lowLatency ? 1u : 0u;
+        opts.lowLatency = (tap.backend == Backend::XeFg && (off || !xessReady)) ? 0u : (tap.lowLatency ? 1u : 0u);
         opts.gpuPriority = tap.gpuPriority ? 1u : 0u;
         opts.hideFromCapture = tap.hideFromCapture ? 1u : 0u;
         opts.backend = tap.backend;
@@ -833,7 +865,11 @@ bool start(Tap& tap, bool off)
         opts.gpuShotChange = tap.gpuShotChange;
         opts.experimentalAnrOptIn = tap.experimentalAnrOptIn;
         opts.anrDllPath = tap.anrDllPath;
-        opts.hudLock = tap.hudLock;
+        opts.hudLock = uiPolicy.hud_lock_enabled ? tap.hudLock : 0u;
+        opts.xessRuntimeDir = (tap.backend == Backend::XeFg || tap.backend == Backend::XeMfg) ? xessDir : std::wstring{};
+        opts.experimentalXeMfgOptIn = tap.xemfgOptIn ? 1u : 0u;
+        opts.xemfgDllPath = tap.xemfgDllPath;
+        opts.sharedNvofEnabled = tap.sharedNvof ? 1u : 0u;
         opts.pacingRepair = tap.pacingRepair;
         opts.adaptiveFg = tap.adaptiveFg;
         opts.adaptiveTargetFps = tap.adaptiveTargetFps;
@@ -879,14 +915,91 @@ void stop(void* data)
     }, queued, false);
 }
 
-std::wstring anr_path_from_settings(obs_data_t* settings)
+Backend decode_backend(long long value)
 {
-    auto path = utf8_to_wide(obs_data_get_string(settings, "vfg_anr_dll_path"));
+    switch (static_cast<Backend>(value)) {
+    case Backend::NativeVfg: return Backend::NativeVfg;
+    case Backend::PushFlow: return Backend::PushFlow;
+    case Backend::AnrExperimental: return Backend::AnrExperimental;
+    case Backend::XeFg: return Backend::XeFg;
+    case Backend::XeMfg: return Backend::XeMfg;
+    }
+    return Backend::NativeVfg;
+}
+
+static_assert(ui::backend_native_vfg == static_cast<uint32_t>(Backend::NativeVfg));
+static_assert(ui::backend_pushflow == static_cast<uint32_t>(Backend::PushFlow));
+static_assert(ui::backend_anr == static_cast<uint32_t>(Backend::AnrExperimental));
+static_assert(ui::backend_xefg == static_cast<uint32_t>(Backend::XeFg));
+static_assert(ui::backend_xemfg == static_cast<uint32_t>(Backend::XeMfg));
+static_assert(ui::multiplier_max == max_multiplier);
+
+std::wstring path_from_settings(obs_data_t* settings, const char* key)
+{
+    auto path = utf8_to_wide(obs_data_get_string(settings, key));
     // OBS's Windows picker returns drive paths with forward slashes.
     if (path.size() >= 3 && path[1] == L':' && (path[2] == L'/' || path[2] == L'\\') &&
         ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')))
         std::ranges::replace(path, L'/', L'\\');
     return path;
+}
+
+std::wstring anr_path_from_settings(obs_data_t* settings)
+{
+    return path_from_settings(settings, "vfg_anr_dll_path");
+}
+
+std::filesystem::path host_exe_directory()
+{
+    wchar_t image[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, image, static_cast<DWORD>(ARRAYSIZE(image)));
+    if (!length || length >= ARRAYSIZE(image)) return {};
+    return std::filesystem::path(image).parent_path();
+}
+
+// The presenter defaults an empty session path to <presenter>/xess-fg. The
+// plugin resolves the same directory up front so a valid session header can be
+// built and the status row can tell "found" from "missing" before launch.
+std::wstring xess_runtime_directory(bool& ready)
+{
+    ready = false;
+    std::vector<std::filesystem::path> candidates;
+    wchar_t env[32768]{};
+    const auto length = GetEnvironmentVariableW(L"OBS_NR_XESS_RUNTIME", env, ARRAYSIZE(env));
+    if (length && length < ARRAYSIZE(env) && std::filesystem::path(env).is_absolute())
+        candidates.emplace_back(env);
+    if (auto host = host_exe_directory(); !host.empty()) candidates.push_back(host / L"xess-fg");
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate / L"libxess_fg.dll", ec) &&
+            std::filesystem::exists(candidate / L"libxell.dll", ec)) {
+            ready = true;
+            return candidate.lexically_normal().wstring();
+        }
+    }
+    // Keep a non-empty path even when the DLLs are missing: the session header
+    // stays valid and the presenter reports the exact initialization failure
+    // instead of a generic header rejection.
+    return candidates.empty() ? std::wstring{} : candidates.front().lexically_normal().wstring();
+}
+
+ui::Selection selection_from(const Tap& tap, bool xess_ready)
+{
+    return {static_cast<uint32_t>(tap.backend), tap.multiplier, tap.xemfgOptIn,
+        !tap.xemfgDllPath.empty(), xess_ready, tap.lowLatency != 0};
+}
+
+ui::Selection selection_from(obs_data_t* settings, bool xess_ready)
+{
+    // A missing saved/default multiplier means "use the 2x default", not the
+    // 1x off-preview path; start(off) passes its 1x separately.
+    const auto saved = obs_data_get_int(settings, "vfg_multiplier");
+    const auto mult = saved > static_cast<long long>(ui::multiplier_min)
+        ? static_cast<uint32_t>(saved) : ui::defaults.multiplier;
+    return {static_cast<uint32_t>(decode_backend(obs_data_get_int(settings, "vfg_backend"))), mult,
+        obs_data_get_bool(settings, "vfg_xemfg_opt_in"),
+        !path_from_settings(settings, "vfg_xemfg_dll_path").empty(), xess_ready,
+        obs_data_get_bool(settings, "vfg_low_latency")};
 }
 
 void apply_settings(Tap& tap, obs_data_t* settings)
@@ -916,13 +1029,28 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     const char* mon = obs_data_get_string(settings, "vfg_monitor");
     const bool enabled = obs_data_get_bool(settings, "vfg_upscale");
     const bool compare = obs_data_get_bool(settings, "vfg_upscale_compare");
+    const auto backend = decode_backend(obs_data_get_int(settings, "vfg_backend"));
+    const bool xemfgOptIn = obs_data_get_bool(settings, "vfg_xemfg_opt_in");
+    const auto xemfgDllPath = path_from_settings(settings, "vfg_xemfg_dll_path");
+    const bool sharedNvof = obs_data_get_bool(settings, "vfg_shared_nvof");
+    bool xessReady = false;
+    (void)xess_runtime_directory(xessReady);
+    const auto uiPolicy = ui::policy(selection_from(settings, xessReady));
+    // XeFG is 2x-only. Normalize an explicit saved value the visible list cannot
+    // represent so the next sheet open and the session both see the capped
+    // multiplier, exactly like an invalid dedup mode.
+    if (mult && (mult < ui::multiplier_min || mult > uiPolicy.multiplier_limit))
+        obs_data_set_int(settings, "vfg_multiplier", static_cast<long long>(uiPolicy.effective_multiplier));
+    if (!uiPolicy.split_compare_enabled)
+        obs_data_set_bool(settings, "split_compare_enabled", false);
     std::lock_guard lock(tap.command);
     tap.splitSetting.update(settings);
     if (obs_upscale::update(tap.upscale, settings, enabled && !compare, enabled))
         tap.breakPair = true;
     const auto previousDedup = tap.dedupMode;
     const auto previousLiveAnchor = tap.liveAnchor;
-    tap.multiplier = std::clamp<uint32_t>(mult ? mult : 2, 2, max_multiplier);
+    tap.backend = backend;
+    tap.multiplier = uiPolicy.effective_multiplier;
     tap.quality = quality;
     tap.dedupMode = dedup;
     tap.liveAnchor = liveAnchor;
@@ -930,21 +1058,20 @@ void apply_settings(Tap& tap, obs_data_t* settings)
     tap.lowLatency = ll;
     tap.gpuPriority = gp;
     tap.hideFromCapture = hideFromCapture;
-    switch (obs_data_get_int(settings, "vfg_backend")) {
-    case 1: tap.backend = Backend::PushFlow; break;
-    case 2: tap.backend = Backend::AnrExperimental; break;
-    default: tap.backend = Backend::NativeVfg; break;
-    }
     tap.pushflowTier = obs_data_get_int(settings, "vfg_pushflow_tier") == 1 ? PushFlowTier::Quality : PushFlowTier::Fast;
     tap.experimentalAnrOptIn = obs_data_get_bool(settings, "vfg_experimental_anr");
     tap.anrDllPath = anr_path_from_settings(settings);
+    tap.xemfgOptIn = xemfgOptIn;
+    tap.xemfgDllPath = xemfgDllPath;
+    tap.sharedNvof = sharedNvof;
     tap.gpuShotChange = obs_data_get_bool(settings, "vfg_gpu_shot_change");
-    tap.hudLock = obs_data_get_bool(settings, "vfg_hud_lock");
+    tap.hudLock = uiPolicy.hud_lock_enabled && obs_data_get_bool(settings, "vfg_hud_lock");
     tap.pacingRepair = obs_data_get_bool(settings, "vfg_pacing_repair");
     tap.adaptiveFg = obs_data_get_bool(settings, "vfg_adaptive_fg");
     tap.adaptiveTargetFps = static_cast<uint32_t>(std::clamp(obs_data_get_int(settings, "vfg_adaptive_target_fps"), 0LL, static_cast<long long>(LONG_MAX)));
     tap.hideSourceCanvas.store(hideSourceCanvas, std::memory_order_release);
     tap.monitorId = mon ? mon : "";
+    tap.lastRefusal.clear();
     if (tap.controller) {
         tap.controller->set_fps_overlay(tap.fpsOverlay);
         tap.controller->set_low_latency(tap.lowLatency);
@@ -1065,55 +1192,251 @@ bool refresh_quality_warning(obs_properties_t* properties, obs_property_t*, obs_
     return true;
 }
 
-bool refresh_backend_properties(obs_properties_t* properties, obs_property_t*, obs_data_t* settings)
+struct UiLive {
+    bool preview_open{};
+    bool nr_present{};
+    bool nr_enabled{};
+    bool shared_nvof{true};
+    uint64_t frames{};
+    uint64_t hits{};
+    std::string refusal;
+};
+
+UiLive ui_live(obs_properties_t* properties)
 {
-    const auto backend = obs_data_get_int(settings, "vfg_backend");
-    const bool experimental = backend == static_cast<long long>(Backend::AnrExperimental);
-    const bool pushflow = backend == static_cast<long long>(Backend::PushFlow);
-    const bool optedIn = obs_data_get_bool(settings, "vfg_experimental_anr");
-    obs_property_set_visible(obs_properties_get(properties, "vfg_pushflow_tier"),
-        pushflow);
-    obs_property_set_visible(obs_properties_get(properties, "vfg_experimental_anr"), experimental);
-    obs_property_set_visible(obs_properties_get(properties, "vfg_anr_warning"), experimental);
-    obs_property_set_visible(obs_properties_get(properties, "vfg_anr_dll_path"),
-        experimental && optedIn);
-    auto* status = obs_properties_get(properties, "vfg_status");
-    const char* key;
-    if (pushflow) {
+    UiLive live;
+    auto* tap = properties ? static_cast<Tap*>(obs_properties_get_param(properties)) : nullptr;
+    if (!tap) return live;
+    std::lock_guard lock(tap->command);
+    live.preview_open = tap->controller && tap->controller->alive() && !tap->stopping;
+    live.nr_present = tap->nrPresent;
+    live.nr_enabled = tap->nrEnabled;
+    live.shared_nvof = tap->sharedNvof;
+    live.frames = tap->flowFrames;
+    live.hits = tap->flowHits;
+    live.refusal = tap->lastRefusal;
+    return live;
+}
+
+std::string multiplier_label(uint32_t multiplier)
+{
+    switch (multiplier) {
+    case 2: return "2x (120fps)";
+    case 3: return "3x (180fps)";
+    case 4: return "4x (240fps)";
+    default: return std::to_string(multiplier) + "x";
+    }
+}
+
+void set_visible(obs_properties_t* properties, const char* key, bool visible)
+{
+    if (auto* property = obs_properties_get(properties, key))
+        obs_property_set_visible(property, visible);
+}
+
+void set_info(obs_properties_t* properties, const char* key, const std::string& text)
+{
+    if (auto* property = obs_properties_get(properties, key))
+        obs_property_set_description(property, text.c_str());
+}
+
+bool xemfg_selection_exists(const std::wstring& path)
+{
+    if (path.empty()) return false;
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec);
+}
+
+const char* xemfg_status_key(obs_data_t* settings, bool opted_in)
+{
+    if (!opted_in) return "VFG.Status.XeMfg.OptInRequired";
+    const auto path = path_from_settings(settings, "vfg_xemfg_dll_path");
+    if (path.empty()) return "VFG.Status.XeMfg.Select";
+    if (path.size() >= std::size(Session{}.xemfgDllPath)) return "VFG.Status.XeMfg.InvalidPath";
+    return xemfg_selection_exists(path) ? "VFG.Status.XeMfg.Ready" : "VFG.Status.XeMfg.Missing";
+}
+
+void sync_visibility(obs_properties_t* properties, obs_data_t* settings)
+{
+    if (!properties || !settings) return;
+    const auto backend = decode_backend(obs_data_get_int(settings, "vfg_backend"));
+    bool xessReady = false;
+    const auto xessDir = xess_runtime_directory(xessReady);
+    const auto selection = selection_from(settings, xessReady);
+    const auto policy = ui::policy(selection);
+    const auto live = ui_live(properties);
+
+    if (auto* mult = obs_properties_get(properties, "vfg_multiplier")) {
+        obs_property_list_clear(mult);
+        for (uint32_t value = ui::multiplier_min; value <= policy.multiplier_limit; ++value) {
+            const auto label = multiplier_label(value);
+            obs_property_list_add_int(mult, label.c_str(), value);
+        }
+        const auto current = obs_data_get_int(settings, "vfg_multiplier");
+        if (current && (current < static_cast<long long>(ui::multiplier_min) ||
+                current > static_cast<long long>(policy.multiplier_limit)))
+            obs_data_set_int(settings, "vfg_multiplier", static_cast<long long>(policy.effective_multiplier));
+        obs_property_set_long_description(mult, obs_module_text(
+            policy.multiplier_limit == ui::multiplier_min ? "VFG.Hint.MultiplierXeFg" : "VFG.Hint.Multiplier"));
+    }
+
+    for (const auto* key : {"split_compare_enabled", "split_compare_position", "split_compare_swap"})
+        set_visible(properties, key, policy.split_compare_enabled);
+    if (!policy.split_compare_enabled) obs_data_set_bool(settings, "split_compare_enabled", false);
+    if (auto* notice = obs_properties_get(properties, "vfg_split_compare_notice")) {
+        obs_property_set_visible(notice, !policy.split_compare_enabled);
+        obs_property_set_description(notice, obs_module_text(
+            policy.split_reason_key ? policy.split_reason_key : "VFG.Status.SplitCompareXeFg"));
+    }
+
+    set_visible(properties, "vfg_hud_lock", policy.hud_lock_enabled);
+    if (auto* notice = obs_properties_get(properties, "vfg_hud_lock_notice")) {
+        obs_property_set_visible(notice, !policy.hud_lock_enabled);
+        obs_property_set_description(notice, obs_module_text(
+            policy.hud_lock_reason_key ? policy.hud_lock_reason_key : "VFG.Status.HudLockXeFg"));
+    }
+
+    if (auto* lowLatency = obs_properties_get(properties, "vfg_low_latency")) {
+        const bool forced = policy.low_latency_reason_key != nullptr;
+        obs_property_set_enabled(lowLatency, !forced);
+        obs_property_set_long_description(lowLatency, obs_module_text(
+            forced ? "VFG.Hint.LowLatencyXeFg" : "VFG.Hint.LowLatency"));
+    }
+    if (auto* notice = obs_properties_get(properties, "vfg_low_latency_notice")) {
+        obs_property_set_visible(notice, policy.low_latency_reason_key != nullptr);
+        obs_property_set_description(notice, obs_module_text(
+            policy.low_latency_reason_key ? policy.low_latency_reason_key : "VFG.Status.LowLatencyForced"));
+    }
+
+    set_visible(properties, "vfg_xemfg_opt_in", policy.xemfg_opt_in_visible);
+    set_visible(properties, "vfg_xemfg_warning", policy.xemfg_opt_in_visible);
+    set_visible(properties, "vfg_xemfg_dll_path", policy.xemfg_path_visible);
+
+    const char* statusKey = "VFG.Status.Ready";
+    switch (backend) {
+    case Backend::PushFlow: {
         const bool quality = obs_data_get_int(settings, "vfg_pushflow_tier") == 1;
         const auto tier = quality ? PushFlowTier::Quality : PushFlowTier::Fast;
         const bool found = !Controller::find_pushflow_dir(tier).empty();
-        key = quality ? (found ? "VFG.Status.PushFlow.QualityFound" : "VFG.Status.PushFlow.QualityMissing")
-                      : (found ? "VFG.Status.PushFlow.FastFound" : "VFG.Status.PushFlow.FastMissing");
-    } else if (experimental) {
-        if (!optedIn)
-            key = "VFG.Status.AnrOptInRequired";
-        else if (const auto path = anr_path_from_settings(settings); path.empty())
-            key = "VFG.Status.ANR.Select";
-        else {
-            const auto result = anr::validate_addon(path, optedIn);
-            if (result.status == anr::ValidationStatus::Accepted)
-                key = "VFG.Status.ANR.Validated";
-            else if (result.status == anr::ValidationStatus::IncompleteAddonMissingCompanions)
-                key = "VFG.Status.ANR.Incomplete";
-            else
-                key = "VFG.Status.ANR.Invalid";
-        }
-    } else {
-        key = Controller::find_runtime_dir().empty() ? "VFG.Status.MissingRuntime" : "VFG.Status.Ready";
+        statusKey = quality ? (found ? "VFG.Status.PushFlow.QualityFound" : "VFG.Status.PushFlow.QualityMissing")
+                            : (found ? "VFG.Status.PushFlow.FastFound" : "VFG.Status.PushFlow.FastMissing");
+        break;
     }
-    obs_property_set_description(status, obs_module_text(key));
+    case Backend::AnrExperimental:
+        if (!obs_data_get_bool(settings, "vfg_experimental_anr"))
+            statusKey = "VFG.Status.AnrOptInRequired";
+        else if (const auto path = anr_path_from_settings(settings); path.empty())
+            statusKey = "VFG.Status.ANR.Select";
+        else {
+            const auto result = anr::validate_addon(path, true);
+            if (result.status == anr::ValidationStatus::Accepted)
+                statusKey = "VFG.Status.ANR.Validated";
+            else if (result.status == anr::ValidationStatus::IncompleteAddonMissingCompanions)
+                statusKey = "VFG.Status.ANR.Incomplete";
+            else
+                statusKey = "VFG.Status.ANR.Invalid";
+        }
+        break;
+    case Backend::XeFg:
+        statusKey = xessReady ? "VFG.Status.XeFg.Ready" : "VFG.Status.XeFg.RuntimeMissing";
+        break;
+    case Backend::XeMfg:
+        statusKey = xemfg_status_key(settings, obs_data_get_bool(settings, "vfg_xemfg_opt_in"));
+        break;
+    case Backend::NativeVfg:
+        statusKey = Controller::find_runtime_dir().empty() ? "VFG.Status.MissingRuntime" : "VFG.Status.Ready";
+        break;
+    }
+    if (auto* status = obs_properties_get(properties, "vfg_status")) {
+        std::string text;
+        if (!live.refusal.empty() && !live.preview_open) {
+            text = obs_module_text("VFG.Status.Refused");
+            text += " ";
+            text += obs_module_text(live.refusal.c_str());
+        } else if (live.preview_open) {
+            text = obs_module_text("VFG.Status.PreviewOpen");
+            text += " ";
+            text += obs_module_text(ui::backend_key(static_cast<uint32_t>(backend)));
+            text += " | ";
+            text += obs_module_text(statusKey);
+        } else {
+            text = obs_module_text(statusKey);
+        }
+        obs_property_set_description(status, text.c_str());
+    }
+
+    std::string runtimeInfo;
+    if (!live.refusal.empty()) {
+        runtimeInfo = obs_module_text("VFG.Status.Refused");
+        runtimeInfo += " ";
+        runtimeInfo += obs_module_text(live.refusal.c_str());
+        runtimeInfo += " | ";
+    }
+    runtimeInfo += obs_module_text(xessReady ? "VFG.Status.XeFg.RuntimeFound" : "VFG.Status.XeFg.RuntimeNotFound");
+    if (!xessDir.empty()) {
+        runtimeInfo += " (";
+        runtimeInfo += wide_to_utf8(xessDir.c_str());
+        runtimeInfo += ")";
+    }
+    runtimeInfo += " | ";
+    runtimeInfo += obs_module_text("VFG.Status.Requested");
+    runtimeInfo += " ";
+    runtimeInfo += obs_module_text(ui::backend_key(static_cast<uint32_t>(backend)));
+    runtimeInfo += " ";
+    runtimeInfo += std::to_string(policy.effective_multiplier);
+    runtimeInfo += "x";
+    if (live.preview_open) {
+        runtimeInfo += " | ";
+        runtimeInfo += obs_module_text("VFG.Status.FallbackNote");
+    }
+    if (!policy.can_launch) {
+        runtimeInfo += " | ";
+        runtimeInfo += obs_module_text("VFG.Status.NoPresenterAbove1x");
+    }
+    if (policy.multiplier_reason_key) {
+        runtimeInfo += " | ";
+        runtimeInfo += obs_module_text(policy.multiplier_reason_key);
+    }
+    if (policy.low_latency_reason_key) {
+        runtimeInfo += " | ";
+        runtimeInfo += obs_module_text(policy.low_latency_reason_key);
+    }
+    set_info(properties, "vfg_xess_runtime_info", runtimeInfo);
+
+    const ui::SharedNvofInput sharedInput{
+        live.preview_open, live.shared_nvof, live.nr_present, live.nr_enabled, live.frames, live.hits};
+    const auto shared = ui::shared_nvof_status_text(sharedInput,
+        [](const char* key) { return std::string(obs_module_text(key)); });
+    set_info(properties, "vfg_shared_nvof_status", shared);
+}
+
+bool refresh_backend_properties(obs_properties_t* properties, obs_property_t*, obs_data_t* settings)
+{
+    if (!properties || !settings) return false;
+    const auto backend = decode_backend(obs_data_get_int(settings, "vfg_backend"));
+    const bool experimental = backend == Backend::AnrExperimental;
+    const bool pushflow = backend == Backend::PushFlow;
+    const bool optedIn = obs_data_get_bool(settings, "vfg_experimental_anr");
+    set_visible(properties, "vfg_pushflow_tier", pushflow);
+    set_visible(properties, "vfg_experimental_anr", experimental);
+    set_visible(properties, "vfg_anr_warning", experimental);
+    set_visible(properties, "vfg_anr_dll_path", experimental && optedIn);
+    sync_visibility(properties, settings);
     return true;
 }
 
 obs_properties_t* properties(void* opaque)
 {
-    auto* p = obs_properties_create();
+    // Callbacks receive the topmost properties object (libobs get_topmost_parent),
+    // so this is the one that must carry the live Tap.
+    auto* p = obs_properties_create_param(opaque, nullptr);
     auto* coreGrp = obs_properties_create();
     auto* backend = obs_properties_add_list(coreGrp, "vfg_backend", obs_module_text("VFG.Backend"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(backend, obs_module_text("VFG.Backend.Native"), static_cast<long long>(Backend::NativeVfg));
     obs_property_list_add_int(backend, obs_module_text("VFG.Backend.PushFlow"), static_cast<long long>(Backend::PushFlow));
+    obs_property_list_add_int(backend, obs_module_text("VFG.Backend.XeFg"), static_cast<long long>(Backend::XeFg));
+    obs_property_list_add_int(backend, obs_module_text("VFG.Backend.XeMfg"), static_cast<long long>(Backend::XeMfg));
     obs_property_list_add_int(backend, obs_module_text("VFG.Backend.ANR"), static_cast<long long>(Backend::AnrExperimental));
     obs_property_set_long_description(backend, obs_module_text("VFG.Hint.Reopen"));
     obs_property_set_modified_callback(backend, refresh_backend_properties);
@@ -1132,6 +1455,18 @@ obs_properties_t* properties(void* opaque)
         OBS_PATH_FILE, "nvngx_dlssg.dll (nvngx_dlssg.dll)", nullptr);
     obs_property_set_long_description(path, obs_module_text("VFG.Hint.Reopen"));
     obs_property_set_modified_callback(path, refresh_backend_properties);
+    auto* xemfgWarning = obs_properties_add_text(coreGrp, "vfg_xemfg_warning",
+        obs_module_text("VFG.XeMfg.Warning"), OBS_TEXT_INFO);
+    obs_property_set_enabled(xemfgWarning, false);
+    auto* xemfgOptIn = obs_properties_add_bool(coreGrp, "vfg_xemfg_opt_in",
+        obs_module_text("VFG.XeMfg.OptIn"));
+    obs_property_set_long_description(xemfgOptIn, obs_module_text("VFG.Hint.XeMfg.OptIn"));
+    obs_property_set_modified_callback(xemfgOptIn, refresh_backend_properties);
+    auto* xemfgPath = obs_properties_add_path(coreGrp, "vfg_xemfg_dll_path",
+        obs_module_text("VFG.XeMfg.DllPath"), OBS_PATH_FILE,
+        "MFGUnlocker.dll (MFGUnlocker.dll)", nullptr);
+    obs_property_set_long_description(xemfgPath, obs_module_text("VFG.Hint.XeMfg.DllPath"));
+    obs_property_set_modified_callback(xemfgPath, refresh_backend_properties);
 
     auto* mult = obs_properties_add_list(coreGrp, "vfg_multiplier", obs_module_text("VFG.Multiplier"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -1139,6 +1474,7 @@ obs_properties_t* properties(void* opaque)
     obs_property_list_add_int(mult, "3x (180fps)", 3);
     obs_property_list_add_int(mult, "4x (240fps)", 4);
     obs_property_set_long_description(mult, obs_module_text("VFG.Hint.Multiplier"));
+    obs_property_set_modified_callback(mult, refresh_backend_properties);
 
     auto* qual = obs_properties_add_list(coreGrp, qualityKey, obs_module_text("VFG.Quality"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -1171,6 +1507,10 @@ obs_properties_t* properties(void* opaque)
     auto* liveAnchor = obs_properties_add_bool(coreGrp, liveAnchorKey, obs_module_text("VFG.LiveAnchor"));
     obs_property_set_long_description(liveAnchor, obs_module_text("VFG.Hint.LiveAnchor"));
 
+    auto* sharedNvof = obs_properties_add_bool(coreGrp, "vfg_shared_nvof", obs_module_text("VFG.SharedNvof"));
+    obs_property_set_long_description(sharedNvof, obs_module_text("VFG.Hint.SharedNvof"));
+    obs_property_set_modified_callback(sharedNvof, refresh_backend_properties);
+
     auto* mon = obs_properties_add_list(coreGrp, "vfg_monitor", obs_module_text("VFG.Monitor"),
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
     obs_property_list_add_string(mon, obs_module_text("VFG.Monitor.Auto"), "");
@@ -1188,12 +1528,22 @@ obs_properties_t* properties(void* opaque)
 
     auto* ll = obs_properties_add_bool(coreGrp, "vfg_low_latency", obs_module_text("VFG.LowLatency"));
     obs_property_set_long_description(ll, obs_module_text("VFG.Hint.LowLatency"));
+    obs_property_set_modified_callback(ll, refresh_backend_properties);
+    auto* llNotice = obs_properties_add_text(coreGrp, "vfg_low_latency_notice",
+        obs_module_text("VFG.Status.LowLatencyForced"), OBS_TEXT_INFO);
+    obs_property_set_enabled(llNotice, false);
+    obs_property_set_visible(llNotice, false);
     auto* gp = obs_properties_add_bool(coreGrp, "vfg_gpu_priority", obs_module_text("VFG.GpuPriority"));
     obs_property_set_long_description(gp, obs_module_text("VFG.Hint.GpuPriority"));
     obs_properties_add_group(p, "vfg_grp_core", obs_module_text("VFG.Group.Core"), OBS_GROUP_NORMAL, coreGrp);
 
     auto* abGrp = obs_properties_create();
-    obs_properties_add_bool(abGrp, "vfg_hud_lock", obs_module_text("VFG.HudLock"));
+    auto* hudLock = obs_properties_add_bool(abGrp, "vfg_hud_lock", obs_module_text("VFG.HudLock"));
+    obs_property_set_modified_callback(hudLock, refresh_backend_properties);
+    auto* hudLockNotice = obs_properties_add_text(abGrp, "vfg_hud_lock_notice",
+        obs_module_text("VFG.Status.HudLockXeFg"), OBS_TEXT_INFO);
+    obs_property_set_enabled(hudLockNotice, false);
+    obs_property_set_visible(hudLockNotice, false);
     auto* shot = obs_properties_add_bool(abGrp, "vfg_gpu_shot_change", obs_module_text("VFG.GpuShotChange"));
     obs_property_set_long_description(shot, obs_module_text("VFG.Hint.GpuShotChange"));
     obs_properties_add_bool(abGrp, "vfg_pacing_repair", obs_module_text("VFG.PacingRepair"));
@@ -1219,6 +1569,12 @@ obs_properties_t* properties(void* opaque)
     }
     auto* st = obs_properties_add_text(ctrlGrp, "vfg_status", obs_module_text("VFG.Status.MissingRuntime"), OBS_TEXT_INFO);
     obs_property_set_enabled(st, false);
+    auto* runtimeInfo = obs_properties_add_text(ctrlGrp, "vfg_xess_runtime_info",
+        obs_module_text("VFG.Status.XeFg.RuntimeMissing"), OBS_TEXT_INFO);
+    obs_property_set_enabled(runtimeInfo, false);
+    auto* sharedStatus = obs_properties_add_text(ctrlGrp, "vfg_shared_nvof_status",
+        obs_module_text("VFG.SharedNvof.Unavailable"), OBS_TEXT_INFO);
+    obs_property_set_enabled(sharedStatus, false);
     if (running) {
         auto* active = obs_properties_add_text(ctrlGrp, "vfg_active_status",
             obs_module_text("VFG.Status.ActivePreview"), OBS_TEXT_INFO);
@@ -1237,6 +1593,10 @@ obs_properties_t* properties(void* opaque)
     obs_property_set_long_description(hideCanvas, obs_module_text("VFG.Hint.HideSourceCanvas"));
     obs_properties_add_group(p, "vfg_grp_control", obs_module_text("VFG.Group.Control"), OBS_GROUP_NORMAL, ctrlGrp);
     split::add_properties(p);
+    auto* splitNotice = obs_properties_add_text(p, "vfg_split_compare_notice",
+        obs_module_text("VFG.Status.SplitCompareXeFg"), OBS_TEXT_INFO);
+    obs_property_set_enabled(splitNotice, false);
+    obs_property_set_visible(splitNotice, false);
     auto* upscale = obs_properties_create();
     auto* compare = obs_properties_add_bool(upscale, "vfg_upscale_compare", obs_module_text("VFG.Upscale.Compare"));
     obs_property_set_long_description(compare, obs_module_text("VFG.Upscale.CompareHint"));
@@ -1257,20 +1617,23 @@ extern "C" void nr_register_vfg_tap()
     info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB;
     info.get_name = [](void*) -> const char* { return obs_module_text("VFG.Name"); };
     info.get_defaults = [](obs_data_t* settings) {
-        obs_data_set_default_int(settings, "vfg_multiplier", 2);
+        obs_data_set_default_int(settings, "vfg_multiplier", ui::defaults.multiplier);
         obs_data_set_default_int(settings, qualityKey, static_cast<long long>(Quality::Medium));
         obs_data_set_default_int(settings, dedupModeKey, static_cast<long long>(DedupMode::Auto));
         obs_data_set_default_bool(settings, liveAnchorKey, true);
         obs_data_set_default_string(settings, "vfg_monitor", "");
         obs_data_set_default_int(settings, "vfg_fps_overlay", 1);
-        obs_data_set_default_bool(settings, "vfg_low_latency", true);
+        obs_data_set_default_bool(settings, "vfg_low_latency", ui::defaults.low_latency);
         obs_data_set_default_bool(settings, "vfg_gpu_priority", true);
         obs_data_set_default_bool(settings, "vfg_hide_from_capture", false);
         obs_data_set_default_bool(settings, "vfg_hide_source_canvas", false);
-        obs_data_set_default_int(settings, "vfg_backend", static_cast<long long>(Backend::NativeVfg));
+        obs_data_set_default_int(settings, "vfg_backend", static_cast<long long>(ui::defaults.backend));
         obs_data_set_default_int(settings, "vfg_pushflow_tier", static_cast<long long>(PushFlowTier::Fast));
         obs_data_set_default_bool(settings, "vfg_experimental_anr", false);
         obs_data_set_default_string(settings, "vfg_anr_dll_path", "");
+        obs_data_set_default_bool(settings, "vfg_xemfg_opt_in", ui::defaults.xemfg_opt_in);
+        obs_data_set_default_string(settings, "vfg_xemfg_dll_path", "");
+        obs_data_set_default_bool(settings, "vfg_shared_nvof", ui::defaults.shared_nvof);
         obs_data_set_default_bool(settings, "vfg_hud_lock", false);
         obs_data_set_default_bool(settings, "vfg_gpu_shot_change", false);
         obs_data_set_default_bool(settings, "vfg_pacing_repair", false);

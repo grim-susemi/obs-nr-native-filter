@@ -304,13 +304,13 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
                  {"vfg_backend", 0}, {"vfg_pushflow_tier", 0}, {"vfg_adaptive_target_fps", 0},
                  {"cas_strength", 35}, {"scaling_backend", 0}, {"dlss_model", 1}, {"split_compare_position", 50}})
             expect(obs_data_get_int(saved.get(), key) == expected, key);
-        for (const auto* key : {"vfg_low_latency", "vfg_gpu_priority", "vfg_live_anchor"})
+        for (const auto* key : {"vfg_low_latency", "vfg_gpu_priority", "vfg_live_anchor", "vfg_shared_nvof"})
             expect(obs_data_get_bool(saved.get(), key), key);
         for (const auto* key : {"vfg_hide_from_capture", "vfg_hide_source_canvas", "vfg_upscale", "vfg_upscale_compare",
-                 "split_compare_enabled", "vfg_experimental_anr", "vfg_hud_lock", "vfg_gpu_shot_change",
-                 "vfg_pacing_repair", "vfg_adaptive_fg"})
+                 "split_compare_enabled", "vfg_experimental_anr", "vfg_xemfg_opt_in", "vfg_hud_lock",
+                 "vfg_gpu_shot_change", "vfg_pacing_repair", "vfg_adaptive_fg"})
             expect(!obs_data_get_bool(saved.get(), key), key);
-        for (const auto* key : {"vfg_monitor", "dlss_runtime_path", "vfg_anr_dll_path"})
+        for (const auto* key : {"vfg_monitor", "dlss_runtime_path", "vfg_anr_dll_path", "vfg_xemfg_dll_path"})
             expect(std::string_view(obs_data_get_string(saved.get(), key)).empty(), key);
     }
 
@@ -352,7 +352,7 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
         for (const auto choice : choices)
             expect(obs_property_list_item_int(property, index++) == choice, obs_property_name(property));
     };
-    list(backend, {0, 1, 2});
+    list(backend, {0, 1, 3, 4, 2});
     list(tier, {0, 1});
     list(target, {0, 60, 120, 144, 165, 240});
     auto* dedup = get("vfg_dedup_mode");
@@ -394,6 +394,130 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
             obs_data_get_bool(nrDefaults.get(), "nr_perf_model") ? 1 : 0,
             obs_data_get_bool(nrDefaults.get(), "nr_dedup_reuse") ? 1 : 0);
         std::fflush(stdout);
+    }
+    obs_data_set_int(values.get(), "vfg_multiplier", 4);
+    obs_data_set_int(values.get(), "vfg_backend", 3);
+    expect(obs_property_modified(backend, values.get()), "refresh XeFG");
+    expect(obs_data_get_int(values.get(), "vfg_multiplier") == 2, "XeFG clamps the saved 4x to 2x");
+    {
+        auto* multiplier = get("vfg_multiplier");
+        expect(obs_property_get_type(multiplier) == OBS_PROPERTY_LIST &&
+            obs_property_list_item_count(multiplier) == 1 && obs_property_list_item_int(multiplier, 0) == 2,
+            "XeFG exposes only 2x");
+    }
+    expect(!obs_property_visible(get("split_compare_enabled")) &&
+        !obs_property_visible(get("split_compare_position")) &&
+        !obs_property_visible(get("split_compare_swap")), "XeFG hides split compare");
+    expect(obs_property_visible(get("vfg_split_compare_notice")) &&
+        std::string_view(obs_property_description(get("vfg_split_compare_notice"))).find("not supported") !=
+            std::string_view::npos, "XeFG explains the split compare gate");
+    expect(!obs_property_visible(get("vfg_hud_lock")) && obs_property_visible(get("vfg_hud_lock_notice")) &&
+        std::string_view(obs_property_description(get("vfg_hud_lock_notice"))).find("HUD lock needs") !=
+            std::string_view::npos, "XeFG hides HUD lock with its reason");
+    expect(obs_property_visible(get("vfg_low_latency_notice")) &&
+        std::string_view(obs_property_description(get("vfg_low_latency_notice"))).find("forced") !=
+            std::string_view::npos, "XeFG discloses forced low latency");
+    status_has(get("vfg_xess_runtime_info"), "XeSS 3.0.2 runtime");
+    status_has(get("vfg_shared_nvof_status"), "Unavailable");
+    expect(!obs_property_visible(get("vfg_xemfg_opt_in")), "XeFG hides XeMFG opt-in");
+    std::printf("PASS VFG XeFG controls: multiplier=2x split_compare=off hud_lock=off low_latency=forced\n");
+    std::fflush(stdout);
+
+    obs_data_set_int(values.get(), "vfg_backend", 4);
+    obs_data_set_bool(values.get(), "vfg_xemfg_opt_in", false);
+    obs_data_set_string(values.get(), "vfg_xemfg_dll_path", "");
+    expect(obs_property_modified(backend, values.get()), "refresh XeMFG");
+    {
+        auto* multiplier = get("vfg_multiplier");
+        expect(obs_property_list_item_count(multiplier) == 3 &&
+            obs_property_list_item_int(multiplier, 0) == 2 &&
+            obs_property_list_item_int(multiplier, 1) == 3 &&
+            obs_property_list_item_int(multiplier, 2) == 4, "XeMFG keeps 2x/3x/4x");
+    }
+    expect(obs_property_visible(get("vfg_xemfg_opt_in")) && obs_property_visible(get("vfg_xemfg_warning")) &&
+        !obs_property_visible(get("vfg_xemfg_dll_path")), "XeMFG gates its DLL path behind opt-in");
+    status_has(status, "requires explicit opt-in");
+    {
+        auto refused = source(filterId, values.get());
+        auto refusedProps = properties(refused.get());
+        expect(!obs_property_button_clicked(obs_properties_get(refusedProps.get(), "vfg_start"), refused.get()),
+            "XeMFG start refuses without opt-in");
+        auto* refusedBackend = obs_properties_get(refusedProps.get(), "vfg_backend");
+        expect(obs_property_modified(refusedBackend, values.get()), "refresh refused status");
+        expect(std::string_view(obs_property_description(
+                   obs_properties_get(refusedProps.get(), "vfg_status"))).find("Refused") !=
+                std::string_view::npos, "refused status uses the live property param");
+        std::printf("refused status: %s\n",
+            obs_property_description(obs_properties_get(refusedProps.get(), "vfg_status")));
+        std::fflush(stdout);
+    }
+    obs_data_set_bool(values.get(), "vfg_xemfg_opt_in", true);
+    expect(obs_property_modified(get("vfg_xemfg_opt_in"), values.get()), "refresh XeMFG opt-in");
+    expect(obs_property_visible(get("vfg_xemfg_dll_path")), "XeMFG opt-in reveals the DLL path");
+    status_has(status, "select the user-supplied");
+    const auto xemfgPath = (scratch / L"MFGUnlocker.dll").make_preferred();
+    std::ofstream(xemfgPath) << "inert, invalid PE";
+    const auto xemfgUtf8 = xemfgPath.u8string();
+    obs_data_set_string(values.get(), "vfg_xemfg_dll_path", reinterpret_cast<const char*>(xemfgUtf8.c_str()));
+    expect(obs_property_modified(get("vfg_xemfg_dll_path"), values.get()), "refresh XeMFG DLL path");
+    status_has(status, "look valid");
+    expect(obs_property_visible(get("vfg_hud_lock")), "XeMFG keeps HUD lock");
+    {
+        const std::string oversizedPath(600, 'x');
+        obs_data_set_string(values.get(), "vfg_xemfg_dll_path", oversizedPath.c_str());
+        expect(obs_property_modified(get("vfg_xemfg_dll_path"), values.get()), "refresh oversized XeMFG DLL path");
+        status_has(status, "too long");
+        auto refused = source(filterId, values.get());
+        auto refusedProps = properties(refused.get());
+        expect(!obs_property_button_clicked(obs_properties_get(refusedProps.get(), "vfg_start"), refused.get()),
+            "XeMFG start refuses an oversized DLL path");
+    }
+    std::printf("PASS VFG XeMFG controls: opt-in/path gating, oversized refusal, and 2x/3x/4x ceiling\n");
+    std::fflush(stdout);
+    obs_data_set_string(values.get(), "vfg_xemfg_dll_path", "");
+    obs_data_set_bool(values.get(), "vfg_xemfg_opt_in", false);
+    obs_data_set_int(values.get(), "vfg_multiplier", 2);
+    obs_data_set_int(values.get(), "vfg_backend", 0);
+    expect(obs_property_modified(backend, values.get()), "return to Native after VFG UI checks");
+
+    {
+        auto input = source("vfg_test_color");
+        auto liveData = settings();
+        auto liveFilter = source(filterId, liveData.get());
+        obs_source_filter_add(input.get(), liveFilter.get());
+        obs_set_output_source(0, input.get());
+        struct ClearOutput { ~ClearOutput() { obs_set_output_source(0, nullptr); } } clearOutput;
+        auto liveProps = properties(liveFilter.get());
+        auto* liveBackend = obs_properties_get(liveProps.get(), "vfg_backend");
+        auto* liveStatus = obs_properties_get(liveProps.get(), "vfg_status");
+        auto* liveShared = obs_properties_get(liveProps.get(), "vfg_shared_nvof_status");
+        auto* liveRuntime = obs_properties_get(liveProps.get(), "vfg_xess_runtime_info");
+        expect(liveBackend != nullptr, "live backend row exists");
+        expect(liveStatus != nullptr, "live status row exists");
+        expect(liveShared != nullptr, "live shared status row exists");
+        expect(liveRuntime != nullptr, "live runtime info row exists");
+        expect(obs_property_button_clicked(obs_properties_get(liveProps.get(), "vfg_off"), liveFilter.get()),
+            "start live-state preview");
+        expect(obs_property_modified(liveBackend, liveData.get()), "refresh live status");
+        expect(std::string_view(obs_property_description(liveStatus)).find("Preview open") !=
+            std::string_view::npos, "live status reports Preview open");
+        expect(std::string_view(obs_property_description(liveShared)).find("Local NVOF fallback") !=
+            std::string_view::npos, "live shared status uses the property param");
+        expect(std::string_view(obs_property_description(liveRuntime)).find("falls back to 1x originals") !=
+            std::string_view::npos, "live runtime info uses the property param");
+        std::printf("live status: status=%s | shared=%s | runtime=%s\n",
+            obs_property_description(liveStatus), obs_property_description(liveShared),
+            obs_property_description(liveRuntime));
+        std::fflush(stdout);
+        expect(obs_property_button_clicked(obs_properties_get(liveProps.get(), "vfg_stop"), liveFilter.get()),
+            "stop live-state preview");
+        expect(obs_property_modified(liveBackend, liveData.get()), "refresh closed status");
+        expect(std::string_view(obs_property_description(liveShared)).find("Unavailable") !=
+            std::string_view::npos, "closed preview reports Unavailable");
+        std::printf("PASS VFG live status: Preview open + Local NVOF fallback + fallback note, "
+            "Unavailable after close\n");
+        std::fflush(stdout);
+        obs_source_filter_remove(input.get(), liveFilter.get());
     }
     {
         const auto log = scratch / "live-controls-presenter.log";
@@ -564,6 +688,7 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
     obs_data_set_int(values.get(), "vfg_backend", 0);
     expect(obs_property_modified(backend, values.get()), "return to Native");
     status_has(status, "NVIDIA VFG");
+
     obs_data_set_int(values.get(), "vfg_backend", 2);
     obs_data_set_bool(values.get(), "vfg_experimental_anr", false);
     obs_data_set_string(values.get(), "vfg_anr_dll_path", "nvngx_dlssg.dll");
