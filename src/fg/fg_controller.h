@@ -39,6 +39,7 @@ class Controller final {
     uint64_t launchEpoch_{1};
     std::unique_ptr<Controller> replacement_;
     std::jthread relaunchWorker_;
+    HANDLE relaunchSettledEvent_{};
     Controller(const LaunchOptions&, bool fallback);
     void run_fallback(LaunchOptions options);
     void sync_live_settings() noexcept;
@@ -63,6 +64,9 @@ public:
     bool can_recover() const noexcept;
     bool begin_async_fallback_relaunch(bool forceFaultOnTimeout = false) noexcept;
     RelaunchState poll_async_fallback_relaunch() noexcept;
+    // Blocks until an in-flight fallback relaunch settles (Ready/Failed) or the
+    // timeout expires. poll_async_fallback_relaunch() still consumes Ready.
+    bool await_async_fallback_relaunch(DWORD timeoutMs) noexcept;
     void set_fps_overlay(uint32_t pos) noexcept;
     void set_low_latency(uint32_t on) noexcept;
     void set_hide_from_capture(uint32_t hide) noexcept;

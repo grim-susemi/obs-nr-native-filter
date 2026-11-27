@@ -165,11 +165,8 @@ void fallback_live_settings_survive(const fs::path& exe, const fs::path& scratch
     expect(applied.dedupMode == 5 && applied.liveAnchor == 1,
         "live setters apply dedupMode and liveAnchor to the running session");
     expect(ctrl.begin_async_fallback_relaunch(true), "simulated fallback relaunch begins");
-    const auto deadline = clock_ns() + 8'000'000'000ULL;
-    while (ctrl.poll_async_fallback_relaunch() != RelaunchState::Ready) {
-        expect(clock_ns() < deadline, "simulated fallback relaunch reaches Ready");
-        Sleep(10);
-    }
+    expect(ctrl.await_async_fallback_relaunch(8000), "simulated fallback relaunch settles");
+    expect(ctrl.poll_async_fallback_relaunch() == RelaunchState::Ready, "simulated fallback relaunch reaches Ready");
     const auto recovered = ctrl.live_settings();
     expect(recovered.dedupMode == 5 && recovered.liveAnchor == 1,
         "dedupMode and liveAnchor survive the fallback recovery relaunch");

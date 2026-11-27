@@ -887,6 +887,8 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         SetEvent(s->exitSettledEvent);
     });
     session_ = std::move(session);
+    Handle relaunchSettled{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    require(relaunchSettled.value != nullptr, "VFG relaunch settled event");
     // Start relaunchWorker_ last, after session_ is committed, so constructor errors never deadlock unwind.
     if (!fallback && options.backend != Backend::NativeVfg) {
         auto recovery = options_;
@@ -894,6 +896,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         recovery.pushflowRuntimeDir.clear();
         relaunchWorker_ = std::jthread([this, recovery = std::move(recovery)] { run_fallback(recovery); });
     }
+    relaunchSettledEvent_ = relaunchSettled.release();
 }
 
 ipc::Peer Controller::peer() const { return ipc::identity(session_->child); }
@@ -950,6 +953,7 @@ void Controller::stop(bool userStop) noexcept
     if (relaunchWorker_.joinable()) relaunchWorker_.join();
     replacement_.reset();
     relaunchState_.store(RelaunchState::Idle);
+    if (relaunchSettledEvent_) SetEvent(relaunchSettledEvent_);
     if (userStop && session_ && options_.backend == Backend::PushFlow) {
         if (session_->child && WaitForSingleObject(session_->child, 0) == WAIT_OBJECT_0)
             await_exit_cleanup(250);
@@ -974,6 +978,7 @@ bool Controller::begin_async_fallback_relaunch(bool forceFaultOnTimeout) noexcep
     if (forceFaultOnTimeout && session_ && session_->view) stamp_exit_reason(*session_->view, ExitReason::Fault);
     if (exit_reason() == ExitReason::UserClosed) return false;
     fallbackRestarted_ = true;
+    if (relaunchSettledEvent_) ResetEvent(relaunchSettledEvent_);
     relaunchState_.store(RelaunchState::InFlight);
     wakeRelaunch_.store(true);
     wakeRelaunch_.notify_one();
@@ -1005,8 +1010,10 @@ void Controller::run_fallback(LaunchOptions recovery)
         replacement_.reset(new Controller(recovery, true));
         if (stopRequested_.load()) replacement_.reset();
         relaunchState_.store(replacement_ ? RelaunchState::Ready : RelaunchState::Failed);
+        if (relaunchSettledEvent_) SetEvent(relaunchSettledEvent_);
     } catch (const std::exception&) {
         relaunchState_.store(RelaunchState::Failed);
+        if (relaunchSettledEvent_) SetEvent(relaunchSettledEvent_);
     }
 }
 
@@ -1021,6 +1028,11 @@ RelaunchState Controller::poll_async_fallback_relaunch() noexcept
         relaunchState_.store(RelaunchState::Idle);
     }
     return result;
+}
+
+bool Controller::await_async_fallback_relaunch(DWORD timeoutMs) noexcept
+{
+    return relaunchSettledEvent_ && WaitForSingleObject(relaunchSettledEvent_, timeoutMs) == WAIT_OBJECT_0;
 }
 
 void Controller::set_fps_overlay(uint32_t pos) noexcept
@@ -1098,6 +1110,7 @@ Controller::~Controller()
 {
     stop();
     session_.reset();
+    if (relaunchSettledEvent_) CloseHandle(relaunchSettledEvent_);
 }
 
 bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID adapter) noexcept

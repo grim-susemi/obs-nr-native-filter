@@ -40,9 +40,16 @@ public:
     pushflow::ShaderPath shader_path() const noexcept { return shader_; }
     std::optional<FgPairTicket> submit_pair(const FgPairDesc&, unsigned, unsigned) override;
     bool subframe_ready(const FgPairTicket&, uint32_t) override;
+    // Event-based producer wait; bounded and polling-free.
+    bool wait_subframe(const FgPairTicket&, uint32_t sub, DWORD timeoutMs);
     void resolve_subframe(ID3D12GraphicsCommandList*, const FgPairTicket&, ID3D12Resource*, uint32_t) override;
     size_t max_in_flight_pairs() const noexcept override { return batch_capacity; }
     void retire_pair(const FgPairTicket&, ID3D12Fence* consumeFence = nullptr, uint64_t consumeValue = 0) noexcept override;
     void synchronize() override;
+    // Diagnostic/test: whether a pair bank is free to accept a new pair.
+    bool bank_available(size_t index) const;
+    // Test-only: the next submit_pair claims a bank and then reports a producer
+    // failure, exercising the partial-submit bank return path.
+    void fail_next_submit_for_test() noexcept;
 };
 } // namespace nr::fg::vfg

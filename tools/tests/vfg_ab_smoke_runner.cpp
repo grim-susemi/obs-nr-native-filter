@@ -49,6 +49,29 @@ size_t count_tokens(const std::string& text, std::string_view token)
     return c;
 }
 
+// Waits on directory change notifications for the next log write instead of
+// polling the file. The predicate is re-checked around registration so a write
+// racing the setup cannot be missed.
+template <class Predicate>
+void wait_file_change(const fs::path& path, Predicate ready, uint64_t timeoutMs)
+{
+    const auto deadline = GetTickCount64() + timeoutMs;
+    for (;;) {
+        if (ready()) return;
+        Handle watch;
+        watch.value = FindFirstChangeNotificationW(path.parent_path().c_str(), FALSE,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+        if (watch.value == INVALID_HANDLE_VALUE) {
+            watch.value = nullptr;
+            return;
+        }
+        if (ready()) return;
+        const auto now = GetTickCount64();
+        if (now >= deadline) return;
+        WaitForSingleObject(watch.value, static_cast<DWORD>(deadline - now));
+    }
+}
+
 std::string find_line(const std::string& text, std::string_view prefix, std::string_view extra = {})
 {
     std::istringstream lines(text);
@@ -1913,15 +1936,13 @@ void run_pair_probe(const std::wstring& presenter, const fs::path& log, const st
         if (shot) wait_line(event("present_original", last), 1000);
         if (resize) {
             expect(ctl.request_resize(), "request resize");
-            const auto end = clock_ns() + 2'000'000'000;
-            while (!ctl.resize_drained() && clock_ns() < end) Sleep(1);
+            wait_file_change(log, [&] { return ctl.resize_drained(); }, 2000);
             expect(ctl.resize_drained(), "resize drain acknowledgement");
             GpuFixture resizedGpu(960, 540);
             ipc::Producer resized(resizedGpu.dev.Get(), unique_mapping(L"resized"), resizedGpu.shape);
             expect(ctl.offer(resized.connect(ctl.peer()), resizedGpu.shape, resizedGpu.luid) &&
                 WaitForSingleObject(resized.control_event(), 10000) == WAIT_OBJECT_0, "resize offer");
-            const auto readyEnd = clock_ns() + 3'000'000'000;
-            while (count_tokens(read_text(log), "event=initialized") < 2 && clock_ns() < readyEnd) Sleep(1);
+            wait_file_change(log, [&] { return count_tokens(read_text(log), "event=initialized") >= 2; }, 3000);
             expect(count_tokens(read_text(log), "event=initialized") == 2, "resized backend ready");
             resizedGpu.fill_frame(0xff303030, 0xff303030, 0);
             expect(resized.publish(resizedGpu.tex.Get(), basePts + 50'000'000, clock_ns()) == ipc::Status::Ok, "resized anchor");

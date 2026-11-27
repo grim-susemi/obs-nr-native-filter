@@ -4,6 +4,8 @@
 #include "../fg-presenter/vfg_gpu.h"
 #include <array>
 #include <cstdlib>
+#include <functional>
+#include <utility>
 
 namespace {
 using namespace nr::fg;
@@ -278,21 +280,13 @@ void close_bank_backend(PushFlowBackend& backend, TestRun& test, const char* lab
     }
 }
 
-bool wait_for_subframe(PushFlowBackend& backend, const FgPairTicket& ticket, uint32_t sub)
-{
-    const auto deadline = GetTickCount64() + 20000;
-    while (!backend.subframe_ready(ticket, sub)) {
-        if (backend.faulted() || GetTickCount64() >= deadline) return false;
-        Sleep(1);
-    }
-    return true;
-}
-
 void deep_pair_banks(TestRun& test, const fs::path& runtime)
 {
     BankFixture fixture(runtime);
-    const auto submit = [&](PushFlowBackend& backend, uint64_t first, uint64_t second) {
-        return backend.submit_pair({fixture.gpu->input[0].Get(), fixture.gpu->input[1].Get(), first, second, 2, false}, 0, 1);
+    const auto submit = [&](PushFlowBackend& backend, uint64_t first, uint64_t second,
+                            std::function<void()> stage = {}) {
+        return backend.submit_pair({fixture.gpu->input[0].Get(), fixture.gpu->input[1].Get(), first, second, 2,
+            false, false, std::move(stage)}, 0, 1);
     };
     {
         PushFlowBackend backend;
@@ -327,7 +321,7 @@ void deep_pair_banks(TestRun& test, const fs::path& runtime)
             close_bank_backend(backend, test, "delayed fence teardown");
             return;
         }
-        test.expect(wait_for_subframe(backend, *first, first->lastSubmittedSub), "pair 1 producer subframe completes");
+        test.expect(backend.wait_subframe(*first, first->lastSubmittedSub, 20000), "pair 1 producer subframe completes");
         backend.retire_pair(*first, consume.Get(), 10);
         test.expect(consume->GetCompletedValue() < 10, "consumer completion fence stays below its retire value");
         const auto second = submit(backend, 9, 10);
@@ -348,6 +342,48 @@ void deep_pair_banks(TestRun& test, const fs::path& runtime)
         std::printf("PUSHFLOW pair=4 accepted=%d bank=%u consumer=10/10\n", released ? 1 : 0,
             released ? released->slotParity : 99u);
         close_bank_backend(backend, test, "delayed fence teardown drains both banks");
+    }
+    {
+        PushFlowBackend backend;
+        if (!open_bank_backend(backend, fixture, test, "partial-submit fixture opens PushFlow")) {
+            close_bank_backend(backend, test, "partial-submit teardown");
+            return;
+        }
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            bool threw = false;
+            try {
+                (void)submit(backend, 21, 22, [] { throw std::runtime_error("inject_stage_failure"); });
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            test.expect(threw, "injected staging failure escapes submit_pair");
+            test.expect(backend.bank_available(0) && backend.bank_available(1),
+                "partial submit returns its bank to the free set");
+        }
+        const auto first = submit(backend, 23, 24);
+        const auto second = submit(backend, 25, 26);
+        const auto third = submit(backend, 27, 28);
+        test.expect(first && second && !third, "two pair banks survive repeated partial submits");
+        std::printf("PUSHFLOW partial_submit failures=3 accepted=2 refused=1 banks=0,1\n");
+        close_bank_backend(backend, test, "partial-submit teardown drains returned banks");
+    }
+    {
+        PushFlowBackend backend;
+        if (!open_bank_backend(backend, fixture, test, "fatal partial-submit fixture opens PushFlow")) {
+            close_bank_backend(backend, test, "fatal partial-submit teardown");
+            return;
+        }
+        backend.fail_next_submit_for_test();
+        const auto failed = submit(backend, 29, 30);
+        test.expect(!failed && backend.faulted() && backend.runtime_fault(),
+            "injected producer failure reports the fault");
+        test.expect(backend.bank_available(0) && backend.bank_available(1),
+            "fatal partial submit returns its bank to the free set");
+        std::printf("PUSHFLOW fatal_partial_submit accepted=0 fault=1 banks=0,1\n");
+        close_bank_backend(backend, test, "fatal partial-submit teardown");
+        std::error_code ec;
+        fs::remove(marker_directory() / L"pushflow-starting.txt", ec);
+        test.expect(!ec, "fatal partial-submit marker cleanup");
     }
 }
 }

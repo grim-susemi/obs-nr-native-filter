@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -45,6 +46,7 @@ struct TapLogCapture {
     log_handler_t prior{};
     void* param{};
     mutable std::mutex guard;
+    std::condition_variable changed;
     std::vector<std::string> lines;
     TapLogCapture()
     {
@@ -57,8 +59,11 @@ struct TapLogCapture {
             const int written = vsnprintf(text, sizeof(text), format, copy);
             va_end(copy);
             if (written > 0) {
-                std::lock_guard lock(capture.guard);
-                capture.lines.emplace_back(text, std::min<size_t>(static_cast<size_t>(written), sizeof(text) - 1));
+                {
+                    std::lock_guard lock(capture.guard);
+                    capture.lines.emplace_back(text, std::min<size_t>(static_cast<size_t>(written), sizeof(text) - 1));
+                }
+                capture.changed.notify_all();
             }
             capture.prior(level, format, args, capture.param);
         }, this);
@@ -69,9 +74,13 @@ struct TapLogCapture {
     std::string last(const char* prefix) const
     {
         std::lock_guard lock(guard);
-        for (auto it = lines.rbegin(); it != lines.rend(); ++it)
-            if (it->starts_with(prefix)) return *it;
-        return {};
+        return last_locked(prefix);
+    }
+    std::string wait_last(const char* prefix, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(guard);
+        changed.wait_for(lock, timeout, [&] { return !last_locked(prefix).empty(); });
+        return last_locked(prefix);
     }
     std::vector<std::string> snapshot() const
     {
@@ -82,6 +91,13 @@ struct TapLogCapture {
     {
         std::lock_guard lock(guard);
         lines.clear();
+    }
+private:
+    std::string last_locked(const char* prefix) const
+    {
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it)
+            if (it->starts_with(prefix)) return *it;
+        return {};
     }
 };
 
@@ -231,6 +247,31 @@ std::string text_of(const fs::path& path)
     return {std::istreambuf_iterator<char>(f), {}};
 }
 
+// Waits for the next filesystem modification instead of polling the log.
+template <class Predicate>
+void await_file_change(const fs::path& path, Predicate ready, const char* description, int timeoutMs = 6000)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        if (ready()) return;
+        Handle watch;
+        watch.value = FindFirstChangeNotificationW(path.parent_path().c_str(), FALSE,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+        if (watch.value == INVALID_HANDLE_VALUE) {
+            watch.value = nullptr;
+            expect(false, description);
+            return;
+        }
+        if (ready()) return;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        if (remaining <= 0) {
+            expect(false, description);
+            return;
+        }
+        WaitForSingleObject(watch.value, static_cast<DWORD>(remaining));
+    }
+}
+
 void properties_contract(const fs::path& data, const fs::path& scratch, const fs::path& benign)
 {
     quality_contract();
@@ -372,20 +413,11 @@ void properties_contract(const fs::path& data, const fs::path& scratch, const fs
         const auto offset = text_of(log).size();
         expect(obs_property_button_clicked(obs_properties_get(propsLive.get(), "vfg_off"), liveFilter.get()),
             "start 1x preview for live dedup/anchor updates");
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (text_of(log).substr(offset).find("event=present_original ") == std::string::npos) {
-            expect(std::chrono::steady_clock::now() < deadline, "live-control preview publishes originals");
-            Sleep(1);
-        }
+        await_file_change(log,
+            [&] { return text_of(log).substr(offset).find("event=present_original ") != std::string::npos; },
+            "live-control preview publishes originals", 10000);
         tapLog.clear();
-        const auto wait_line = [&](const char* prefix) {
-            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            while (std::chrono::steady_clock::now() < limit) {
-                if (auto line = tapLog.last(prefix); !line.empty()) return line;
-                Sleep(1);
-            }
-            return std::string{};
-        };
+        const auto wait_line = [&](const char* prefix) { return tapLog.wait_last(prefix, std::chrono::seconds(2)); };
         auto update = settings();
         obs_data_set_int(update.get(), "vfg_dedup_mode", 5);
         obs_data_set_bool(update.get(), "vfg_live_anchor", false);

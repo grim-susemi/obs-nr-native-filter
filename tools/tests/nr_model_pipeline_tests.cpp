@@ -126,8 +126,11 @@ struct Pipeline {
     }
     void close() {
         jobs.clear(); // Release test-side immutable capture leases before the driver session is destroyed.
-        output.request_stop();const auto end=Clock::now()+10s;
-        while(!output.try_close() && Clock::now()<end)std::this_thread::sleep_for(1ms);
+        const auto exited=output.worker_exit();
+        output.request_stop();
+        (void)output.try_close(); // Sends the pipeline stop once ownership is resolved; refusal is awaited below.
+        expect(exited.valid() && exited.wait_for(10s)==std::future_status::ready,"pipeline worker exit timeout");
+        expect(output.try_close(),"pipeline clean close");
         expect(output.closed(),"pipeline clean close");
     }
 };
