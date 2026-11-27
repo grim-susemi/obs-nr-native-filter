@@ -9,7 +9,11 @@ if(OBS_NR_VFG_QA_ACTION)
   target_compile_definitions(obs-nr-filter PRIVATE OBS_NR_VFG_QA_ACTION=1)
 endif()
 
-add_executable(obs-nr-fg-presenter
+set(ANR_BACKEND_SOURCES
+  tools/fg-presenter/anr_fg_backend.cpp tools/fg-presenter/anr_commands.cpp
+  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/shared_guides.cpp
+  tools/fg-presenter/anr_runtime.cpp)
+set(VFG_PRESENTER_SOURCES
   tools/fg-presenter/vfg_presenter.cpp
   tools/fg-presenter/vfg_gpu.cpp
   tools/fg-presenter/vfg_hud_lock.cpp
@@ -19,7 +23,30 @@ add_executable(obs-nr-fg-presenter
   tools/fg-presenter/pushflow_compute.cpp
   tools/fg-presenter/pushflow_ort.cpp
   tools/fg-presenter/pushflow_shader_bytecode.cpp
+  tools/fg-presenter/xefg_runtime.cpp
+  tools/fg-presenter/xefg_presenter.cpp
   src/fg/anr_dll_validator.cpp)
+# One definition for the shipping presenter and the test-fixture presenter. The
+# fixture additionally compiles the NR_FG_TEST_MOCK_XESS admission branch, which
+# only accepts pinned hashes supplied by the test and never exists in shipping.
+function(nr_fg_presenter name)
+  add_executable(${name} ${VFG_PRESENTER_SOURCES})
+  target_sources(${name} PRIVATE "${VFG_CONTENT_HEADER}"
+    "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
+  target_sources(${name} PRIVATE ${ANR_BACKEND_SOURCES})
+  add_dependencies(${name} vfg_presenter_shaders nr_guides_shaders)
+  target_include_directories(${name} PRIVATE deps/ngx deps/xess-3.0.2/inc)
+  target_link_libraries(${name} PRIVATE nr_guides fg_ipc d3d12 dxgi user32 winmm bcrypt wintrust crypt32)
+  target_compile_features(${name} PRIVATE cxx_std_20)
+  target_compile_definitions(${name} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_compile_options(${name} PRIVATE /W4 /WX /permissive-)
+  if(OBS_NR_VFG_QA_ACTION)
+    target_compile_definitions(${name} PRIVATE OBS_NR_VFG_QA_ACTION=1)
+  endif()
+  target_include_directories(${name} PRIVATE src src/fg "${CMAKE_CURRENT_BINARY_DIR}")
+  target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-1.20.1")
+  target_compile_definitions(${name} PRIVATE OBS_NR_HAVE_ONNXRUNTIME=1)
+endfunction()
 set(VFG_SHOT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_shot_change.hlsl")
 set(VFG_SHOT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_shot_change_shader.h")
 foreach(PASS update compose)
@@ -80,27 +107,56 @@ add_custom_target(vfg_presenter_shaders DEPENDS
   "${SHARED_FLOW_SCALE_HEADER}"
   "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_update_shader.h"
   "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_compose_shader.h")
-target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
-  "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
-add_dependencies(obs-nr-fg-presenter vfg_presenter_shaders nr_guides_shaders)
-set(ANR_BACKEND_SOURCES
-  tools/fg-presenter/anr_fg_backend.cpp tools/fg-presenter/anr_commands.cpp
-  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/shared_guides.cpp
-  tools/fg-presenter/anr_runtime.cpp)
-target_sources(obs-nr-fg-presenter PRIVATE ${ANR_BACKEND_SOURCES})
-target_include_directories(obs-nr-fg-presenter PRIVATE deps/ngx)
-target_link_libraries(obs-nr-fg-presenter PRIVATE nr_guides)
-target_compile_features(obs-nr-fg-presenter PRIVATE cxx_std_20)
-target_compile_definitions(obs-nr-fg-presenter PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_compile_options(obs-nr-fg-presenter PRIVATE /W4 /WX /permissive-)
-if(OBS_NR_VFG_QA_ACTION)
-  target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_VFG_QA_ACTION=1)
-endif()
-target_include_directories(obs-nr-fg-presenter PRIVATE src src/fg "${CMAKE_CURRENT_BINARY_DIR}")
-target_include_directories(obs-nr-fg-presenter PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-1.20.1")
-target_compile_definitions(obs-nr-fg-presenter PRIVATE OBS_NR_HAVE_ONNXRUNTIME=1)
-target_link_libraries(obs-nr-fg-presenter PRIVATE fg_ipc d3d12 dxgi user32 winmm bcrypt)
+nr_fg_presenter(obs-nr-fg-presenter)
+nr_fg_presenter(obs-nr-fg-presenter-xefg-mock)
+target_compile_definitions(obs-nr-fg-presenter-xefg-mock PRIVATE NR_FG_TEST_MOCK_XESS=1)
 add_dependencies(obs-nr-filter obs-nr-fg-presenter)
+
+# XeSS 3.0.2 ABI fixtures. The two modules are deliberately unsigned: the
+# runtime test proves they are refused by default and admitted only through the
+# test-only pinned-hash branch.
+add_library(xefg_mock_xell MODULE tools/tests/xefg_mock_dll.cpp)
+set_target_properties(xefg_mock_xell PROPERTIES PREFIX "" OUTPUT_NAME "libxell")
+target_compile_features(xefg_mock_xell PRIVATE cxx_std_20)
+target_compile_definitions(xefg_mock_xell PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+  XEFG_MOCK_LIBRARY_XELL=1 XELL_EXPORT_API=1)
+target_compile_options(xefg_mock_xell PRIVATE /W4 /WX /permissive-)
+target_include_directories(xefg_mock_xell PRIVATE deps/xess-3.0.2/inc)
+target_link_libraries(xefg_mock_xell PRIVATE d3d12 dxgi)
+add_library(xefg_mock_fg MODULE tools/tests/xefg_mock_dll.cpp)
+set_target_properties(xefg_mock_fg PROPERTIES PREFIX "" OUTPUT_NAME "libxess_fg")
+target_compile_features(xefg_mock_fg PRIVATE cxx_std_20)
+target_compile_definitions(xefg_mock_fg PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+  XEFG_MOCK_LIBRARY_FG=1 XEFG_SWAPCHAIN_EXPORT_API=1)
+target_compile_options(xefg_mock_fg PRIVATE /W4 /WX /permissive-)
+target_include_directories(xefg_mock_fg PRIVATE deps/xess-3.0.2/inc)
+target_link_libraries(xefg_mock_fg PRIVATE d3d12 dxgi)
+
+add_executable(xefg_presenter_tests tools/tests/xefg_presenter_tests.cpp
+  tools/fg-presenter/xefg_runtime.cpp tools/fg-presenter/xefg_presenter.cpp
+  tools/fg-presenter/vfg_gpu.cpp tools/fg-presenter/vfg_hud_lock.cpp
+  tools/fg-presenter/vfg_shot_change.cpp tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_features(xefg_presenter_tests PRIVATE cxx_std_20)
+target_compile_definitions(xefg_presenter_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+  NR_FG_TEST_MOCK_XESS=1)
+target_compile_options(xefg_presenter_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(xefg_presenter_tests PRIVATE src src/fg tools/fg-presenter
+  deps/xess-3.0.2/inc deps/ngx "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(xefg_presenter_tests PRIVATE fg_control fg_ipc nr_guides d3d11 d3d12 dxgi
+  user32 winmm bcrypt wintrust crypt32)
+add_dependencies(xefg_presenter_tests vfg_presenter_shaders nr_guides_shaders xefg_mock_fg xefg_mock_xell
+  obs-nr-fg-presenter-xefg-mock)
+add_custom_command(TARGET xefg_presenter_tests POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:xefg_presenter_tests>/xess-fg"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:xefg_mock_fg>"
+    "$<TARGET_FILE_DIR:xefg_presenter_tests>/xess-fg/libxess_fg.dll"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:xefg_mock_xell>"
+    "$<TARGET_FILE_DIR:xefg_presenter_tests>/xess-fg/libxell.dll"
+  VERBATIM)
+add_test(NAME xefg_presenter COMMAND xefg_presenter_tests
+  "$<TARGET_FILE_DIR:xefg_presenter_tests>/xess-fg"
+  "$<TARGET_FILE:obs-nr-fg-presenter-xefg-mock>")
+set_tests_properties(xefg_presenter PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS gpu)
 
 add_library(anr_mock_dll MODULE tools/tests/anr_mock_dll.cpp)
 target_compile_features(anr_mock_dll PRIVATE cxx_std_20)

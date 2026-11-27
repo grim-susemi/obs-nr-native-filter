@@ -82,6 +82,19 @@ struct FgPairDesc {
     std::function<void(uint64_t workNs)> onEnqueued{};
 };
 
+// One original frame that a presentation-owning backend must display. The
+// regular swapchain-owning path uses Gpu::present instead; XeFG owns the only
+// swapchain on the window and must tag every original itself.
+struct FgOriginalDesc {
+    ID3D12Resource* color{};
+    unsigned index{};
+    uint32_t multiplier{1};
+    bool discontinuity{};
+    bool shotCut{};
+    bool repeat{};
+    ImportedFlow flow{};
+};
+
 class IFgBackend {
 public:
     virtual ~IFgBackend() = default;
@@ -115,5 +128,11 @@ public:
     // Teardown is polymorphic: an unconfirmed drain must be reported without
     // unwinding from a destructor. True means every owned resource completed.
     virtual bool close() noexcept { return true; }
+    // A backend that owns the window's only swapchain (official XeFG) displays
+    // originals itself and produces subframes internally; the presenter must
+    // never call Gpu::present or synthesise subframes for it.
+    virtual bool owns_presentation() const noexcept { return false; }
+    // Empty asks the caller to retry at its next scheduling point.
+    virtual std::optional<UINT> present_original(const FgOriginalDesc&) { return std::nullopt; }
 };
 } // namespace nr::fg::vfg

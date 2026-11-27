@@ -10,6 +10,8 @@
 #include "vfg_pacing_repair.h"
 #include "vfg_reflex.h"
 #include "vfg_trace.h"
+#include "xefg_presenter.h"
+#include "xefg_runtime.h"
 #include <mmsystem.h>
 #include <windowsx.h>
 #include <algorithm>
@@ -83,6 +85,17 @@ constexpr UINT workerFinished = WM_APP + 3;
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
+
+// The official XeFG runtime lives in the session-provided directory or beside
+// the presenter. An empty session path selects <exe>/xess-fg.
+std::wstring xefg_directory(const Session& s)
+{
+    if (s.xessRuntimeDir[0]) return s.xessRuntimeDir;
+    wchar_t image[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, image, static_cast<DWORD>(ARRAYSIZE(image)));
+    if (!length || length >= ARRAYSIZE(image)) return {};
+    return (std::filesystem::path(image).parent_path() / L"xess-fg").wstring();
+}
 
 struct Feed {
     Session& view;
@@ -222,7 +235,7 @@ struct PendingPair {
     uint64_t deadlineNs{}, fid{}, hudEpoch{}, extraNs{};
     std::optional<FgPairTicket> ticket{};
     unsigned nextSub{1}, shotParity{};
-    bool repeat{}, updateHud{true}, resetHud{};
+    bool repeat{}, updateHud{true}, resetHud{}, discontinuity{};
     // Split repeats own a presentation slot, never the unique-content anchor.
     const ContentFrame& anchor() const { return repeat ? prevFrame : currFrame; }
     uint64_t due() const {
@@ -289,15 +302,33 @@ void frames(Feed& f)
     const auto requested = f.cliMultiplier <= 1 ? 1u :
         std::clamp<uint32_t>(f.view.multiplier ? f.view.multiplier : f.cliMultiplier, 2, max_multiplier);
     auto mult = f.previewMultiplier.effective(requested);
+    // Official XeFG is the 2x path. The runtime is admitted before any GPU
+    // object exists: an unsigned, wrong-hash, or missing library must degrade to
+    // a normal 1x preview instead of creating a window with no presentation.
+    std::unique_ptr<XeFgRuntime> xefgRuntime;
+    bool xeFgOwnsPresent = false;
+    if (f.view.backend == Backend::XeFg && mult > 1) {
+        xefgRuntime = std::make_unique<XeFgRuntime>();
+        if (xefgRuntime->open(xefg_directory(f.view), f.log) == XeFgLoadStatus::Ok) {
+            mult = std::min(mult, 2u);
+            xeFgOwnsPresent = true;
+        } else {
+            mult = 1;
+            xefgRuntime.reset();
+            fprintf(f.log, "event=xefg_unavailable_fallback_1x\n");
+        }
+    }
     fprintf(f.log, "event=offer mode=%ux size=%ux%u quality=%u generation=%llu luid=%08lx:%08lx hwnd=%p pid=%lu backend=%s epoch=%llu\n",
         mult, f.view.width, f.view.height, f.view.quality,
         static_cast<unsigned long long>(f.view.generation), static_cast<unsigned long>(f.view.adapter.HighPart),
         f.view.adapter.LowPart, static_cast<void*>(f.window), GetCurrentProcessId(), backend_name(f.view.backend),
         static_cast<unsigned long long>(f.view.launchEpoch));
     set_gpu_process_priority(InterlockedCompareExchange(&f.view.gpuPriority, 0, 0) != 0, f.log);
-    const bool split = f.view.splitCompare != 0;
+    const bool splitRequested = f.view.splitCompare != 0;
+    const bool split = splitRequested && f.view.backend != Backend::XeFg;
+    if (splitRequested && !split) fprintf(f.log, "event=xefg_split_compare_unsupported requested=1\n");
     f.split.reset(split);
-    Gpu gpu(f.view, f.window, mult);
+    Gpu gpu(f.view, f.window, mult, !xeFgOwnsPresent);
     ReflexContext reflex(f.view.backend == Backend::NativeVfg ? gpu.d3d_device() : nullptr,
         f.view.backend == Backend::NativeVfg ? gpu.drawQueue.Get() : nullptr, f.log);
     LONG lastReflex = -1;
@@ -337,6 +368,7 @@ void frames(Feed& f)
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     };
     uint64_t flowUnavailable = 0;
+    const bool hudLockSupported = f.view.backend != Backend::XeFg;
     const auto work = [&] {
     // Shared NVOF import. One private motion texture per content input keeps a
     // live pair's MV stable exactly like the colour input it was copied with.
@@ -410,11 +442,20 @@ void frames(Feed& f)
             mult = std::min(mult, anrBackend->multiplier_limit());
             break;
         }
-        case Backend::XeFg:
-            // Todo 6 installs the official XeFG presenter; until then a XeFG
-            // session must degrade to the original frame instead of a null backend.
-            fprintf(f.log, "event=xefg_backend_unavailable_fallback_1x\n");
+        case Backend::XeFg: {
+            if (!xeFgOwnsPresent || !xefgRuntime) {
+                fprintf(f.log, "event=xefg_unavailable_fallback_1x\n");
+                break;
+            }
+            auto owner = std::make_unique<XeFgPresenter>(gpu, f.view, f.log);
+            if (!owner->open(std::move(xefgRuntime))) {
+                fprintf(f.log, "event=xefg_init_failed_fallback_fault\n");
+                check(E_FAIL, "XeFG initialization failed");
+            }
+            backend = std::move(owner);
+            vfg = backend.get();
             break;
+        }
         case Backend::XeMfg:
             // Todo 7 installs the opt-in XeMFG backend; same safe 1x contract.
             fprintf(f.log, "event=xemfg_backend_unavailable_fallback_1x\n");
@@ -429,9 +470,10 @@ void frames(Feed& f)
     // only the 4x path stays single-pair.
     const size_t backendCapacity = vfg ? vfg->max_in_flight_pairs() : 1;
     const size_t batchCapacity = mult == max_multiplier ? 1 : backendCapacity;
+    const LONG reportedHudLock = hudLockSupported ? InterlockedCompareExchange(&f.view.hudLock, 0, 0) : 0;
     fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld batch_capacity=%zu\n",
         vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, lastReflex, f.view.gpuShotChange,
-        InterlockedCompareExchange(&f.view.hudLock, 0, 0), InterlockedCompareExchange(&f.view.pacingRepair, 0, 0),
+        reportedHudLock, InterlockedCompareExchange(&f.view.pacingRepair, 0, 0),
         InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0), batchCapacity);
     f.beat();
     f.initializing.store(false);
@@ -470,8 +512,14 @@ void frames(Feed& f)
     bool staticHold = false, wasRepairing = false, wasAdaptive = false, backendFault = false;
     bool hudEnabled = false, hudReset = true;
     uint64_t hudEpoch = 0;
+    bool hudUnsupportedLogged = false;
     const auto sync_hud_lock = [&] {
-        const bool enabled = InterlockedCompareExchange(&f.view.hudLock, 0, 0) != 0;
+        const LONG requested = InterlockedCompareExchange(&f.view.hudLock, 0, 0);
+        if (!hudLockSupported && requested && !hudUnsupportedLogged) {
+            hudUnsupportedLogged = true;
+            fprintf(f.log, "event=xefg_hud_lock_unsupported requested=1\n");
+        }
+        const bool enabled = hudLockSupported && requested != 0;
         if (enabled != hudEnabled) { hudReset = true; ++hudEpoch; }
         hudEnabled = enabled;
         gpu.sync_hud_lock(enabled);
@@ -682,8 +730,26 @@ void frames(Feed& f)
         if (!shown) { PostMessageW(f.window, reveal, 0, 0); shown = true; }
         refresh_hud(true);
         if (!p.repeat) reflex.marker(ReflexMarker::PresentStart, p.fid);
-        const UINT pid = gpu.present(gpu.input[index].Get(), false, split ? static_cast<int>(index) : -1,
-            split ? f.split.current() : 50, split && f.split.swapped());
+        UINT pid = 0;
+        if (vfg && vfg->owns_presentation()) {
+            FgOriginalDesc original{};
+            original.color = gpu.input[index].Get();
+            original.index = index;
+            original.multiplier = p.telemetry.multiplier;
+            // No admitted pair means there is no previous original to
+            // interpolate from (first frame, stage busy, or a dropped pair),
+            // so XeFG must not reuse a history that does not belong to it.
+            original.discontinuity = p.discontinuity || !p.ticket.has_value();
+            original.shotCut = p.telemetry.shotCut;
+            original.repeat = p.repeat;
+            original.flow = imported[index];
+            const auto id = vfg->present_original(original);
+            if (!id) return retry();
+            pid = *id;
+        } else {
+            pid = gpu.present(gpu.input[index].Get(), false, split ? static_cast<int>(index) : -1,
+                split ? f.split.current() : 50, split && f.split.swapped());
+        }
         if (!p.repeat) reflex.marker(ReflexMarker::PresentEnd, p.fid);
         record(f, p.repeat ? split ? "present_repeat_split" : "present_repeat_original" : "present_original", b, nullptr, pid, p.telemetry);
         if (!p.repeat) { history.retain(index, b); gpu.enter_steady_state(); }
@@ -866,6 +932,7 @@ void frames(Feed& f)
         auto& pending = queue.emplace_back(PendingPair{anchor.value_or(current), current, telemetry, plan, 0, fid, hudEpoch});
         pending.shotParity = shotParity;
         pending.resetHud = hudReset || telemetry.shotCut || !anchor;
+        pending.discontinuity = !continuous;
         if (telemetry.hudLock) hudReset = false;
         reflex.sleep(clock_ns(), clock_ns);
         reflex.marker(ReflexMarker::SimulationStart, fid);
