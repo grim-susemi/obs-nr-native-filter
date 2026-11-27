@@ -47,19 +47,18 @@ void DescriptorStager::write_uav(ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_
     device_->CopyDescriptorsSimple(1, dest, source, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
-Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier)
+Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier, bool create_swapchain)
     : window_(window), pushflow_(s.backend == Backend::PushFlow)
 {
     ComPtr<IDXGIFactory5> factory5;
-    ComPtr<IDXGIFactory4> factory;
-    check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
+    check(CreateDXGIFactory1(IID_PPV_ARGS(&factory_)), "DXGI factory");
     BOOL tearingSupport = FALSE;
-    if (SUCCEEDED(factory.As(&factory5))) {
+    if (SUCCEEDED(factory_.As(&factory5))) {
         (void)factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearingSupport, sizeof(tearingSupport));
     }
     allowTearing_ = tearingSupport == TRUE;
     ComPtr<IDXGIAdapter1> adapter;
-    check(factory->EnumAdapterByLuid(s.adapter, IID_PPV_ARGS(&adapter)), "OBS adapter LUID");
+    check(factory_->EnumAdapterByLuid(s.adapter, IID_PPV_ARGS(&adapter)), "OBS adapter LUID");
     check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)), "D3D12 device");
     D3D12_COMMAND_QUEUE_DESC q{};
     check(device_->CreateCommandQueue(&q, IID_PPV_ARGS(&ipcQueue)), "IPC queue");
@@ -75,27 +74,34 @@ Gpu::Gpu(const Session& s, HWND window, uint32_t multiplier)
     event_.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event_.h) check(E_FAIL, "present fence event");
 
-    DXGI_SWAP_CHAIN_DESC1 swap{};
-    swap.Width = s.width; swap.Height = s.height;
-    swap.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swap.SampleDesc.Count = 1;
-    swap.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swap.BufferCount = 3;
-    swap.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swap.Scaling = DXGI_SCALING_STRETCH;
-    swap.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | (allowTearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
-    ComPtr<IDXGISwapChain1> base;
-    check(factory->CreateSwapChainForHwnd(drawQueue.Get(), window, &swap, nullptr, nullptr, &base), "flip swapchain");
-    check(factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER), "DXGI association");
-    check(base.As(&swap_), "swapchain3");
-    check(swap_->SetMaximumFrameLatency(1), "present latency");
-    latency_.h = swap_->GetFrameLatencyWaitableObject();
-    if (!latency_.h) check(E_FAIL, "frame latency event");
+    // A swapchain-owning backend keeps the historical DXGI preview. XeFG owns
+    // the window's only swapchain (its proxy), so Gpu must not create a second
+    // one: two flip swapchains on one HWND is the exact conflict this mode exists
+    // to prevent. The proxy is created by xefgSwapChainD3D12InitFromSwapChainDesc
+    // on this same drawQueue.
+    if (create_swapchain) {
+        DXGI_SWAP_CHAIN_DESC1 swap{};
+        swap.Width = s.width; swap.Height = s.height;
+        swap.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        swap.SampleDesc.Count = 1;
+        swap.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        swap.BufferCount = 3;
+        swap.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        swap.Scaling = DXGI_SCALING_STRETCH;
+        swap.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | (allowTearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u);
+        ComPtr<IDXGISwapChain1> base;
+        check(factory_->CreateSwapChainForHwnd(drawQueue.Get(), window, &swap, nullptr, nullptr, &base), "flip swapchain");
+        check(factory_->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER), "DXGI association");
+        check(base.As(&swap_), "swapchain3");
+        check(swap_->SetMaximumFrameLatency(1), "present latency");
+        latency_.h = swap_->GetFrameLatencyWaitableObject();
+        if (!latency_.h) check(E_FAIL, "frame latency event");
+    }
 
     desc_.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc_.Width = s.width; desc_.Height = s.height;
     desc_.DepthOrArraySize = desc_.MipLevels = 1;
-    desc_.Format = swap.Format; desc_.SampleDesc.Count = 1;
+    desc_.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc_.SampleDesc.Count = 1;
     const auto heap = gpu_heap();
     for (auto& t : input)
         check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc_,
@@ -469,6 +475,7 @@ void Gpu::set_hud(uint32_t pos, uint32_t inset, uint32_t w, uint32_t h, const ui
 }
 UINT Gpu::present(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
+    if (!swap_) throw ipc::Error(ipc::Status::ProtocolError, E_UNEXPECTED, "swapchain-less Gpu cannot present");
     if (!latencyReady_ && WaitForSingleObject(latency_.h, 240) != WAIT_OBJECT_0)
         check(E_FAIL, "swapchain latency timeout");
     (void)begin();
@@ -478,6 +485,7 @@ UINT Gpu::present(ID3D12Resource* source, bool synthetic, int beforeIndex, uint3
 std::optional<UINT> Gpu::try_present_synthetic(const SyntheticFrame& frame, uint64_t deadlineNs,
     int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
+    if (!swap_) throw ipc::Error(ipc::Status::ProtocolError, E_UNEXPECTED, "swapchain-less Gpu cannot present");
     if (!commands_ready()) return {};
     const auto now = clock_ns();
     if (now >= deadlineNs) return {};
@@ -513,15 +521,25 @@ ID3D12Resource* Gpu::record_synthetic_display(ID3D12GraphicsCommandList* cmd, co
     return display;
 }
 
+void Gpu::draw_hud_onto(ID3D12GraphicsCommandList* cmd, ID3D12Resource* backbuffer, D3D12_RESOURCE_STATES state)
+{
+    if (!cmd || !backbuffer || !hudW_ || !hudH_ || !hudUpload_) return;
+    auto barrier = transition(backbuffer, state, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (state != D3D12_RESOURCE_STATE_COPY_DEST) cmd->ResourceBarrier(1, &barrier);
+    const UINT dstX = hudPos_ == 2 ? static_cast<UINT>(desc_.Width) - hudW_ - hudInset_ : hudInset_;
+    D3D12_TEXTURE_COPY_LOCATION dloc{backbuffer, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
+    D3D12_TEXTURE_COPY_LOCATION sloc{hudUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, hudFp_};
+    D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
+    cmd->CopyTextureRegion(&dloc, dstX, hudInset_, 0, &sloc, &box);
+    if (state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd->ResourceBarrier(1, &barrier);
+    }
+}
+
 void Gpu::record_present_copy(ID3D12GraphicsCommandList* cmd, const PresentCopy& copy)
 {
-    const auto drawHud = [&] {
-        const UINT dstX = hudPos_ == 2 ? static_cast<UINT>(desc_.Width) - hudW_ - hudInset_ : hudInset_;
-        D3D12_TEXTURE_COPY_LOCATION dloc{copy.destination, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-        D3D12_TEXTURE_COPY_LOCATION sloc{hudUpload_.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, hudFp_};
-        D3D12_BOX box{0, 0, 0, hudW_, hudH_, 1};
-        cmd->CopyTextureRegion(&dloc, dstX, hudInset_, 0, &sloc, &box);
-    };
+    const auto drawHud = [&] { draw_hud_onto(cmd, copy.destination, D3D12_RESOURCE_STATE_COPY_DEST); };
     const auto drawSplit = [&] {
         const UINT width = static_cast<UINT>(desc_.Width);
         const UINT split = static_cast<UINT>(UINT64{width} * std::min(copy.splitPercent, 100u) / 100);
@@ -556,6 +574,7 @@ void Gpu::record_present_copy(ID3D12GraphicsCommandList* cmd, const PresentCopy&
 
 UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex, uint32_t splitPercent, bool splitSwap)
 {
+    if (!swap_) throw ipc::Error(ipc::Status::ProtocolError, E_UNEXPECTED, "swapchain-less Gpu cannot present");
     latencyReady_ = false;
     ComPtr<ID3D12Resource> dst;
     check(swap_->GetBuffer(swap_->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&dst)), "back buffer");
@@ -570,7 +589,9 @@ UINT Gpu::present_ready(ID3D12Resource* source, bool synthetic, int beforeIndex,
         mark_inputs_read(index, index, submitted);
     }
     const auto hr = allowTearing_ ? swap_->Present(0, DXGI_PRESENT_ALLOW_TEARING) : swap_->Present(1, 0);
-    check(hr == S_OK ? hr : FAILED(hr) ? hr : E_FAIL, "DXGI Present");
+    // DXGI_STATUS_OCCLUDED is a success: an occluded preview must not fault the
+    // generation. Only a failed HRESULT aborts presentation.
+    if (FAILED(hr)) check(hr, "DXGI Present");
     UINT presentId{};
     check(swap_->GetLastPresentCount(&presentId), "DXGI present count");
     return presentId;

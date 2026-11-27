@@ -53,6 +53,19 @@
 /deps/onnxruntime-1.20.1/*.dll
 /deps/onnxruntime-1.20.1/*.lib
 /deps/onnxruntime-1.20.1/*.onnx
+# Intel XeSS 3.0.2: unmodified public headers and provenance only. No binaries
+# may be admitted by these exceptions.
+!/deps/xess-3.0.2/
+/deps/xess-3.0.2/*
+!/deps/xess-3.0.2/README.md
+!/deps/xess-3.0.2/inc/
+!/deps/xess-3.0.2/inc/xell/
+!/deps/xess-3.0.2/inc/xell/xell.h
+!/deps/xess-3.0.2/inc/xell/xell_d3d12.h
+!/deps/xess-3.0.2/inc/xess_fg/
+!/deps/xess-3.0.2/inc/xess_fg/xefg_swapchain.h
+!/deps/xess-3.0.2/inc/xess_fg/xefg_swapchain_d3d12.h
+!/deps/xess-3.0.2/inc/xess_fg/xefg_swapchain_debug.h
 
 # Exclude macOS legacy resource forks
 .DS_Store

@@ -5,6 +5,7 @@
 #include "vfg_content.h"
 #include "vfg_shot_change.h"
 #include "vfg_hud_lock.h"
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <array>
 #include <functional>
@@ -48,6 +49,7 @@ class Gpu final {
     bool pushflow_;
     const PushFlowShaderBytecodeSet pushflowShaders_{make_pushflow_shader_bytecode()};
     ComPtr<ID3D12Device> device_;
+    ComPtr<IDXGIFactory4> factory_;
     struct CmdSlot {
         ComPtr<ID3D12CommandAllocator> alloc;
         ComPtr<ID3D12GraphicsCommandList> list;
@@ -120,7 +122,16 @@ public:
     {
         return pushflowShaders_;
     }
-    Gpu(const Session&, HWND, uint32_t multiplier);
+    Gpu(const Session&, HWND, uint32_t multiplier, bool create_swapchain = true);
+    [[nodiscard]] bool swapchain_less() const noexcept { return !swap_; }
+    [[nodiscard]] IDXGISwapChain3* swapchain() const noexcept { return swap_.Get(); }
+    [[nodiscard]] IDXGIFactory2* dxgi_factory() const noexcept { return factory_.Get(); }
+    [[nodiscard]] HWND window() const noexcept { return window_; }
+    // HUD-only overlay onto an already acquired backbuffer. XeFG's proxy
+    // swapchain backbuffer is composited here because the presenter never owns
+    // a Gpu swapchain in that mode. COPY_DEST means the caller already holds the
+    // resource in that state and keeps it there.
+    void draw_hud_onto(ID3D12GraphicsCommandList*, ID3D12Resource* backbuffer, D3D12_RESOURCE_STATES state);
     void enter_steady_state() noexcept { waitMs_ = 1000; }
     // Called before submitting a copy to this input on ipcQueue.
     void prepare_input(unsigned index);
