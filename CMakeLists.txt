@@ -33,6 +33,17 @@ set_tests_properties(flow_contract PROPERTIES
   ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")
 include(cmake/nr/Color.cmake)
 add_dependencies(obs-nr-filter nr_color_shaders)
+# SR Shared-NVOF consumption: ownership policy, D3D12->D3D11 import lane, and
+# the worker's ngxMutex/finish_worker discipline.
+add_executable(upscale_shared_flow_tests tools/tests/upscale_shared_flow_tests.cpp)
+target_compile_features(upscale_shared_flow_tests PRIVATE cxx_std_20)
+target_compile_options(upscale_shared_flow_tests PRIVATE /W4 /WX /permissive-)
+target_compile_definitions(upscale_shared_flow_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+  "UPSCALE_DLSS_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/src/obs_upscale_dlss.cpp\"")
+target_include_directories(upscale_shared_flow_tests PRIVATE src)
+target_link_libraries(upscale_shared_flow_tests PRIVATE d3d11 d3d12 dxgi d3dcompiler)
+add_test(NAME upscale_shared_flow COMMAND upscale_shared_flow_tests)
+set_tests_properties(upscale_shared_flow PROPERTIES TIMEOUT 180)
 include(cmake/nr/Scheduler.cmake)
 target_link_libraries(nr_scheduler PUBLIC nr_interop)
 include(cmake/nr/Lifecycle.cmake)
