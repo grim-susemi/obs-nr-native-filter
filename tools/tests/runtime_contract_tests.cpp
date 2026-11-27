@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Production adapter; doubles replace only NGX ABI and physical completion boundaries.
+#include <windows.h>
 #include "nr_runtime.h"
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <variant>
@@ -152,33 +154,111 @@ static void admissionTable() {
         variants[1].sha256=="cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed","pinned SHA-256 values");
     check(!runtime::supports_model_b(variants[0].sha256) && runtime::supports_model_b(variants[1].sha256),"capability lookup");
     check(!runtime::supports_model_b(std::string(64,'0')),"unknown SHA-256 has no capability");
-    check(runtime::model_b_preset==2u,"probe-verified Model B preset");
-    puts("admission: two pinned runtimes, capability lookup and probe-verified Model B preset PASS");
+    check(runtime::model_a_preset==1u && runtime::model_b_preset==2u,"probe-verified Model A/B presets");
+    puts("admission: two pinned runtimes, capability lookup and probe-verified Model A/B presets PASS");
 }
-static void modelBSwitch() {
-    for(const bool supports:{false,true}) {
-        for(const bool perf:{false,true}) {
-            auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, supports);
-            Pass pass(module); auto created=std::make_shared<Completion>(Completion::Recorded);
-            const auto chosen=perfSettings(perf,3);
-            check(pass.prepare(chosen,chosen.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"perf prepare");
-            unsigned preset=99;
-            check(latest && latest->Get("DLSSNR.Hint.Render.Preset",&preset)==NVSDK_NGX_Result_Success,"preset parameter");
-            const auto expected=supports && perf?model_b_preset:3u;
-            check(preset==expected,"Model B only when enabled on a Model B runtime; 310.8 keeps the caller preset");
-            *created=Completion::Complete; check(pass.release(),"perf release");
+// The production refusal token leaves through OutputDebugStringA. The test observes it at
+// that real boundary by redirecting this image's import slot; no production seam is added.
+static std::string debugOutput;
+static void WINAPI captureDebugOutput(LPCSTR text) { if(text) debugOutput+=text; }
+struct DebugOutputHook {
+    IMAGE_THUNK_DATA64* slot=nullptr; ULONGLONG original=0;
+    DebugOutputHook() {
+        auto* base=reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+        if(!base) return;
+        auto* dos=reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+        if(dos->e_magic!=IMAGE_DOS_SIGNATURE) return;
+        auto* nt=reinterpret_cast<IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
+        const auto& dir=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if(!dir.VirtualAddress || !dir.Size) return;
+        for(auto* desc=reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base+dir.VirtualAddress);desc->Name;++desc) {
+            if(!desc->OriginalFirstThunk) continue;
+            auto* names=reinterpret_cast<IMAGE_THUNK_DATA64*>(base+desc->OriginalFirstThunk);
+            auto* slots=reinterpret_cast<IMAGE_THUNK_DATA64*>(base+desc->FirstThunk);
+            for(;names->u1.AddressOfData;++names,++slots) {
+                if(IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+                auto* name=reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base+names->u1.AddressOfData);
+                if(std::strcmp(reinterpret_cast<const char*>(name->Name),"OutputDebugStringA")!=0) continue;
+                DWORD protect=0;
+                if(!VirtualProtect(slots,sizeof(*slots),PAGE_READWRITE,&protect)) return;
+                original=slots->u1.Function;
+                slots->u1.Function=reinterpret_cast<ULONGLONG>(&captureDebugOutput);
+                VirtualProtect(slots,sizeof(*slots),protect,&protect);
+                slot=slots; return;
+            }
         }
     }
-    auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, true);
-    auto created=std::make_shared<Completion>(Completion::Recorded); Pass first(module),second(module);
-    const auto chosen=perfSettings(true,1);
-    check(first.prepare(chosen,chosen.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"pass1 prepare");
-    unsigned preset=99; latest->Get("DLSSNR.Hint.Render.Preset",&preset); check(preset==model_b_preset,"pass1 Model B preset");
-    const ModelTuning pass2{0,2,1,1,0,-1,true};
-    check(second.prepare(chosen,pass2,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"pass2 prepare");
-    latest->Get("DLSSNR.Hint.Render.Preset",&preset); check(preset==model_b_preset,"pass2 Model B preset");
-    *created=Completion::Complete; check(first.release() && second.release(),"perf pair release");
-    puts("model_b: verified preset on both passes, Model A retained on 310.8 CPU PASS");
+    ~DebugOutputHook() {
+        if(!slot) return;
+        DWORD protect=0;
+        if(!VirtualProtect(slot,sizeof(*slot),PAGE_READWRITE,&protect)) return;
+        slot->u1.Function=original;
+        VirtualProtect(slot,sizeof(*slot),protect,&protect);
+    }
+    DebugOutputHook(const DebugOutputHook&)=delete;
+    DebugOutputHook& operator=(const DebugOutputHook&)=delete;
+};
+static void modelBSwitch() {
+    // 310.9.16.0: the toggle selects the network on BOTH passes (off -> Model A 1, on -> Model B 2).
+    for(const bool perf:{false,true}) {
+        auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, true);
+        auto created=std::make_shared<Completion>(Completion::Recorded);
+        Pass first(module),second(module);
+        const auto chosen=perfSettings(perf,3);
+        const ModelTuning pass2{0,2,1,1,0,-1,true};
+        const uint32_t expected=perf?model_b_preset:model_a_preset;
+        check(expected==(perf?2u:1u),"toggle maps off to Model A 1 and on to Model B 2");
+        check(first.prepare(chosen,chosen.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"pass1 prepare");
+        unsigned preset1=99;
+        check(latest && latest->Get("DLSSNR.Hint.Render.Preset",&preset1)==NVSDK_NGX_Result_Success,"pass1 preset parameter");
+        check(preset1==expected,"pass1 follows the toggle on 310.9.16.0");
+        check(second.prepare(chosen,pass2,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"pass2 prepare");
+        unsigned preset2=99;
+        check(latest->Get("DLSSNR.Hint.Render.Preset",&preset2)==NVSDK_NGX_Result_Success,"pass2 preset parameter");
+        check(preset2==expected,"pass2 follows the toggle on 310.9.16.0");
+        printf("model_b: 310.9.16.0 perfModel=%s -> pass1 preset=%u (%s) pass2 preset=%u (%s)\n",
+            perf?"on":"off",preset1,perf?"Model B small-fp8":"Model A full-weights",
+            preset2,perf?"Model B small-fp8":"Model A full-weights");
+        *created=Completion::Complete; check(first.release() && second.release(),"perf pair release");
+    }
+    // Toggling off after on must select Model A on the next prepared pass, not retain Model B.
+    {
+        auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, true);
+        auto created=std::make_shared<Completion>(Completion::Recorded);
+        const auto enabled=perfSettings(true,3),disabled=perfSettings(false,3);
+        Pass on(module); unsigned preset=99;
+        check(on.prepare(enabled,enabled.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"stale on prepare");
+        latest->Get("DLSSNR.Hint.Render.Preset",&preset); check(preset==model_b_preset,"toggle on selects Model B");
+        *created=Completion::Complete; check(on.release(),"stale on release");
+        created=std::make_shared<Completion>(Completion::Recorded); Pass off(module);
+        check(off.prepare(disabled,disabled.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"stale off prepare");
+        latest->Get("DLSSNR.Hint.Render.Preset",&preset); check(preset==model_a_preset,"toggled off pass selects Model A");
+        *created=Completion::Complete; check(off.release(),"stale off release");
+    }
+    // 310.8.0.0 never supports Model B: the caller preset is retained and the refusal is named.
+    for(const bool perf:{false,true}) {
+        DebugOutputHook hook; debugOutput.clear();
+        auto module=Module::controlled(api(),api(true),std::make_shared<int>(1),Route::DriverFallback,{}, {}, false);
+        auto created=std::make_shared<Completion>(Completion::Recorded);
+        Pass first(module),second(module);
+        const auto chosen=perfSettings(perf,3);
+        const ModelTuning pass2{0,2,1,1,0,-1,true};
+        check(first.prepare(chosen,chosen.tuning,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"fallback pass1 prepare");
+        unsigned preset1=99;
+        check(latest && latest->Get("DLSSNR.Hint.Render.Preset",&preset1)==NVSDK_NGX_Result_Success,"fallback pass1 preset");
+        check(preset1==3u,"310.8 keeps the caller preset on pass1");
+        check(second.prepare(chosen,pass2,{1920,1080},1,recording(1,created))==NVSDK_NGX_Result_Success,"fallback pass2 prepare");
+        unsigned preset2=99;
+        check(latest->Get("DLSSNR.Hint.Render.Preset",&preset2)==NVSDK_NGX_Result_Success,"fallback pass2 preset");
+        check(preset2==0u,"310.8 keeps the caller preset on pass2");
+        const bool named=debugOutput.find("model_b_unavailable_on_310_8")!=std::string::npos;
+        check(named==perf,"310.8 names the Model B refusal only when it is requested");
+        check(preset1!=model_b_preset && preset2!=model_b_preset,"310.8 never requests the Model B network");
+        printf("model_b: 310.8.0.0 perfModel=%s -> pass1 preset=%u pass2 preset=%u fallback=%s\n",
+            perf?"on":"off",preset1,preset2,named?"model_b_unavailable_on_310_8":"none (not requested)");
+        *created=Completion::Complete; check(first.release() && second.release(),"fallback pair release");
+    }
+    puts("model_b: 310.9 off->1/1 Model A on->2/2 Model B; 310.8 caller preset + named refusal CPU PASS");
 }
 static void metadataTests() {
     std::vector<unsigned char> file(0x1400);

@@ -43,6 +43,7 @@ inline bool supports_model_b(std::string_view sha256)
 // runtime: preset 1 builds the full-weights network (Model A), preset 2 builds
 // hnet-crazy-cuckoo-small-fp8 (Model B / CC_SMALL_FP8), presets 0 and 3 are not
 // available and fall back to preset 2. Never change without new probe evidence.
+inline constexpr uint32_t model_a_preset=1;
 inline constexpr uint32_t model_b_preset=2;
 struct RuntimeIdentity { std::filesystem::path canonicalPath; std::string sha256; };
 struct Inspection { bool accepted=false,loaded=false; std::string reason,sha256; std::vector<std::string> exports; };

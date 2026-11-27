@@ -566,11 +566,12 @@ NVSDK_NGX_Result Pass::prepare(const Settings& settings,const ModelTuning& passT
     auto& p=*impl_; auto& m=*p.module->impl_; std::lock_guard lock(m.mutex);
     if(p.failed || p.retired || !settings.valid() || !passTuning.valid() || !settings.enabled || !size.width || !size.height || !history || !valid(recording) ||
         (!m.controlled && std::filesystem::path(settings.runtimePath)!=m.identity.canonicalPath)) return NVSDK_NGX_Result_Fail;
-    // The verified Model B preset replaces both pass tunings only on a runtime that
-    // advertises the capability; 310.8.0.0 keeps its caller preset (Model A) and
-    // names the refusal. With the toggle off the caller's preset is authoritative.
+    // On a runtime that advertises Model B (310.9.16.0) the toggle is authoritative on
+    // both passes: on selects the verified Model B preset, off selects the full-weights
+    // Model A preset instead of forwarding the caller preset. 310.8.0.0 keeps its caller
+    // preset (Model A) and names the refusal.
     if(settings.perfModel && !m.supportsModelB)OutputDebugStringA("NR runtime: model_b_unavailable_on_310_8\n");
-    const uint32_t effectivePreset=settings.perfModel && m.supportsModelB?model_b_preset:passTuning.preset;
+    const uint32_t effectivePreset=m.supportsModelB?(settings.perfModel?model_b_preset:model_a_preset):passTuning.preset;
     const ModelTuning effective{effectivePreset,
         passTuning.style,passTuning.intensity,passTuning.localStructure,passTuning.localTone,
         passTuning.skinStructure,passTuning.autoMask};
