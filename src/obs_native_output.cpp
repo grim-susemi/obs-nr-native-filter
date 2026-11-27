@@ -49,6 +49,8 @@ void log_job_timeline(const model::Job& job,const interop::Ownership& physical)
              instance,generation,serial,t.stop,t.settle,u64(t.pendingSerial),t.pendingHasFence,u64(t.pendingFence),
              t.pendingReady,t.pendingCallback,t.pendingGuide,t.guideState);
     }
+    if(const auto json=model::job_telemetry_json(job); !json.empty())
+        blog(LOG_INFO,"[obs-nr-timeline] gpu %s",json.c_str());
 }
 // Explicit QA transport processor, never a model success. Uses the SAME production
 // scheduler, Bridge, capture pin and output consumer as real model processing.

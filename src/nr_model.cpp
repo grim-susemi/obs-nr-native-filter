@@ -8,6 +8,7 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
@@ -29,6 +30,22 @@ bool entry_interposed(HMODULE owner,const void* entry) {
     const auto* code=static_cast<const unsigned char*>(entry);
     return code[0]==0xE9||(code[0]==0xFF&&code[1]==0x25);
 }
+// Fixed-size diagnostic slot. A Job retains it from admission to completion; the
+// pool never waits, and every value is read only through this slot's own queries.
+struct GpuTimingSlot {
+    static constexpr UINT queryCount=14,queueStamps=10,markerFirst=10;
+    UINT base=0;
+    uint64_t frequency=0,markerFrequency=0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>,4> markerAllocator;
+    std::array<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>,4> markerList;
+    Microsoft::WRL::ComPtr<ID3D12Fence> markerFence;
+    uint64_t markerSerial=0;
+    uint32_t stages=0; // 1 dedup, 2 color prep, 4 NGX pass, 8 stabilize, 16 color restore
+    uint32_t markers=0; // 1 admitted, 2 bootstrap, 4 refinement, 8 guide conversion
+    uint8_t* mapped=nullptr;
+    ~GpuTimingSlot() { if(readback && mapped) readback->Unmap(0,nullptr); }
+};
 namespace {
 std::atomic<uint64_t> signalLive{0};
 class ModuleSignal final:public QaSignal {
@@ -54,6 +71,98 @@ int64_t stamp() { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return
 // Diagnostic split of the per-job "prep" stage (CPU time before the codec encode).
 std::atomic<int64_t> prepPre{0},prepGuide{0},prepWorker{0},prepAlloc{0},prepColor{0},prepMid{0},prepCore{0},prepTotal{0};
 std::atomic<uint32_t> prepJobs{0};
+// Exact-JobKey telemetry. One record per completed job; every aggregate is a mean
+// of per-job values from this window, so a maximum from another job/window can never
+// be summed into a different job's attribution.
+struct TelemetryRecord {
+    uint64_t instance=0,generation=0,serial=0,ingress=0;
+    const char* kind="none";
+    int64_t settleTicks=-1,dedupTicks=-1;
+    JobGpuTiming gpu;
+    int64_t preTicks=-1,submitTicks=-1,admitTicks=-1,deltaTicks=-1;
+};
+struct TelemetryAcc { double sum=0; unsigned n=0; };
+struct TelemetryAggState {
+    unsigned jobs=0;
+    TelemetryAcc settle,dedup,dedupGpu,ofaBoot,ofaRefine,guides,prep,ngx,stab,restore,gpu;
+    TelemetryAcc preSubmit,submitToDone,admitToDone;
+    double identityDeltaMax=-1;
+};
+struct TelemetryState {
+    std::mutex lock;
+    std::array<TelemetryRecord,16> ring{};
+    unsigned head=0;
+    TelemetryAggState agg;
+};
+TelemetryState telemetryState;
+TelemetryRecord telemetry_record(const Job& job) {
+    TelemetryRecord record;
+    const auto& c=job.chronology;
+    record.instance=job.contract.key.frame.instanceId;
+    record.generation=job.contract.key.resourceGeneration;
+    record.serial=job.contract.key.submissionSerial;
+    record.ingress=job.contract.key.frame.ingressSequence;
+    record.kind=job.reused?"reuse":job.warmup?"warmup":job.evaluated?"evaluation":"creation";
+    record.settleTicks=job.settleWaitQpc;
+    record.dedupTicks=job.dedupWaitQpc;
+    record.gpu=job.gpuTiming;
+    const auto admitted=job.admittedQpc;
+    if(admitted>0 && c[5]>=admitted && c[6]>=c[5]) {
+        record.preTicks=c[5]-admitted;
+        record.submitTicks=c[6]-c[5];
+        record.admitTicks=c[6]-admitted;
+        record.deltaTicks=record.admitTicks-(record.preTicks+record.submitTicks);
+    }
+    return record;
+}
+std::string telemetry_json(const TelemetryRecord& record) {
+    const auto ms=[](int64_t value) { return value>=0?qpc_ms(value):-1.0; };
+    char buffer[1024];
+    std::snprintf(buffer,sizeof buffer,
+        "{\"instance\":%llu,\"gen\":%llu,\"serial\":%llu,\"ingress\":%llu,\"kind\":\"%s\","
+        "\"settleWaitMs\":%.3f,\"dedupWaitMs\":%.3f,\"dedupGpuMs\":%.3f,\"ofaBootstrapMs\":%.3f,"
+        "\"ofaRefineMs\":%.3f,\"guidesShaderMs\":%.3f,\"colorPrepMs\":%.3f,\"ngxPassMs\":%.3f,"
+        "\"stabilizeMs\":%.3f,\"colorRestoreMs\":%.3f,\"gpuMs\":%.3f,"
+        "\"preSubmitMs\":%.3f,\"submitToDoneMs\":%.3f,\"admitToDoneMs\":%.3f,\"identityDeltaMs\":%.4f}",
+        static_cast<unsigned long long>(record.instance),static_cast<unsigned long long>(record.generation),
+        static_cast<unsigned long long>(record.serial),static_cast<unsigned long long>(record.ingress),record.kind,
+        ms(record.settleTicks),ms(record.dedupTicks),record.gpu.dedupGpuMs,record.gpu.ofaBootstrapMs,
+        record.gpu.ofaRefineMs,record.gpu.guidesShaderMs,record.gpu.colorPrepMs,record.gpu.ngxPassMs,
+        record.gpu.stabilizeMs,record.gpu.colorRestoreMs,record.gpu.gpuMs,
+        ms(record.preTicks),ms(record.submitTicks),ms(record.admitTicks),ms(record.deltaTicks));
+    return buffer;
+}
+JobTelemetry public_telemetry(const TelemetryRecord& record) {
+    const auto ms=[](int64_t value) { return value>=0?qpc_ms(value):-1.0; };
+    JobTelemetry value;
+    value.instance=record.instance;value.generation=record.generation;
+    value.serial=record.serial;value.ingress=record.ingress;value.kind=record.kind;
+    value.settleWaitMs=ms(record.settleTicks);value.dedupWaitMs=ms(record.dedupTicks);
+    value.gpu=record.gpu;
+    value.preSubmitMs=ms(record.preTicks);value.submitToDoneMs=ms(record.submitTicks);
+    value.admitToDoneMs=ms(record.admitTicks);value.identityDeltaMs=ms(record.deltaTicks);
+    return value;
+}
+void record_telemetry(const Job& job) {
+    if(!job.contract.key.submissionSerial || job.chronology[6]<=0) return;
+    const auto record=telemetry_record(job);
+    std::lock_guard<std::mutex> guard(telemetryState.lock);
+    telemetryState.ring[telemetryState.head++&15]=record;
+    auto& agg=telemetryState.agg;
+    ++agg.jobs;
+    const auto add=[](TelemetryAcc& acc,double value) { if(value>=0.0){acc.sum+=value;++acc.n;} };
+    const auto ms=[](int64_t value) { return value>=0?qpc_ms(value):-1.0; };
+    add(agg.settle,ms(record.settleTicks));add(agg.dedup,ms(record.dedupTicks));
+    add(agg.dedupGpu,record.gpu.dedupGpuMs);add(agg.ofaBoot,record.gpu.ofaBootstrapMs);
+    add(agg.ofaRefine,record.gpu.ofaRefineMs);add(agg.guides,record.gpu.guidesShaderMs);
+    add(agg.prep,record.gpu.colorPrepMs);add(agg.ngx,record.gpu.ngxPassMs);
+    add(agg.stab,record.gpu.stabilizeMs);add(agg.restore,record.gpu.colorRestoreMs);
+    add(agg.gpu,record.gpu.gpuMs);
+    add(agg.preSubmit,ms(record.preTicks));add(agg.submitToDone,ms(record.submitTicks));
+    add(agg.admitToDone,ms(record.admitTicks));
+    if(record.deltaTicks>=0)
+        agg.identityDeltaMax=std::max(agg.identityDeltaMax,std::fabs(qpc_ms(record.deltaTicks)));
+}
 struct TimingAgg {
     std::atomic<unsigned> jobs{0};
     std::atomic<int64_t> sumSubmit{0},maxSubmit{0},sumEncode{0},maxEncode{0},sumAdmit{0},maxAdmit{0};
@@ -76,6 +185,7 @@ void raise_max(std::atomic<int64_t>& slot,int64_t value) {
     while(value>seen && !slot.compare_exchange_weak(seen,value,std::memory_order_relaxed)) {}
 }
 void record_timing(const Job& job) { // diagnostic only: evaluation jobs carry an encode stamp
+    record_telemetry(job);
     const auto& c=job.chronology;
     const auto& q=job.qaTiming;
     if(c[1]<=0 && c[0]>0 && c[5]>0 && c[6]>=c[0]) {
@@ -155,6 +265,131 @@ ComPtr<ID3D12DescriptorHeap> heap(ID3D12Device* device,UINT count) {
     checked(device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&result)),"model private descriptor heap");
     return result;
 }
+void read_gpu_timing(Job&); // frees the job's slot after this job's own completion
+struct GpuStamp {
+    ID3D12QueryHeap* heap=nullptr;
+    ID3D12Resource* readback=nullptr;
+    UINT first=0;
+    uint32_t* stages=nullptr;
+    uint32_t bit=0;
+};
+// Diagnostic-only timestamp owner: one query heap shared by four readback slots,
+// plus a dedicated marker queue that timestamps OFA fence milestones. The hot path
+// only records EndQuery/ResolveQueryData and enqueues; it never waits for a query.
+class GpuTimeline {
+public:
+    static constexpr UINT slotCount=4;
+    // Diagnostic teardown only (never record_timing): bound any marker-queue lag so
+    // a readback is not released while its last resolve may still be in flight.
+    ~GpuTimeline() {
+        for(auto& slot:slots) {
+            if(!slot || !slot->markerFence || !slot->markerSerial) continue;
+            const auto completed=slot->markerFence->GetCompletedValue();
+            if(completed==UINT64_MAX || completed>=slot->markerSerial) continue;
+            HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+            if(!event) continue;
+            if(SUCCEEDED(slot->markerFence->SetEventOnCompletion(slot->markerSerial,event)))
+                (void)WaitForSingleObject(event,20);
+            CloseHandle(event);
+        }
+    }
+    void ensure(ID3D12Device* device,ID3D12CommandQueue* queue) {
+        if(initialized) return;
+        initialized=true;
+        if(!trace_job_timeline()) return;
+        char injection[8]{};
+        if(GetEnvironmentVariableA("OBS_NR_TEST_GPU_TIMER_FAIL",injection,sizeof injection) && injection[0]) return;
+        if(!device || !queue) return;
+        UINT64 frequency=0;
+        if(FAILED(queue->GetTimestampFrequency(&frequency)) || !frequency) return;
+        D3D12_QUERY_HEAP_DESC desc{}; desc.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        desc.Count=slotCount*GpuTimingSlot::queryCount;
+        if(FAILED(device->CreateQueryHeap(&desc,IID_PPV_ARGS(&queries)))) return;
+        D3D12_COMMAND_QUEUE_DESC queueDesc{}; queueDesc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if(FAILED(device->CreateCommandQueue(&queueDesc,IID_PPV_ARGS(&markers)))) { queries.Reset(); return; }
+        UINT64 markerFrequency=0;
+        if(FAILED(markers->GetTimestampFrequency(&markerFrequency)) || !markerFrequency) {
+            queries.Reset(); markers.Reset(); return;
+        }
+        for(UINT i=0;i<slotCount;++i) {
+            auto slot=std::make_shared<GpuTimingSlot>();
+            slot->base=i*GpuTimingSlot::queryCount;
+            slot->frequency=frequency; slot->markerFrequency=markerFrequency;
+            D3D12_HEAP_PROPERTIES allocation{}; allocation.Type=D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC buffer{}; buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; buffer.Width=256;
+            buffer.Height=1; buffer.DepthOrArraySize=1; buffer.MipLevels=1;
+            buffer.SampleDesc.Count=1; buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if(FAILED(device->CreateCommittedResource(&allocation,D3D12_HEAP_FLAG_NONE,&buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&slot->readback)))) { fail(); return; }
+            if(FAILED(slot->readback->Map(0,nullptr,reinterpret_cast<void**>(&slot->mapped))) || !slot->mapped) {
+                fail(); return;
+            }
+            std::memset(slot->mapped,0,256);
+            if(FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&slot->markerFence)))) { fail(); return; }
+            for(UINT k=0;k<4;++k) {
+                if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&slot->markerAllocator[k])))) { fail(); return; }
+                if(FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    slot->markerAllocator[k].Get(),nullptr,IID_PPV_ARGS(&slot->markerList[k])))) { fail(); return; }
+                if(FAILED(slot->markerList[k]->Close())) { fail(); return; }
+            }
+            slots[i]=std::move(slot);
+        }
+        enabled=true;
+    }
+    bool ready() const { return enabled; }
+    ID3D12QueryHeap* heap() const { return enabled?queries.Get():nullptr; }
+    GpuStamp dedup_stamp(const std::shared_ptr<GpuTimingSlot>& slot) const {
+        if(!enabled || !slot) return {};
+        return {queries.Get(),slot->readback.Get(),slot->base,&slot->stages,1u};
+    }
+    // Called on the worker immediately after a successful guides submit. Cross-queue
+    // waits timestamp the actual OFA fence milestones without touching nr_guides.
+    void observe_guides(GpuTimingSlot& slot,const FlowResult& flow) {
+        if(!enabled || !markers) return;
+        const std::array<NV_OF_FENCE_POINT,4> points{flow.inputAdmitted,flow.bootstrapComplete,
+            flow.refinementComplete,flow.complete};
+        for(UINT i=0;i<points.size();++i) {
+            const auto& point=points[i];
+            if(!point.fence || !point.value) continue;
+            auto& allocator=slot.markerAllocator[i];
+            auto& list=slot.markerList[i];
+            if(FAILED(allocator->Reset()) ||
+               FAILED(list->Reset(allocator.Get(),nullptr))) { enabled=false; return; }
+            list->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,
+                slot.base+GpuTimingSlot::markerFirst+i);
+            list->ResolveQueryData(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,
+                slot.base+GpuTimingSlot::markerFirst+i,1,slot.readback.Get(),128+i*8);
+            if(FAILED(list->Close())) { enabled=false; return; }
+            if(FAILED(markers->Wait(point.fence,point.value))) { enabled=false; return; }
+            ID3D12CommandList* lists[]{list.Get()};
+            markers->ExecuteCommandLists(1,lists);
+            slot.markers|=1u<<i;
+        }
+        if(FAILED(markers->Signal(slot.markerFence.Get(),++slot.markerSerial))) { enabled=false; return; }
+    }
+    std::shared_ptr<GpuTimingSlot> acquire() {
+        if(!enabled) return {};
+        for(auto& slot:slots) {
+            if(!slot || slot.use_count()!=1 || !slot->markerFence || !slot->mapped) continue;
+            const auto completed=slot->markerFence->GetCompletedValue();
+            if(completed==UINT64_MAX || (slot->markerSerial && completed<slot->markerSerial)) continue;
+            slot->stages=slot->markers=0;
+            std::memset(slot->mapped,0,256); // never attribute a previous job's stamp
+            return slot;
+        }
+        return {};
+    }
+private:
+    void fail() {
+        enabled=false; queries.Reset(); markers.Reset();
+        for(auto& slot:slots) slot.reset();
+    }
+    bool initialized=false,enabled=false;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> queries;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> markers;
+    std::array<std::shared_ptr<GpuTimingSlot>,slotCount> slots;
+};
 struct Driver;
 // Worker-only; neither the allocator nor an immutable analysis lease can retire
 // before the compare's own exact fence, even if the readback budget expires.
@@ -186,12 +421,18 @@ struct DedupCompare {
         checked(zero->Map(0,&empty,&mapped),"NR compare zero");std::memset(mapped,0,4);zero->Unmap(0,nullptr);
     }
     bool retired() const { const auto done=fence->GetCompletedValue();return done!=UINT64_MAX && done>=serial; }
-    bool same(const interop::Context& context,std::array<std::shared_ptr<const Frame>,2> images) {
+    bool same(const interop::Context& context,std::array<std::shared_ptr<const Frame>,2> images,
+        const GpuStamp& stamp={}) {
         if(!retired())return false;
         leases=std::move(images);
         auto* device=context.device();
+        const bool stamping=stamp.heap && stamp.readback;
         checked(allocator->Reset(),"NR compare allocator reset");
         checked(commands->Reset(allocator.Get(),pipeline.Get()),"NR compare reset");
+        if(stamping) {
+            commands->EndQuery(stamp.heap,D3D12_QUERY_TYPE_TIMESTAMP,stamp.first);
+            if(stamp.stages)*stamp.stages|=stamp.bit;
+        }
         auto cpu=descriptors->GetCPUDescriptorHandleForHeapStart();
         for(const auto& frame:leases) {
             auto* image=frame->analysis.Get();
@@ -212,6 +453,10 @@ struct DedupCompare {
         barrier(commands.Get(),count.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
         for(const auto& frame:leases)
             barrier(commands.Get(),frame->analysis.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        if(stamping) {
+            commands->EndQuery(stamp.heap,D3D12_QUERY_TYPE_TIMESTAMP,stamp.first+1);
+            commands->ResolveQueryData(stamp.heap,D3D12_QUERY_TYPE_TIMESTAMP,stamp.first,2,stamp.readback,0);
+        }
         checked(commands->Close(),"NR compare close");
         ID3D12CommandList* lists[]{commands.Get()};
         context.queue()->ExecuteCommandLists(1,lists);
@@ -500,6 +745,49 @@ std::array<uintptr_t,3> Job::descriptor_heaps() const {
         std::array<uintptr_t,3>{};
 }
 namespace {
+// Reads this job's own slot after its completion. Nothing waits: a slot whose
+// marker fence has not retired leaves only those fields unavailable (-1.0).
+void read_gpu_timing(Job& job) {
+    auto slot=job.gpuSlot;
+    if(!slot) return;
+    const auto* values=slot->mapped?reinterpret_cast<const uint64_t*>(slot->mapped):nullptr;
+    const auto queueValue=job.resources && job.resources->complete?job.resources->complete->GetCompletedValue():0;
+    const bool queueComplete=values && job.resources && job.resources->complete &&
+        queueValue>=1 && queueValue!=UINT64_MAX;
+    const auto markerValue=slot->markerFence?slot->markerFence->GetCompletedValue():0;
+    const bool markersComplete=values && slot->markerFence && slot->markerSerial &&
+        markerValue>=slot->markerSerial && markerValue!=UINT64_MAX;
+    const auto elapsed=[&](UINT first,uint64_t frequency) {
+        if(!values || !frequency) return -1.0;
+        const auto begin=values[first],end=values[first+1];
+        if(!begin || !end || end<=begin) return -1.0;
+        return 1000.0*static_cast<double>(end-begin)/static_cast<double>(frequency);
+    };
+    const auto interval=[&](uint64_t begin,uint64_t end) {
+        if(!begin || !end || end<=begin || !slot->markerFrequency) return -1.0;
+        return 1000.0*static_cast<double>(end-begin)/static_cast<double>(slot->markerFrequency);
+    };
+    auto& gpu=job.gpuTiming;
+    if(queueComplete) {
+        if(slot->stages&1) gpu.dedupGpuMs=elapsed(0,slot->frequency);
+        if(slot->stages&2) gpu.colorPrepMs=elapsed(2,slot->frequency);
+        if(slot->stages&4) gpu.ngxPassMs=elapsed(4,slot->frequency);
+        if(slot->stages&8) gpu.stabilizeMs=elapsed(6,slot->frequency);
+        if(slot->stages&16) gpu.colorRestoreMs=elapsed(8,slot->frequency);
+    }
+    // Marker resolves land at byte offset 128 of this slot's readback (uint64 index 16).
+    if(markersComplete) {
+        if((slot->markers&3)==3) gpu.ofaBootstrapMs=interval(values[16],values[17]);
+        if((slot->markers&6)==6) gpu.ofaRefineMs=interval(values[17],values[18]);
+        if((slot->markers&12)==12) gpu.guidesShaderMs=interval(values[18],values[19]);
+    }
+    double sum=0; bool measured=false;
+    for(const double value:{gpu.dedupGpuMs,gpu.ofaBootstrapMs,gpu.ofaRefineMs,gpu.guidesShaderMs,
+        gpu.colorPrepMs,gpu.ngxPassMs,gpu.stabilizeMs,gpu.colorRestoreMs})
+        if(value>=0.0){sum+=value;measured=true;}
+    gpu.gpuMs=measured?sum:-1.0;
+    job.gpuSlot.reset(); // returns the slot to the pool; the readback is not touched again
+}
 void observe_completed(Job& job) {
     auto* o=job.observation;
     if(!o)return;
@@ -547,7 +835,9 @@ void finish_completed(Job& job) {
             if(!job.evaluated)eligAgg.noEval.fetch_add(1);if(!job.submitted)eligAgg.noSubmit.fetch_add(1);
             if(!complete)eligAgg.incomplete.fetch_add(1);if(!qaOk)eligAgg.qa.fetch_add(1);}
     }
-    job.chronology[7]=stamp();record_timing(job);
+    job.chronology[7]=stamp();
+    read_gpu_timing(job);
+    record_timing(job);
     job.ready.store(true,std::memory_order_release);
     observe_completed(job);
     SetEvent(job.observed);
@@ -645,6 +935,7 @@ struct Processor::Impl {
     std::optional<JobKey> previousKey;
     std::shared_ptr<const Frame> previousFrame;
     std::unique_ptr<DedupCompare> dedup;
+    GpuTimeline timer; // optional diagnostic timestamp owner; never blocks
     ComPtr<ID3D12Resource> previousNrColor;
     std::shared_ptr<Job> pending;
     std::shared_ptr<ColorSlabPool> pool;
@@ -993,6 +1284,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->chronology[0]=stamp();if(p.config.qaObservations||job->observation)job->qaTiming[0]=stamp();
     auto fail=[&](uint32_t code) {
         job->code=code; p.reset=true; p.lastResetSetter="presubmit-failure";
+        if(job->gpuSlot) job->gpuSlot->stages=0; // the worker list was not submitted
         p.diag_fail(code,*job);
         if(job->fault!=Fault::None)job->qaFailure.store(code,std::memory_order_release);
         require(work.binding.transport->discard_recording(work.binding.ticket),"model presubmit discard");
@@ -1002,10 +1294,15 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     };
     try {
     p.realWork=true;
+    p.timer.ensure(p.context->device(),p.context->queue());
+    const int64_t settleBegin=stamp();
     const bool stopped=stop.stop_requested();
     const bool settled=!stopped && p.settle(stop);
-    if(t) { t->stop=stopped;t->settleEnd=stamp(); }
+    const int64_t settleEnd=stamp();
+    job->settleWaitQpc=settleEnd-settleBegin;
+    if(t) { t->stop=stopped;t->settleEnd=settleEnd; }
     if(!settled) return fail(0xe002);
+    job->gpuSlot=p.timer.acquire();
     const auto& d=work.job.input.descriptor;
     const Extent size{d.active.width,d.active.height};
     const auto working=work_extent(d.active,work.job.input.settings.workScale);
@@ -1158,7 +1455,11 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(work.job.input.settings.dedupReuse && job->fault==Fault::None && !reset &&
        p.previousFrame && p.previousNrColor && p.previousKey->submissionSerial<work.job.key.submissionSerial) {
         if(!p.dedup)p.dedup=std::make_unique<DedupCompare>(device);
-        if(p.dedup->same(*p.context,{job->frame,p.previousFrame})) {
+        const int64_t dedupBegin=stamp();
+        const bool duplicate=p.dedup->same(*p.context,{job->frame,p.previousFrame},
+            p.timer.dedup_stamp(job->gpuSlot));
+        job->dedupWaitQpc=stamp()-dedupBegin;
+        if(duplicate) {
             const auto view=work.binding.transport->begin_worker(work.binding.ticket);
             require(view.has_value(),"NR reuse Bridge admission");
             job->output=view->output;job->reused=true;job->referenceValid=true;
@@ -1198,6 +1499,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const auto flow=p.guides->submit({current,previous?&*previous:nullptr,d.allocation,d.active,reset,work.job.input.settings.stabilize.motionMode});
     if(flow!=FlowProblem::None) return fail(0xe100+static_cast<uint32_t>(flow));
     const auto* guide=p.guides->result(); require(guide && guide->key==work.job.key,"exact native guides");
+    if(job->gpuSlot) p.timer.observe_guides(*job->gpuSlot,*guide);
     if(t)t->guideTarget=guide->complete.value;
     job->flow.emplace(*guide);
     job->guideGrid=p.guides->grid_size();
@@ -1234,6 +1536,15 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const int64_t tAlloc1=stamp();
     if(t) { t->allocEnd=tAlloc1;t->recordBegin=tAlloc1; }
     auto* list=view->commands;
+    ID3D12QueryHeap* const stampHeap=p.timer.heap();
+    const UINT stampBase=job->gpuSlot?job->gpuSlot->base:0;
+    const auto stampAt=[&](UINT index) {
+        if(stampHeap && job->gpuSlot) list->EndQuery(stampHeap,D3D12_QUERY_TYPE_TIMESTAMP,stampBase+index);
+    };
+    const auto stampStage=[&](UINT index,uint32_t bit) {
+        stampAt(index);
+        if(stampHeap && job->gpuSlot) job->gpuSlot->stages|=bit;
+    };
     if(slab) { // A returned slab ended its last submitted job in COMMON, including status.
         for(auto& color:r.colors) if(color)
             barrier(list,color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1254,8 +1565,10 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     r.color=p.color;
     const int64_t tColor1=stamp();
     barrier(list,r.colors[2].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    stampAt(2);
     require(r.color->record(list,r.prepareHeap.Get(),*plan,job->frame->original.Get(),
         r.colors[2].Get(),r.colors[0].Get(),r.status.Get(),false),"actual canonical color prepare");
+    stampStage(3,2);
     barrier(list,r.colors[2].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier(list,r.colors[0].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const auto ct=[&](size_t i) {const auto extent=layout.extents()[i];
@@ -1276,7 +1589,9 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         std::make_unique<Evaluator>(std::array{p.passes[0].get(),p.passes[1].get()},job));
     const int64_t tCore1=stamp();
     p.subscribe(job);
+    stampAt(4);
     const auto result=r.core->record(input);
+    stampStage(5,4);
     if(!job->warmup && job->chronology[1]>tCore1) {
         prepPre.fetch_add(tGuide0-job->qaTiming[1],std::memory_order_relaxed);prepGuide.fetch_add(tGuide1-tGuide0,std::memory_order_relaxed);
         prepWorker.fetch_add(tAlloc0-tGuide1,std::memory_order_relaxed);prepAlloc.fetch_add(tAlloc1-tAlloc0,std::memory_order_relaxed);
@@ -1287,6 +1602,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->evaluated=result.evaluated; job->composed=result.composed; job->code=result.error;
     job->completedPasses=result.passes;job->failedPass=result.failedPass;job->passError=result.passError;
     if(result.state!=CoreState::Recorded || job->fault==Fault::Submission) {
+        if(job->gpuSlot) job->gpuSlot->stages=0; // discarded worker list: no stage resolves execute
         if(t)t->recordEnd=stamp();
         require(r.submission->discard(),"unsubmitted evaluation discard");
         require(work.binding.transport->discard_recording(work.binding.ticket),"failed core Bridge discard");
@@ -1316,11 +1632,13 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
             barrier(list,res,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(auto* res:{p.stabilizeHold[stabCur].Get(),p.stabilizeTemporal[stabCur].Get(),p.stabilizeOrig[stabCur].Get()})
             barrier(list,res,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        stampAt(6);
         require(p.stabilizer->record(list,r.stabilizeHeap.Get(),size,stabCfg,hasStabHistory,
             r.colors[0].Get(),r.colors[4].Get(),guide->motion,
             p.stabilizeOrig[stabPrev].Get(),p.stabilizeTemporal[stabPrev].Get(),p.stabilizeHold[stabPrev].Get(),
             p.stabilizeHold[stabCur].Get(),p.stabilizeTemporal[stabCur].Get(),p.stabilizeOrig[stabCur].Get()),
             "actual anti-flicker stabilize pass");
+        stampStage(7,8);
         barrier(list,p.stabilizeHold[stabCur].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(list,p.stabilizeTemporal[stabCur].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         barrier(list,p.stabilizeOrig[stabCur].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
@@ -1335,8 +1653,10 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     D3D12_RESOURCE_BARRIER order{}; order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; order.UAV.pResource=r.status.Get();
     list->ResourceBarrier(1,&order);
     job->referenceValid=!reset&&previous.has_value();
+    stampAt(8);
     require(r.color->record(list,r.restoreHeap.Get(),*plan,job->frame->original.Get(),canonicalOutput,
         view->output,r.status.Get(),true,job->referenceValid),"actual source-relative color restore");
+    stampStage(9,16);
     if(stabDispatched) barrier(list,p.stabilizeHold[stabCur].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     barrier(list,r.status.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(r.statusRead.Get(),0,r.status.Get(),0,4); r.statusRecorded=true;
@@ -1389,8 +1709,15 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
             barrier(list,r.guideObservations[i].Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
         }
     }
+    if(stampHeap && job->gpuSlot) {
+        // Resolve only this job's own ranges; masks decide which values are attributed.
+        list->ResolveQueryData(stampHeap,D3D12_QUERY_TYPE_TIMESTAMP,stampBase+2,4,job->gpuSlot->readback.Get(),16);
+        list->ResolveQueryData(stampHeap,D3D12_QUERY_TYPE_TIMESTAMP,stampBase+6,2,job->gpuSlot->readback.Get(),48);
+        list->ResolveQueryData(stampHeap,D3D12_QUERY_TYPE_TIMESTAMP,stampBase+8,2,job->gpuSlot->readback.Get(),64);
+    }
     if(t)t->recordEnd=stamp();
     job->submitted=work.binding.transport->submit_worker(work.binding.ticket);
+    if(!job->submitted && job->gpuSlot) job->gpuSlot->stages=0; // list never executed
     r.slabExecuted=job->submitted;
     job->chronology[4]=stamp();
     if(job->submitted) job->submitted=r.submission->submitted(p.context->queue());
@@ -1404,6 +1731,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     return {work.job,job->submitted,job};
     } catch(const std::exception& error) {
         job->diagnostic=error.what(); job->code=0xefff; p.reset=true; p.lastResetSetter="process-exception";
+        if(job->gpuSlot) job->gpuSlot->stages=0;
         p.diagExc.fetch_add(1);if(!p.diagWhatSet.load()){{const char* m=error.what();size_t i=0;for(;m[i]&&i+1<p.diagWhat.size();++i)p.diagWhat[i]=m[i];p.diagWhat[i]=0;}p.diagWhatSet.store(true,std::memory_order_release);}p.diag_fail(0xefff,*job);
         // No recording/resources means no feature submission occurred. All other
         // failures retain their exact resource owners; never manufacture completion.
@@ -1531,7 +1859,31 @@ std::string take_job_trace() {
             jobs,pre,guide,worker,alloc,color,mid,core,total-pre-guide-worker-alloc-color-mid-core,total);
         out+=buf;
     }
+    if(trace_job_timeline()) {
+        std::lock_guard<std::mutex> guard(telemetryState.lock);
+        const unsigned count=telemetryState.head<4?telemetryState.head:4;
+        if(count) {
+            out+=" | telemetry [";
+            for(unsigned k=count;k>0;--k) {
+                if(k!=count) out+=",";
+                out+=telemetry_json(telemetryState.ring[(telemetryState.head-k)&15]);
+            }
+            out+="]";
+        }
+    }
     return out;
+}
+std::vector<JobTelemetry> take_job_telemetry() {
+    std::lock_guard<std::mutex> guard(telemetryState.lock);
+    const unsigned count=telemetryState.head<16?telemetryState.head:16;
+    std::vector<JobTelemetry> out;
+    out.reserve(count);
+    for(unsigned k=count;k>0;--k) out.push_back(public_telemetry(telemetryState.ring[(telemetryState.head-k)&15]));
+    return out;
+}
+std::string job_telemetry_json(const Job& job) {
+    if(job.chronology[6]<=0) return {};
+    return telemetry_json(telemetry_record(job));
 }
 JobTimingWindow take_job_timing() {
     LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
@@ -1552,6 +1904,22 @@ JobTimingWindow take_job_timing() {
     w.submitMaxMs=static_cast<double>(timingAgg.maxSubmit.exchange(0))*toMs;
     w.encodeMaxMs=static_cast<double>(timingAgg.maxEncode.exchange(0))*toMs;
     if(w.jobs){w.submitMeanMs=static_cast<double>(ss)*toMs/w.jobs;w.encodeMeanMs=static_cast<double>(se)*toMs/w.jobs;}
+    {
+        std::lock_guard<std::mutex> guard(telemetryState.lock);
+        auto& a=telemetryState.agg;
+        const auto mean=[](TelemetryAcc& acc) {
+            const double value=acc.n?acc.sum/acc.n:-1.0; acc={}; return value;
+        };
+        w.telemetryJobs=a.jobs; a.jobs=0;
+        w.settleWaitMs=mean(a.settle); w.dedupWaitMs=mean(a.dedup);
+        w.dedupGpuMs=mean(a.dedupGpu); w.ofaBootstrapMs=mean(a.ofaBoot);
+        w.ofaRefineMs=mean(a.ofaRefine); w.guidesShaderMs=mean(a.guides);
+        w.colorPrepMs=mean(a.prep); w.ngxPassMs=mean(a.ngx);
+        w.stabilizeMs=mean(a.stab); w.colorRestoreMs=mean(a.restore); w.gpuMs=mean(a.gpu);
+        w.preSubmitMs=mean(a.preSubmit); w.submitToDoneMs=mean(a.submitToDone);
+        w.admitToDoneMs=mean(a.admitToDone);
+        w.identityDeltaMaxMs=a.identityDeltaMax; a.identityDeltaMax=-1;
+    }
     return w;
 }
 } // namespace nr::model

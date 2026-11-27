@@ -10,6 +10,7 @@
 #include "nr_model_passes.h"
 #include <string>
 #include <atomic>
+#include <vector>
 #include "nr_qa_fault.h"
 
 namespace nr::model {
@@ -97,6 +98,18 @@ inline bool observe_publication(pipeline::FramePipeline& pipeline,const interop:
         return true; // Withhold only graphics completion availability, not a physical receipt's fields.
     return pipeline.observe(ticket,physical); // Terminal/retired/stopping owners always collect normally.
 }
+// Per-job GPU stage attribution. -1.0 means the job did not reach that stage or
+// no timestamp-query owner was available; it is never reported as zero. Values are
+// written once from this Job's own completion before ready is published.
+struct JobGpuTiming {
+    static constexpr double unavailable=-1.0;
+    double gpuMs=unavailable; // sum of the measured stages, -1 when none was measured
+    double dedupGpuMs=unavailable,ofaBootstrapMs=unavailable,ofaRefineMs=unavailable,guidesShaderMs=unavailable;
+    double colorPrepMs=unavailable,ngxPassMs=unavailable,stabilizeMs=unavailable,colorRestoreMs=unavailable;
+};
+// Ring-buffered timestamp readback owner retained by exactly one Job until its
+// completion is read; the pool never blocks or waits for a slot.
+struct GpuTimingSlot;
 struct Job {
     struct Resources;
     const std::shared_ptr<const Frame> frame;
@@ -142,6 +155,9 @@ struct Job {
         bool pendingReady=false,pendingCallback=false,pendingGuide=false,pendingHasFence=false,stop=false;
     };
     std::optional<Timeline> timeline; // Warmup/diagnostic only; read after ready AND dispatch returned.
+    JobGpuTiming gpuTiming; // Diagnostic; published by ready like Resources.
+    int64_t settleWaitQpc=-1,dedupWaitQpc=-1; // Diagnostic CPU waits; -1 = stage not reached.
+    std::shared_ptr<GpuTimingSlot> gpuSlot; // Retained until finish_completed reads it.
     std::optional<FlowResult> flow;
     std::optional<JobKey> guideReferenceKey; // Actual SDK reference, absent on cold/reset.
     uint32_t guideGrid=0;
@@ -190,7 +206,29 @@ public:
     std::shared_ptr<const GuidePreparation> guide_preparation() const;
     bool publish(const std::shared_ptr<Job>&,const Selection&,const interop::Ownership&);
 };
-struct JobTimingWindow {unsigned jobs=0,late=0;double submitMeanMs=0,submitMaxMs=0,encodeMeanMs=0,encodeMaxMs=0,admitMeanMs=0,admitMaxMs=0,queueMeanMs=0,queueMaxMs=0,prodMeanMs=0,prodMaxMs=0,prepMeanMs=0,recMeanMs=0,gpuMeanMs=0,creationMeanMs=0,creationMaxMs=0;unsigned creationJobs=0;};
+struct JobTimingWindow {
+    unsigned jobs=0,late=0;
+    double submitMeanMs=0,submitMaxMs=0,encodeMeanMs=0,encodeMaxMs=0,admitMeanMs=0,admitMaxMs=0;
+    double queueMeanMs=0,queueMaxMs=0,prodMeanMs=0,prodMaxMs=0,prepMeanMs=0,recMeanMs=0,gpuMeanMs=0;
+    double creationMeanMs=0,creationMaxMs=0;unsigned creationJobs=0;
+    // Diagnostic stage attribution for completed jobs in this window. -1 = no sample.
+    unsigned telemetryJobs=0;
+    double settleWaitMs=-1,dedupWaitMs=-1;
+    double dedupGpuMs=-1,ofaBootstrapMs=-1,ofaRefineMs=-1,guidesShaderMs=-1;
+    double colorPrepMs=-1,ngxPassMs=-1,stabilizeMs=-1,colorRestoreMs=-1,gpuMs=-1;
+    double preSubmitMs=-1,submitToDoneMs=-1,admitToDoneMs=-1,identityDeltaMaxMs=-1;
+};
+// Exact-JobKey telemetry record. Every value belongs to one job; no maxima from
+// different jobs or windows are combined into this record.
+struct JobTelemetry {
+    uint64_t instance=0,generation=0,serial=0,ingress=0;
+    const char* kind="none";
+    double settleWaitMs=-1,dedupWaitMs=-1;
+    JobGpuTiming gpu;
+    double preSubmitMs=-1,submitToDoneMs=-1,admitToDoneMs=-1,identityDeltaMs=-1;
+};
+std::vector<JobTelemetry> take_job_telemetry(); // diagnostic: recent completed jobs, non-draining
+std::string job_telemetry_json(const Job&); // diagnostic: one JSON object, empty before completion
 int64_t qpc_now(); // diagnostic clock
 double qpc_ms(int64_t delta);
 bool trace_job_timeline() noexcept;

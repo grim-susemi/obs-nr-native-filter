@@ -140,6 +140,11 @@ bool nr_run_cost_scenario(const std::filesystem::path& root,std::wstring_view te
         {L"959x539",{959,539}},{L"480x270",{480,270}},{L"64x64",{64,64}}}};
     const auto found=std::find_if(sizes.begin(),sizes.end(),[text](const auto& x){return x.first==text;});
     if(found==sizes.end()) { std::cout<<"NR_COST_INVALID_SIZE\n"; return false; }
+    // This lane drives qa::CostDriver/runtime::Pass directly and has no model::Processor
+    // JobKey, so its gpu_ms is a whole-pass measurement. Stage attribution lives in
+    // the model timeline lane (nr_model_pipeline / OBS_NR_JOB_TIMELINE); never read
+    // these two numbers as the same contract.
+    std::cout<<"NR_COST_SCOPE {\"model_processor\":false,\"job_key_telemetry\":\"nr_model_pipeline\",\"gpu_timing\":\"whole_pass\"}"<<std::endl;
     const auto size=found->second;
     auto owner=std::make_unique<Owner>();
     try {
