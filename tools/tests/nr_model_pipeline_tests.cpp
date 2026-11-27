@@ -3,8 +3,10 @@
 // scenarios; a second translation unit would duplicate Host/Pipeline/prime and needs CMake outside this task.
 #include "obs_native_output.h"
 #include <obs.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <numeric>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -19,7 +21,7 @@ using Microsoft::WRL::ComPtr;
 using namespace std::chrono_literals;
 namespace fs=std::filesystem;
 using Clock=std::chrono::steady_clock;
-constexpr UINT w=640,h=384; // NR buffer (native extent) shared by both modes.
+constexpr UINT w=640,h=384; // Default NR buffer (native extent) shared by both legacy modes.
 constexpr UINT videoW=1920,videoH=1080; // 1080p mode OBS video frame; the NR buffer stays w x h.
 constexpr uint64_t frame60Ns=16'666'667,frame120Ns=8'333'333;
 struct JitterTiming {
@@ -70,37 +72,40 @@ struct Faults final : model::ObservationSink {
 struct Pipeline {
     static uint64_t next_instance() { static uint64_t next=51; return next++; }
     const uint64_t instance;
-    const FrameDescriptor desc{{w,h},{0,0,w,h},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80};
+    const UINT bufferW,bufferH;
+    const FrameDescriptor desc;
     const Settings settings;
     obs_adapter::NativeOutput output;
     ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> graphics;
     ComPtr<ID3D11Texture2D> source,target,staging;
     std::shared_ptr<Faults> faults=std::make_shared<Faults>();
+    std::vector<uint32_t> patternPixels;
     uint64_t tick=100,seq=0;
     std::vector<std::shared_ptr<model::Job>> jobs;
-    Pipeline(const model::Config& config,const fs::path& assets,bool reuse,bool stabilize=false)
-        :instance(next_instance()),
-         settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),1,100,{},
-            stabilize?StabilizeSettings{0.25f,0.10f,0.02f,0}:StabilizeSettings{},false,reuse},
+    Pipeline(const model::Config& config,const fs::path& assets,bool reuse,bool stabilize=false,
+        uint32_t workScale=100,bool perfModel=false,UINT width=w,UINT height=h)
+        :instance(next_instance()),bufferW(width),bufferH(height),patternPixels(static_cast<size_t>(width)*height),
+         desc{{bufferW,bufferH},{0,0,bufferW,bufferH},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80},
+         settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),1,workScale,{},
+            stabilize?StabilizeSettings{0.25f,0.10f,0.02f,0}:StabilizeSettings{},perfModel,reuse},
          output(instance,config,shader(assets/"nr_interop_vertex.cso"),shader(assets/"nr_interop_pixel.cso"),shader(assets/"nr_obs_analysis.cso")) {
         check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&graphics));
         ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;DXGI_ADAPTER_DESC d{};
         check(device.As(&dxgi));check(dxgi->GetAdapter(&adapter));check(adapter->GetDesc(&d));
         std::printf("adapter=%ls vendor=%04x device=%04x hardware D3D11/12\n",d.Description,d.VendorId,d.DeviceId);
-        D3D11_TEXTURE2D_DESC tex{};tex.Width=w;tex.Height=h;tex.MipLevels=tex.ArraySize=tex.SampleDesc.Count=1;
+        D3D11_TEXTURE2D_DESC tex{};tex.Width=bufferW;tex.Height=bufferH;tex.MipLevels=tex.ArraySize=tex.SampleDesc.Count=1;
         tex.Format=DXGI_FORMAT_B8G8R8A8_UNORM;tex.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
         check(device->CreateTexture2D(&tex,nullptr,&source));check(device->CreateTexture2D(&tex,nullptr,&target));
         tex.BindFlags=0;tex.Usage=D3D11_USAGE_STAGING;tex.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         check(device->CreateTexture2D(&tex,nullptr,&staging));output.observe_with(faults);
     }
     void pattern(unsigned shift,unsigned blue=0,unsigned overBand=0) {
-        std::vector<uint32_t> pixels(w*h);
-        for(UINT i=0;i<w*h;++i) {
-            const auto v=(i/w*3+i%w+shift)%192+32;
-            pixels[i]=0xff000000u|((v+(i<overBand?4:0))<<16)|(v<<8)|(v+blue);
+        for(UINT i=0;i<bufferW*bufferH;++i) {
+            const auto v=(i/bufferW*3+i%bufferW+shift)%192+32;
+            patternPixels[i]=0xff000000u|((v+(i<overBand?4:0))<<16)|(v<<8)|(v+blue);
         }
-        graphics->UpdateSubresource(source.Get(),0,nullptr,pixels.data(),w*4,0);
+        graphics->UpdateSubresource(source.Get(),0,nullptr,patternPixels.data(),bufferW*4,0);
     }
     Selection arrive() {
         ++tick;
@@ -126,8 +131,8 @@ struct Pipeline {
     std::vector<uint32_t> presented() {
         graphics->CopyResource(staging.Get(),target.Get());D3D11_MAPPED_SUBRESOURCE m{};
         check(graphics->Map(staging.Get(),0,D3D11_MAP_READ,0,&m));
-        std::vector<uint32_t> result(w*h);
-        for(UINT y=0;y<h;++y)std::memcpy(result.data()+y*w,static_cast<const char*>(m.pData)+y*m.RowPitch,w*4);
+        std::vector<uint32_t> result(bufferW*bufferH);
+        for(UINT y=0;y<bufferH;++y)std::memcpy(result.data()+y*bufferW,static_cast<const char*>(m.pData)+y*m.RowPitch,bufferW*4);
         graphics->Unmap(staging.Get(),0);return result;
     }
     void close() {
@@ -149,13 +154,15 @@ void prime(Pipeline& p) {
     expect(ordinary->evaluated && ordinary->referenceValid && ordinary->eligible,"real Feature18 + NVOF priming");
 }
 void reuse_and_refusal(Pipeline& p) {
+    expect(_putenv_s("OBS_NR_TEST_DEDUP_SYNC","1")==0,"deterministic dedup fixture");
     prime(p);
     {
     const auto ordinary=p.current();
     const auto first=p.arrive();p.ready();
     expect(first.kind==OutputKind::DelayedNr && p.output.selected_job()==ordinary,"publish real ordinary result");
     const auto pixels=p.presented();const auto duplicate=p.current();
-    expect(duplicate->reused && duplicate->eligible && !duplicate->evaluated && !duplicate->flow,"duplicate bypassed both engines");
+    expect(duplicate->reused && duplicate->eligible && !duplicate->evaluated &&
+        duplicate->flow && !duplicate->flow->reset,"duplicate did not bypass NR evaluation with contiguous guides");
     expect(p.arrive().kind==OutputKind::DelayedNr && p.output.selected_job()==duplicate && p.presented()==pixels,
         "pixel-identical published duplicate");p.ready();
     const auto last=p.current();expect(last->reused,"consecutive duplicate");
@@ -171,6 +178,22 @@ void reuse_and_refusal(Pipeline& p) {
     p.pattern(111,3,4);p.arrive();p.ready();
     expect(!p.current()->reused && p.current()->eligible && p.current()->flow && !p.current()->flow->reset,"over-budget difference");
     std::puts("band_lsb=3 ppm=5 over_band=3:reuse,4:evaluate reset=0");
+    // QA failure: an un-signalled comparison readback must skip reuse without a
+    // worker stall, evaluate NR normally, and leave the next frame unaffected.
+    expect(_putenv_s("OBS_NR_TEST_DEDUP_UNSIGNALLED","1")==0,"injected dedup silence");
+    p.pattern(455);p.arrive();p.ready();
+    p.pattern(455);p.arrive();p.ready();const auto skipped=p.current();
+    expect(!skipped->reused && skipped->evaluated && skipped->eligible && skipped->flow &&
+        (skipped->code==0||skipped->code==1),"injected silence did not fall back to evaluation");
+    expect(skipped->dedupWaitQpc>=0 && model::qpc_ms(skipped->dedupWaitQpc)<0.2,
+        "un-signalled dedup readback blocked the worker");
+    const auto trace=model::take_job_trace();
+    expect(trace.find("dedupSkippedNotReady")!=std::string::npos &&
+        trace.find("dedupSkippedNotReady 0")==std::string::npos,"dedup skip not recorded");
+    p.pattern(466);p.arrive();p.ready();
+    expect(p.current()->eligible && p.current()->evaluated &&
+        (p.current()->code==0||p.current()->code==1),"post-skip evaluation failed");
+    expect(_putenv_s("OBS_NR_TEST_DEDUP_UNSIGNALLED","")==0,"dedup silence restore");
     }
     p.faults->fault=true;p.arrive();p.faults->fault=false;
     auto stuck=p.current();
@@ -191,19 +214,23 @@ void reuse_and_refusal(Pipeline& p) {
     std::printf("fault=CompletionSignal 0xe002=1 settle_ms=%.3f retained_on_close=1 serial=%llu\n",ms,stuck->contract.key.submissionSerial);
     expect(p.output.release_original_marker(stuck->contract.key),"release original marker");
     expect(WaitForSingleObject(stuck->observed,5000)==WAIT_OBJECT_0 && stuck->ready,"original notification");
-    stuck.reset();p.close();
+    stuck.reset();
+    expect(_putenv_s("OBS_NR_TEST_DEDUP_SYNC","")==0,"dedup sync restore");
+    p.close();
 }
 void dedup_proof(Pipeline& p) {
+    expect(_putenv_s("OBS_NR_TEST_DEDUP_SYNC","1")==0,"deterministic dedup fixture");
     const auto ordinary=p.current();
     const auto first=p.arrive();p.ready();
     expect(first.kind==OutputKind::DelayedNr && p.output.selected_job()==ordinary,"1080p publish real ordinary result");
     const auto pixels=p.presented();const auto duplicate=p.current();
-    expect(duplicate->reused && duplicate->eligible && !duplicate->evaluated && !duplicate->flow,
-        "1080p duplicate bypassed both engines");
+    expect(duplicate->reused && duplicate->eligible && !duplicate->evaluated &&
+        duplicate->flow && !duplicate->flow->reset,"1080p duplicate bypassed NR evaluation with contiguous guides");
     expect(p.arrive().kind==OutputKind::DelayedNr && p.output.selected_job()==duplicate && p.presented()==pixels,
         "1080p pixel-identical published duplicate");p.ready();
     expect(p.current()->reused && !pixels.empty(),"1080p consecutive duplicate and identical pixels");
-    std::printf("dedup nr_reused=%u pixels_identical=%zu passes_skipped=2 reset=0 0xe002=0\n",2u,pixels.size());
+    std::printf("dedup nr_reused=%u pixels_identical=%zu nr_passes_skipped=2 guides_contiguous=1 reset=0 0xe002=0\n",2u,pixels.size());
+    expect(_putenv_s("OBS_NR_TEST_DEDUP_SYNC","")==0,"dedup sync restore");
 }
 void jitter(Pipeline& p,const JitterTiming& timing) {
     prime(p);const auto history=p.current()->contract.key.historyEpoch;
@@ -358,6 +385,178 @@ void gpu_timer_fallback(Pipeline& p) {
     p.close();
 }
 }
+std::shared_ptr<model::Job> ready_job(const std::shared_ptr<model::Job>& job) {
+    expect(WaitForSingleObject(job->observed,30000)==WAIT_OBJECT_0,"perf completion timeout");
+    expect(job->ready.load(std::memory_order_acquire),"perf completion callback");
+    return job;
+}
+// High-resolution absolute cadence: the default Sleep granularity (~15.6 ms) lets a
+// 60 Hz synthetic tick drift, which shows up as deadline misses unrelated to NR.
+void wait_until(Clock::time_point deadline) {
+    static HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
+    expect(timer!=nullptr,"high-resolution cadence timer");
+    for(;;) {
+        const auto now=Clock::now();
+        if(now>=deadline)return;
+        const auto remain=std::chrono::duration_cast<std::chrono::microseconds>(deadline-now).count();
+        if(remain<=1200) {YieldProcessor();continue;}
+        LARGE_INTEGER due{};due.QuadPart=-static_cast<LONGLONG>((remain-1000)*10);
+        expect(SetWaitableTimer(timer,&due,0,nullptr,nullptr,0)!=FALSE,"cadence timer arm");
+        expect(WaitForSingleObject(timer,INFINITE)==WAIT_OBJECT_0,"cadence timer wait");
+    }
+}
+double percentile(std::vector<double> values,double q) {
+    if(values.empty())return -1.0;
+    std::sort(values.begin(),values.end());
+    const auto index=std::min(values.size()-1,static_cast<size_t>(q*static_cast<double>(values.size())));
+    return values[index];
+}
+struct PerfCase {
+    uint32_t scale=100;
+    bool stabilize=false,modelB=true,enforce=false,loaded=false;
+};
+// Real 1440p NR+Model B lane with an explicit duplicate burst. The gate drives one
+// complete frame per interval (work latency only); the loaded audit keeps one job
+// outstanding so the settle/display cadence is visible too. Metrics come from the
+// production Job fields, not from the test clock; no frame is dropped.
+struct PerfTrial {
+    double p50=0,p95=0,p99=0,max=0,workerP95=0,queueP95=0,settleP95=0,dedupP95=0,dedupMax=0,applied=1;
+    double gpu=-1,ofaBoot=-1,ofaRefine=-1,guides=-1,ngx=-1,colorPrep=-1,stab=-1;
+    size_t samples=0,dedupSamples=0,considered=0,misses=0,code2=0,evaluated=0,reused=0,eligible=0,published=0;
+};
+double median3(std::array<double,3> v) {std::sort(v.begin(),v.end());return v[1];}
+// Real 1440p NR+Model B lane with an explicit duplicate burst. Three independent
+// steady bursts are summarised by their median (the project's benchmark rule); every
+// trial still reports its own p95, applied denominator, and evaluated count, so no
+// trial may hide dropped NR frames. The loaded audit keeps one job outstanding so the
+// settle/display cadence is visible; the gate drives one complete frame per interval.
+void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kase) {
+    constexpr int frames=48,trials=3;
+    constexpr int duplicateFirst=20,duplicateLast=23;
+    Pipeline p(c,assets,true,kase.stabilize,kase.scale,kase.modelB,2560,1440);
+    prime(p);
+    const char* runtime="?";
+    for(const auto& variant:runtime::allowed_runtimes())
+        if(variant.sha256==c.runtime.sha256) runtime=variant.version.data();
+    const int moving=frames-(duplicateLast-duplicateFirst+1);
+    std::array<PerfTrial,trials> results{};
+    for(int trial=0;trial<trials;++trial) {
+        std::vector<std::shared_ptr<model::Job>> measured;
+        std::vector<Selection> selections;
+        auto deadline=Clock::now();
+        for(int n=0;n<frames;++n) {
+            deadline+=std::chrono::nanoseconds(frame60Ns);
+            wait_until(deadline);
+            if(n>=duplicateFirst && n<=duplicateLast) p.pattern(777+trial*13,0,0);
+            else p.pattern(static_cast<unsigned>(31*n+5+trial*997),0,0);
+            selections.push_back(p.arrive());
+            measured.push_back(p.current());
+            if(kase.loaded) {if(measured.size()>1) ready_job(measured[measured.size()-2]);}
+            else ready_job(measured.back());
+        }
+        for(auto& job:measured) if(!job->ready.load(std::memory_order_acquire)) ready_job(job);
+        const size_t considered=measured.size()>2?measured.size()-2:0;
+        std::vector<double> admits,workers,queues,settles,dedups,gpus;
+        double admitMax=0.0,dedupMax=0.0;
+        double ofaBoot=0.0,ofaRefine=0.0,guidesMs=0.0,ngxMs=0.0,prepMs=0.0,stabMs=0.0;size_t stageN=0;
+        auto& r=results[trial];r.considered=considered;
+        for(size_t i=0;i<considered;++i) {
+            const auto& job=*measured[i];
+            expect(job.chronology[6]>0 && job.admittedQpc>0,"perf job missing completion stamps");
+            admits.push_back(model::qpc_ms(job.chronology[6]-job.admittedQpc));
+            if(admits.size()==1 || admits.back()>admitMax) admitMax=admits.back();
+            workers.push_back(model::qpc_ms(job.chronology[6]-job.dequeuedQpc));
+            queues.push_back(model::qpc_ms(job.dequeuedQpc-job.admittedQpc));
+            settles.push_back(model::qpc_ms(job.settleWaitQpc));
+            if(job.dedupWaitQpc>=0) {
+                dedups.push_back(model::qpc_ms(job.dedupWaitQpc));
+                if(dedups.size()==1 || dedups.back()>dedupMax) dedupMax=dedups.back();
+            }
+            if(job.gpuTiming.gpuMs>=0.0) gpus.push_back(job.gpuTiming.gpuMs);
+            if(job.evaluated && job.gpuTiming.ofaBootstrapMs>=0.0 && job.gpuTiming.ngxPassMs>=0.0) {
+                ofaBoot+=job.gpuTiming.ofaBootstrapMs;ofaRefine+=job.gpuTiming.ofaRefineMs;
+                guidesMs+=job.gpuTiming.guidesShaderMs;ngxMs+=job.gpuTiming.ngxPassMs;
+                prepMs+=job.gpuTiming.colorPrepMs;stabMs+=job.gpuTiming.stabilizeMs>=0.0?job.gpuTiming.stabilizeMs:0.0;
+                ++stageN;
+            }
+            if(job.code==0xe002)++r.code2;
+            if(job.reused)++r.reused;
+            if(job.evaluated)++r.evaluated;
+            if(job.eligible)++r.eligible;
+            if(job.published)++r.published;
+        }
+        for(const auto& selected:selections) if(selected.reason==Reason::DeadlineMiss) ++r.misses;
+        r.applied=r.eligible?static_cast<double>(r.published)/static_cast<double>(r.eligible):1.0;
+        r.p50=percentile(admits,0.50);r.p95=percentile(admits,0.95);r.p99=percentile(admits,0.99);r.max=admitMax;
+        r.workerP95=percentile(workers,0.95);r.queueP95=percentile(queues,0.95);
+        r.settleP95=percentile(settles,0.95);r.samples=dedups.size();r.dedupP95=percentile(dedups,0.95);r.dedupMax=dedupMax;
+        r.gpu=gpus.empty()?-1.0:std::accumulate(gpus.begin(),gpus.end(),0.0)/static_cast<double>(gpus.size());
+        r.ofaBoot=stageN?ofaBoot/stageN:-1.0;r.ofaRefine=stageN?ofaRefine/stageN:-1.0;
+        r.guides=stageN?guidesMs/stageN:-1.0;r.ngx=stageN?ngxMs/stageN:-1.0;
+        r.colorPrep=stageN?prepMs/stageN:-1.0;r.stab=stageN?stabMs/stageN:-1.0;
+        std::printf("NR_PERF_TRIAL {\"scale\":%u,\"stabilize\":%s,\"model\":\"%s\",\"trial\":%d,"
+            "\"admitP50Ms\":%.3f,\"admitP95Ms\":%.3f,\"admitP99Ms\":%.3f,\"admitMaxMs\":%.3f,"
+            "\"workerP95Ms\":%.3f,\"queueP95Ms\":%.3f,\"settleP95Ms\":%.3f,\"dedupSamples\":%zu,\"dedupP95Ms\":%.3f,\"dedupMaxMs\":%.3f,"
+            "\"deadlineMiss\":%zu,\"code0xe002\":%zu,\"evaluated\":%zu,\"reused\":%zu,"
+            "\"eligible\":%zu,\"published\":%zu,\"applied\":%.4f}\n",
+            kase.scale,kase.stabilize?"true":"false",kase.modelB?"B":"A",trial,
+            r.p50,r.p95,r.p99,r.max,r.workerP95,r.queueP95,r.settleP95,r.samples,r.dedupP95,r.dedupMax,
+            r.misses,r.code2,r.evaluated,r.reused,r.eligible,r.published,r.applied);
+        measured.clear();selections.clear();p.jobs.clear();
+    }
+    const auto med=[&](const auto& get) {return median3({get(results[0]),get(results[1]),get(results[2])});};
+    const double p95=med([](const PerfTrial& t){return t.p95;});
+    const double p99=med([](const PerfTrial& t){return t.p99;});
+    const double p50=med([](const PerfTrial& t){return t.p50;});
+    const double worker=med([](const PerfTrial& t){return t.workerP95;});
+    const double dedup=med([](const PerfTrial& t){return t.dedupP95;});
+    const double misses=med([](const PerfTrial& t){return static_cast<double>(t.misses);});
+    const double applied=med([](const PerfTrial& t){return t.applied;});
+    size_t minEval=results[0].evaluated,maxReuse=0,minSamples=results[0].samples,maxCode2=0;
+    for(const auto& t:results) {
+        minEval=std::min(minEval,t.evaluated);maxReuse=std::max(maxReuse,t.reused);
+        minSamples=std::min(minSamples,t.samples);maxCode2=std::max(maxCode2,t.code2);
+    }
+    std::printf("NR_PERF_LANE {\"scale\":%u,\"stabilize\":%s,\"model\":\"%s\",\"runtime\":\"%s\","
+        "\"trials\":%d,\"frames\":%d,\"considered\":%zu,\"moving\":%d,"
+        "\"admitP50Ms\":%.3f,\"admitP95Ms\":%.3f,\"admitP99Ms\":%.3f,"
+        "\"workerP95Ms\":%.3f,\"queueP95Ms\":%.3f,"
+        "\"p95Trials\":[%.3f,%.3f,%.3f],\"missTrials\":[%zu,%zu,%zu],\"dedupP95Trials\":[%.3f,%.3f,%.3f],"
+        "\"appliedTrials\":[%.4f,%.4f,%.4f],\"evaluatedTrials\":[%zu,%zu,%zu],\"reusedTrials\":[%zu,%zu,%zu],"
+        "\"dedupSamples\":%zu,\"dedupP95Ms\":%.3f,\"deadlineMiss\":%.0f,\"code0xe002\":%zu,"
+        "\"evaluated\":%zu,\"reused\":%zu,\"applied\":%.4f,\"gpuMeanMs\":%.3f,"
+        "\"ofaBootstrapMs\":%.3f,\"ofaRefineMs\":%.3f,\"guidesShaderMs\":%.3f,\"ngxPassMs\":%.3f,"
+        "\"colorPrepMs\":%.3f,\"stabilizeMs\":%.3f}\n",
+        kase.scale,kase.stabilize?"true":"false",kase.modelB?"B":"A",runtime,trials,frames,
+        results[0].considered,moving,p50,p95,p99,worker,med([](const PerfTrial& t){return t.queueP95;}),
+        results[0].p95,results[1].p95,results[2].p95,
+        results[0].misses,results[1].misses,results[2].misses,
+        results[0].dedupP95,results[1].dedupP95,results[2].dedupP95,
+        results[0].applied,results[1].applied,results[2].applied,
+        results[0].evaluated,results[1].evaluated,results[2].evaluated,
+        results[0].reused,results[1].reused,results[2].reused,
+        minSamples,dedup,misses,maxCode2,minEval,maxReuse,applied,
+        med([](const PerfTrial& t){return t.gpu;}),med([](const PerfTrial& t){return t.ofaBoot;}),
+        med([](const PerfTrial& t){return t.ofaRefine;}),med([](const PerfTrial& t){return t.guides;}),
+        med([](const PerfTrial& t){return t.ngx;}),med([](const PerfTrial& t){return t.colorPrep;}),
+        med([](const PerfTrial& t){return t.stab;}));
+    if(kase.enforce) {
+        expect(kase.modelB && p.settings.dedupReuse && !kase.stabilize,"budget gate covers Model B + dedup reuse only");
+        // The worker is the unit under test: the queue split is the caller's
+        // capture/display thread, which the NR pre-submit cannot influence. Both
+        // numbers are emitted; only the worker latency is gated here.
+        expect(worker<=16.67,"1440p worker median p95 over one frame interval");
+        expect(minSamples>=2,"dedup path not exercised");
+        expect(dedup<0.2,"dedup readback stalled the worker");
+        expect(misses==0,"deadline miss census");
+        expect(maxCode2==0,"worker evaluation failure census");
+        expect(applied>=0.99,"applied denominator below steady publication");
+        expect(minEval>=static_cast<size_t>(moving-1),"NR frames dropped to lower a percentile");
+        expect(maxReuse<=static_cast<size_t>(duplicateLast-duplicateFirst+1),"dedup reuse rate inflated");
+    }
+    p.jobs.clear();
+    p.close();
+}
 model::Config config(const Host& host,const fs::path& assets,uint64_t intervalNs) {
     model::Config c;
     // The installed allowlisted variant may be either pinned NR build (310.8.0.0 or
@@ -379,6 +578,30 @@ int main(int argc,char** argv) try {
     std::array<wchar_t,32768> exe{};expect(GetModuleFileNameW(nullptr,exe.data(),DWORD(exe.size()))!=0,"test location");
     const auto assets=fs::path(exe.data()).parent_path().parent_path();
     const bool mode1080p=argc>1 && std::string(argv[1])=="--1080p";
+    const std::string mode=argc>1?std::string(argv[1]):std::string{};
+    const bool mode1440p=mode=="--1440p" || mode=="--1440p-baseline";
+    const bool modeAudit=mode=="--1440p-audit";
+    if(mode1440p || modeAudit) {
+        const bool enforce=mode=="--1440p";
+        Host host(2560,1440,60);
+        const auto c=config(host,assets,frame60Ns);
+        const bool modelB=runtime::supports_model_b(c.runtime.sha256);
+        if(enforce && !modelB) throw std::runtime_error("installed NR runtime cannot select Model B");
+        if(modeAudit) {
+            for(const bool perf:{false,true}) for(const auto scale:{100u,85u,75u})
+                perf_lane(c,assets,PerfCase{scale,false,perf,false,true});
+            std::puts("PASS nr_model_pipeline 1440p Model A/B audit");
+            return 0;
+        }
+        const bool loaded=mode=="--1440p-baseline";
+        for(const auto scale:{100u,75u}) {
+            perf_lane(c,assets,PerfCase{scale,false,true,enforce,loaded});
+            if(scale==75u) perf_lane(c,assets,PerfCase{scale,true,true,false,loaded});
+        }
+        if(!enforce) std::puts("NR_PERF_BASELINE_ONLY budgets not asserted");
+        std::puts("PASS nr_model_pipeline 1440p Model B");
+        return 0;
+    }
     if(mode1080p) {
         // Real 1920x1080 OBS video frame with the NR buffer fixed at 640x384.
         for(const unsigned fps: {60u,120u}) {
