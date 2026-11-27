@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "nr_properties.h"
 #include "nr_core.h"
+#include <obs-module.h>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 using namespace nr::properties;
+// The plugin resolves obs_module_text through OBS_MODULE_USE_DEFAULT_LOCALE, and libobs
+// exports no such symbol; this executable mirrors that macro's miss path, returning the key.
+const char* obs_module_text(const char* lookup) {return lookup;}
 void expect(bool value,const char* reason) { if(!value)throw std::runtime_error(reason); }
 #include "passes_properties_tests.inc"
 #include "nr_hotfix_properties_tests.inc"
@@ -52,6 +59,67 @@ void dual_runtime_admission(const std::filesystem::path& fixture)
     std::puts("admission: 310.9.16.0 digest accepted, modified digest hashMismatch, one inspection each, zero load");
     obs_data_release(data);
 }
+struct LocalizedLabel {const char* text;const char* key;};
+void localized_label_mapping()
+{
+    const Labels defaults;
+    const auto localized=localized_labels();
+    expect(localized.perfModel!=defaults.perfModel,"perf model label comes from obs_module_text, not the hardcoded default");
+    expect(localized.hintPerfModel!=defaults.hintPerfModel,"perf model hint comes from obs_module_text");
+    expect(localized.dedupReuse!=defaults.dedupReuse,"dedup reuse label comes from obs_module_text");
+    expect(localized.hintDedupReuse!=defaults.hintDedupReuse,"dedup reuse hint comes from obs_module_text");
+    expect(localized.runtimeInfo!=defaults.runtimeInfo,"runtime info label comes from obs_module_text");
+    for(const LocalizedLabel& label:{LocalizedLabel{localized.perfModel,"NR.PerfModel"},
+            LocalizedLabel{localized.hintPerfModel,"NR.Hint.PerfModel"},LocalizedLabel{localized.dedupReuse,"NR.DedupReuse"},
+            LocalizedLabel{localized.hintDedupReuse,"NR.Hint.DedupReuse"},LocalizedLabel{localized.runtimeInfo,"NR.RuntimeInfo"}})
+        expect(label.text && std::string(label.text)==label.key,"localized label resolves its exact locale key");
+    expect(defaults.perfModelUnavailable && *defaults.perfModelUnavailable &&
+        std::string(defaults.perfModelUnavailable)!=defaults.perfModel,"unavailable explanation has a distinct English fallback");
+    std::puts("localized_labels: 5 NR labels resolve through obs_module_text (key echo stub), unavailable fallback present, not the hardcoded defaults");
+}
+std::filesystem::path locale_dir()
+{
+    std::error_code ec;
+    auto dir=std::filesystem::current_path(ec);
+    for(int depth=0;!ec && depth<6;++depth) {
+        if(std::filesystem::exists(dir/"data"/"locale"/"en-US.ini",ec))return dir/"data"/"locale";
+        if(!dir.has_parent_path()||dir.parent_path()==dir)break;
+        dir=dir.parent_path();
+    }
+    return {};
+}
+void locale_keys()
+{
+    const auto dir=locale_dir();
+    if(dir.empty()) {
+        std::puts("SKIP locale keys: data/locale/en-US.ini not reachable from the test working directory");
+        return;
+    }
+    const char* keys[]={"NR.PerfModel","NR.Hint.PerfModel","NR.PerfModel.Unavailable",
+        "NR.DedupReuse","NR.Hint.DedupReuse","NR.RuntimeInfo"};
+    for(const char* locale:{"en-US.ini","ko-KR.ini"}) {
+        std::ifstream file(dir/locale);
+        if(!file) {
+            std::printf("SKIP locale keys: cannot read data/locale/%s\n",locale);
+            return;
+        }
+        std::vector<std::string> lines;
+        for(std::string line;std::getline(file,line);)lines.push_back(line);
+        for(const char* key:keys) {
+            const std::string prefix=std::string(key)+"=";
+            bool present=false;
+            for(const auto& line:lines) {
+                if(line.rfind(prefix,0)!=0)continue;
+                auto value=line.substr(prefix.size());
+                while(!value.empty() && (value.back()=='\r' || value.back()==' '))value.pop_back();
+                if(!value.empty() && value!="\"\"") {present=true;break;}
+            }
+            const std::string reason=std::string(key)+" missing or empty in data/locale/"+locale;
+            expect(present,reason.c_str());
+        }
+    }
+    std::puts("locale keys: 6/6 NR Model B/dedup/runtime keys present with values in en-US.ini and ko-KR.ini");
+}
 void model_b_controls(const std::shared_ptr<const nr::Settings>& initial)
 {
     auto* data=obs_data_create();defaults(data);
@@ -73,11 +141,23 @@ void model_b_controls(const std::shared_ptr<const nr::Settings>& initial)
     expect(obs_property_next(&row) && std::string(obs_property_name(row))=="nr_perf_model" &&
         obs_property_next(&row) && std::string(obs_property_name(row))=="nr_dedup_reuse" &&
         obs_property_next(&row) && std::string(obs_property_name(row))=="nr_runtime_info","performance control order");
+    expect(!obs_properties_get(props,"nr_perf_model_unavailable"),"available Model B hides the unavailable row");
     obs_properties_destroy(props);
-    Labels unavailable;unavailable.perfModelAvailable=false;
+    Labels unavailable;unavailable.perfModelAvailable=false;unavailable.perfModelUnavailable="U-unavailable";
     auto* gated=controls({},unavailable);
-    expect(!obs_property_enabled(obs_properties_get(gated,"nr_perf_model")),"310.8 Model B control disabled");
+    auto* gatedPerf=obs_properties_get(gated,"nr_perf_model");
+    expect(gatedPerf && !obs_property_enabled(gatedPerf),"310.8 Model B control disabled");
+    expect(std::string(obs_property_long_description(gatedPerf))=="U-unavailable","disabled Model B tooltip explains why");
+    auto* note=obs_properties_get(gated,"nr_perf_model_unavailable");
+    expect(note && obs_property_get_type(note)==OBS_PROPERTY_TEXT && !obs_property_enabled(note) &&
+        std::string(obs_property_description(note))=="U-unavailable","Model B unavailable row exact text and disabled state");
+    auto* afterRuntime=obs_properties_get(gated,"nr_runtime_info");
+    expect(obs_property_next(&afterRuntime) && std::string(obs_property_name(afterRuntime))=="nr_perf_model_unavailable",
+        "unavailable row follows the runtime info row");
+    std::puts("model_b_controls: 310.8 Model B checkbox disabled, tooltip 'U-unavailable', nr_perf_model_unavailable TEXT row disabled with 'U-unavailable' after nr_runtime_info, available Model B hides the row");
     obs_properties_destroy(gated);
+    localized_label_mapping();
+    locale_keys();
     obs_data_release(data);
 }
 struct CpuProcessor final:nr::pipeline::Processor {

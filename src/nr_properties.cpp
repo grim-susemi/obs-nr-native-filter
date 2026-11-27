@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "nr_properties.h"
 #include "nr_core.h"
+#include <obs-module.h>
 namespace nr::properties {
 std::optional<unsigned> deadline_warning(uint32_t total,uint32_t late)
 {
@@ -279,6 +280,18 @@ static bool on_nr_preset_or_layout_changed(obs_properties_t* props,obs_property_
     sync_visibility(props,data);
     return true;
 }
+// Kept next to controls() so the plugin entry point and the contract tests resolve the
+// Model B / dedup-reuse / runtime labels through the same locale lookups.
+Labels localized_labels()
+{
+    Labels labels;
+    labels.perfModel=obs_module_text("NR.PerfModel");
+    labels.hintPerfModel=obs_module_text("NR.Hint.PerfModel");
+    labels.dedupReuse=obs_module_text("NR.DedupReuse");
+    labels.hintDedupReuse=obs_module_text("NR.Hint.DedupReuse");
+    labels.runtimeInfo=obs_module_text("NR.RuntimeInfo");
+    return labels;
+}
 obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
 {
     auto* props=obs_properties_create();
@@ -300,13 +313,18 @@ obs_properties_t* controls(const StatusSnapshot& snapshot,const Labels& labels)
     obs_property_int_set_suffix(pScale,"%");
     obs_property_set_long_description(pScale,labels.hintWorkScale);
     auto* pPerf=obs_properties_add_bool(grpBasic,"nr_perf_model",labels.perfModel);
-    obs_property_set_long_description(pPerf,labels.hintPerfModel);
+    const bool modelBGated=!labels.perfModelAvailable && labels.perfModelUnavailable;
+    obs_property_set_long_description(pPerf,modelBGated?labels.perfModelUnavailable:labels.hintPerfModel);
     obs_property_set_enabled(pPerf,labels.perfModelAvailable);
     auto* pDedup=obs_properties_add_bool(grpBasic,"nr_dedup_reuse",labels.dedupReuse);
     obs_property_set_long_description(pDedup,labels.hintDedupReuse);
     auto* pRuntime=obs_properties_add_text(grpBasic,"nr_runtime_info",
         labels.runtimeInfoText?labels.runtimeInfoText:labels.runtimeInfo,OBS_TEXT_INFO);
     obs_property_set_enabled(pRuntime,false);
+    if(modelBGated) {
+        auto* pUnavailable=obs_properties_add_text(grpBasic,"nr_perf_model_unavailable",labels.perfModelUnavailable,OBS_TEXT_INFO);
+        obs_property_set_enabled(pUnavailable,false);
+    }
     obs_properties_add_group(props,"nr_grp_basic",labels.groupBasic,OBS_GROUP_NORMAL,grpBasic);
 
     auto* grpPass1=obs_properties_create();

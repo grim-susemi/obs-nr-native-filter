@@ -43,6 +43,7 @@ struct Labels {
     const char* runtimeInfo="NR runtime";
     const char* hintPerfModel="310.9.16.0 only: switches the NGX NR network from Model A full weights to the verified Model B small-FP8 preset. 310.8.0.0 keeps Model A.";
     const char* hintDedupReuse="When consecutive source frames are identical, reuse the previous NR result instead of evaluating again.";
+    const char* perfModelUnavailable="Performance model (Model B) needs the 310.9.16.0 NR runtime; the current runtime keeps Model A.";
     const char* preset="NR model preset (0-3)";
     const char* style="NR style";
     const char* styleStandard="Standard";
@@ -98,6 +99,9 @@ struct Labels {
     bool perfModelAvailable=true;
     model::PassStatus passStatus{1,1,0,0};
 };
+// Resolves the Model B, dedup-reuse, and runtime labels through the module locale. The
+// caller keeps the struct defaults for every other field and for perfModelUnavailable.
+Labels localized_labels();
 void sync_visibility(obs_properties_t*,obs_data_t*);
 obs_properties_t* controls(const StatusSnapshot&,const Labels& labels=Labels{});
 }

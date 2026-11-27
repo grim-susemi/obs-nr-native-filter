@@ -544,6 +544,16 @@ obs_properties_t *properties(void *opaque)
     }
     labels.runtimeInfoText=runtimeInfoText.c_str();
     labels.perfModelAvailable=perfModelAvailable;
+    const auto localeLabels=nr::properties::localized_labels();
+    labels.perfModel=localeLabels.perfModel;labels.hintPerfModel=localeLabels.hintPerfModel;
+    labels.dedupReuse=localeLabels.dedupReuse;labels.hintDedupReuse=localeLabels.hintDedupReuse;
+    labels.runtimeInfo=localeLabels.runtimeInfo;
+    if(!perfModelAvailable) {
+        // A locale miss echoes the key; keep the English struct default instead of the echoed key.
+        const char* unavailable=obs_module_text("NR.PerfModel.Unavailable");
+        if(unavailable && *unavailable && std::strcmp(unavailable,"NR.PerfModel.Unavailable")!=0)
+            labels.perfModelUnavailable=unavailable;
+    }
     // Display only: public state/reason codes stay stable (host tests and QA read them); translate here.
     const auto localized=[](const char* prefix,std::string code)->std::string {
         struct Sentence{const char* text;const char* id;};
