@@ -162,24 +162,34 @@ struct NativeVfg::Impl {
         void* image{};
     };
     static constexpr size_t maxExchange = 2 + (max_multiplier - 1);
+    // A pair bank owns every D3D12/CUDA allocation one in-flight pair touches.
+    // It becomes reusable only after its producer CUDA work and every queued
+    // consumer GPU draw that reads it have completed; activePair is retained
+    // past retirement so a reused bank can never be mistaken for the old pair.
+    struct PairBank {
+        std::array<ComPtr<ID3D12Resource>, maxExchange> exchange;
+        std::array<Handle, maxExchange> exported;
+        std::array<MappedBuffer, maxExchange> mapped{};
+        size_t mappedCount{};
+        std::array<CUevent, max_multiplier> subEvents{};
+        std::optional<FgPairTicket> activePair;
+        bool retired{true};
+        ComPtr<ID3D12Fence> consumeFence;
+        uint64_t consumeValue{};
+    };
     Gpu& gpu;
-    std::array<ComPtr<ID3D12Resource>, maxExchange> exchange;
-    std::array<Handle, maxExchange> exported;
+    std::array<PairBank, batch_capacity> banks;
     ComPtr<ID3D12Fence> stageFence;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    std::array<MappedBuffer, maxExchange> mapped{};
-    size_t mappedCount{};
 
     CUdevice device{};
     CUcontext cudaContext{};
     CUstream stream{};
     CUexternalSemaphore stageSemaphore{};
-    std::array<CUevent, max_multiplier> subEvents{};
     bool retained{};
     void* effect{};
     const uint32_t ceiling;
     uint32_t activeMultiplier;
-    std::optional<FgPairTicket> activePair;
     uint64_t nextPairId{};
     bool failed{}, pending{};
     unsigned version{};
@@ -212,7 +222,29 @@ struct NativeVfg::Impl {
         }
     };
 
-    void copy(ID3D12GraphicsCommandList* cmd, ID3D12Resource* texture, size_t bufferIndex) const
+    bool producer_complete(const PairBank& bank) const
+    {
+        if (!bank.activePair) return true;
+        CtxGuard ctx(*this);
+        for (uint32_t sub = 1; sub <= bank.activePair->lastSubmittedSub; ++sub) {
+            const auto status = cuEventQuery(bank.subEvents[sub]);
+            if (status == CUDA_ERROR_NOT_READY) return false;
+            cu_check(status, "cuEventQuery");
+        }
+        return true;
+    }
+
+    bool bank_available(size_t index) const
+    {
+        const auto& bank = banks[index];
+        if (!bank.activePair) return true;
+        if (!bank.retired || !producer_complete(bank)) return false;
+        if (!bank.consumeFence) return true;
+        const auto completed = bank.consumeFence->GetCompletedValue();
+        return completed != UINT64_MAX && completed >= bank.consumeValue;
+    }
+
+    void copy(ID3D12GraphicsCommandList* cmd, const PairBank& bank, ID3D12Resource* texture, size_t bufferIndex) const
     {
         const bool input = bufferIndex < 2;
         D3D12_RESOURCE_BARRIER barrier{};
@@ -220,7 +252,8 @@ struct NativeVfg::Impl {
             input ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST};
         cmd->ResourceBarrier(1, &barrier);
         const D3D12_TEXTURE_COPY_LOCATION tex{texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {0}};
-        const D3D12_TEXTURE_COPY_LOCATION buf{exchange[bufferIndex].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, footprint};
+        const D3D12_TEXTURE_COPY_LOCATION buf{bank.exchange[bufferIndex].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            footprint};
         cmd->CopyTextureRegion(input ? &buf : &tex, 0, 0, 0, input ? &tex : &buf, nullptr);
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
         cmd->ResourceBarrier(1, &barrier);
@@ -239,13 +272,16 @@ struct NativeVfg::Impl {
                 }
                 if (stageSemaphore) (void)cuDestroyExternalSemaphore(stageSemaphore);
                 if (effect && destroyEffect) destroyEffect(effect);
-                for (size_t i = 0; i < mappedCount; ++i) {
-                    if (mapped[i].image && imageDestroy) imageDestroy(mapped[i].image);
-                    if (mapped[i].pointer && cuMemFree) (void)cuMemFree(mapped[i].pointer);
-                    if (mapped[i].memory && cuDestroyExternalMemory) (void)cuDestroyExternalMemory(mapped[i].memory);
-                }
-                for (auto& ev : subEvents) {
-                    if (ev && cuEventDestroy) (void)cuEventDestroy(ev);
+                for (auto& bank : banks) {
+                    for (size_t i = 0; i < bank.mappedCount; ++i) {
+                        if (bank.mapped[i].image && imageDestroy) imageDestroy(bank.mapped[i].image);
+                        if (bank.mapped[i].pointer && cuMemFree) (void)cuMemFree(bank.mapped[i].pointer);
+                        if (bank.mapped[i].memory && cuDestroyExternalMemory)
+                            (void)cuDestroyExternalMemory(bank.mapped[i].memory);
+                    }
+                    for (auto& ev : bank.subEvents) {
+                        if (ev && cuEventDestroy) (void)cuEventDestroy(ev);
+                    }
                 }
                 if (stream && cuStreamDestroy) (void)cuStreamDestroy(stream);
                 (void)cuCtxPopCurrent(&prev);
@@ -337,8 +373,10 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, Gpu& gpu, const Session& sessio
         desc.handle.win32.handle = fenceHandle.h;
         p.cu_check(p.cuImportExternalSemaphore(&p.stageSemaphore, &desc), "cuImportExternalSemaphore");
     }
-    for (uint32_t s = 1; s < p.ceiling; ++s) {
-        p.cu_check(p.cuEventCreate(&p.subEvents[s], 2u /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
+    for (auto& bank : p.banks) {
+        for (uint32_t s = 1; s < p.ceiling; ++s) {
+            p.cu_check(p.cuEventCreate(&bank.subEvents[s], 2u /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
+        }
     }
 
     const std::array<const wchar_t*, 5> deps{
@@ -388,27 +426,31 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, Gpu& gpu, const Session& sessio
     buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     const auto allocated = device->GetResourceAllocationInfo(0, 1, &buffer).SizeInBytes;
     const size_t total = 2 + (p.ceiling - 1);
-    for (size_t i = 0; i < total; ++i) {
-        check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
-            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&p.exchange[i])), "CUDA exchange buffer");
-        check(device->CreateSharedHandle(p.exchange[i].Get(), nullptr, GENERIC_ALL, nullptr, &p.exported[i].h),
-            "CUDA resource NT handle");
-        auto& buf = p.mapped[i];
-        CUDA_EXTERNAL_MEMORY_HANDLE_DESC hdesc{};
-        hdesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
-        hdesc.handle.win32.handle = p.exported[i].h;
-        hdesc.size = allocated;
-        hdesc.flags = CU_EXTERNAL_MEMORY_DEDICATED;
-        p.cu_check(p.cuImportExternalMemory(&buf.memory, &hdesc), "cuImportExternalMemory");
-        p.mappedCount = i + 1;
+    for (auto& bank : p.banks) {
+        for (size_t i = 0; i < total; ++i) {
+            check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &buffer,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&bank.exchange[i])), "CUDA exchange buffer");
+            check(device->CreateSharedHandle(bank.exchange[i].Get(), nullptr, GENERIC_ALL, nullptr, &bank.exported[i].h),
+                "CUDA resource NT handle");
+            auto& buf = bank.mapped[i];
+            CUDA_EXTERNAL_MEMORY_HANDLE_DESC hdesc{};
+            hdesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
+            hdesc.handle.win32.handle = bank.exported[i].h;
+            hdesc.size = allocated;
+            hdesc.flags = CU_EXTERNAL_MEMORY_DEDICATED;
+            p.cu_check(p.cuImportExternalMemory(&buf.memory, &hdesc), "cuImportExternalMemory");
+            bank.mappedCount = i + 1;
 
-        CUDA_EXTERNAL_MEMORY_BUFFER_DESC bdesc{};
-        bdesc.size = bytes;
-        p.cu_check(p.cuExternalMemoryGetMappedBuffer(&buf.pointer, buf.memory, &bdesc), "cuExternalMemoryGetMappedBuffer");
-        p.cv_check(p.imageCreate(1, 1, pixFmt, compType, layout, 0, 1, &buf.image), "NvCVImage_Create");
-        p.imageDealloc(buf.image);
-        p.cv_check(p.imageInit(buf.image, session.width, session.height, static_cast<int>(p.footprint.Footprint.RowPitch),
-            reinterpret_cast<void*>(buf.pointer), pixFmt, compType, layout, 1), "NvCVImage_Init");
+            CUDA_EXTERNAL_MEMORY_BUFFER_DESC bdesc{};
+            bdesc.size = bytes;
+            p.cu_check(p.cuExternalMemoryGetMappedBuffer(&buf.pointer, buf.memory, &bdesc),
+                "cuExternalMemoryGetMappedBuffer");
+            p.cv_check(p.imageCreate(1, 1, pixFmt, compType, layout, 0, 1, &buf.image), "NvCVImage_Create");
+            p.imageDealloc(buf.image);
+            p.cv_check(p.imageInit(buf.image, session.width, session.height,
+                static_cast<int>(p.footprint.Footprint.RowPitch), reinterpret_cast<void*>(buf.pointer), pixFmt, compType,
+                layout, 1), "NvCVImage_Init");
+        }
     }
 
     const auto mode = static_cast<unsigned>(decode_quality(session.quality));
@@ -419,12 +461,12 @@ NativeVfg::NativeVfg(const fs::path& runtimeDir, Gpu& gpu, const Session& sessio
     p.cv_check(p.setU32(p.effect, "Mode", mode), "Mode");
     p.cv_check(p.setU32(p.effect, "AutomaticShotChangeDetectionEnabled", gpuShotChange ? 0u : 1u),
         "AutomaticShotChangeDetectionEnabled");
-    p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "initial SrcImage0");
-    p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "initial SrcImage1");
+    p.cv_check(p.setImage(p.effect, "SrcImage0", p.banks[0].mapped[0].image), "initial SrcImage0");
+    p.cv_check(p.setImage(p.effect, "SrcImage1", p.banks[0].mapped[1].image), "initial SrcImage1");
     if (beat) beat();
     p.cv_check(p.loadEffect(p.effect), "NvVFX_Load");
     if (beat) beat();
-    p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[2].image), "initial DstImage0");
+    p.cv_check(p.setImage(p.effect, "DstImage0", p.banks[0].mapped[2].image), "initial DstImage0");
     p.cv_check(p.setU32(p.effect, "FrameMultiplier", p.activeMultiplier), "FrameMultiplier");
 }
 
@@ -433,12 +475,20 @@ NativeVfg::~NativeVfg() = default;
 std::optional<FgPairTicket> NativeVfg::submit_pair(const FgPairDesc& pair, unsigned prevIndex, unsigned currIndex)
 {
     auto& p = *impl_;
-    if (p.activePair && !subframe_ready(*p.activePair, p.activePair->lastSubmittedSub)) return {};
     if (pair.effectiveMultiplier < 2 || pair.effectiveMultiplier > p.ceiling)
         check(E_INVALIDARG, "Native VFG pair multiplier");
+    size_t bankIndex = p.banks.size();
+    for (size_t b = 0; b < p.banks.size(); ++b) {
+        if (p.bank_available(b)) {
+            bankIndex = b;
+            break;
+        }
+    }
+    if (bankIndex == p.banks.size()) return {};
+    auto& bank = p.banks[bankIndex];
     const auto stageFence = p.gpu.record_draw([&](ID3D12GraphicsCommandList* cmd) {
-        p.copy(cmd, pair.prevTex, 0);
-        p.copy(cmd, pair.currTex, 1);
+        p.copy(cmd, bank, pair.prevTex, 0);
+        p.copy(cmd, bank, pair.currTex, 1);
     });
     if (!stageFence) return {};
     p.gpu.mark_inputs_read(prevIndex, currIndex, stageFence);
@@ -454,35 +504,40 @@ std::optional<FgPairTicket> NativeVfg::submit_pair(const FgPairDesc& pair, unsig
         CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait{};
         wait.params.fence.value = stageFence;
         p.cu_check(p.cuWaitExternalSemaphoresAsync(&p.stageSemaphore, &wait, 1, p.stream), "cuWaitExternalSemaphoresAsync");
-        p.cv_check(p.setImage(p.effect, "SrcImage0", p.mapped[0].image), "SetImage SrcImage0");
-        p.cv_check(p.setImage(p.effect, "SrcImage1", p.mapped[1].image), "SetImage SrcImage1");
+        p.cv_check(p.setImage(p.effect, "SrcImage0", bank.mapped[0].image), "SetImage SrcImage0");
+        p.cv_check(p.setImage(p.effect, "SrcImage1", bank.mapped[1].image), "SetImage SrcImage1");
         if (p.activeMultiplier != pair.effectiveMultiplier) {
             p.cv_check(p.setU32(p.effect, "FrameMultiplier", pair.effectiveMultiplier), "FrameMultiplier");
             p.activeMultiplier = pair.effectiveMultiplier;
         }
         p.cv_check(p.setU32(p.effect, "ShotChange", pair.shotCut ? 1u : 0u), "SetU32 ShotChange");
         for (uint32_t sub = 1; sub < p.activeMultiplier; ++sub) {
-            p.cv_check(p.setImage(p.effect, "DstImage0", p.mapped[1 + sub].image), "SetImage DstImage0");
+            p.cv_check(p.setImage(p.effect, "DstImage0", bank.mapped[1 + sub].image), "SetImage DstImage0");
             p.cv_check(p.setU32(p.effect, "FrameIndex", sub), "SetU32 FrameIndex");
             p.cv_check(p.runEffect(p.effect, 1), "NvVFX_Run");
-            p.cu_check(p.cuEventRecord(p.subEvents[sub], p.stream), "cuEventRecord");
+            p.cu_check(p.cuEventRecord(bank.subEvents[sub], p.stream), "cuEventRecord");
         }
     }
     if (pair.onEnqueued) pair.onEnqueued(clock_ns() - enqueueStart);
     const auto id = ++p.nextPairId;
-    p.activePair.emplace(FgPairTicket{id, prevIndex, currIndex, p.activeMultiplier, p.activeMultiplier - 1,
-        static_cast<uint32_t>(id % 2)});
+    bank.activePair.emplace(FgPairTicket{id, prevIndex, currIndex, p.activeMultiplier, p.activeMultiplier - 1,
+        static_cast<uint32_t>(bankIndex)});
+    bank.retired = false;
+    bank.consumeFence.Reset();
+    bank.consumeValue = 0;
     p.failed = false;
-    return p.activePair;
+    return bank.activePair;
 }
 
 bool NativeVfg::subframe_ready(const FgPairTicket& ticket, uint32_t subIndex)
 {
     auto& p = *impl_;
-    if (p.failed || !p.activePair || ticket != *p.activePair || !subIndex || subIndex > ticket.lastSubmittedSub)
+    if (p.failed || ticket.slotParity >= p.banks.size()) return false;
+    auto& bank = p.banks[ticket.slotParity];
+    if (!bank.activePair || ticket != *bank.activePair || !subIndex || subIndex > ticket.lastSubmittedSub)
         return false;
     Impl::CtxGuard ctx(p);
-    const auto status = p.cuEventQuery(p.subEvents[subIndex]);
+    const auto status = p.cuEventQuery(bank.subEvents[subIndex]);
     if (status == CUDA_ERROR_NOT_READY) return false;
     p.failed = status != CUDA_SUCCESS;
     p.cu_check(status, "cuEventQuery");
@@ -493,9 +548,22 @@ void NativeVfg::resolve_subframe(ID3D12GraphicsCommandList* cmd, const FgPairTic
     ID3D12Resource* outTex, uint32_t sub)
 {
     const auto& p = *impl_;
-    if (p.failed || !p.activePair || ticket != *p.activePair || !sub || sub > ticket.lastSubmittedSub)
+    if (p.failed || ticket.slotParity >= p.banks.size()) check(E_INVALIDARG, "inactive Native VFG pair");
+    const auto& bank = p.banks[ticket.slotParity];
+    if (!bank.activePair || ticket != *bank.activePair || !sub || sub > ticket.lastSubmittedSub)
         check(E_INVALIDARG, "inactive Native VFG pair");
-    p.copy(cmd, outTex, 1 + sub);
+    p.copy(cmd, bank, outTex, 1 + sub);
+}
+
+void NativeVfg::retire_pair(const FgPairTicket& ticket, ID3D12Fence* consumeFence, uint64_t consumeValue) noexcept
+{
+    auto& p = *impl_;
+    if (ticket.slotParity >= p.banks.size()) return;
+    auto& bank = p.banks[ticket.slotParity];
+    if (!bank.activePair || *bank.activePair != ticket) return;
+    bank.consumeFence = consumeFence;
+    bank.consumeValue = consumeValue;
+    bank.retired = true;
 }
 
 void NativeVfg::synchronize()

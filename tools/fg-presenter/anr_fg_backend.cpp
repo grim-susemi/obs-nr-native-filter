@@ -21,6 +21,9 @@ struct AnrFgBackend::Impl {
     std::optional<FlowImage> previous;
     std::optional<JobKey> pending;
     std::optional<FgPairTicket> ticket;
+    ComPtr<ID3D12Fence> consumeFence;
+    uint64_t consumeValue{};
+    bool retired{true};
     std::array<std::optional<Output>, max_multiplier - 1> selection;
     unsigned generated{}, slot{};
     uint64_t lastSerial{}, sequence{}, epoch{}, pairId{};
@@ -38,6 +41,13 @@ struct AnrFgBackend::Impl {
         if (!pending) return;
         if (!guides->collect(*pending, commands->last_point())) check(E_FAIL, "ANR guide collect");
         pending.reset();
+    }
+
+    bool consumer_complete() const
+    {
+        if (!consumeFence) return true;
+        const auto completed = consumeFence->GetCompletedValue();
+        return completed != UINT64_MAX && completed >= consumeValue;
     }
 
     bool evaluate_frame(ID3D12Resource* color, uint64_t serial, unsigned count, bool reset)
@@ -144,7 +154,10 @@ std::optional<FgPairTicket> AnrFgBackend::submit_pair(const FgPairDesc& pair, un
 {
     if (faulted_ || pair.discontinuity || pair.effectiveMultiplier < 2) return {};
     auto& s = *impl_;
-    if (s.ticket && !pair_complete(*s.ticket)) return {};
+    // A presented pair keeps the single bank reserved: retire_pair names the
+    // consumer draw completion point, and no later pair may reuse the guides,
+    // commands or dispatch allocations before that fence reaches its value.
+    if (s.ticket && (!s.retired || !pair_complete(*s.ticket) || !s.consumer_complete())) return {};
     s.ticket.reset();
     const unsigned count = std::min(s.generated, pair.effectiveMultiplier - 1);
     try {
@@ -177,8 +190,21 @@ std::optional<FgPairTicket> AnrFgBackend::submit_pair(const FgPairDesc& pair, un
         return {};
     }
     s.selection = {};
-    s.ticket.emplace(FgPairTicket{++s.pairId, prevIndex, currIndex, count + 1, count, s.slot});
+    s.ticket.emplace(FgPairTicket{++s.pairId, prevIndex, currIndex, count + 1, count, 0});
+    s.retired = false;
+    s.consumeFence.Reset();
+    s.consumeValue = 0;
     return s.ticket;
+}
+
+void AnrFgBackend::retire_pair(const FgPairTicket& ticket, ID3D12Fence* consumeFence, uint64_t consumeValue) noexcept
+{
+    if (!impl_) return;
+    auto& s = *impl_;
+    if (!s.ticket || *s.ticket != ticket) return;
+    s.consumeFence = consumeFence;
+    s.consumeValue = consumeValue;
+    s.retired = true;
 }
 
 bool AnrFgBackend::pair_complete(const FgPairTicket& ticket) const

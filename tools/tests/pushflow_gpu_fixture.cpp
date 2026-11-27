@@ -167,7 +167,9 @@ bool exercise_pair(Gpu& gpu, PushFlowBackend& backend, const Session& session, u
         pixels = readback(gpu, backend, *ticket, sub);
         samples[sub - 1] = {{static_cast<int>(session.width), static_cast<int>(session.height), pixels}, double(sub) / mult};
     }
-    return verify_interpolated_sequence(std::span(samples).first(mult - 1), endpointA, endpointB);
+    const bool ordered = verify_interpolated_sequence(std::span(samples).first(mult - 1), endpointA, endpointB);
+    backend.retire_pair(*ticket);
+    return ordered;
 }
 }
 

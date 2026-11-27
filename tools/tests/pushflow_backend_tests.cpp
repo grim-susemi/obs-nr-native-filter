@@ -3,6 +3,7 @@
 #include "pushflow_review_contracts.h"
 #include "../fg-presenter/vfg_gpu.h"
 #include <array>
+#include <cstdlib>
 
 namespace {
 using namespace nr::fg;
@@ -216,6 +217,139 @@ void loader_failures(TestRun& test, const fs::path& dir)
             manual.effective(4) == 1 && !fs::exists(quarantine), "new manual preview evaluates marker policy again");
     }
 }
+
+struct BankFixture {
+    HWND window;
+    Session session{};
+    std::unique_ptr<nr::fg::vfg::Gpu> gpu;
+    explicit BankFixture(const fs::path& runtime)
+        : window(CreateWindowExW(0, L"STATIC", L"PushFlow bank fixture", WS_POPUP, 0, 0, fixtureWidth, fixtureHeight,
+              nullptr, nullptr, GetModuleHandleW(nullptr), nullptr))
+    {
+        if (!window) throw std::runtime_error("bank fixture window");
+        ComPtr<IDXGIFactory6> factory;
+        ComPtr<IDXGIAdapter1> adapter;
+        check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "bank fixture DXGI factory");
+        check(factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)),
+            "bank fixture GPU adapter");
+        DXGI_ADAPTER_DESC1 info{};
+        check(adapter->GetDesc1(&info), "bank fixture adapter description");
+        if (info.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) throw std::runtime_error("bank fixture requires a hardware adapter");
+        session.backend = Backend::PushFlow;
+        session.pushflowTier = PushFlowTier::Fast;
+        session.multiplier = 2;
+        session.width = fixtureWidth;
+        session.height = fixtureHeight;
+        session.adapter = info.AdapterLuid;
+        const auto path = fs::absolute(runtime);
+        if (path.native().size() >= ARRAYSIZE(session.pushflowRuntimeDir))
+            throw std::runtime_error("bank fixture runtime path too long");
+        wcscpy_s(session.pushflowRuntimeDir, path.c_str());
+        gpu = std::make_unique<nr::fg::vfg::Gpu>(session, window, session.multiplier);
+    }
+    ~BankFixture()
+    {
+        if (window) DestroyWindow(window);
+    }
+    BankFixture(const BankFixture&) = delete;
+    BankFixture& operator=(const BankFixture&) = delete;
+};
+
+bool open_bank_backend(PushFlowBackend& backend, BankFixture& fixture, TestRun& test, const char* label)
+{
+    const bool opened = backend.open({fixture.session, stdout, [] {}, [] { return false; }, 0}, fixture.gpu.get());
+    test.expect(opened, label);
+    return opened;
+}
+
+void close_bank_backend(PushFlowBackend& backend, TestRun& test, const char* label)
+{
+    bool closed = false;
+    try {
+        closed = backend.close();
+    } catch (...) {
+        // The fixture owns an unverified teardown only until process exit.
+    }
+    test.expect(closed, label);
+    if (!closed) {
+        std::fputs("bank fixture owns an unverified PushFlow teardown\n", stderr);
+        std::fflush(stderr);
+        std::_Exit(3);
+    }
+}
+
+bool wait_for_subframe(PushFlowBackend& backend, const FgPairTicket& ticket, uint32_t sub)
+{
+    const auto deadline = GetTickCount64() + 20000;
+    while (!backend.subframe_ready(ticket, sub)) {
+        if (backend.faulted() || GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    }
+    return true;
+}
+
+void deep_pair_banks(TestRun& test, const fs::path& runtime)
+{
+    BankFixture fixture(runtime);
+    const auto submit = [&](PushFlowBackend& backend, uint64_t first, uint64_t second) {
+        return backend.submit_pair({fixture.gpu->input[0].Get(), fixture.gpu->input[1].Get(), first, second, 2, false}, 0, 1);
+    };
+    {
+        PushFlowBackend backend;
+        if (!open_bank_backend(backend, fixture, test, "2-deep overlap fixture opens PushFlow")) {
+            close_bank_backend(backend, test, "2-deep overlap teardown");
+            return;
+        }
+        const auto first = submit(backend, 1, 2);
+        test.expect(first && first->slotParity == 0, "first admitted pair occupies bank 0");
+        std::printf("PUSHFLOW pair=1 accepted=%d bank=%u\n", first ? 1 : 0, first ? first->slotParity : 99u);
+        const auto second = submit(backend, 3, 4);
+        test.expect(second && second->slotParity == 1, "second pair overlaps in bank 1 while bank 0 is unretired");
+        std::printf("PUSHFLOW pair=2 accepted=%d bank=%u bank0=unretired\n", second ? 1 : 0,
+            second ? second->slotParity : 99u);
+        const auto third = submit(backend, 5, 6);
+        test.expect(!third, "third pair refused while both banks are reserved");
+        std::printf("PUSHFLOW pair=3 accepted=%d reason=both_banks_reserved\n", third ? 1 : 0);
+        close_bank_backend(backend, test, "2-deep overlap teardown drains both banks");
+    }
+    {
+        PushFlowBackend backend;
+        if (!open_bank_backend(backend, fixture, test, "delayed consumer fence fixture opens PushFlow")) {
+            close_bank_backend(backend, test, "delayed fence teardown");
+            return;
+        }
+        ComPtr<ID3D12Fence> consume;
+        check(fixture.gpu->d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&consume)),
+            "consumer completion fence");
+        const auto first = submit(backend, 7, 8);
+        test.expect(first && first->slotParity == 0, "delayed-fence pair 1 occupies bank 0");
+        if (!first) {
+            close_bank_backend(backend, test, "delayed fence teardown");
+            return;
+        }
+        test.expect(wait_for_subframe(backend, *first, first->lastSubmittedSub), "pair 1 producer subframe completes");
+        backend.retire_pair(*first, consume.Get(), 10);
+        test.expect(consume->GetCompletedValue() < 10, "consumer completion fence stays below its retire value");
+        const auto second = submit(backend, 9, 10);
+        test.expect(second && second->slotParity == 1, "retired bank 0 leaves bank 1 as the only free bank");
+        std::printf("PUSHFLOW pair=2 accepted=%d bank=%u consumer=0/10\n", second ? 1 : 0,
+            second ? second->slotParity : 99u);
+        const auto blocked = submit(backend, 11, 12);
+        test.expect(!blocked, "retired bank 0 stays reserved while its consumer GPU fence is below value");
+        std::printf("PUSHFLOW pair=3 accepted=%d reason=bank0_consumer_pending completed=0/10\n", blocked ? 1 : 0);
+        Handle ready;
+        ready.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const auto signalled = ready.h ? fixture.gpu->drawQueue->Signal(consume.Get(), 10) : E_FAIL;
+        const auto armed = SUCCEEDED(signalled) ? consume->SetEventOnCompletion(10, ready.h) : signalled;
+        test.expect(SUCCEEDED(signalled) && SUCCEEDED(armed) && WaitForSingleObject(ready.h, 5000) == WAIT_OBJECT_0 &&
+            consume->GetCompletedValue() == 10, "consumer GPU fence reaches its retire value");
+        const auto released = submit(backend, 13, 14);
+        test.expect(released && released->slotParity == 0, "consumer GPU completion releases bank 0");
+        std::printf("PUSHFLOW pair=4 accepted=%d bank=%u consumer=10/10\n", released ? 1 : 0,
+            released ? released->slotParity : 99u);
+        close_bank_backend(backend, test, "delayed fence teardown drains both banks");
+    }
+}
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -251,7 +385,10 @@ int wmain(int argc, wchar_t** argv)
         lifecycle(test, scratch.path / L"markers");
         ownership_and_timeout_controls(test, scratch.path / L"ring");
         model_facts(test, scratch.path);
-        if (size && size < ARRAYSIZE(runtime) && !test.failures) real_pushflow(test, runtime, expected);
+        if (size && size < ARRAYSIZE(runtime) && !test.failures) {
+            real_pushflow(test, runtime, expected);
+            if (!test.failures) deep_pair_banks(test, runtime);
+        }
         else if (required) test.expect(false, "required OBS_NR_PUSHFLOW_RUNTIME was not exercised");
         else if (expected) test.expect(false, "cannot verify --expect-outputs without OBS_NR_PUSHFLOW_RUNTIME");
         else std::puts("SKIP optional runtime: OBS_NR_PUSHFLOW_RUNTIME not configured");

@@ -2,11 +2,15 @@
 #pragma once
 #include <windows.h>
 #include <d3d12.h>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
 
 namespace nr::fg::vfg {
+// The presenter schedules at most two pairs through one backend. A backend
+// that cannot overlap keeps the default single pair in flight.
+inline constexpr size_t batch_capacity = 2;
 struct FgPairTicket {
     const uint64_t pairId;
     const unsigned prevIndex, currIndex;
@@ -33,6 +37,14 @@ public:
     virtual const char* name() const noexcept = 0;
     virtual unsigned version_tag() const noexcept = 0;
     virtual bool faulted() const noexcept = 0;
+    virtual size_t max_in_flight_pairs() const noexcept { return 1; }
+    // A pair still occupies its bank while presentation reads it. retire_pair
+    // records the consumer completion point: the bank must stay reserved until
+    // every queued draw that reads the pair has finished on the GPU as well.
+    // Submitting or dropping CPU-side work is not GPU completion.
+    virtual void retire_pair(const FgPairTicket& /*ticket*/, ID3D12Fence* /*consumeFence*/ = nullptr,
+        uint64_t /*consumeValue*/ = 0) noexcept
+    {}
     // A transport break is never a valid interpolation pair. A shot cut is
     // still submitted so the shared GPU display path can consume its predicate.
     std::optional<FgPairTicket> try_submit_pair(const FgPairDesc& pair, unsigned prevIndex, unsigned currIndex)

@@ -12,6 +12,18 @@ constexpr size_t subframes = max_multiplier - 1;
 }
 
 struct PushFlowBackend::Impl {
+    // A pair bank owns its command allocators, subframe completion fences and
+    // consumer completion point. The bank is reusable only after both the
+    // producer subframe fences and the consumer draws that read the outputs have
+    // completed on the GPU; retired stays true until a new pair claims it.
+    struct PairBank {
+        std::array<pf::Command, subframes> packs, resolves;
+        std::array<UINT64, subframes> subfences{};
+        std::optional<FgPairTicket> ticket;
+        ComPtr<ID3D12Fence> consumeFence;
+        UINT64 consumeValue{};
+        bool retired{};
+    };
     const PushFlowOpen callbacks;
     pf::StartingMarker marker{pf::marker_directory(), callbacks.session.markerOwnerToken};
     pf::OrtState ort{callbacks.log};
@@ -20,11 +32,9 @@ struct PushFlowBackend::Impl {
     std::array<ComPtr<ID3D12Resource>, content_input_count> retainedInputs;
     std::array<ComPtr<ID3D12Resource>, 2 * subframes> retainedOutputs;
     std::optional<pf::Compute> compute;
-    std::array<pf::Command, subframes> packs, resolves;
+    std::array<PairBank, batch_capacity> banks;
     ComPtr<ID3D12Fence> done;
     Handle event;
-    std::optional<FgPairTicket> ticket;
-    std::array<UINT64, subframes> subfences{};
     UINT64 fence{}, pairs{}, inferences{};
     uint32_t maxMultiplier{};
     bool ready{}, queued{}, teardownStarted{}, drained{}, releaseFailed{};
@@ -40,6 +50,23 @@ struct PushFlowBackend::Impl {
             WaitForSingleObject(event.h, drain_ms) != WAIT_OBJECT_0) return false;
         const auto completed = done->GetCompletedValue();
         return completed != UINT64_MAX && completed >= value;
+    }
+
+    bool bank_available(size_t index) const
+    {
+        const auto& bank = banks[index];
+        if (!bank.ticket) return true;
+        if (!bank.retired) return false;
+        const auto completed = done->GetCompletedValue();
+        if (completed == UINT64_MAX) return false;
+        for (const auto value : bank.subfences) {
+            if (value > completed) return false;
+        }
+        if (bank.consumeFence) {
+            const auto consumed = bank.consumeFence->GetCompletedValue();
+            if (consumed == UINT64_MAX || consumed < bank.consumeValue) return false;
+        }
+        return true;
     }
 
     bool stop()
@@ -104,14 +131,16 @@ bool PushFlowBackend::open(const PushFlowOpen& open, Gpu* gpu)
         if (!p.ort.bind(gpu->d3d_device())) return false;
         open.beat();
         p.compute.emplace(*gpu, p.ort, pf::Compute::Config{geometry, facts});
-        for (auto& command : p.packs) command.prepare(gpu->d3d_device());
-        for (auto& command : p.resolves) command.prepare(gpu->d3d_device());
+        for (auto& bank : p.banks) {
+            for (auto& command : bank.packs) command.prepare(gpu->d3d_device());
+            for (auto& command : bank.resolves) command.prepare(gpu->d3d_device());
+        }
         check(gpu->d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p.done)), "PushFlow fence");
         p.event.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!p.event.h) return false;
         open.beat();
-        p.compute->clear_input(p.packs[0].begin());
-        p.packs[0].submit(p.queue.Get());
+        p.compute->clear_input(p.banks[0].packs[0].begin());
+        p.banks[0].packs[0].submit(p.queue.Get());
         p.queued = true;
         const bool warm = p.ort.run() && p.ort.sync() && p.drain();
         open.beat();
@@ -140,17 +169,34 @@ std::optional<FgPairTicket> PushFlowBackend::submit_pair(const FgPairDesc& pair,
 {
     auto& p = *impl_;
     if (!p.ready || faulted_ || pair.discontinuity || pair.effectiveMultiplier <= 1 ||
-        pair.effectiveMultiplier > p.maxMultiplier ||
-        (p.ticket && !subframe_ready(*p.ticket, p.ticket->lastSubmittedSub))) return {};
+        pair.effectiveMultiplier > p.maxMultiplier) return {};
     if (prev >= p.retainedInputs.size() || curr >= p.retainedInputs.size() || prev == curr ||
         pair.prevTex != p.retainedInputs[prev].Get() || pair.currTex != p.retainedInputs[curr].Get()) return {};
-    const FgPairTicket ticket{++p.pairs, prev, curr, pair.effectiveMultiplier, pair.effectiveMultiplier - 1, 0};
-    p.ticket.emplace(ticket);
+    if (p.done->GetCompletedValue() == UINT64_MAX) {
+        faulted_ = runtimeFault_ = true;
+        return {};
+    }
+    size_t bankIndex = p.banks.size();
+    for (size_t b = 0; b < p.banks.size(); ++b) {
+        if (p.bank_available(b)) {
+            bankIndex = b;
+            break;
+        }
+    }
+    if (bankIndex == p.banks.size()) return {};
+    auto& bank = p.banks[bankIndex];
+    const FgPairTicket ticket{++p.pairs, prev, curr, pair.effectiveMultiplier, pair.effectiveMultiplier - 1,
+        static_cast<uint32_t>(bankIndex)};
+    bank.ticket.emplace(ticket);
+    bank.retired = false;
+    bank.consumeFence.Reset();
+    bank.consumeValue = 0;
+    bank.subfences.fill(0);
     uint64_t queuedAt{};
     for (uint32_t sub = 1; sub <= ticket.lastSubmittedSub; ++sub) {
         const pf::Compute::Dispatch work{ticket, sub};
         const auto reads = pf::input_reads(p.ort.shader, sub);
-        const auto& pack = p.packs[sub - 1];
+        const auto& pack = bank.packs[sub - 1];
         p.compute->pack(pack.begin(), work);
         pack.submit(p.queue.Get());
         if (reads.pack) p.gpu->mark_external_inputs_read(prev, curr);
@@ -159,13 +205,13 @@ std::optional<FgPairTicket> PushFlowBackend::submit_pair(const FgPairDesc& pair,
             queuedAt = clock_ns();
         }
         if (!p.ort.run()) break;
-        const auto& resolve = p.resolves[sub - 1];
+        const auto& resolve = bank.resolves[sub - 1];
         p.compute->resolve(resolve.begin(), work);
         resolve.submit(p.queue.Get());
         if (reads.resolve) p.gpu->mark_external_inputs_read(prev, curr);
         const auto value = ++p.fence;
         check(p.queue->Signal(p.done.Get(), value), "PushFlow subframe fence");
-        p.subfences[sub - 1] = value;
+        bank.subfences[sub - 1] = value;
         if (++p.inferences % pf::steady_interval == 0 && (!p.ort.sync() || !p.drain())) break;
         if (!p.marker.steady()) break;
         if (sub == ticket.lastSubmittedSub) {
@@ -180,20 +226,22 @@ std::optional<FgPairTicket> PushFlowBackend::submit_pair(const FgPairDesc& pair,
 bool PushFlowBackend::subframe_ready(const FgPairTicket& ticket, uint32_t sub)
 {
     const auto& p = *impl_;
-    if (faulted_ || !p.ticket || *p.ticket != ticket || sub == 0 || sub > ticket.lastSubmittedSub) return false;
+    if (faulted_ || ticket.slotParity >= p.banks.size() || sub == 0 || sub > ticket.lastSubmittedSub) return false;
+    const auto& bank = p.banks[ticket.slotParity];
+    if (!bank.ticket || *bank.ticket != ticket) return false;
     const auto completed = p.done->GetCompletedValue();
     if (completed == UINT64_MAX) {
         faulted_ = runtimeFault_ = true;
         return false;
     }
-    return completed >= p.subfences[sub - 1];
+    return completed >= bank.subfences[sub - 1];
 }
 
 void PushFlowBackend::resolve_subframe(ID3D12GraphicsCommandList* cmd, const FgPairTicket& ticket,
     ID3D12Resource* out, uint32_t sub)
 {
     if (!subframe_ready(ticket, sub)) return;
-    auto* source = impl_->retainedOutputs[sub - 1].Get();
+    auto* source = impl_->retainedOutputs[ticket.slotParity * subframes + (sub - 1)].Get();
     if (source == out) return; // The resolve list already returned this presenter texture to COMMON.
     constexpr auto common = D3D12_RESOURCE_STATE_COMMON;
     constexpr auto src = D3D12_RESOURCE_STATE_COPY_SOURCE, dst = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -202,6 +250,18 @@ void PushFlowBackend::resolve_subframe(ID3D12GraphicsCommandList* cmd, const FgP
     cmd->CopyResource(out, source);
     const D3D12_RESOURCE_BARRIER leave[]{pf::transition(source, src, common), pf::transition(out, dst, common)};
     cmd->ResourceBarrier(ARRAYSIZE(leave), leave);
+}
+
+void PushFlowBackend::retire_pair(const FgPairTicket& ticket, ID3D12Fence* consumeFence, uint64_t consumeValue) noexcept
+{
+    if (!impl_) return;
+    auto& p = *impl_;
+    if (ticket.slotParity >= p.banks.size()) return;
+    auto& bank = p.banks[ticket.slotParity];
+    if (!bank.ticket || *bank.ticket != ticket) return;
+    bank.consumeFence = consumeFence;
+    bank.consumeValue = consumeValue;
+    bank.retired = true;
 }
 
 void PushFlowBackend::synchronize()

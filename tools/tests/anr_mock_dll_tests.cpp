@@ -138,6 +138,42 @@ void verify_submission_order(const fs::path& path)
     std::printf("execute_producer_before_consumer=PASS pairs=%u\n", groups);
 }
 
+void verify_single_bank(Graphics& g, const fs::path& dll, const Scratch& s)
+{
+    const auto fixture = stage(s.dir / "single-bank", dll, true);
+    const auto log = s.dir / "single-bank.log";
+    Log fixtureLog(log);
+    AnrFgBackend backend;
+    require(backend.max_in_flight_pairs() == 1, "ANR keeps a single pair in flight");
+    require(backend.open({g.gpu->d3d_device(), g.gpu->drawQueue.Get(), extent, 1, fixture.native(), true,
+        fixtureLog.file, g.gpu.get()}, std::make_unique<FixtureGuides>(g)), "open single-bank mock addon");
+    const auto first = backend.try_submit_pair(pair(g, 1, 60, 2), 0, 1);
+    require(first && first->slotParity == 0, "first ANR pair owns bank 0");
+    std::puts("ANR pair=1 bank=0 accepted=1");
+    require(!backend.try_submit_pair(pair(g, 0, 61, 2), 1, 0), "second ANR pair refused while bank 0 is unretired");
+    std::puts("ANR pair=2 refused=1 reason=bank0_active_unretired");
+    backend.synchronize();
+    ComPtr<ID3D12Fence> consume;
+    check(g.gpu->d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&consume)), "ANR consumer fence");
+    backend.retire_pair(*first, consume.Get(), 5);
+    require(consume->GetCompletedValue() < 5, "consumer fence starts below its retire value");
+    require(!backend.try_submit_pair(pair(g, 0, 62, 2), 1, 0),
+        "retired bank 0 refused while consumer GPU draws are pending");
+    std::puts("ANR pair=3 refused=1 reason=consumer_pending completed=0/5");
+    Handle done;
+    done.h = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    require(done.h && SUCCEEDED(g.gpu->drawQueue->Signal(consume.Get(), 5)) &&
+        SUCCEEDED(consume->SetEventOnCompletion(5, done.h)) && WaitForSingleObject(done.h, 4000) == WAIT_OBJECT_0 &&
+        consume->GetCompletedValue() == 5, "ANR consumer fence completion");
+    const auto released = backend.try_submit_pair(pair(g, 1, 63, 2), 0, 1);
+    require(released && released->slotParity == 0, "consumer completion releases ANR bank 0");
+    std::puts("ANR pair=4 bank=0 accepted=1 completed=5/5");
+    backend.synchronize();
+    backend.retire_pair(*released);
+    require(backend.close(), "close single-bank mock addon");
+    std::puts("ANR single_bank=PASS max_in_flight_pairs=1");
+}
+
 void verify_warp(const fs::path& dll, const Scratch& s)
 {
     Graphics g(true);
@@ -178,6 +214,7 @@ void verify_warp(const fs::path& dll, const Scratch& s)
                 g.record([&](auto* cmd) { backend.resolve_subframe(cmd, *ticket, target, sub); });
                 require(g.transfer(target) == Image(area, color[sub - 1]), "mock GPU color transfer");
             }
+            backend.retire_pair(*ticket);
         }
         {
             const Environment disable(L"OBS_NR_TEST_ANR_DISABLE", L"1");
@@ -190,6 +227,7 @@ void verify_warp(const fs::path& dll, const Scratch& s)
                 backend.output(*ticket, 3) == AnrFgBackend::Output::Ready, "pair sentinel must initialize only on sub 1");
             std::puts("disable_bytes=1,0,0 display_decisions=suppressed,ready,ready");
             verify_display(g, backend, *ticket, white);
+            backend.retire_pair(*ticket);
         }
         {
             const Environment fault(L"OBS_NR_TEST_ANR_FAULT", L"1");
@@ -219,6 +257,7 @@ void verify_warp(const fs::path& dll, const Scratch& s)
             backend.multiplier_limit() == 1, "insufficient provider capability fallback");
     }
     require(contents(trace).substr(events.size()) == "attach\ninit\nshutdown\n", "capability refusal skips create");
+    verify_single_bank(g, dll, s);
     g.verify_debug();
     std::puts("warp_mock=PASS groups=4,2,3 bgra=PASS release_before_shutdown=PASS");
     hardware(fixture, false);

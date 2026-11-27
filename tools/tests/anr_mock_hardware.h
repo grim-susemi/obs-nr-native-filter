@@ -83,6 +83,7 @@ inline void hardware(const std::filesystem::path& dll, bool real)
             }
             if (real)
                 require(nr::fg::qa::verify_interpolated_sequence(frames, left, right), "real B15 anti-blend oracle");
+            backend.retire_pair(*ticket);
         }
     }
     graphics.verify_debug();

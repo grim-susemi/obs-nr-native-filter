@@ -37,6 +37,10 @@ public:
     Output output(const FgPairTicket&, uint32_t sub);
     bool subframe_ready(const FgPairTicket& ticket, uint32_t sub) override { return output(ticket, sub) == Output::Ready; }
     void resolve_subframe(ID3D12GraphicsCommandList*, const FgPairTicket&, ID3D12Resource*, uint32_t) override;
+    // The experimental ANR path owns one guides/commands/dispatch bank, so its
+    // single pair must complete before a second pair can be admitted.
+    size_t max_in_flight_pairs() const noexcept override { return 1; }
+    void retire_pair(const FgPairTicket&, ID3D12Fence* consumeFence = nullptr, uint64_t consumeValue = 0) noexcept override;
     void synchronize() override;
     [[nodiscard]] bool close();
 };

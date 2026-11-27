@@ -21,6 +21,8 @@ public:
     std::optional<FgPairTicket> submit_pair(const FgPairDesc&, unsigned prevIndex, unsigned currIndex) override;
     bool subframe_ready(const FgPairTicket&, uint32_t sub) override;
     void resolve_subframe(ID3D12GraphicsCommandList*, const FgPairTicket&, ID3D12Resource*, uint32_t sub) override;
+    size_t max_in_flight_pairs() const noexcept override { return batch_capacity; }
+    void retire_pair(const FgPairTicket&, ID3D12Fence* consumeFence = nullptr, uint64_t consumeValue = 0) noexcept override;
     void synchronize() override;
 };
 } // namespace nr::fg::vfg
