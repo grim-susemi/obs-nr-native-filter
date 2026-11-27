@@ -484,12 +484,14 @@ struct DedupCompare {
         checked(commands->Close(),"NR compare close");
         ID3D12CommandList* lists[]{commands.Get()};
         context.queue()->ExecuteCommandLists(1,lists);
+        // The list is submitted: from here a failure must retain its inputs for the
+        // fence owner, never free them under an executing command list.
+        pending=true;
         checked(context.queue()->Signal(fence.Get(),++serial),"NR compare signal");
         if(qa_sync()) {
             ResetEvent(event.Get());
             checked(fence->SetEventOnCompletion(serial,event.Get()),"NR compare QA subscription");
         }
-        pending=true;
         return true;
     }
     // nullopt means the readback has not signalled: the caller evaluates NR in full
@@ -1349,7 +1351,20 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     auto* t=job->timeline?&*job->timeline:nullptr;
     job->chronology[0]=stamp();if(p.config.qaObservations||job->observation)job->qaTiming[0]=stamp();
     bool dedupQueued=false;
-    // Submit the duplicate comparison before the settle wait. Its exact fence and
+    auto fail=[&](uint32_t code) {
+        job->code=code; p.reset=true; p.lastResetSetter="presubmit-failure";
+        if(job->gpuSlot) job->gpuSlot->stages=0; // the worker list was not submitted
+        p.diag_fail(code,*job);
+        if(job->fault!=Fault::None)job->qaFailure.store(code,std::memory_order_release);
+        require(work.binding.transport->discard_recording(work.binding.ticket),"model presubmit discard");
+        if(t)job->chronology[7]=stamp();
+        job->ready.store(true,std::memory_order_release); observe_completed(*job);SetEvent(job->observed);
+        return pipeline::Processed{work.job,false,{}};
+    };
+    try {
+    p.realWork=true;
+    // Submit the duplicate comparison before the settle wait, under the same
+    // failure handling as every other worker-side submission. Its exact fence and
     // leases outlive this job if the compare has not retired; a stale result is
     // discarded by begin(), never by blocking the worker.
     if(job->fault==Fault::None && work.job.input.settings.dedupReuse && work.job.input.settings.valid() &&
@@ -1370,18 +1385,6 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
             dedupQueued=p.dedup->begin(*p.context,{job->frame,p.dedupAnchor},job->frame->producer);
         }
     }
-    auto fail=[&](uint32_t code) {
-        job->code=code; p.reset=true; p.lastResetSetter="presubmit-failure";
-        if(job->gpuSlot) job->gpuSlot->stages=0; // the worker list was not submitted
-        p.diag_fail(code,*job);
-        if(job->fault!=Fault::None)job->qaFailure.store(code,std::memory_order_release);
-        require(work.binding.transport->discard_recording(work.binding.ticket),"model presubmit discard");
-        if(t)job->chronology[7]=stamp();
-        job->ready.store(true,std::memory_order_release); observe_completed(*job);SetEvent(job->observed);
-        return pipeline::Processed{work.job,false,{}};
-    };
-    try {
-    p.realWork=true;
     p.timer.ensure(p.context->device(),p.context->queue());
     const int64_t settleBegin=stamp();
     const bool stopped=stop.stop_requested();

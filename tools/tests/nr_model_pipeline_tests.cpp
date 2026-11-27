@@ -435,6 +435,22 @@ void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kas
     constexpr int duplicateFirst=20,duplicateLast=23;
     Pipeline p(c,assets,true,kase.stabilize,kase.scale,kase.modelB,2560,1440);
     prime(p);
+    // One discarded full-length trial so clocks, driver caches and the slab pool are
+    // steady before the three measured trials; the plan gates the median of those 3.
+    {
+        auto deadline=Clock::now();
+        for(int n=0;n<frames;++n) {
+            deadline+=std::chrono::nanoseconds(frame60Ns);
+            wait_until(deadline);
+            p.pattern(static_cast<unsigned>(701+n*3),0,0);
+            p.arrive();
+            const auto job=p.current();
+            if(kase.loaded) {if(n>0) ready_job(p.jobs[p.jobs.size()-2]);}
+            else ready_job(job);
+        }
+        for(auto& job:p.jobs) if(!job->ready.load(std::memory_order_acquire)) ready_job(job);
+        p.jobs.clear();
+    }
     const char* runtime="?";
     for(const auto& variant:runtime::allowed_runtimes())
         if(variant.sha256==c.runtime.sha256) runtime=variant.version.data();
@@ -542,10 +558,10 @@ void perf_lane(const model::Config& c,const fs::path& assets,const PerfCase& kas
         med([](const PerfTrial& t){return t.stab;}));
     if(kase.enforce) {
         expect(kase.modelB && p.settings.dedupReuse && !kase.stabilize,"budget gate covers Model B + dedup reuse only");
-        // The worker is the unit under test: the queue split is the caller's
-        // capture/display thread, which the NR pre-submit cannot influence. Both
-        // numbers are emitted; only the worker latency is gated here.
-        expect(worker<=16.67,"1440p worker median p95 over one frame interval");
+        // Plan metric: the median of the three trials' admit->done p95. Individual
+        // trials may carry host scheduling noise; the plan's rule is the 3-trial
+        // median. worker/queue remain printed diagnostics, not the gate.
+        expect(p95<=16.67,"1440p admit->done median p95 over one frame interval");
         expect(minSamples>=2,"dedup path not exercised");
         expect(dedup<0.2,"dedup readback stalled the worker");
         expect(misses==0,"deadline miss census");
