@@ -97,7 +97,9 @@ struct FlowBrokerTarget {
 // texture is never exposed: each export copies it through the sanitize shader
 // into a D3D12_HEAP_FLAG_SHARED slot. A slot is reused only when its write fence
 // and every actually leased consumer's return fence have completed; process
-// exit or a timeout is never treated as GPU completion.
+// exit or a timeout is never treated as GPU completion. A live broker reserves
+// one of the two retirement slots at admission, exactly like fg_ipc's producer,
+// so a third concurrent ring is refused rather than leaked.
 class FlowBroker {
     struct Impl;
     std::shared_ptr<Impl> impl_;

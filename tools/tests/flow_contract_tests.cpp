@@ -474,6 +474,72 @@ void gpu_flow_broker()
     observer.signal_shared(recoveredFence.Get(), recoveredLease->returnValue);
     require(second->close(), "ring closes after all recovered consumers returned");
 
+    // Admission reserves one of the two retirement slots for the broker's whole
+    // life, exactly as fg_ipc's producer reserves a physical generation: two live
+    // rings fill the budget, and a third is refused instead of being pinned.
+    {
+        std::string admitDiagnostic, fullDiagnostic, reusableDiagnostic;
+        auto liveA = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 4},
+            &admitDiagnostic);
+        require(static_cast<bool>(liveA), admitDiagnostic.empty() ? "first live ring unavailable" : admitDiagnostic.c_str());
+        auto liveB = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 5},
+            &admitDiagnostic);
+        require(static_cast<bool>(liveB), admitDiagnostic.empty() ? "second live ring unavailable" : admitDiagnostic.c_str());
+        require(!FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 6}, &fullDiagnostic),
+            "a third live ring must not be admitted");
+        require(fullDiagnostic.find("flow ring retirement budget") != std::string::npos,
+            "refused admission reports the retirement budget");
+        liveB.reset(); // every fence is complete: the slot is handed back at teardown
+        auto reused = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 6},
+            &reusableDiagnostic);
+        require(static_cast<bool>(reused),
+            reusableDiagnostic.empty() ? "released admission slot not reusable" : reusableDiagnostic.c_str());
+        reused.reset();
+        liveA.reset();
+    }
+
+    // A ring with an open consumer fence is parked, not freed: its admission slot
+    // stays held until the fence completes, then collect_parked() reclaims it.
+    {
+        std::string parkingDiagnostic, heldDiagnostic, blockedDiagnostic, reclaimDiagnostic;
+        auto parking = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 7},
+            &parkingDiagnostic);
+        require(static_cast<bool>(parking), parkingDiagnostic.empty() ? "parking ring unavailable" : parkingDiagnostic.c_str());
+        const auto parkingPrevious = job_key(instance + 7, 1, 601);
+        const auto parkingCurrent = job_key(instance + 7, 2, 602);
+        const FlowExport parkingFlow{FlowFrameRef{parkingCurrent, 71}, FlowFrameRef{parkingPrevious, 70},
+            source.Get(), guide};
+        owner.begin("parking");
+        require(parking->record_export(owner.list.Get(), parkingFlow), "parking export admission");
+        owner.flush();
+        parking->commit_export(owner.queue.Get());
+        owner.sync();
+        const auto parkingPair = pair_key(instance + 7, 70, 71, 601, 602);
+        const auto parkingLease = parking->find_pair(parkingPair, FlowConsumer::Sr);
+        require(parkingLease.has_value(), "parking lease");
+        ComPtr<ID3D12Fence> parkingReturn;
+        gpu_checked(observer.device->OpenSharedHandle(parkingLease->returnFence, IID_PPV_ARGS(&parkingReturn)),
+            "open parking return fence");
+        require(parkingReturn->GetCompletedValue() < parkingLease->returnValue,
+            "parking consumer fence starts incomplete");
+        parking.reset(); // unresolved consumer ownership parks the ring
+        auto heldRing = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 8},
+            &heldDiagnostic);
+        require(static_cast<bool>(heldRing), heldDiagnostic.empty() ? "parked ring consumed both slots" : heldDiagnostic.c_str());
+        require(!FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 9}, &blockedDiagnostic),
+            "a parked ring still holds its admission slot");
+        require(blockedDiagnostic.find("flow ring retirement budget") != std::string::npos,
+            "parked admission reports the retirement budget");
+        observer.signal_shared(parkingReturn.Get(), parkingLease->returnValue);
+        require(parkingReturn->GetCompletedValue() >= parkingLease->returnValue, "parking fence completed");
+        auto reclaimed = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 9},
+            &reclaimDiagnostic);
+        require(static_cast<bool>(reclaimed),
+            reclaimDiagnostic.empty() ? "completed fence did not free the parked slot" : reclaimDiagnostic.c_str());
+        reclaimed.reset();
+        heldRing.reset();
+    }
+
     // Teardown with an outstanding lease: the ring is parked, never freed, and
     // the next generation still fits the two-entry retirement budget.
     std::string parkedDiagnostic, nextDiagnostic;

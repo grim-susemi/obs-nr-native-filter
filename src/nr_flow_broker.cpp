@@ -291,17 +291,22 @@ FlowBroker::FlowBroker(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 FlowBroker::~FlowBroker()
 {
     unregister_flow_broker(this);
-    if (close()) return;
+    const auto released = close();
     {
         std::lock_guard<std::mutex> guard(impl_->lock);
         impl_->retired = true;
     }
     std::lock_guard<std::mutex> guard(parked_lock());
+    // Admission reserved this owner's vault slot for its whole life, so teardown
+    // only hands that reservation back: immediately once the ring is gone, and
+    // through collect_parked() when fences still keep the retired ring parked.
     collect_parked();
-    for (auto& entry : parked_rings())
-        if (!entry) { entry = impl_; return; }
-    // Two unresolved generations are already preserved; pin this owner for the
-    // process lifetime rather than freeing a ring a consumer may still read.
+    if (released) return;
+    if (std::any_of(parked_rings().begin(), parked_rings().end(),
+            [this](const auto& entry) { return entry.get() == impl_.get(); })) return;
+    // Unreachable for a normally admitted broker: the caller already holds the
+    // vault slot. Pin this owner for the process lifetime rather than freeing a
+    // ring a consumer may still read.
     (void)new std::shared_ptr<Impl>(impl_);
 }
 std::array<std::shared_ptr<FlowBroker::Impl>, flow_ring_generation_limit>& FlowBroker::parked_rings()
@@ -321,6 +326,9 @@ void FlowBroker::collect_parked()
         bool done = false;
         {
             std::lock_guard<std::mutex> guard(entry->lock);
+            // A live owner holds its admission reservation; only a ring handed
+            // back by its destructor (retired) or already released may go.
+            if (!entry->retired && !entry->closed) continue;
             if (entry->retirable()) entry->release();
             done = entry->closed;
         }
@@ -332,11 +340,17 @@ std::shared_ptr<FlowBroker> FlowBroker::create(const FlowBrokerTarget& target, s
     try {
         std::lock_guard<std::mutex> guard(parked_lock());
         collect_parked();
-        if (std::all_of(parked_rings().begin(), parked_rings().end(), [](const auto& e) { return e != nullptr; }))
+        auto& vault = parked_rings();
+        const auto available = std::find(vault.begin(), vault.end(), nullptr);
+        if (available == vault.end())
             throw std::runtime_error("flow ring retirement budget: two unresolved generations");
         auto impl = std::make_shared<Impl>(target.analysis, target.sourceInstanceId);
         impl->initialize(target.device, target.queue);
-        std::shared_ptr<FlowBroker> broker(new FlowBroker(std::move(impl)));
+        std::shared_ptr<FlowBroker> broker(new FlowBroker(impl));
+        // Admission reserves one vault slot for this owner's whole life, exactly as
+        // fg_ipc reserves a physical generation in Producer::connect(). A third
+        // concurrent ring is therefore refused instead of reaching the pin path.
+        *available = impl;
         register_flow_broker(broker);
         return broker;
     } catch (const std::exception& error) {
