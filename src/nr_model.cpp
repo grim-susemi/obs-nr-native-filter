@@ -180,6 +180,22 @@ EligEntry eligTrace[16];
 std::atomic<unsigned> eligHead{0};
 struct EligAgg {std::atomic<unsigned> n{0},bad{0},badHist{0},badReset{0},orMask{0},noEval{0},noSubmit{0},incomplete{0},qa{0};};
 EligAgg eligAgg;
+std::atomic<unsigned> dedupSkippedNotReady{0};
+// A used asynchronous dedup comparison is the job's own GPU stage even though its
+// query heap is not the job timer's. Four exact-serial slots cover completion lag.
+struct DedupGpuSample {std::atomic<uint64_t> serial{0};std::atomic<int64_t> micros{-1};};
+std::array<DedupGpuSample,4> dedupGpuSamples;
+void store_dedup_gpu(uint64_t serial,double ms) {
+    auto& slot=dedupGpuSamples[serial&3];
+    slot.micros.store(ms>=0.0?static_cast<int64_t>(ms*1000.0):-1,std::memory_order_relaxed);
+    slot.serial.store(serial,std::memory_order_release);
+}
+double take_dedup_gpu(uint64_t serial) {
+    auto& slot=dedupGpuSamples[serial&3];
+    if(slot.serial.load(std::memory_order_acquire)!=serial)return -1.0;
+    const auto micros=slot.micros.load(std::memory_order_relaxed);
+    return micros>=0?static_cast<double>(micros)/1000.0:-1.0;
+}
 std::atomic<uint32_t> appliedPerf{0},appliedGrid{0},appliedHint{0}; // diagnostic: estimator settings actually in use
 void raise_max(std::atomic<int64_t>& slot,int64_t value) {
     auto seen=slot.load(std::memory_order_relaxed);
@@ -267,13 +283,6 @@ ComPtr<ID3D12DescriptorHeap> heap(ID3D12Device* device,UINT count) {
     return result;
 }
 void read_gpu_timing(Job&); // frees the job's slot after this job's own completion
-struct GpuStamp {
-    ID3D12QueryHeap* heap=nullptr;
-    ID3D12Resource* readback=nullptr;
-    UINT first=0;
-    uint32_t* stages=nullptr;
-    uint32_t bit=0;
-};
 // Diagnostic-only timestamp owner: one query heap shared by four readback slots,
 // plus a dedicated marker queue that timestamps OFA fence milestones. The hot path
 // only records EndQuery/ResolveQueryData and enqueues; it never waits for a query.
@@ -340,10 +349,6 @@ public:
     }
     bool ready() const { return enabled; }
     ID3D12QueryHeap* heap() const { return enabled?queries.Get():nullptr; }
-    GpuStamp dedup_stamp(const std::shared_ptr<GpuTimingSlot>& slot) const {
-        if(!enabled || !slot) return {};
-        return {queries.Get(),slot->readback.Get(),slot->base,&slot->stages,1u};
-    }
     // Called on the worker immediately after a successful guides submit. Cross-queue
     // waits timestamp the actual OFA fence milestones without touching nr_guides.
     void observe_guides(GpuTimingSlot& slot,const FlowResult& flow) {
@@ -400,10 +405,13 @@ struct DedupCompare {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commands;
     ComPtr<ID3D12DescriptorHeap> descriptors;
-    ComPtr<ID3D12Resource> zero,count,readback;
+    ComPtr<ID3D12Resource> zero,count,readback,stamps;
+    ComPtr<ID3D12QueryHeap> queries;
     ComPtr<ID3D12Fence> fence;
     Microsoft::WRL::Wrappers::Event event;
-    uint64_t serial=0;
+    uint64_t serial=0,frequency=0;
+    uint32_t width=0,height=0;
+    bool pending=false;
     std::array<std::shared_ptr<const Frame>,2> leases;
     explicit DedupCompare(ID3D12Device* device)
         :descriptors(heap(device,2)),zero(buffer(device,D3D12_HEAP_TYPE_UPLOAD)),
@@ -418,22 +426,38 @@ struct DedupCompare {
         checked(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&commands)),"NR compare list");
         checked(commands->Close(),"NR compare initial close");
         checked(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"NR compare fence");
+        D3D12_QUERY_HEAP_DESC heapDesc{};heapDesc.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;heapDesc.Count=2;
+        checked(device->CreateQueryHeap(&heapDesc,IID_PPV_ARGS(&queries)),"NR compare query heap");
+        D3D12_HEAP_PROPERTIES read{};read.Type=D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC stampDesc{};stampDesc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+        stampDesc.Width=16;stampDesc.Height=1;stampDesc.DepthOrArraySize=stampDesc.MipLevels=1;
+        stampDesc.SampleDesc.Count=1;stampDesc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        checked(device->CreateCommittedResource(&read,D3D12_HEAP_FLAG_NONE,&stampDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&stamps)),"NR compare stamp readback");
         void* mapped=nullptr;const D3D12_RANGE empty{};
         checked(zero->Map(0,&empty,&mapped),"NR compare zero");std::memset(mapped,0,4);zero->Unmap(0,nullptr);
     }
-    bool retired() const { const auto done=fence->GetCompletedValue();return done!=UINT64_MAX && done>=serial; }
-    bool same(const interop::Context& context,std::array<std::shared_ptr<const Frame>,2> images,
-        const GpuStamp& stamp={}) {
+    bool retired() const {
+        if(!pending)return true;
+        const auto done=fence->GetCompletedValue();
+        return done!=UINT64_MAX && done>=serial;
+    }
+    // Submit exactly one comparison and return without touching its readback. The
+    // result is consumed by a later poll only when its own fence has signalled; a
+    // stale, unconsumed result is dropped before the next submission.
+    bool begin(const interop::Context& context,std::array<std::shared_ptr<const Frame>,2> images,
+        NV_OF_FENCE_POINT producer) {
         if(!retired())return false;
+        if(pending) {pending=false;leases={};}
         leases=std::move(images);
+        if(!leases[0] || !leases[1]) {leases={};return false;}
         auto* device=context.device();
-        const bool stamping=stamp.heap && stamp.readback;
+        if(!frequency) checked(context.queue()->GetTimestampFrequency(&frequency),"NR compare timestamp frequency");
         checked(allocator->Reset(),"NR compare allocator reset");
         checked(commands->Reset(allocator.Get(),pipeline.Get()),"NR compare reset");
-        if(stamping) {
-            commands->EndQuery(stamp.heap,D3D12_QUERY_TYPE_TIMESTAMP,stamp.first);
-            if(stamp.stages)*stamp.stages|=stamp.bit;
-        }
+        if(producer.fence && producer.value)
+            checked(context.queue()->Wait(producer.fence,producer.value),"NR compare producer dependency");
+        commands->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0);
         auto cpu=descriptors->GetCPUDescriptorHandleForHeapStart();
         for(const auto& frame:leases) {
             auto* image=frame->analysis.Get();
@@ -448,28 +472,61 @@ struct DedupCompare {
         commands->SetComputeRootDescriptorTable(0,descriptors->GetGPUDescriptorHandleForHeapStart());
         commands->SetComputeRootUnorderedAccessView(1,count->GetGPUVirtualAddress());
         const auto d=leases[0]->analysis->GetDesc();
-        commands->Dispatch((static_cast<UINT>(d.Width)+15)/16,(d.Height+15)/16,1);
+        width=static_cast<uint32_t>(d.Width);height=static_cast<uint32_t>(d.Height);
+        commands->Dispatch((width+15)/16,(height+15)/16,1);
         barrier(commands.Get(),count.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->CopyBufferRegion(readback.Get(),0,count.Get(),0,4);
         barrier(commands.Get(),count.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
         for(const auto& frame:leases)
             barrier(commands.Get(),frame->analysis.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
-        if(stamping) {
-            commands->EndQuery(stamp.heap,D3D12_QUERY_TYPE_TIMESTAMP,stamp.first+1);
-            commands->ResolveQueryData(stamp.heap,D3D12_QUERY_TYPE_TIMESTAMP,stamp.first,2,stamp.readback,0);
-        }
+        commands->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
+        commands->ResolveQueryData(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,stamps.Get(),0);
         checked(commands->Close(),"NR compare close");
         ID3D12CommandList* lists[]{commands.Get()};
         context.queue()->ExecuteCommandLists(1,lists);
+        // The list is submitted: from here a failure must retain its inputs for the
+        // fence owner, never free them under an executing command list.
+        pending=true;
         checked(context.queue()->Signal(fence.Get(),++serial),"NR compare signal");
-        ResetEvent(event.Get()); // A previous timed-out comparison may have signaled since.
-        checked(fence->SetEventOnCompletion(serial,event.Get()),"NR compare subscription");
-        if(WaitForSingleObject(event.Get(),16)!=WAIT_OBJECT_0 || !retired())return false;
+        if(qa_sync()) {
+            ResetEvent(event.Get());
+            checked(fence->SetEventOnCompletion(serial,event.Get()),"NR compare QA subscription");
+        }
+        return true;
+    }
+    // nullopt means the readback has not signalled: the caller evaluates NR in full
+    // instead of waiting. The compare retires later and is discarded, never reused.
+    std::optional<bool> poll(uint64_t jobSerial) {
+        if(!pending || unsignalled())return std::nullopt;
+        if(qa_sync() && WaitForSingleObject(event.Get(),16)!=WAIT_OBJECT_0)return std::nullopt;
+        if(!retired())return std::nullopt;
+        pending=false;
+        void* mapped=nullptr;const D3D12_RANGE range{0,16},empty{};
+        checked(stamps->Map(0,&range,&mapped),"NR compare stamp readback");
+        std::array<uint64_t,2> values{};
+        std::memcpy(values.data(),mapped,16);stamps->Unmap(0,&empty);
+        const double ms=values[1]>values[0] && frequency?
+            1000.0*static_cast<double>(values[1]-values[0])/static_cast<double>(frequency):-1.0;
+        store_dedup_gpu(jobSerial,ms);
         leases={};
-        void* mapped=nullptr;const D3D12_RANGE range{0,4},empty{};
-        checked(readback->Map(0,&range,&mapped),"NR compare readback");
-        uint32_t over=0;std::memcpy(&over,mapped,4);readback->Unmap(0,&empty);
-        return over<=std::max<uint64_t>(1,d.Width*d.Height*3*5/1'000'000);
+        void* result=nullptr;const D3D12_RANGE resultRange{0,4};
+        checked(readback->Map(0,&resultRange,&result),"NR compare readback");
+        uint32_t over=0;std::memcpy(&over,result,4);readback->Unmap(0,&empty);
+        return over<=std::max<uint64_t>(1,uint64_t{width}*height*3*5/1'000'000);
+    }
+    // QA-only injected readback silence. The real submission and fence stay intact;
+    // only the consumer pretends the signal never arrived.
+    static bool unsignalled() {
+        char value[2]{};
+        size_t size=0;
+        return getenv_s(&size,value,sizeof value,"OBS_NR_TEST_DEDUP_UNSIGNALLED")==0 && size==sizeof(value) && value[0]=='1';
+    }
+    // QA-only deterministic readback for the threshold/invariant fixtures. The
+    // production path above never waits; this mirrors the retired synchronous check.
+    static bool qa_sync() {
+        char value[2]{};
+        size_t size=0;
+        return getenv_s(&size,value,sizeof value,"OBS_NR_TEST_DEDUP_SYNC")==0 && size==sizeof(value) && value[0]=='1';
     }
 };
 struct CreateReceipt { uint32_t code=0;bool handle=false; };
@@ -776,6 +833,7 @@ void read_gpu_timing(Job& job) {
         if(slot->stages&8) gpu.stabilizeMs=elapsed(6,slot->frequency);
         if(slot->stages&16) gpu.colorRestoreMs=elapsed(8,slot->frequency);
     }
+    if(gpu.dedupGpuMs<0.0) gpu.dedupGpuMs=take_dedup_gpu(job.contract.key.submissionSerial);
     // Marker resolves land at byte offset 128 of this slot's readback (uint64 index 16).
     if(markersComplete) {
         if((slot->markers&3)==3) gpu.ofaBootstrapMs=interval(values[16],values[17]);
@@ -940,6 +998,10 @@ struct Processor::Impl {
     std::optional<Extent> extent;
     std::optional<JobKey> previousKey;
     std::shared_ptr<const Frame> previousFrame;
+    // Last evaluated frame, the anchor of the duplicate comparison. A reused frame
+    // advances guide/flow history but never this anchor, so repeated small changes
+    // cannot accumulate into an unbounded reuse chain.
+    std::shared_ptr<const Frame> dedupAnchor;
     std::unique_ptr<DedupCompare> dedup;
     GpuTimeline timer; // optional diagnostic timestamp owner; never blocks
     ComPtr<ID3D12Resource> previousNrColor;
@@ -1015,7 +1077,7 @@ struct Processor::Impl {
             !historyRecorded || completion==runtime::Completion::Complete || completion==runtime::Completion::Discarded,
             pending->eligible})) {diagSettle.store(3);return false;}
         if(pending->failedPass) {reset=true;lastResetSetter="pass-failed";}
-        if(!pending->eligible)previousNrColor.Reset();
+        if(!pending->eligible){previousNrColor.Reset();dedupAnchor.reset();}
         passStatus.store(pack_pass_status(chain.status()),std::memory_order_release);
         pendingGuide.reset(); pending->resources->unsubscribe(); pending.reset(); return true;
     }
@@ -1288,6 +1350,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     job->enqueuedQpc=work.enqueued;job->dequeuedQpc=work.dequeued;
     auto* t=job->timeline?&*job->timeline:nullptr;
     job->chronology[0]=stamp();if(p.config.qaObservations||job->observation)job->qaTiming[0]=stamp();
+    bool dedupQueued=false;
     auto fail=[&](uint32_t code) {
         job->code=code; p.reset=true; p.lastResetSetter="presubmit-failure";
         if(job->gpuSlot) job->gpuSlot->stages=0; // the worker list was not submitted
@@ -1300,6 +1363,28 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     };
     try {
     p.realWork=true;
+    // Submit the duplicate comparison before the settle wait, under the same
+    // failure handling as every other worker-side submission. Its exact fence and
+    // leases outlive this job if the compare has not retired; a stale result is
+    // discarded by begin(), never by blocking the worker.
+    if(job->fault==Fault::None && work.job.input.settings.dedupReuse && work.job.input.settings.valid() &&
+       !p.reset && !stop.stop_requested() && p.previousFrame && p.previousKey && p.dedupAnchor && p.previousNrColor) {
+        const auto& candidate=work.job.input.descriptor;
+        const Extent candidateSize{candidate.active.width,candidate.active.height};
+        const bool steady=p.settings && *p.settings==work.job.input.settings &&
+            p.extent && *p.extent==candidateSize && p.generation==work.job.key.resourceGeneration &&
+            p.previousKey->frame.instanceId==work.job.key.frame.instanceId &&
+            p.previousKey->frame.contentEpoch==work.job.key.frame.contentEpoch &&
+            p.previousKey->historyEpoch==work.job.key.historyEpoch &&
+            p.previousKey->resourceGeneration==work.job.key.resourceGeneration &&
+            p.previousKey->frame.ingressSequence+1==work.job.key.frame.ingressSequence &&
+            p.previousKey->submissionSerial<work.job.key.submissionSerial &&
+            work_admitted(work_extent(candidate.active,work.job.input.settings.workScale));
+        if(steady) {
+            if(!p.dedup)p.dedup=std::make_unique<DedupCompare>(p.context->device());
+            dedupQueued=p.dedup->begin(*p.context,{job->frame,p.dedupAnchor},job->frame->producer);
+        }
+    }
     p.timer.ensure(p.context->device(),p.context->queue());
     const int64_t settleBegin=stamp();
     const bool stopped=stop.stop_requested();
@@ -1357,7 +1442,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         p.generation!=work.job.key.resourceGeneration;
     if(adapterChanged || !p.settings) {
         if(!job->prewarmAdopted && !release_passes(p.passes))return fail(0xe007);
-        p.previousFrame.reset(); p.previousKey.reset();
+        p.previousFrame.reset(); p.previousKey.reset(); p.dedupAnchor.reset();
         if(p.guidePreparation.valid()) {
             p.guidePreparation.wait();
             p.guidePreparation={};
@@ -1372,7 +1457,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
         p.reset=true; p.lastResetSetter=job->prewarmAdopted?"inactive-prewarm-adopted":"pass-retired";
     } else if(p.passes[0] && !p.passes[0]->ready(job->epoch)) {
         if(!p.passes[0]->release())return fail(0xe007);
-        p.passes[0].reset();p.previousFrame.reset();p.previousKey.reset();
+        p.passes[0].reset();p.previousFrame.reset();p.previousKey.reset();p.dedupAnchor.reset();
         p.reset=true;p.lastResetSetter="first-pass-retired";
     }
     if(p.chain.status().failedPass && !release_passes(p.passes,p.chain.limit()))return fail(0xe007);
@@ -1459,30 +1544,6 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const bool reset=p.reset || !p.previousKey || p.previousKey->historyEpoch!=work.job.key.historyEpoch ||
         p.previousKey->frame.contentEpoch!=work.job.key.frame.contentEpoch ||
         p.previousKey->frame.ingressSequence+1!=work.job.key.frame.ingressSequence;
-    if(work.job.input.settings.dedupReuse && job->fault==Fault::None && !reset &&
-       p.previousFrame && p.previousNrColor && p.previousKey->submissionSerial<work.job.key.submissionSerial) {
-        if(!p.dedup)p.dedup=std::make_unique<DedupCompare>(device);
-        const int64_t dedupBegin=stamp();
-        const bool duplicate=p.dedup->same(*p.context,{job->frame,p.previousFrame},
-            p.timer.dedup_stamp(job->gpuSlot));
-        job->dedupWaitQpc=stamp()-dedupBegin;
-        if(duplicate) {
-            const auto view=work.binding.transport->begin_worker(work.binding.ticket);
-            require(view.has_value(),"NR reuse Bridge admission");
-            job->output=view->output;job->reused=true;job->referenceValid=true;
-            p.subscribe(job);
-            barrier(view->commands,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
-            barrier(view->commands,view->output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
-            view->commands->CopyResource(view->output,p.previousNrColor.Get());
-            barrier(view->commands,view->output,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
-            barrier(view->commands,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
-            job->submitted=work.binding.transport->submit_worker(work.binding.ticket) && r.submission->submitted(p.context->queue());
-            if(job->submitted)p.previousKey.emplace(work.job.key);
-            else {p.reset=true;p.lastResetSetter="reuse-submit-failed";}
-            p.signal(job);
-            return {work.job,job->submitted,job};
-        }
-    }
     if(!p.guides) {
         if(t)t->guideInit=stamp();
         if(p.guidePreparation.valid()) {
@@ -1523,6 +1584,50 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     checked(p.context->queue()->Wait(guide->complete.fence,guide->complete.value),"native guide queue dependency");
     const int64_t tGuide1=stamp();
     if(t)t->guideDone=tGuide1;
+    // The comparison was submitted before settle; guides now provide the CPU
+    // runway to read it without a readback wait. A duplicate still owns its
+    // guide submission, so the next evaluation sees contiguous guide history.
+    if(work.job.input.settings.dedupReuse && job->fault==Fault::None && !reset &&
+       p.dedupAnchor && p.previousNrColor && p.previousKey->submissionSerial<work.job.key.submissionSerial) {
+        std::optional<bool> duplicate;
+        if(dedupQueued) {
+            const int64_t pollQpc=stamp();
+            duplicate=p.dedup->poll(work.job.key.submissionSerial);
+            job->dedupWaitQpc=stamp()-pollQpc;
+            if(!duplicate)dedupSkippedNotReady.fetch_add(1,std::memory_order_relaxed);
+        } else {
+            job->dedupWaitQpc=0;
+            dedupSkippedNotReady.fetch_add(1,std::memory_order_relaxed);
+        }
+        if(duplicate && *duplicate) {
+            const auto view=work.binding.transport->begin_worker(work.binding.ticket);
+            require(view.has_value(),"NR reuse Bridge admission");
+            job->output=view->output;job->reused=true;job->referenceValid=true;
+            auto* list=view->commands;
+            p.subscribe(job);
+            if(p.flowBroker && previous) {
+                const FlowExport flowExport{{work.job.key,work.job.input.canonicalTick},
+                    FlowFrameRef{previous->key,work.job.input.precedingCanonicalTick},guide->motion,
+                    SharedFlowSlot{d.allocation.width,d.allocation.height,d.active.x,d.active.y,
+                        d.active.width,d.active.height,1.0f,1.0f,false,false}};
+                (void)p.flowBroker->record_export(list,flowExport);
+            }
+            barrier(list,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(list,view->output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyResource(view->output,p.previousNrColor.Get());
+            barrier(list,view->output,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+            barrier(list,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+            job->submitted=work.binding.transport->submit_worker(work.binding.ticket) && r.submission->submitted(p.context->queue());
+            if(p.flowBroker) {
+                if(job->submitted) p.flowBroker->commit_export(p.context->queue());
+                else p.flowBroker->abandon_export();
+            }
+            if(job->submitted) {p.previousKey.emplace(work.job.key);p.previousFrame=job->frame;}
+            else {p.reset=true;p.lastResetSetter="reuse-submit-failed";}
+            p.signal(job);
+            return {work.job,job->submitted,job};
+        }
+    }
     const auto view=work.binding.transport->begin_worker(work.binding.ticket);
     require(view.has_value(),"actual Bridge worker admission");
     job->output=view->output;
@@ -1755,6 +1860,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     if(stabDispatched && job->submitted) { p.stabilizeValid=true; p.stabilizeIndex=stabCur^1u; }
     else p.stabilizeValid=false;
     p.previousKey.emplace(work.job.key); p.previousFrame=job->frame;
+    if(job->submitted)p.dedupAnchor=job->frame;
     p.signal(job);
     p.diagOk.fetch_add(1);
     return {work.job,job->submitted,job};
@@ -1802,7 +1908,7 @@ void Processor::worker_stopping() noexcept {
                 if(p.dedup && !p.dedup->retired())return false;
                 if(!release_passes(p.prewarmed) || !release_passes(p.passes))return false;
                 p.dedup.reset();p.previousNrColor.Reset();
-                p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
+                p.previousFrame.reset();p.previousKey.reset();p.dedupAnchor.reset();p.pool.reset();
                 p.stabilizeOrig={};p.stabilizeTemporal={};p.stabilizeHold={};p.stabilizer.reset();
                 p.stabilizeValid=false;p.stabilizeExtent.reset();
                 return true;
@@ -1902,6 +2008,7 @@ std::string take_job_trace() {
             out+="]";
         }
     }
+    out+=" | dedupSkippedNotReady "+std::to_string(dedupSkippedNotReady.exchange(0,std::memory_order_relaxed));
     return out;
 }
 std::vector<JobTelemetry> take_job_telemetry() {

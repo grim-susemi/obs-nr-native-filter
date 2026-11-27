@@ -40,3 +40,8 @@ add_dependencies(nr_model_pipeline_tests nr_color_shaders nr_obs_analysis_shader
 add_test(NAME nr_model_pipeline COMMAND nr_model_pipeline_tests)
 set_tests_properties(nr_model_pipeline PROPERTIES TIMEOUT 120 RESOURCE_LOCK nr_gpu
   ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")
+# Plan Todo 8 gate: 2560x1440 Model B + dedupReuse at workScale 100/75, 3-trial
+# median admit->done p95 <= 16.67 ms with zero deadline misses and applied >= 0.99.
+add_test(NAME nr_model_pipeline_1440p COMMAND nr_model_pipeline_tests --1440p)
+set_tests_properties(nr_model_pipeline_1440p PROPERTIES TIMEOUT 300 RESOURCE_LOCK nr_gpu
+  ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:OBS::libobs>")
