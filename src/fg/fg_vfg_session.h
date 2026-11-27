@@ -5,7 +5,23 @@
 
 namespace nr::fg::vfg {
 inline constexpr uint32_t max_multiplier = 4;
-inline constexpr uint32_t session_version = 2;
+inline constexpr uint32_t session_version = 3;
+enum class DedupMode : uint32_t { OffExact = 0, Auto = 1, Adaptive60To30 = 5, Fixed60To30 = 6 };
+inline constexpr bool is_valid_dedup_mode(uint32_t mode) noexcept
+{
+    switch (static_cast<DedupMode>(mode)) {
+    case DedupMode::OffExact:
+    case DedupMode::Auto:
+    case DedupMode::Adaptive60To30:
+    case DedupMode::Fixed60To30:
+        return true;
+    }
+    return false;
+}
+inline constexpr bool is_valid_live_anchor(uint32_t anchor) noexcept
+{
+    return anchor <= 1;
+}
 inline std::wstring format_marker_token_w(uint64_t token)
 {
     wchar_t buf[24]{};
@@ -64,12 +80,17 @@ struct Session {
     alignas(4) volatile LONG gpuPriority; // 0 = normal, 1 = high
     alignas(4) volatile LONG hideFromCapture; // 0 = capturable (WDA_NONE), 1 = hidden (WDA_EXCLUDEFROMCAPTURE = 0x11)
     uint32_t splitCompare; // Fixed for the lifetime of each offered generation.
+    alignas(4) volatile LONG dedupMode{0}; // DedupMode: 0 = off/exact, 1 = auto, 5 = 60->30 adaptive, 6 = 60->30 fixed
+    alignas(4) volatile LONG liveAnchor{0}; // 0 = off, 1 = live clock phase-lock
+    uint64_t transportIntervalNs{0}; // OBS video tick in ns; 0 = presenter default pacing
 };
 inline bool validate_session_header(const Session& s) noexcept
 {
     if (s.sessionVersion != session_version || s.sessionBytes != sizeof(Session) ||
         (s.backend != Backend::NativeVfg && s.backend != Backend::PushFlow && s.backend != Backend::AnrExperimental) ||
         (s.pushflowTier != PushFlowTier::Fast && s.pushflowTier != PushFlowTier::Quality) ||
+        !is_valid_dedup_mode(static_cast<uint32_t>(s.dedupMode)) ||
+        !is_valid_live_anchor(static_cast<uint32_t>(s.liveAnchor)) ||
         !wmemchr(s.pushflowRuntimeDir, L'\0', ARRAYSIZE(s.pushflowRuntimeDir)) ||
         !wmemchr(s.anrDllPath, L'\0', ARRAYSIZE(s.anrDllPath))) return false;
     return s.backend != Backend::AnrExperimental || (s.experimentalAnrOptIn == 1 && s.anrDllPath[0]);

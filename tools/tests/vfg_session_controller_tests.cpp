@@ -28,15 +28,35 @@ void check_header()
     LaunchOptions opts{};
     expect(opts.backend == Backend::NativeVfg && opts.pushflowTier == PushFlowTier::Fast && opts.multiplier == 2 &&
         !opts.gpuShotChange && !opts.experimentalAnrOptIn && !opts.hudLock && !opts.pacingRepair &&
-        !opts.adaptiveFg && !opts.adaptiveTargetFps, "v0.2.10 launch defaults");
+        !opts.adaptiveFg && !opts.adaptiveTargetFps && !opts.dedupMode && !opts.liveAnchor && !opts.transportIntervalNs,
+        "v0.2.12 launch defaults");
     Session s{};
-    expect(s.sessionVersion == 2 && s.sessionBytes == sizeof(Session) && validate_session_header(s),
-        "default v2 session");
+    expect(s.sessionVersion == 3 && s.sessionBytes == sizeof(Session) && !s.dedupMode && !s.liveAnchor &&
+        !s.transportIntervalNs && validate_session_header(s), "default v3 session");
+    for (const LONG mode : {0L, 1L, 5L, 6L}) {
+        s.dedupMode = mode;
+        expect(validate_session_header(s), "accept DedupMode v3 header");
+    }
+    s.dedupMode = 99;
+    expect(!validate_session_header(s), "reject dedupMode 99");
+    s.dedupMode = 0;
+    for (const LONG anchor : {0L, 1L}) {
+        s.liveAnchor = anchor;
+        expect(validate_session_header(s), "accept liveAnchor v3 header");
+    }
+    s.liveAnchor = 2;
+    expect(!validate_session_header(s), "reject liveAnchor 2");
+    s.liveAnchor = 0;
     s.sessionVersion = 99;
     expect(!validate_session_header(s), "reject bad ABI version");
     s.sessionVersion = 2;
+    expect(!validate_session_header(s), "reject v2 ABI version");
+    s.sessionVersion = 3;
+    ++s.sessionBytes;
+    expect(!validate_session_header(s), "reject oversized ABI byte count");
     --s.sessionBytes;
-    expect(!validate_session_header(s), "reject bad ABI byte count");
+    --s.sessionBytes;
+    expect(!validate_session_header(s), "reject undersized ABI byte count");
     ++s.sessionBytes;
     std::fill_n(s.pushflowRuntimeDir, ARRAYSIZE(s.pushflowRuntimeDir), L'x');
     expect(!validate_session_header(s), "reject unterminated runtime path");
@@ -50,6 +70,8 @@ void check_header()
     stamp_exit_reason(s, ExitReason::Fault);
     stamp_exit_reason(s, ExitReason::UserClosed);
     expect(read_exit_reason(s) == ExitReason::Fault, "the first exit reason wins");
+    std::printf("PASS vfg_session_controller: session_v3 dedup={0,1,5,6} liveAnchor={0,1} accepted; "
+        "sessionVersion={2,99}, dedupMode=99, liveAnchor=2, and mismatched sessionBytes rejected\n");
 }
 
 void reject_parent_options()
@@ -74,6 +96,12 @@ void reject_parent_options()
     opts.backend = Backend::PushFlow;
     opts.pushflowRuntimeDir.assign(520, L'x');
     reject(opts, "VFG runtime path too long");
+    LaunchOptions badDedup{};
+    badDedup.dedupMode = 99;
+    reject(badDedup, "VFG invalid session header");
+    LaunchOptions badAnchor{};
+    badAnchor.liveAnchor = 2;
+    reject(badAnchor, "VFG invalid session header");
 }
 
 void runtime_contract(const fs::path& scratch)
@@ -89,6 +117,66 @@ void runtime_contract(const fs::path& scratch)
     fs::remove(runtime / L"DirectML.dll");
     expect(Controller::find_pushflow_dir(PushFlowTier::Fast) != runtime.wstring(), "incomplete PushFlow runtime not admitted");
     fs::remove_all(runtime);
+}
+
+void runtime_version_order(const fs::path& scratch)
+{
+    const auto localApp = fs::absolute(scratch / L"veyra-localapp");
+    const auto versions = localApp / L"Programs" / L"Veyra (NVIDIA)" / L"versions";
+    const auto make_runtime = [&](const wchar_t* version, bool complete) {
+        const auto dir = (versions / version / L"runtime" / L"nvidia-vfg").lexically_normal();
+        fs::create_directories(dir);
+        for (const wchar_t* dll : {L"NVVideoEffects.dll", L"NVCVImage.dll", L"nvVFXVideoFrameGeneration.dll",
+                 L"nvngxruntime.dll", L"cudart64_12.dll"}) {
+            std::ofstream(dir / dll) << "discovery only";
+        }
+        if (!complete) fs::remove(dir / L"cudart64_12.dll");
+        return dir;
+    };
+    const auto older = make_runtime(L"2.2.1", true);
+    const auto newer = make_runtime(L"2.10.0", true);
+    make_runtime(L"2.9.9", false);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_RUNTIME", nullptr);
+    SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
+    expect(Controller::find_runtime_dir() == newer.wstring(),
+        "Veyra discovery sorts versions numerically and skips incomplete installs");
+    std::printf("PASS vfg_session_controller: runtime_version_order 2.10.0 > 2.2.1 (incomplete 2.9.9 skipped)\n");
+    fs::remove(newer / L"nvngxruntime.dll");
+    expect(Controller::find_runtime_dir() == older.wstring(),
+        "next complete Veyra version wins when the newest install lost its DLLs");
+    fs::remove_all(localApp);
+}
+
+void fallback_live_settings_survive(const fs::path& exe, const fs::path& scratch)
+{
+    const auto localApp = fs::absolute(scratch / L"live-settings-localapp");
+    fs::create_directories(localApp / L"obs-nr-native-filter");
+    SetEnvironmentVariableW(L"LOCALAPPDATA", localApp.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", exe.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", (scratch / L"live-settings.log").c_str());
+    LaunchOptions opts{};
+    opts.backend = Backend::PushFlow;
+    opts.multiplier = 2;
+    Controller ctrl(opts);
+    ctrl.set_dedup_mode(5);
+    ctrl.set_live_anchor(1);
+    ctrl.set_dedup_mode(99); // invalid live input must not perturb the session
+    const auto applied = ctrl.live_settings();
+    expect(applied.dedupMode == 5 && applied.liveAnchor == 1,
+        "live setters apply dedupMode and liveAnchor to the running session");
+    expect(ctrl.begin_async_fallback_relaunch(true), "simulated fallback relaunch begins");
+    const auto deadline = clock_ns() + 8'000'000'000ULL;
+    while (ctrl.poll_async_fallback_relaunch() != RelaunchState::Ready) {
+        expect(clock_ns() < deadline, "simulated fallback relaunch reaches Ready");
+        Sleep(10);
+    }
+    const auto recovered = ctrl.live_settings();
+    expect(recovered.dedupMode == 5 && recovered.liveAnchor == 1,
+        "dedupMode and liveAnchor survive the fallback recovery relaunch");
+    std::printf("PASS vfg_session_controller: live_settings_survive_fallback dedup=5 anchor=1 (invalid dedup=99 ignored)\n");
+    ctrl.stop(true);
+    expect(ctrl.await_exit_cleanup(2000), "fallback live settings cleanup");
+    fs::remove_all(localApp);
 }
 
 void malformed_child(const fs::path& exe, const fs::path& log)
@@ -568,9 +656,12 @@ int wmain(int argc, wchar_t** argv)
         SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", (scratch / L"must-not-run.exe").c_str());
         reject_parent_options();
         runtime_contract(scratch);
+        runtime_version_order(scratch);
         malformed_child(exe, log);
         cancel_io_ex_and_marker_fallback_contract(exe, scratch);
-        std::puts("PASS vfg_session_controller: v2 defaults, malformed header and paths, parent and child admission, overlapped cancel & marker fallback");
+        fallback_live_settings_survive(exe, scratch);
+        std::puts("PASS vfg_session_controller: v3 defaults, malformed header and paths, parent and child admission, "
+            "numeric runtime order, overlapped cancel & marker fallback, live dedup/anchor across fallback");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL vfg_session_controller: %s\n", e.what());

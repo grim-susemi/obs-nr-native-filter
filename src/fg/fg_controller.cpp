@@ -106,6 +106,47 @@ bool has_pushflow_runtime(const fs::path& dir, PushFlowTier tier)
     return dir.is_absolute() && fs::is_regular_file(dir / L"onnxruntime.dll", ec) &&
         fs::is_regular_file(dir / L"DirectML.dll", ec) && fs::is_regular_file(dir / L"models" / model, ec);
 }
+using VersionTriple = std::array<uint32_t, 3>;
+std::optional<VersionTriple> parse_version_dir(std::wstring_view name) noexcept
+{
+    VersionTriple out{};
+    size_t i = 0;
+    for (size_t part = 0; part < out.size(); ++part) {
+        const auto begin = i;
+        uint64_t value = 0;
+        while (i < name.size() && name[i] >= L'0' && name[i] <= L'9') {
+            if (i - begin >= 9) return std::nullopt;
+            value = value * 10 + static_cast<uint64_t>(name[i] - L'0');
+            ++i;
+        }
+        if (i == begin) return std::nullopt;
+        out[part] = static_cast<uint32_t>(value);
+        if (part + 1 < out.size() && (i >= name.size() || name[i++] != L'.')) return std::nullopt;
+    }
+    return i == name.size() ? std::optional<VersionTriple>(out) : std::nullopt;
+}
+// Veyra installs versioned runtimes under LOCALAPPDATA; compare parsed versions numerically so 2.10.0 beats 2.2.1.
+fs::path newest_veyra_runtime(const std::wstring& localApp)
+{
+    const fs::path versions = fs::path(localApp) / L"Programs" / L"Veyra (NVIDIA)" / L"versions";
+    std::error_code ec;
+    std::optional<VersionTriple> bestVersion;
+    fs::path best;
+    for (fs::directory_iterator it(versions, fs::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        std::error_code typeEc;
+        if (!it->is_directory(typeEc) || typeEc) continue;
+        const auto version = parse_version_dir(it->path().filename().wstring());
+        if (!version) continue;
+        const auto runtime = (it->path() / L"runtime" / L"nvidia-vfg").lexically_normal();
+        if (!has_vfg_dlls(runtime)) continue;
+        if (!bestVersion || *version > *bestVersion) {
+            bestVersion = version;
+            best = runtime;
+        }
+    }
+    return best;
+}
 std::wstring resolve_presenter_exe()
 {
     if (auto p = env_path(L"OBS_NR_VFG_PRESENTER"); !p.empty()) return p;
@@ -532,6 +573,9 @@ struct Controller::ChildSession {
 std::wstring Controller::find_runtime_dir()
 {
     if (auto p = env_path(L"OBS_NR_VFG_RUNTIME"); !p.empty() && has_vfg_dlls(p)) return p;
+    wchar_t localApp[4096]{};
+    const auto la = GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, ARRAYSIZE(localApp));
+    const bool hasLocalApp = la && la < ARRAYSIZE(localApp);
     const auto mod = own_module_dir();
     const auto exe = host_exe_dir();
     std::vector<fs::path> candidates{
@@ -539,9 +583,8 @@ std::wstring Controller::find_runtime_dir()
         mod / L"nvidia-vfg",
         mod / L".." / L".." / L"bin" / L"64bit" / L"nvidia-vfg"
     };
-    wchar_t localApp[4096]{};
-    const auto la = GetEnvironmentVariableW(L"LOCALAPPDATA", localApp, ARRAYSIZE(localApp));
-    if (la && la < ARRAYSIZE(localApp)) {
+    if (hasLocalApp) {
+        if (auto versioned = newest_veyra_runtime(localApp); !versioned.empty()) candidates.push_back(versioned);
         candidates.push_back(fs::path(localApp) / L"Programs" / L"Veyra-2.1.9-NVIDIA-Virtual-Camera" /
             L"Veyra-2.1.9-virtual-camera-NVIDIA-win64-portable" / L"runtime" / L"nvidia-vfg");
     }
@@ -578,6 +621,9 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     header.pushflowTier = options.pushflowTier;
     header.gpuShotChange = options.gpuShotChange != 0;
     header.experimentalAnrOptIn = options.experimentalAnrOptIn;
+    header.dedupMode = static_cast<LONG>(options.dedupMode);
+    header.liveAnchor = static_cast<LONG>(options.liveAnchor);
+    header.transportIntervalNs = options.transportIntervalNs;
     header.launchEpoch = fallback ? 2 : 1;
     require(options.pushflowRuntimeDir.size() < ARRAYSIZE(header.pushflowRuntimeDir) &&
         options.anrDllPath.size() < ARRAYSIZE(header.anrDllPath), "VFG runtime path too long");
@@ -1016,6 +1062,24 @@ void Controller::set_adaptive_target_fps(uint32_t fps) noexcept
     if (session_ && session_->view)
         InterlockedExchange(&session_->view->adaptiveTargetFps, static_cast<LONG>(options_.adaptiveTargetFps));
 }
+void Controller::set_dedup_mode(uint32_t mode) noexcept
+{
+    if (!is_valid_dedup_mode(mode)) return;
+    options_.dedupMode = mode;
+    if (session_ && session_->view) InterlockedExchange(&session_->view->dedupMode, static_cast<LONG>(mode));
+}
+void Controller::set_live_anchor(uint32_t on) noexcept
+{
+    if (!is_valid_live_anchor(on)) return;
+    options_.liveAnchor = on;
+    if (session_ && session_->view) InterlockedExchange(&session_->view->liveAnchor, static_cast<LONG>(on));
+}
+LiveSettings Controller::live_settings() const noexcept
+{
+    if (!session_ || !session_->view) return LiveSettings{options_.dedupMode, options_.liveAnchor};
+    return LiveSettings{static_cast<uint32_t>(InterlockedCompareExchange(&session_->view->dedupMode, 0, 0)),
+        static_cast<uint32_t>(InterlockedCompareExchange(&session_->view->liveAnchor, 0, 0))};
+}
 
 void Controller::sync_live_settings() noexcept
 {
@@ -1026,6 +1090,8 @@ void Controller::sync_live_settings() noexcept
     set_pacing_repair(options_.pacingRepair);
     set_adaptive_fg(options_.adaptiveFg);
     set_adaptive_target_fps(options_.adaptiveTargetFps);
+    set_dedup_mode(options_.dedupMode);
+    set_live_anchor(options_.liveAnchor);
 }
 
 Controller::~Controller()
@@ -1051,6 +1117,8 @@ bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID ad
     InterlockedExchange(&view->lowLatency, static_cast<LONG>(options_.lowLatency ? 1u : 0u));
     InterlockedExchange(&view->gpuPriority, static_cast<LONG>(options_.gpuPriority ? 1u : 0u));
     InterlockedExchange(&view->hideFromCapture, static_cast<LONG>(options_.hideFromCapture ? 1u : 0u));
+    InterlockedExchange(&view->dedupMode, static_cast<LONG>(options_.dedupMode));
+    InterlockedExchange(&view->liveAnchor, static_cast<LONG>(options_.liveAnchor));
     wcscpy_s(view->mapping, offer.mapping.c_str());
     if (!options_.monitorId.empty() && options_.monitorId.size() < ARRAYSIZE(view->monitorId)) {
         wcscpy_s(view->monitorId, options_.monitorId.c_str());

@@ -20,6 +20,13 @@ struct LaunchOptions {
     uint32_t gpuShotChange{}, experimentalAnrOptIn{};
     std::wstring pushflowRuntimeDir, anrDllPath;
     uint32_t hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{};
+    uint32_t dedupMode = 0; // DedupMode: 0 = off/exact, 1 = auto, 5 = 60->30 adaptive, 6 = 60->30 fixed
+    uint32_t liveAnchor = 0; // 0 = off, 1 = live clock phase-lock
+    uint64_t transportIntervalNs = 0; // OBS video tick in ns; 0 = presenter default pacing
+};
+struct LiveSettings {
+    uint32_t dedupMode{};
+    uint32_t liveAnchor{};
 };
 enum class RelaunchState { Idle, InFlight, Ready, Failed };
 class Controller final {
@@ -63,6 +70,9 @@ public:
     void set_pacing_repair(uint32_t on) noexcept;
     void set_adaptive_fg(uint32_t on) noexcept;
     void set_adaptive_target_fps(uint32_t fps) noexcept;
+    void set_dedup_mode(uint32_t mode) noexcept;
+    void set_live_anchor(uint32_t on) noexcept;
+    LiveSettings live_settings() const noexcept;
     static std::wstring find_runtime_dir();
     static std::wstring find_pushflow_dir(PushFlowTier tier);
 };
