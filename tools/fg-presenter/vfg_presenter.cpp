@@ -378,7 +378,14 @@ void frames(Feed& f)
         }
         }
     }
-    const size_t batchCapacity = vfg ? vfg->max_in_flight_pairs() : 1;
+    // A 4x pair's three subframes share one 60 Hz period, leaving ~4.2 ms per
+    // slot. A synchronous pair enqueue measures 4.3..6.1 ms, so admitting a
+    // second pair while the current one presents pushes that pair's subframes
+    // past their cutoffs: +0.6..+2.3 ms original latency and late drops against
+    // the single-pair baseline. 2x's ~8.3 ms windows absorb the overlap, so
+    // only the 4x path stays single-pair.
+    const size_t backendCapacity = vfg ? vfg->max_in_flight_pairs() : 1;
+    const size_t batchCapacity = mult == max_multiplier ? 1 : backendCapacity;
     fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld batch_capacity=%zu\n",
         vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, lastReflex, f.view.gpuShotChange,
         InterlockedCompareExchange(&f.view.hudLock, 0, 0), InterlockedCompareExchange(&f.view.pacingRepair, 0, 0),

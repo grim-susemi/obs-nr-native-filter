@@ -210,6 +210,22 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     const auto subCount = events("event=present_vfg_subframe");
     const auto origCount = events("event=present_original");
     expect(events("event=error") == 0, "presenter logged an error");
+    if (parity) {
+        // 4x keeps one pair in flight so its ~4.2 ms subframe windows are not
+        // queued behind a second pair's staging/enqueue; 2x keeps both banks.
+        const auto depth = mult == max_multiplier ? "batch_capacity=1" : "batch_capacity=2";
+        expect(content.find(depth) != std::string::npos, mult == max_multiplier ?
+            "4x initialized with more than one pair in flight" : "2x lost its two-bank initialization");
+        if (mult == max_multiplier) {
+            std::istringstream lines(content);
+            for (std::string line; std::getline(lines, line);) {
+                if (!line.starts_with("event=pair_admitted ")) continue;
+                const auto at = line.find(" depth=");
+                expect(at != std::string::npos && line.compare(at + 7, 1, "1") == 0 &&
+                    (at + 8 == line.size() || line[at + 8] == ' '), "a 4x admission queued a second pair");
+            }
+        }
+    }
     if (split) {
         std::map<std::string, std::string> ingress;
         unsigned originals = 0, repeats = 0, mismatched = 0, wrongRepeat = 0;
