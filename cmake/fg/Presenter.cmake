@@ -146,6 +146,26 @@ add_dependencies(vfg_hud_lock_gpu_tests vfg_presenter_shaders)
 add_test(NAME vfg_hud_lock_gpu COMMAND vfg_hud_lock_gpu_tests)
 set_tests_properties(vfg_hud_lock_gpu PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS gpu)
 
+# Veyra-parity band-tolerant content comparison: mode 1 visits every pixel of a
+# 64x16 tile and counts RGB components further than the band, instead of stopping
+# at the first difference.
+set(VFG_CONTENT_BAND_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/vfg_content_compare_band.hlsl")
+set(VFG_CONTENT_BAND_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vfg_content_compare_band_shader.h")
+add_custom_command(OUTPUT "${VFG_CONTENT_BAND_HEADER}"
+  COMMAND "${NR_FXC}" /nologo /WX /Ges /T cs_5_0 /E main /Fh "${VFG_CONTENT_BAND_HEADER}"
+    /Vn vfg_content_compare_band_shader "${VFG_CONTENT_BAND_SHADER}"
+  DEPENDS "${VFG_CONTENT_BAND_SHADER}" VERBATIM)
+add_custom_target(vfg_content_band_shader DEPENDS "${VFG_CONTENT_BAND_HEADER}")
+add_executable(vfg_content_dedup_tests tools/tests/vfg_content_dedup_tests.cpp)
+target_compile_features(vfg_content_dedup_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_content_dedup_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_content_dedup_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_content_dedup_tests PRIVATE tools/fg-presenter src "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(vfg_content_dedup_tests PRIVATE d3d12 dxgi)
+add_dependencies(vfg_content_dedup_tests vfg_content_band_shader)
+add_test(NAME vfg_content_dedup COMMAND vfg_content_dedup_tests)
+set_tests_properties(vfg_content_dedup PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS gpu)
+
 add_executable(vfg_native_smoke_tests tools/tests/vfg_native_smoke_tests.cpp)
 target_compile_features(vfg_native_smoke_tests PRIVATE cxx_std_20)
 target_compile_definitions(vfg_native_smoke_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
