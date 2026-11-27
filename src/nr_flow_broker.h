@@ -145,6 +145,16 @@ public:
     uint32_t slot_count() const;
     bool close(); // true only when every published slot completed; unresolved ownership is kept
 
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+    // Test transport only. The destructor signals `reached` after close() and
+    // before collect_parked(), then parks on `resume` so the QA host can finish
+    // the exact lease return value inside that window. The pin counter observes
+    // the unreachable lifetime-pin fallback; production objects expose neither.
+    void test_teardown_probe(HANDLE reached, HANDLE resume);
+    static uint64_t test_pin_count();
+    static void test_reset_pin_count();
+#endif
+
     // Contract view used by tests and by the SR/FG consumers: the exact display
     // tick a job key serves (displayed tick T -> analysed pair ending at T-1).
     static bool display_tick_for(const FramePairKey&, uint64_t displayTick);

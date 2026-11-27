@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 using namespace nr;
 using Microsoft::WRL::ComPtr;
@@ -571,6 +572,65 @@ void gpu_flow_broker()
     next->commit_export(owner.queue.Get());
     owner.sync();
     require(next->close(), "next generation closes without leases");
+    next.reset(); // hand its admission slot back; the parked ring keeps the other
+
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+    // The pin must be decided from post-collection state, not from close(). A
+    // consumer fence still incomplete at close() can complete inside the window
+    // before collect_parked(); the collector then releases this ring itself. The
+    // probe parks teardown exactly there so the QA host finishes the exact lease.
+    {
+        std::string windowDiagnostic;
+        auto windowed = FlowBroker::create({owner.device.Get(), owner.queue.Get(), extent, instance + 10},
+            &windowDiagnostic);
+        require(static_cast<bool>(windowed),
+            windowDiagnostic.empty() ? "teardown-window broker unavailable" : windowDiagnostic.c_str());
+        const auto windowPrevious = job_key(instance + 10, 1, 701);
+        const auto windowCurrent = job_key(instance + 10, 2, 702);
+        const FlowExport windowFlow{FlowFrameRef{windowCurrent, 91}, FlowFrameRef{windowPrevious, 90},
+            source.Get(), guide};
+        owner.begin("teardown window");
+        require(windowed->record_export(owner.list.Get(), windowFlow), "teardown-window export admission");
+        owner.flush();
+        windowed->commit_export(owner.queue.Get());
+        owner.sync();
+        const auto windowPair = pair_key(instance + 10, 90, 91, 701, 702);
+        const auto windowLease = windowed->find_pair(windowPair, FlowConsumer::Sr);
+        require(windowLease.has_value(), "teardown-window lease");
+        ComPtr<ID3D12Fence> windowReturn;
+        gpu_checked(observer.device->OpenSharedHandle(windowLease->returnFence, IID_PPV_ARGS(&windowReturn)),
+            "open teardown-window return fence");
+        require(windowReturn->GetCompletedValue() < windowLease->returnValue,
+            "teardown-window fence starts incomplete");
+        const auto reached = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        const auto resume = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        require(reached != nullptr && resume != nullptr, "teardown probe events");
+        FlowBroker::test_reset_pin_count();
+        windowed->test_teardown_probe(reached, resume);
+        std::thread teardown([&windowed] { windowed.reset(); });
+        const auto parkedInWindow = WaitForSingleObject(reached, 30000);
+        std::exception_ptr windowFailure;
+        try {
+            observer.signal_shared(windowReturn.Get(), windowLease->returnValue);
+        } catch (...) {
+            windowFailure = std::current_exception();
+        }
+        const auto resumed = SetEvent(resume) != FALSE;
+        teardown.join();
+        CloseHandle(reached);
+        CloseHandle(resume);
+        require(resumed, "resume broker teardown");
+        require(parkedInWindow == WAIT_OBJECT_0, "broker teardown reached the collection window");
+        if (windowFailure) std::rethrow_exception(windowFailure);
+        require(windowReturn->GetCompletedValue() >= windowLease->returnValue,
+            "teardown-window fence completed");
+        const auto windowPins = FlowBroker::test_pin_count();
+        if (windowPins)
+            std::printf("TEARDOWN PIN observed count=%llu\n", static_cast<unsigned long long>(windowPins));
+        require(windowPins == 0,
+            "a fence completed inside teardown must not pin an already-released ring");
+    }
+#endif
 }
 } // namespace
 
