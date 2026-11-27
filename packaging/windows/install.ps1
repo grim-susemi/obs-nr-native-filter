@@ -8,6 +8,8 @@ param(
     [string]$Runtime = '',
     [string]$SrRuntime = '',
     [string]$VfgRuntimeDir = '',
+    [string]$XeSsRuntimeDir = '',
+    [string]$XeSsSdkZip = '',
     [string]$PushFlowRuntimeDir = '',
     [string]$PushFlowModelsDir = '',
     [string]$PushFlowModelZipUrl = '',
@@ -18,6 +20,7 @@ param(
     [switch]$SkipOptional,
     [switch]$DownloadPushFlow,
     [switch]$SkipPushFlow,
+    [switch]$InstallXeFg,
     [switch]$Uninstall,
     [switch]$Yes,
     [switch]$NoPause,
@@ -52,7 +55,7 @@ $Text = @{
         sPayload   = '설치 파일 확인'
         sObs       = 'OBS 찾기'
         sRuntime   = 'NR 모델 파일 확인'
-        sOpt       = '선택 확장 런타임 (DLSS 4.5 SR · NVIDIA VFG)'
+        sOpt       = '선택 확장 런타임 (DLSS 4.5 SR · NVIDIA VFG · Intel XeSS 3.0.2)'
         sCopy      = '파일 복사'
         sRemove    = '파일 제거'
         payloadBad = '설치 파일이 빠졌거나 손상됐습니다: {0}. 릴리즈 zip을 다시 받아 전부 풀어 주세요.'
@@ -95,6 +98,12 @@ $Text = @{
         vfgVerify  = 'wheel SHA-256 검증 및 VFG DLL 5개 추출 중...'
         vfgFail    = 'NVIDIA VFG 자동 설치 건너뜀({0}). NR/업스케일 필터는 정상 동작합니다.'
         vfgCopied  = 'NVIDIA VFG 런타임(5개 DLL)을 넣었습니다: {0}'
+        xefgPrompt = '공식 Intel XeSS 3.0.2 프레임 생성 런타임(libxess_fg.dll + libxell.dll)을 설치할까요? (Y/n)'
+        xefgDown   = 'Intel 공식 GitHub에서 XeSS_SDK_3.0.2.zip을 내려받는 중...'
+        xefgVerify = 'XeSS SDK SHA-256, Intel 서명, DLL 해시를 확인하고 압축을 푸는 중...'
+        xefgLocal  = '검증된 XeSS 3.0.2 런타임을 재사용합니다: {0}'
+        xefgOk     = 'XeSS 3.0.2 런타임 확인됨: {0}'
+        xefgFail   = 'XeSS 설치 건너뜀({0}). XeFG는 1x로 동작하며 NR과 업스케일은 정상입니다.'
         backup     = '백업: {0}'
         copy       = '설치: {0}'
         verifyFail = '복사한 파일 확인에 실패했습니다: {0}'
@@ -121,7 +130,7 @@ $Text = @{
         sPayload   = 'Checking package files'
         sObs       = 'Finding OBS'
         sRuntime   = 'Checking the NR model file'
-        sOpt       = 'Optional runtimes (DLSS 4.5 SR & NVIDIA VFG)'
+        sOpt       = 'Optional runtimes (DLSS 4.5 SR, NVIDIA VFG & Intel XeSS 3.0.2)'
         sCopy      = 'Copying files'
         sRemove    = 'Removing files'
         payloadBad = 'A package file is missing or damaged: {0}. Download the release zip again and extract all of it.'
@@ -164,6 +173,12 @@ $Text = @{
         vfgVerify  = 'Verifying wheel SHA-256 and extracting 5 VFG DLLs...'
         vfgFail    = 'Skipped NVIDIA VFG download ({0}). Native NR and upscaling still work.'
         vfgCopied  = 'NVIDIA VFG runtime (5 DLLs) copied: {0}'
+        xefgPrompt = 'Install the official Intel XeSS 3.0.2 frame generation runtime (libxess_fg.dll + libxell.dll)? (Y/n)'
+        xefgDown   = 'Downloading XeSS_SDK_3.0.2.zip from Intel GitHub...'
+        xefgVerify = 'Verifying the XeSS SDK SHA-256, Intel signature, and DLL hashes, then extracting...'
+        xefgLocal  = 'Reusing the verified XeSS 3.0.2 runtime: {0}'
+        xefgOk     = 'XeSS 3.0.2 runtime OK: {0}'
+        xefgFail   = 'Skipped the XeSS install ({0}). XeFG stays at 1x; NR and upscaling still work.'
         backup     = 'Backup: {0}'
         copy       = 'Installed: {0}'
         verifyFail = 'Check failed after copying: {0}'
@@ -222,12 +237,12 @@ function Format-Console([string]$Message) {
 }
 function Say([string]$Key, [object[]]$Arg = @(), [string]$Color = 'Gray') {
     $message = T $Key $Arg
-    if ($Key -in 'copy','backup','error','srFail','vfgFail' -or $script:SingleScreen) { $script:LogDetails.Add($message) }
+    if ($Key -in 'copy','backup','error','srFail','vfgFail','xefgFail' -or $script:SingleScreen) { $script:LogDetails.Add($message) }
     $status = switch ($Key) {
-        {$_ -in 'done','uDone','payloadOk','rtOk','rtBundled','rtLocal','srOk','vfgOk','vfgLocal','srSigOk','uRestored'} { 'OK' }
-        {$_ -in 'rtSkipped','srFail','vfgFail','uChanged','cancelled','uNoState'} { '-' }
+        {$_ -in 'done','uDone','payloadOk','rtOk','rtBundled','rtLocal','srOk','vfgOk','vfgLocal','srSigOk','xefgOk','xefgLocal','uRestored'} { 'OK' }
+        {$_ -in 'rtSkipped','srFail','vfgFail','xefgFail','uChanged','cancelled','uNoState'} { '-' }
         {$_ -in 'error','adminFail','obsInvalid','obsOld','obsRunning','rtWrong','rtNotFound','rtBadHash','rolledBack'} { '!' }
-        {$_ -in 'admin','srDown','vfgDown','vfgVerify','rtWillCopy'} { '>' }
+        {$_ -in 'admin','srDown','vfgDown','vfgVerify','xefgDown','xefgVerify','rtWillCopy'} { '>' }
     }
     if ($Key -in 'copy','backup') { return }
     $ko = $script:L -eq 'ko'
@@ -273,6 +288,8 @@ function Get-FullPath([string]$Path) {
     return [IO.Path]::GetFullPath(($Path.Trim().Trim('"') -replace '/', '\')).TrimEnd('\')
 }
 function Get-PackagePaths {
+    # Required payload only. Optional runtimes (SR, VFG, PushFlow, XeSS) use
+    # their own allowlists; XeSS receipt paths come from Get-XeFgPaths.
     return @('obs-plugins\64bit\obs-nr-filter.dll', 'bin\64bit\obs-nr-fg-presenter.exe',
         'data\obs-plugins\obs-nr-filter\locale\en-US.ini', 'data\obs-plugins\obs-nr-filter\locale\ko-KR.ini',
         'bin\64bit\nr_codec.dxil', 'bin\64bit\nr_color.dxil', 'bin\64bit\nr_guides.cso',
@@ -289,6 +306,7 @@ function Test-PushFlowModelName([string]$Name) {
 function Assert-ReceiptFile([string]$Relative, [string]$Backup) {
     $modelsPrefix = 'bin\64bit\pushflow\models\'
     $allowed = (Test-PackagePath $Relative) -or $Relative -in @($RuntimeRel, $SrRel) -or
+        $Relative -in (Get-XeFgPaths) -or
         $Relative -in @($VfgDlls | ForEach-Object { "$VfgDirRel\$_" }) -or
         $Relative -in 'bin\64bit\pushflow\onnxruntime.dll', 'bin\64bit\pushflow\DirectML.dll' -or
         ($Relative.StartsWith($modelsPrefix, [StringComparison]::OrdinalIgnoreCase) -and
@@ -302,14 +320,146 @@ function Assert-ReceiptFile([string]$Relative, [string]$Backup) {
         }
     }
 }
-function Assert-PushFlowPath([string]$Root, [string]$Relative) {
+function Assert-NoReparsePath([string]$Root, [string]$Relative, [string]$Failure) {
     $path = $Root
     foreach ($component in $Relative.Split('\')) {
         $path = Join-Path $path $component
         $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw 'PushFlow path must not contain a reparse point'
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw $Failure }
+    }
+}
+function Assert-PushFlowPath([string]$Root, [string]$Relative) {
+    Assert-NoReparsePath $Root $Relative 'PushFlow path must not contain a reparse point'
+}
+function Assert-XeFgPath([string]$Root, [string]$Relative) {
+    Assert-NoReparsePath $Root $Relative 'XeSS runtime path must not contain a reparse point'
+}
+function Get-XeFgSpec {
+    return @{
+        DirRel  = 'bin\64bit\xess-fg'
+        License = 'LICENSE.txt'
+        Dlls    = [ordered]@{
+            'libxess_fg.dll' = 'ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27'
+            'libxell.dll'    = 'd2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7'
         }
+        Members = [ordered]@{
+            'libxess_fg.dll' = 'bin/libxess_fg.dll'
+            'libxell.dll'    = 'bin/libxell.dll'
+        }
+        SdkUrl  = 'https://github.com/intel/xess/releases/download/v3.0.2/XeSS_SDK_3.0.2.zip'
+        SdkSha  = '88b8a373f30e33f3558a77a93e634f11b8132fc3047ea1a8edeead32b8471990'
+    }
+}
+function Get-XeFgPaths {
+    $spec = Get-XeFgSpec
+    $paths = @($spec.Dlls.Keys | ForEach-Object { "$($spec.DirRel)\$_" })
+    return $paths + "$($spec.DirRel)\$($spec.License)"
+}
+function Test-IntelSigned([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path
+        return $sig.Status -eq 'Valid' -and $sig.SignerCertificate -and
+            ($sig.SignerCertificate.Subject -match '(?:^|,\s*)O=Intel Corporation(?:,|$)')
+    } catch { return $false }
+}
+function Test-XeFgDir([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $false }
+    $spec = Get-XeFgSpec
+    foreach ($name in $spec.Dlls.Keys) {
+        $file = Join-Path $Dir $name
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $false }
+        if ((Get-Sha $file) -ne $spec.Dlls[$name]) { return $false }
+        if (-not (Test-IntelSigned $file)) { return $false }
+    }
+    return $true
+}
+function Expand-XeFgArchive([string]$Archive, [string]$Destination) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $spec = Get-XeFgSpec
+    $wanted = [ordered]@{}
+    foreach ($name in $spec.Dlls.Keys) { $wanted[$spec.Members[$name]] = $name }
+    $wanted[$spec.License] = $spec.License
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $found = @{}
+        foreach ($entry in $zip.Entries) {
+            if (-not $entry.Name) { continue }
+            $name = Assert-ArchivePath $entry.FullName
+            foreach ($member in @($wanted.Keys)) {
+                if ($name -ne $member) { continue }
+                if ($found.ContainsKey($member)) { throw "Duplicate XeSS SDK archive member: $member" }
+                $found[$member] = $entry
+            }
+        }
+        foreach ($member in $wanted.Keys) {
+            if (-not $found.ContainsKey($member)) { throw "XeSS SDK archive is missing $member" }
+            $target = Join-Path $Destination $wanted[$member]
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($found[$member], $target)
+        }
+    } finally { $zip.Dispose() }
+}
+function Resolve-XeFgRuntime([string]$Dir, [string]$StageDir) {
+    $spec = Get-XeFgSpec
+    if ($XeSsRuntimeDir) {
+        $source = Get-FullPath $XeSsRuntimeDir
+        if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "XeSS runtime directory not found: $source" }
+        $item = Get-Item -LiteralPath $source -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'XeSS runtime directory must not be a reparse point' }
+        if (-not (Test-XeFgDir $source)) { throw 'XeSS runtime directory failed Intel signature or pinned SHA-256 verification' }
+        if (-not (Test-Path -LiteralPath (Join-Path $source $spec.License) -PathType Leaf)) { throw "XeSS runtime directory is missing $($spec.License)" }
+        Say 'xefgLocal' @($source) 'Green'
+        return $source
+    }
+    $required = [bool]($InstallXeFg -or $XeSsSdkZip)
+    if (-not $required) {
+        if ($SkipOptional -or $RuntimeDecided -or $Yes) { return '' }
+        $prompt = T 'xefgPrompt'
+        Show-Screen $(if ($script:L -eq 'ko') {'[4/5] Intel XeSS 3.0.2'} else {'[4/5] Intel XeSS 3.0.2'})
+        if ($script:SingleScreen) {
+            if ($script:L -eq 'ko') {
+                Write-Host '공식 Intel XeSS 3.0.2 · libxess_fg.dll + libxell.dll · 약 80 MB'
+                $prompt = '[Y/Enter] 설치  [N] 건너뛰기'
+            } else {
+                Write-Host 'Official Intel XeSS 3.0.2 · libxess_fg.dll + libxell.dll · about 80 MB'
+                $prompt = '[Y/Enter] Install  [N] Skip'
+            }
+            $script:LogDetails.Add((T 'xefgPrompt'))
+        }
+        $ans = (Read-Host (Format-Console $prompt)).Trim()
+        if ($ans -and $ans -notmatch '^(y|yes|ㅛ|예|네)$') { return '' }
+    } elseif ($RuntimeDecided) {
+        # The elevated child received -InstallXeFg without a staged directory; never retry a download.
+        return ''
+    }
+    $extract = Join-Path $StageDir ('xess-fg-sdk-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $extract | Out-Null
+    $zip = $XeSsSdkZip
+    try {
+        if ($zip) {
+            if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw "XeSS SDK archive not found: $zip" }
+        } else {
+            $zip = Join-Path $StageDir 'XeSS_SDK_3.0.2.zip'
+            Show-Screen $(if ($script:L -eq 'ko') {'[4/5] Intel XeSS 3.0.2'} else {'[4/5] Intel XeSS 3.0.2'})
+            Say 'xefgDown' @() 'Cyan'
+            Get-HttpFile $spec.SdkUrl $zip
+        }
+        if ((Get-Sha $zip) -ne $spec.SdkSha) { throw 'XeSS SDK archive SHA-256 mismatch' }
+        Say 'xefgVerify' @() 'Cyan'
+        Expand-XeFgArchive $zip $extract
+        foreach ($name in $spec.Dlls.Keys) {
+            $file = Join-Path $extract $name
+            if ((Get-Sha $file) -ne $spec.Dlls[$name]) { throw "XeSS runtime SHA-256 mismatch: $name" }
+            if (-not (Test-IntelSigned $file)) { throw "XeSS runtime Intel signature verification failed: $name" }
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $extract $spec.License) -PathType Leaf)) { throw "XeSS SDK archive is missing $($spec.License)" }
+        Say 'xefgOk' @($extract) 'Green'
+        return $extract
+    } catch {
+        if ($required) { throw }
+        Say 'xefgFail' @($_.Exception.Message) 'Yellow'
+        return ''
     }
 }
 function Test-ObsDir([string]$Dir) {
@@ -491,9 +641,11 @@ function Invoke-Elevated([string]$Dir, [string]$RuntimeSource, $Optional, [strin
     if ($RuntimeSource) { $argv += @('-Runtime', (& $quote $RuntimeSource)) }
     if ($Optional.sr) { $argv += @('-SrRuntime', (& $quote $Optional.sr)) }
     if ($Optional.vfg) { $argv += @('-VfgRuntimeDir', (& $quote $Optional.vfg)) }
+    if ($Optional.xefg) { $argv += @('-XeSsRuntimeDir', (& $quote $Optional.xefg)) }
     if ($Optional.pushflow.runtime) { $argv += @('-PushFlowRuntimeDir', (& $quote $Optional.pushflow.runtime)) }
     if ($Optional.pushflow.models) { $argv += @('-PushFlowModelsDir', (& $quote $Optional.pushflow.models)) }
     if ($StageDir) { $argv += @('-StageCleanupDir', (& $quote $StageDir)) }
+    if ($InstallXeFg) { $argv += '-InstallXeFg' }
     if ($Uninstall) { $argv += '-Uninstall' }
     if ($Yes) { $argv += '-Yes' }
     if ($NoPause) { $argv += '-NoPause' }
@@ -592,7 +744,8 @@ function Resolve-Runtime([string]$Dir, $Manifest = $null) {
 }
 
 function Resolve-OptionalRuntimes([string]$Dir, [string]$StageDir) {
-    $out = @{ sr = ''; vfg = '' }
+    $out = @{ sr = ''; vfg = ''; xefg = '' }
+    $out.xefg = Resolve-XeFgRuntime $Dir $StageDir
     if ($SrRuntime) {
         $p = Get-FullPath $SrRuntime
         if (Test-NvidiaSigned $p) { $out.sr = $p }
@@ -850,7 +1003,7 @@ function Resolve-PushFlow([string]$StageDir) {
     return $out
 }
 
-function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, $Manifest, $PushFlow) {
+function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, [string]$VfgSourceDir, $Manifest, $PushFlow, [string]$XeFgSourceDir = '') {
     $backupDir = Join-Path $StateDir ('backup-' + [guid]::NewGuid().ToString('N'))
     $rollbackDir = Join-Path $StateDir ('rollback-' + [guid]::NewGuid().ToString('N'))
     $rels = @($Manifest.Keys)
@@ -892,6 +1045,13 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
     if ($VfgSourceDir) {
         foreach ($dll in $VfgDlls) { $sources["$VfgDirRel\$dll"] = Join-Path $VfgSourceDir $dll }
     }
+    if ($XeFgSourceDir) {
+        $xefgSpec = Get-XeFgSpec
+        foreach ($name in $xefgSpec.Dlls.Keys) {
+            $sources["$($xefgSpec.DirRel)\$name"] = Join-Path $XeFgSourceDir $name
+        }
+        $sources["$($xefgSpec.DirRel)\$($xefgSpec.License)"] = Join-Path $XeFgSourceDir $xefgSpec.License
+    }
     if ($PushFlow.runtime) {
         foreach ($dll in 'onnxruntime.dll', 'DirectML.dll') {
             $source = Join-Path $PushFlow.runtime $dll
@@ -910,8 +1070,10 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
             $sources[$rel] = $model.FullName
         }
     }
+    $xefg = Get-XeFgSpec
     foreach ($rel in @($sources.Keys) + @($owned.Keys)) {
         if ($rel -like 'bin\64bit\pushflow\*') { Assert-PushFlowPath $Dir $rel }
+        elseif ($rel -like "$($xefg.DirRel)\*") { Assert-XeFgPath $Dir $rel }
     }
     $touched = @()
     $rollbackSafe = $true
@@ -926,6 +1088,15 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
                     }
                     $rtHash
                 } else { Get-Sha $sources[$rel] }
+            if ($rel -like "$($xefg.DirRel)\*") {
+                $leaf = Split-Path -Leaf $rel
+                if ($xefg.Dlls.Contains($leaf)) {
+                    if ((Get-Sha $sources[$rel]) -ne $xefg.Dlls[$leaf]) { throw "XeSS runtime SHA-256 mismatch: $leaf" }
+                    if (-not (Test-IntelSigned $sources[$rel])) { throw "XeSS runtime Intel signature verification failed: $leaf" }
+                } elseif (-not (Test-Path -LiteralPath $sources[$rel] -PathType Leaf)) {
+                    throw "XeSS runtime is missing $leaf"
+                }
+            }
             $backup = ''
             if ($owned.ContainsKey($rel)) { $backup = [string]$owned[$rel].backup }
             elseif ($legacyFiles.ContainsKey($rel)) { $backup = [string]$legacyFiles[$rel] }
@@ -991,8 +1162,9 @@ function Read-State {
 }
 
 function Remove-EmptyPluginDirs([string]$Dir) {
+    $xefg = Get-XeFgSpec
     foreach ($sub in 'data\obs-plugins\obs-nr-filter\locale', 'data\obs-plugins\obs-nr-filter', $VfgDirRel, 'bin\64bit\dlss',
-            'bin\64bit\pushflow\models', 'bin\64bit\pushflow') {
+            'bin\64bit\pushflow\models', 'bin\64bit\pushflow', $xefg.DirRel) {
         $path = Join-Path $Dir $sub
         if ($sub -like 'bin\64bit\pushflow*') {
             try { Assert-PushFlowPath $Dir $sub } catch { continue }
@@ -1006,6 +1178,7 @@ function Remove-EmptyPluginDirs([string]$Dir) {
 }
 
 function Remove-Files([string]$Dir, $Manifest, $State) {
+    $xefg = Get-XeFgSpec
     $useState = [bool]($State -and $State.obsDir -and (Test-SamePath ([string]$State.obsDir) $Dir))
     if ($useState -and $State.PSObject.Properties['ownedFiles']) {
         foreach ($entry in @($State.ownedFiles)) {
@@ -1015,6 +1188,12 @@ function Remove-Files([string]$Dir, $Manifest, $State) {
                 if ($entry.backup) {
                     $backupRelative = (Get-FullPath $entry.backup).Substring((Get-FullPath $StateDir).Length + 1)
                     Assert-PushFlowPath $StateDir $backupRelative
+                }
+            } elseif ($entry.relative -like "$($xefg.DirRel)\*") {
+                Assert-XeFgPath $Dir $entry.relative
+                if ($entry.backup) {
+                    $backupRelative = (Get-FullPath $entry.backup).Substring((Get-FullPath $StateDir).Length + 1)
+                    Assert-XeFgPath $StateDir $backupRelative
                 }
             }
         }
@@ -1101,7 +1280,7 @@ function Invoke-Install {
         if (-not (Test-Writable $dir)) { return (Invoke-Elevated $dir $runtimeSource $opt $stageDir) }
         Show-Screen ''
         Write-Step 5 5 (T 'sCopy')
-        Install-Files $dir $runtimeSource $opt.sr $opt.vfg $manifest $pushflow
+        Install-Files $dir $runtimeSource $opt.sr $opt.vfg $manifest $pushflow $opt.xefg
     } finally {
         if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue }
         if ($StageCleanupDir -and (Test-Path -LiteralPath $StageCleanupDir) -and ([IO.Path]::GetFileName($StageCleanupDir) -like 'obs-nr-stage-*')) {

@@ -25,6 +25,14 @@ enable_testing()
 add_test(NAME release_installer COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/release_installer_tests.ps1")
 set_tests_properties(release_installer PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+add_test(NAME installer_contract COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+  -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/installer_contract_tests.ps1"
+  -Work "${CMAKE_CURRENT_SOURCE_DIR}" -Evidence "${CMAKE_CURRENT_BINARY_DIR}/installer-contract-evidence" -XeFgOnly)
+set_tests_properties(installer_contract PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+add_test(NAME installer_reparse COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+  -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/installer_reparse_tests.ps1"
+  -Work "${CMAKE_CURRENT_SOURCE_DIR}" -Evidence "${CMAKE_CURRENT_BINARY_DIR}/installer-reparse-evidence" -XeFgOnly)
+set_tests_properties(installer_reparse PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 include(cmake/nr/Runtime.cmake)
 include(cmake/nr/Core.cmake)
 include(cmake/nr/Interop.cmake)

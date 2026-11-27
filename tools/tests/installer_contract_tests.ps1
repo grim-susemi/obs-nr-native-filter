@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$Work,[Parameter(Mandatory)][string]$Evidence,[switch]$RedOnly,[switch]$RecoveryOnly)
+param([Parameter(Mandatory)][string]$Work,[Parameter(Mandatory)][string]$Evidence,[switch]$RedOnly,[switch]$RecoveryOnly,[switch]$XeFgOnly)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $checks=0
@@ -10,6 +10,64 @@ function Sandbox($name){
  @{schema=1;owner='obs-nr-native-filter-task20';qa_only=$true;root=[IO.Path]::GetFullPath($root)}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $root '.nr-installer-sandbox.json') -Encoding UTF8
  $root
 }
+function Invoke-XeFgContract {
+ $installer=Join-Path $Work 'packaging/windows/install.ps1'
+ $tokens=$null;$errors=$null
+ $ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path $installer),[ref]$tokens,[ref]$errors)
+ if($errors.Count){throw $errors[0]}
+ foreach($f in $ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]},$true)){. ([scriptblock]::Create($f.Extent.Text))}
+ $script:StateDir=Join-Path $Evidence 'state'
+ $script:Payload=Join-Path $Evidence 'payload'
+ $script:L='en';$Version='test';$RuntimeRel='bin\64bit\nvngx_dlssnr.dll';$SrRel='bin\64bit\dlss\nvngx_dlss.dll'
+ $VfgDirRel='bin\64bit\nvidia-vfg';$VfgDlls=@('one.dll','two.dll')
+ $Yes=$true;$NoPause=$true;$Uninstall=$false;$SkipOptional=$true;$RuntimeDecided=$false
+ $InstallXeFg=$false;$XeSsRuntimeDir='';$XeSsSdkZip=''
+ $DownloadOptional=$false;$DownloadPushFlow=$false;$SkipPushFlow=$true
+ $PushFlowRuntimeDir='';$PushFlowModelsDir='';$PushFlowModelZipUrl='';$PushFlowModelZipSha=''
+ $StageCleanupDir='';$ObsDir='';$Lang='en';$SrRuntime='';$VfgRuntimeDir='';$Runtime=''
+ function Say{}
+ function Show-Screen{}
+ foreach($allowed in Get-XeFgPaths){Assert-ReceiptFile $allowed ''}
+ $refused=$false
+ try{Assert-ReceiptFile 'bin\64bit\xess-fg\MFGUnlocker.dll' ''}catch{$refused=$_.Exception.Message -eq 'Invalid installer receipt path'}
+ Assert $refused 'XeSS receipt must reject MFGUnlocker.dll'
+ $obs=Join-Path $Evidence 'obs'
+ New-Item -ItemType Directory -Force -Path (Join-Path $obs 'bin\64bit')|Out-Null
+ [IO.File]::WriteAllText((Join-Path $obs 'bin\64bit\obs64.exe'),'mock-obs')
+ $sentinel=Join-Path $obs 'bin\64bit\xess-fg\libxell.dll'
+ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sentinel)|Out-Null
+ [IO.File]::WriteAllText($sentinel,'KEEP')
+ $state=[pscustomobject]@{obsDir=$obs;ownedFiles=@(
+  [pscustomobject]@{relative='bin\64bit\xess-fg\libxess_fg.dll';hash='unused';backup=''}
+  [pscustomobject]@{relative='bin\64bit\xess-fg\MFGUnlocker.dll';hash='unused';backup=''})}
+ $manifest=[ordered]@{}
+ $manifest['obs-plugins\64bit\obs-nr-filter.dll']='unused'
+ $before=(Get-FileHash -LiteralPath $sentinel -Algorithm SHA256).Hash
+ $removeRefused=$false
+ try{Remove-Files $obs $manifest $state}catch{$removeRefused=$_.Exception.Message -eq 'Invalid installer receipt path'}
+ Assert $removeRefused 'uninstall must reject an unallowlisted XeSS receipt entry before deleting'
+ $after=(Get-FileHash -LiteralPath $sentinel -Algorithm SHA256).Hash
+ Assert ($before -eq $after) 'refused receipt must preserve existing bytes'
+ $InstallXeFg=$true
+ $XeSsRuntimeDir=Join-Path $Evidence 'xess stage with spaces'
+ $forwarded=@{install=$false;dir=''}
+ function Start-Process($FilePath,$Verb,$ArgumentList,[switch]$Wait,[switch]$PassThru){
+  Assert ($Verb -eq 'RunAs') 'elevation must use RunAs'
+  $joined=$ArgumentList -join ' '
+  $forwarded['install']=($joined -match ' -InstallXeFg(?: |$)')
+  $m=[regex]::Match($joined,' -XeSsRuntimeDir "([^"]+)"')
+  if($m.Success){$forwarded['dir']=$m.Groups[1].Value}
+  return @{ExitCode=31}
+ }
+ $optional=@{sr='';vfg='';xefg=$XeSsRuntimeDir;pushflow=@{runtime='';models=''}}
+ $code=Invoke-Elevated $obs '' $optional ''
+ Assert ($code -eq 31) 'mocked elevated child exit code'
+ Assert $forwarded['install'] 'InstallXeFg must be forwarded'
+ Assert ($forwarded['dir'] -eq $XeSsRuntimeDir) 'XeSsRuntimeDir must be forwarded as one argument'
+ @{schema=1;utc=[datetime]::UtcNow.ToString('o');checks=$checks;xess_paths=@(Get-XeFgPaths);forwarded=$forwarded;evidence=$Evidence}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $Evidence 'xefg-contract.json') -Encoding UTF8
+ Write-Output ('PASS XeSS installer contract checks='+$checks+' UAC0 GPU0 OBS0')
+}
+if($XeFgOnly){Invoke-XeFgContract;exit 0}
 if($RecoveryOnly){
  . (Join-Path $Work 'tools/NrInstallerSupport.ps1')
  $productionCopy=${function:Copy-NrInstallerPayload}
