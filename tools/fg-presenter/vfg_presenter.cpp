@@ -336,7 +336,32 @@ void frames(Feed& f)
         TerminateProcess(GetCurrentProcess(), userClosed ? 0u : 5u);
         __fastfail(FAST_FAIL_FATAL_APP_EXIT);
     };
+    uint64_t flowUnavailable = 0;
     const auto work = [&] {
+    // Shared NVOF import. One private motion texture per content input keeps a
+    // live pair's MV stable exactly like the colour input it was copied with.
+    std::array<ComPtr<ID3D12Resource>, content_input_count> inputMv;
+    std::array<ipc::GuideShape, content_input_count> inputMvShape{};
+    std::array<ImportedFlow, content_input_count> imported{};
+    const auto ensure_mv = [&](unsigned index, ipc::GuideShape shape) -> ID3D12Resource* {
+        if (!shape.width || !shape.height) return nullptr;
+        if (inputMv[index] && inputMvShape[index] == shape) return inputMv[index].Get();
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = shape.width;
+        desc.Height = shape.height;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        desc.SampleDesc.Count = 1;
+        ComPtr<ID3D12Resource> created;
+        check(gpu.d3d_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&created)), "imported motion texture");
+        inputMv[index] = std::move(created);
+        inputMvShape[index] = shape;
+        return inputMv[index].Get();
+    };
     // External frame providers keep their owners through generation shutdown.
     // Native work exceptions still propagate directly to the worker.
     struct HudUnwindGuard {
@@ -379,7 +404,8 @@ void frames(Feed& f)
             anrBackend = owner.get();
             backend = std::move(owner);
             if (anrBackend->open({gpu.d3d_device(), gpu.drawQueue.Get(), {f.view.width, f.view.height},
-                    f.view.generation, f.view.anrDllPath, f.view.experimentalAnrOptIn == 1, f.log, &gpu}))
+                    f.view.generation, f.view.anrDllPath, f.view.experimentalAnrOptIn == 1, f.log, &gpu,
+                    nullptr, f.view.transportIntervalNs}))
                 vfg = anrBackend;
             mult = std::min(mult, anrBackend->multiplier_limit());
             break;
@@ -503,6 +529,7 @@ void frames(Feed& f)
         bool continuous, interpolate;
         DedupMode mode;
         bool live;
+        bool sharedPair{};
         uint64_t compareStart{};
     };
     std::optional<Incoming> incoming;
@@ -539,8 +566,19 @@ void frames(Feed& f)
         for (const auto& p : queue) { pins[count++] = p.prevFrame.index; pins[count++] = p.currFrame.index; }
         const auto index = history.input_index(std::span(pins).first(count));
         if (index == content_input_count) return;
+        // copy_next chooses the oldest visible slot; inspect the same choice so
+        // the optional motion copy can be sized before submission.
+        std::optional<ipc::Frame> oldest;
+        for (size_t slot = 0; slot < ipc::slot_count; ++slot) {
+            const auto candidate = consumer.frame(slot);
+            if (candidate && (!oldest || candidate->serial < oldest->serial)) oldest = candidate;
+        }
+        ID3D12Resource* motion = nullptr;
+        if (oldest && oldest->flow.hasSharedMv && oldest->shape.guides.width && oldest->shape.guides.height)
+            motion = ensure_mv(index, oldest->shape.guides);
         gpu.prepare_input(index);
-        const auto next = consumer.copy_next(gpu.input[index].Get(), split ? gpu.before[index].Get() : nullptr);
+        const auto next = consumer.copy_next(gpu.input[index].Get(), split ? gpu.before[index].Get() : nullptr,
+            motion);
         if (!next.current) {
             if (next.status != ipc::Status::Pending && next.status != ipc::Status::Dropped) check(E_FAIL, "IPC copy_next");
             return;
@@ -548,6 +586,21 @@ void frames(Feed& f)
         if (next.status != ipc::Status::Ok || consumer.order_copy(*next.current, gpu.drawQueue.Get()) != ipc::Status::Ok)
             check(E_FAIL, "IPC copy dependency");
         const auto& b = next.current->frame;
+        ImportedFlow flow{};
+        flow.owner = b.flow.owner;
+        flow.provenance = b.flow.provenance;
+        flow.shotCut = b.flow.shotCut;
+        flow.reset = b.flow.reset;
+        if (motion) {
+            flow.motion = motion;
+            flow.guideWidth = b.shape.guides.width;
+            flow.guideHeight = b.shape.guides.height;
+            flow.mvScaleX = b.flow.mvScaleX;
+            flow.mvScaleY = b.flow.mvScaleY;
+            const auto ready = gpu.signal_flow_ready();
+            flow.ready = {ready.fence, ready.value};
+        }
+        imported[index] = flow;
         const auto receivedNs = clock_ns();
         if (split) f.split.update(b.splitPercent, b.splitSwap);
         if (vfg && vfg->faulted() && !backendFault) {
@@ -570,7 +623,8 @@ void frames(Feed& f)
         const bool live = InterlockedCompareExchange(&f.view.liveAnchor, 0, 0) != 0;
         if (lastMode != mode) { halfRate = {}; rate.reset(); lastMode = mode; }
         if (wasLive != live) { liveClock.reset(); lastOriginalTarget = 0; wasLive = live; }
-        incoming.emplace(Incoming{*next.current, telemetry, receivedNs, index, step.continuous, vfg && !backendFault, mode, live});
+        incoming.emplace(Incoming{*next.current, telemetry, receivedNs, index, step.continuous, vfg && !backendFault, mode, live,
+            next.hasValidSharedMv});
     };
     const auto advance = [&](uint64_t& wake) {
         auto& p = queue.front();
@@ -670,6 +724,18 @@ void frames(Feed& f)
         const auto status = consumer.copy_status(incoming->copy);
         if (status == ipc::Status::Pending) return false;
         if (status != ipc::Status::Ok) check(E_FAIL, "IPC copy completion");
+        // Single-owner routing for this pair. NR owns the chain whenever it says
+        // so, therefore an unmatched/held pair must show the original frame with
+        // reset history rather than duplicating its device analysis locally.
+        FlowRouting routing = flow_routing(imported[index]);
+        if (routing == FlowRouting::Shared && !incoming->sharedPair) routing = FlowRouting::NrUnavailable;
+        if (routing == FlowRouting::NrUnavailable) {
+            ++flowUnavailable;
+            record_input();
+            record(f, "drop_vfg_flow_unavailable", b, nullptr, 0, telemetry);
+            reset("shared_flow_unavailable");
+            return true;
+        }
         bool same = false;
         if ((interpolate || telemetry.hudLock) && anchor) {
             if (!incoming->compareStart) {
@@ -810,7 +876,7 @@ void frames(Feed& f)
             const auto stageStart = clock_ns();
             const bool pairLate = stageStart >= plan.synthetic_cutoff(activeMult - 1);
             const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult,
-                !continuous, telemetry.shotCut,
+                !continuous, telemetry.shotCut, imported[index],
                 [&] { record(f, "stage_queued", b, &a, 0, telemetry, clock_ns() - stageStart); },
                 [&](uint64_t workNs) { record(f, pushflowBackend ? "pushflow_enqueued" : "cuda_enqueued", b, &a, 0, telemetry, workNs); }};
             if (const auto ticket = pairLate ? std::nullopt : vfg->try_submit_pair(pair, anchor->index, index)) {
@@ -920,8 +986,20 @@ void frames(Feed& f)
     }
     const bool pushflowFault = pushflowBackend && pushflowBackend->runtime_fault();
     try {
-        if (pushflowBackend && !pushflowBackend->close()) drain_failure();
-        if (anrBackend && !anrBackend->close()) drain_failure();
+        if (anrBackend) {
+            const auto shared = anrBackend->guide_stats();
+            const auto unavailable = shared.sharedUnavailable + flowUnavailable;
+            const auto pairs = shared.sharedHits + unavailable;
+            fprintf(f.log, "event=shared_flow_summary fg_ofa_exec_count=%llu shared_mv_hits=%llu "
+                "shared_mv_resets=%llu shared_mv_unavailable=%llu shared_mv_pairs=%llu shared_mv_hit_rate=%.4f\n",
+                static_cast<unsigned long long>(shared.ofaExecutions),
+                static_cast<unsigned long long>(shared.sharedHits),
+                static_cast<unsigned long long>(shared.sharedResets),
+                static_cast<unsigned long long>(unavailable),
+                static_cast<unsigned long long>(pairs),
+                pairs ? static_cast<double>(shared.sharedHits) / static_cast<double>(pairs) : 0.0);
+        }
+        if (backend && !backend->close()) drain_failure();
     } catch (...) {
         drain_failure();
     }

@@ -53,11 +53,34 @@ struct AnrFgBackend::Impl {
     bool evaluate_frame(ID3D12Resource* color, uint64_t serial, unsigned count, bool reset)
     {
         if (reset) ++epoch;
-        auto* list = commands->begin();
-        bgra->record(list, color, slot);
-        const auto converted = commands->submit(list);
         const auto dense = ++sequence;
         const JobKey key{{generation, epoch, dense}, epoch, generation, dense};
+        auto* list = commands->begin();
+        FlowProblem problem = FlowProblem::None;
+        const FlowImage imported{key, nullptr, NV_OF_FENCE_POINT{}};
+        if (guides->shared_path(list, imported, reset, problem)) {
+            // NR owns this pair: imported motion is consumed as-is (or scaled)
+            // and local BGRA + NVOF never run. A failed import withholds the
+            // pair instead of returning a synthesized frame with no motion.
+            const auto* result = guides->result();
+            if (problem != FlowProblem::None || !result || result->key != key) {
+                if (log) fprintf(log, "event=anr_runtime_fault reason=shared_flow status=%u\n", static_cast<unsigned>(problem));
+                return false;
+            }
+            pending.emplace(key);
+            commands->enqueue_wait(result->complete);
+            guidesUncertain = false;
+            previous.reset();
+            for (unsigned sub = 1; sub <= count; ++sub) {
+                if (!dispatch->evaluate(*commands, *feature,
+                        {color, result->motion, result->depth, nullptr, nullptr, serial, count, sub, reset}))
+                    return false;
+            }
+            lastSerial = serial;
+            return true;
+        }
+        bgra->record(list, color, slot);
+        const auto converted = commands->submit(list);
         const FlowImage image{key, bgra->get(slot), converted};
         const FlowInput input{image, reset ? nullptr : &*previous, size, {0, 0, size.width, size.height}, reset};
         guidesUncertain = true;
@@ -94,7 +117,16 @@ AnrFgBackend::~AnrFgBackend()
     (void)impl_.release();
 }
 
-bool AnrFgBackend::close()
+bool AnrFgBackend::close() noexcept
+{
+    try {
+        return close_impl();
+    } catch (...) {
+        return false;
+    }
+}
+
+bool AnrFgBackend::close_impl()
 {
     if (!impl_) return true;
     auto& s = *impl_;
@@ -126,7 +158,10 @@ bool AnrFgBackend::open(const AnrOpen& args, std::unique_ptr<IAnrGuideProvider> 
     try {
         s.generated = std::min(s.feature->open(args.device, args.path, args.optIn), max_multiplier - 1);
         if (!s.generated) return false;
-        s.guides = guides ? std::move(guides) : make_anr_guides(args.device, args.size);
+        auto local = guides ? std::move(guides)
+                            : make_anr_guides(args.device, args.size, guide_interval_ns(args.frameIntervalNs));
+        s.guides = make_shared_anr_guides(args.device, args.size,
+            guide_interval_ns(args.frameIntervalNs), std::move(local));
         s.bgra = std::make_unique<AnrBgra>(args.device, args.size);
         s.commands = std::make_unique<AnrCommands>(args.device, args.queue);
         s.dispatch = std::make_unique<AnrDispatch>(args.device,
@@ -158,11 +193,17 @@ std::optional<FgPairTicket> AnrFgBackend::submit_pair(const FgPairDesc& pair, un
     // consumer draw completion point, and no later pair may reuse the guides,
     // commands or dispatch allocations before that fence reaches its value.
     if (s.ticket && (!s.retired || !pair_complete(*s.ticket) || !s.consumer_complete())) return {};
+    // NR owns the source chain for this pair. When its exact pair is unavailable
+    // the presenter shows the original frame instead of duplicating NR's device
+    // analysis locally, and a valid pair without imported motion is equally
+    // untrustworthy.
+    if (flow_routing(pair.flow) == FlowRouting::NrUnavailable) return {};
     s.ticket.reset();
     const unsigned count = std::min(s.generated, pair.effectiveMultiplier - 1);
     try {
         s.drain();
         s.commands->recycle();
+        s.guides->configure(pair.flow);
         if (pair.onStageQueued) pair.onStageQueued();
         // Startup and skipped evaluations need a withheld reset-A.  Use the
         // actually retained input, rather than guessing from transport serial deltas.
@@ -253,5 +294,10 @@ void AnrFgBackend::resolve_subframe(ID3D12GraphicsCommandList* list, const FgPai
 void AnrFgBackend::synchronize()
 {
     if (impl_) impl_->drain();
+}
+
+SharedGuideStats AnrFgBackend::guide_stats() const noexcept
+{
+    return impl_ && impl_->guides ? impl_->guides->stats() : SharedGuideStats{};
 }
 } // namespace nr::fg::vfg

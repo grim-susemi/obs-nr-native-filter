@@ -208,6 +208,13 @@ void Gpu::prepare_input(unsigned index)
     inputWaitFence_[index] = reader;
 }
 
+FgFencePoint Gpu::signal_flow_ready()
+{
+    const auto value = ++fence_;
+    check(drawQueue->Signal(done_.Get(), value), "imported flow ready signal");
+    return {done_.Get(), value};
+}
+
 bool Gpu::commands_ready() const
 {
     const auto completed = done_->GetCompletedValue();

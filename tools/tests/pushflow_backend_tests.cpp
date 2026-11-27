@@ -286,7 +286,7 @@ void deep_pair_banks(TestRun& test, const fs::path& runtime)
     const auto submit = [&](PushFlowBackend& backend, uint64_t first, uint64_t second,
                             std::function<void()> stage = {}) {
         return backend.submit_pair({fixture.gpu->input[0].Get(), fixture.gpu->input[1].Get(), first, second, 2,
-            false, false, std::move(stage)}, 0, 1);
+            false, false, {}, std::move(stage)}, 0, 1);
     };
     {
         PushFlowBackend backend;

@@ -30,7 +30,7 @@ public:
     PushFlowBackend();
     ~PushFlowBackend() override;
     bool open(const PushFlowOpen&, Gpu*);
-    bool close();
+    bool close() noexcept override;
     const char* name() const noexcept override { return "pushflow"; }
     unsigned version_tag() const noexcept override { return 0x01140100; }
     bool faulted() const noexcept override { return faulted_; }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
+#include "fg_backend.h"
 #include "fg_vfg_session.h"
 #include "vfg_content.h"
 #include "vfg_shot_change.h"
@@ -121,8 +122,12 @@ public:
     }
     Gpu(const Session&, HWND, uint32_t multiplier);
     void enter_steady_state() noexcept { waitMs_ = 1000; }
-    // Call before submitting a copy to this input on ipcQueue.
+    // Called before submitting a copy to this input on ipcQueue.
     void prepare_input(unsigned index);
+    // Insert a draw-queue point after the caller's IPC copy ordering and return
+    // it. Imported motion consumers wait on this instead of assuming CPU arrival
+    // proves GPU completion.
+    FgFencePoint signal_flow_ready();
     [[nodiscard]] bool commands_ready() const;
     // The caller queues the exact IPC copy dependency before comparison and
     // retains both inputs until the result arrives. No CPU fence wait or Map

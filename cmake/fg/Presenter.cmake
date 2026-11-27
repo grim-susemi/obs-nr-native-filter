@@ -67,10 +67,17 @@ add_custom_command(OUTPUT "${PUSHFLOW_RECONSTRUCT_HEADER}"
   COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${PUSHFLOW_RECONSTRUCT_HEADER}"
     -Vn pushflow_reconstruct_shader "${PUSHFLOW_RECONSTRUCT_SHADER}"
   DEPENDS "${PUSHFLOW_RECONSTRUCT_SHADER}" VERBATIM)
+set(SHARED_FLOW_SCALE_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/tools/fg-presenter/shared_flow_scale.hlsl")
+set(SHARED_FLOW_SCALE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/shared_flow_scale_shader.h")
+add_custom_command(OUTPUT "${SHARED_FLOW_SCALE_HEADER}"
+  COMMAND "${NR_COLOR_DXC}" -WX -Ges -T cs_6_0 -E main -Fh "${SHARED_FLOW_SCALE_HEADER}"
+    -Vn shared_flow_scale_shader "${SHARED_FLOW_SCALE_SHADER}"
+  DEPENDS "${SHARED_FLOW_SCALE_SHADER}" VERBATIM)
 add_custom_target(vfg_presenter_shaders DEPENDS
   ${ANR_BGRA_HEADERS}
   "${VFG_CONTENT_HEADER}" "${VFG_SHOT_HEADER}" "${PUSHFLOW_PACK_HEADER}"
   "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}"
+  "${SHARED_FLOW_SCALE_HEADER}"
   "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_update_shader.h"
   "${CMAKE_CURRENT_BINARY_DIR}/vfg_hud_lock_compose_shader.h")
 target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
@@ -78,7 +85,8 @@ target_sources(obs-nr-fg-presenter PRIVATE "${VFG_CONTENT_HEADER}"
 add_dependencies(obs-nr-fg-presenter vfg_presenter_shaders nr_guides_shaders)
 set(ANR_BACKEND_SOURCES
   tools/fg-presenter/anr_fg_backend.cpp tools/fg-presenter/anr_commands.cpp
-  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/anr_runtime.cpp)
+  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/shared_guides.cpp
+  tools/fg-presenter/anr_runtime.cpp)
 target_sources(obs-nr-fg-presenter PRIVATE ${ANR_BACKEND_SOURCES})
 target_include_directories(obs-nr-fg-presenter PRIVATE deps/ngx)
 target_link_libraries(obs-nr-fg-presenter PRIVATE nr_guides)
@@ -115,6 +123,21 @@ add_custom_command(TARGET anr_mock_dll_tests POST_BUILD
 add_test(NAME anr_mock_dll COMMAND anr_mock_dll_tests)
 set_tests_properties(anr_mock_dll PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE LABELS GPU
   ENVIRONMENT "OBS_NR_GUIDES_SHADER=${NR_GUIDES_SHADER}")
+
+# Shared NVOF consumer policy: real D3D12 device records the imported pair, the
+# scale/sanitize pass and the three ownership states.
+add_executable(anr_shared_flow_tests tools/tests/anr_shared_flow_tests.cpp
+  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/shared_guides.cpp
+  tools/fg-presenter/vfg_gpu.cpp tools/fg-presenter/vfg_hud_lock.cpp
+  tools/fg-presenter/vfg_shot_change.cpp tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_features(anr_shared_flow_tests PRIVATE cxx_std_20)
+target_compile_definitions(anr_shared_flow_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(anr_shared_flow_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(anr_shared_flow_tests PRIVATE src src/fg tools/fg-presenter "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(anr_shared_flow_tests PRIVATE fg_ipc nr_guides d3d12 dxgi user32 winmm)
+add_dependencies(anr_shared_flow_tests vfg_presenter_shaders nr_guides_shaders)
+add_test(NAME anr_shared_flow COMMAND anr_shared_flow_tests)
+set_tests_properties(anr_shared_flow PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS gpu)
 
 add_executable(vfg_shot_change_gpu_tests
   tools/tests/vfg_shot_change_gpu_tests.cpp

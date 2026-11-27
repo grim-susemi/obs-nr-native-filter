@@ -17,6 +17,7 @@ struct AnrOpen {
     FILE* log;
     Gpu* gpu{};
     FILE* submissionTrace{};
+    uint64_t frameIntervalNs{};
 };
 
 class AnrFgBackend final : public IFgBackend {
@@ -42,6 +43,9 @@ public:
     size_t max_in_flight_pairs() const noexcept override { return 1; }
     void retire_pair(const FgPairTicket&, ID3D12Fence* consumeFence = nullptr, uint64_t consumeValue = 0) noexcept override;
     void synchronize() override;
-    [[nodiscard]] bool close();
+    [[nodiscard]] bool close() noexcept override;
+    [[nodiscard]] SharedGuideStats guide_stats() const noexcept;
+private:
+    bool close_impl();
 };
 } // namespace nr::fg::vfg
