@@ -180,6 +180,8 @@ void enabled_changed(void* data, calldata_t*)
     static_cast<Filter*>(data)->reset.store(true);
 }
 
+static void sr_snapshot(void* data, calldata_t* params);
+
 Filter* create(obs_data_t* settings, obs_source_t* source)
 {
     auto* f = new (std::nothrow) Filter(source);
@@ -200,6 +202,13 @@ Filter* create(obs_data_t* settings, obs_source_t* source)
         blog(LOG_WARNING, "obs-nr-upscale: spatial effect unavailable, passing through: %s", error ? error : "");
     bfree(error);
     signal_handler_connect(obs_source_get_signal_handler(source), "enable", enabled_changed, f);
+    // Both the standalone filter and the FG tap's integrated SR must publish the
+    // same read-only telemetry seam on the source that owns this draw.
+    proc_handler_add(obs_source_get_proc_handler(source),
+        "void sr_flow_snapshot(out int ofa_exec, out int shared_hits, out int shared_fallbacks, "
+        "out int shared_misses, out int local_fallback, out int present_tick, out int captured_tick, "
+        "out bool upscaled, out bool temporal, out bool ngx_active)",
+        sr_snapshot, f);
     return f;
 }
 
@@ -511,14 +520,8 @@ extern "C" void nr_register_upscale_filter(void)
     info.get_name = [](void*) { return obs_module_text("Upscale.Name"); };
     info.create = [](obs_data_t* settings, obs_source_t* source) -> void* {
         auto* filter = create(settings, source);
-        if (filter) {
+        if (filter)
             filter->splitSetting.update(settings);
-            proc_handler_add(obs_source_get_proc_handler(source),
-                "void sr_flow_snapshot(out int ofa_exec, out int shared_hits, out int shared_fallbacks, "
-                "out int shared_misses, out int local_fallback, out int present_tick, out int captured_tick, "
-                "out bool upscaled, out bool temporal, out bool ngx_active)",
-                sr_snapshot, filter);
-        }
         return filter;
     };
     info.destroy = [](void* data) { destroy(static_cast<Filter*>(data)); };

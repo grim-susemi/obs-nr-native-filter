@@ -6,13 +6,19 @@
 //   NrOwned + Held/Unmatched -> no speculative local OFA (pair is withheld)
 //   ConsumerFallback         -> local analysis runs normally
 // plus the render/guide scale conversion, the 60 Hz interval fallback and the
-// sanitized passthrough when the guide already matches the render extent.
+// sanitized passthrough when the guide already matches the render extent. The
+// SR colour-delay decision keys the displayed colour tick by the SR's own
+// snapshot, never by an output-extent change.
 #include "anr_guides.h"
 #include "fg_backend.h"
+#include "nr_flow_broker.h"
+#include "obs_filter.h"
+#include "sr_display.h"
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -288,6 +294,61 @@ void routing_contract()
     expect(flow_routing(flow) == FlowRouting::NrUnavailable, "explicit reset provenance stays NR-owned");
 }
 
+// Follow-up to Todo 5: the SR colour delay must come from the SR's own per-draw
+// snapshot, never from an output-extent change. The extent proxy mis-keys the
+// shared pair in both directions: DLSS at 1:1 delays without changing extent,
+// and bilinear 1080p->1440p changes extent without delaying.
+void sr_delay_contract()
+{
+    constexpr std::uint64_t interval = 8'333'333; // 120 Hz
+    const std::uint64_t capture = 1200 * interval + interval / 2;
+    const auto canonical = sr_canonical_tick(capture, interval);
+    expect(canonical == nr::sampler::canonical_tick(capture, interval),
+        "FG display tick matches the OBS canonical token");
+    const auto previous = capture - interval;
+
+    // (a) DLSS running natively 1:1 presents the previous capture. The output
+    // extent never changes, so only the snapshot can report the delay.
+    const SrPresentSignal dlss{true, true, false, previous, capture};
+    const auto a = sr_display_decision({capture, interval, false}, dlss);
+    const FlowColorKey dlssDisplayed{7, canonical - 1, 3, 11, 42, 5};
+    const FramePairKey dlssPair{{7, canonical - 3, 3, 11, 40, 5}, {7, canonical - 2, 3, 11, 41, 5}};
+    expect(dlssPair.valid(), "DLSS fixture pair is a valid adjacent pair");
+    expect(a.path == SrDelayPath::Snapshot && a.shift == 1, "DLSS 1:1 delays through the snapshot");
+    expect(a.displayTick == dlssDisplayed.canonicalTick, "DLSS 1:1 keys the displayed colour tick");
+    expect(FlowBroker::display_tick_for(dlssPair, a.displayTick), "DLSS 1:1 pair serves the displayed colour");
+    expect(!FlowBroker::display_tick_for(dlssPair, canonical), "the unshifted tick keys another pair");
+    std::puts("PASS anr_shared_flow case=dlss-native-1to1-delays-without-extent-change");
+
+    // (b) Bilinear 1080p->1440p changes extent but shows this tick's colour.
+    const SrPresentSignal bilinear{true, false, true, previous, previous};
+    const auto b = sr_display_decision({capture, interval, true}, bilinear);
+    const FlowColorKey bilinearDisplayed{7, canonical, 3, 11, 44, 5};
+    const FramePairKey bilinearPair{{7, canonical - 2, 3, 11, 42, 5}, {7, canonical - 1, 3, 11, 43, 5}};
+    expect(bilinearPair.valid(), "bilinear fixture pair is a valid adjacent pair");
+    expect(b.path == SrDelayPath::Snapshot && b.shift == 0, "bilinear extent change never delays");
+    expect(b.displayTick == bilinearDisplayed.canonicalTick, "bilinear keys the displayed colour tick");
+    expect(FlowBroker::display_tick_for(bilinearPair, b.displayTick), "bilinear pair serves the displayed colour");
+    expect(b.displayTick != canonical - 1, "the extent proxy would have shifted the bilinear colour");
+    std::puts("PASS anr_shared_flow case=bilinear-1080p-to-1440p-extent-change-without-delay");
+
+    // (c) No SR telemetry at all: the documented fallback is reported (the tap
+    // logs it once per generation) and keeps the one-tick shift.
+    const auto c = sr_display_decision({capture, interval, true}, SrPresentSignal{});
+    expect(c.path == SrDelayPath::ExtentFallback, "absent snapshot reports the documented fallback");
+    expect(c.shift == 1 && c.displayTick == canonical - 1, "fallback keeps the one-tick shift");
+    const auto noChange = sr_display_decision({capture, interval, false}, SrPresentSignal{});
+    expect(noChange.path == SrDelayPath::ExtentFallback && noChange.shift == 0,
+        "fallback without an extent change does not delay");
+    std::puts("PASS anr_shared_flow case=snapshot-absent-documented-extent-fallback");
+
+    // Telemetry that did not advance for this capture (DLSS stopped mid-session)
+    // must never delay a spatial frame.
+    const SrPresentSignal stale{true, true, false, previous, previous};
+    const auto s = sr_display_decision({capture, interval, true}, stale);
+    expect(s.path == SrDelayPath::Snapshot && s.shift == 0, "stale temporal telemetry never delays");
+}
+
 void shared_flow_case(Device& gpu)
 {
     const Extent guide{64, 36};
@@ -367,6 +428,7 @@ int main()
 {
     try {
         routing_contract();
+        sr_delay_contract();
         Device gpu;
         if (!gpu.open()) {
             std::puts("SKIP anr_shared_flow: no hardware D3D12 adapter");
