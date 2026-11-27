@@ -206,6 +206,15 @@ add_test(NAME vfg_session_controller_native COMMAND vfg_native_smoke_tests
   $<TARGET_FILE:obs-nr-fg-presenter> "${CMAKE_CURRENT_BINARY_DIR}/vfg_session_controller_native" --split-telemetry)
 set_tests_properties(vfg_session_controller_native PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE LABELS gpu)
 
+add_executable(vfg_log_policy_tests tools/tests/vfg_log_policy_tests.cpp)
+target_compile_features(vfg_log_policy_tests PRIVATE cxx_std_20)
+target_compile_definitions(vfg_log_policy_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(vfg_log_policy_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(vfg_log_policy_tests PRIVATE src/fg tools/fg-presenter)
+target_link_libraries(vfg_log_policy_tests PRIVATE fg_control user32)
+add_test(NAME vfg_log_policy COMMAND vfg_log_policy_tests "${CMAKE_CURRENT_BINARY_DIR}/vfg_log_policy")
+set_tests_properties(vfg_log_policy PROPERTIES TIMEOUT 20)
+
 add_library(anr_benign_fixture MODULE tools/tests/anr_benign_fixture.cpp)
 target_compile_options(anr_benign_fixture PRIVATE /W4 /WX /permissive-)
 add_executable(anr_validator_tests tools/tests/anr_validator_tests.cpp tools/tests/anr_validator_disk_cases.cpp)

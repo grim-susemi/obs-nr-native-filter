@@ -97,6 +97,10 @@ struct WriteTestHooks {
 };
 WriteEventStatus write_event_bounded(const std::wstring& path, const std::string& text,
     DWORD timeoutMs = 150, const WriteTestHooks* hooks = nullptr) noexcept;
+// Presenter log path. The default %TEMP% path is truncated once per process so
+// a stale unbounded log never survives into a new session; an explicit
+// OBS_NR_VFG_LOG path is returned untouched.
+std::wstring resolve_log_path();
 using MarkerMutexCreateFn = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR);
 void set_marker_mutex_create_fn_for_test(MarkerMutexCreateFn fn) noexcept;
 }

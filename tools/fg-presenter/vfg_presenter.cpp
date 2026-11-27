@@ -9,6 +9,7 @@
 #include "vfg_live_anchor.h"
 #include "vfg_pacing_repair.h"
 #include "vfg_reflex.h"
+#include "vfg_trace.h"
 #include <mmsystem.h>
 #include <windowsx.h>
 #include <algorithm>
@@ -98,6 +99,7 @@ struct Feed {
     std::atomic_bool pushflowActive{false};
     std::atomic<LONG> pendingAffinityLog{-1};
     pushflow::PreviewMultiplier previewMultiplier;
+    TraceSink trace;
     bool stopped() { return state(view) < 0 || WaitForSingleObject(parent, 0) != WAIT_TIMEOUT; }
     bool active() { return state(view) == 1 && !stopped(); }
     void beat() { heartbeat.store(clock_ns()); }
@@ -177,22 +179,28 @@ struct PairTelemetry {
 };
 
 template<class... Fields>
-void trace(Feed& f, const char* format, Fields... fields)
+void write_trace(Feed& f, bool force, const char* format, Fields... fields)
 {
+    if (!force && !f.trace.enabled) return;
     char line[640];
     const int len = snprintf(line, sizeof(line), format, fields...);
     if (len > 0) {
-        const auto bytes = static_cast<DWORD>(std::min<int>(len, static_cast<int>(sizeof(line) - 1)));
-        const int fd = _fileno(f.log);
-        const HANDLE hLog = fd >= 0 ? reinterpret_cast<HANDLE>(_get_osfhandle(fd)) : INVALID_HANDLE_VALUE;
+        const int bytes = std::min<int>(len, static_cast<int>(sizeof(line) - 1));
         const LogWriteScope ioScope{f.view};
-        if (hLog != INVALID_HANDLE_VALUE) {
-            DWORD written{};
-            (void)WriteFile(hLog, line, bytes, &written, nullptr);
-        } else {
-            fwrite(line, 1, bytes, f.log);
-        }
+        (void)f.trace.send(line, bytes, force);
     }
+}
+
+template<class... Fields>
+void trace(Feed& f, const char* format, Fields... fields)
+{
+    write_trace(f, false, format, fields...);
+}
+
+template<class... Fields>
+void trace_event(Feed& f, const char* format, Fields... fields)
+{
+    write_trace(f, true, format, fields...);
 }
 
 void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a, UINT id,
@@ -718,7 +726,7 @@ void frames(Feed& f)
         const auto lockedPeriod = interpolate ? cadence.observe(timestamp,
             live ? cadence_max_interval_live_ns : cadence_max_interval_legacy_ns) : 0;
         if (lockedPeriod && lockedPeriod != lastLockedPeriod) {
-            fprintf(f.log, "event=cadence_locked period_ns=%llu repairing=%d\n",
+            trace_event(f, "event=cadence_locked period_ns=%llu repairing=%d\n",
                 static_cast<unsigned long long>(lockedPeriod), repairing ? 1 : 0);
         }
         lastLockedPeriod = lockedPeriod;
@@ -836,7 +844,7 @@ void frames(Feed& f)
                 bank.reset();
             } else if (now - bank->since >= 1500 * ms) {
                 if (!recoverySince) {
-                    trace(f, "event=error reason=bank_wait_timeout bank=%u fence=%llu completed=%llu waited_ms=%llu\n",
+                    trace_event(f, "event=error reason=bank_wait_timeout bank=%u fence=%llu completed=%llu waited_ms=%llu\n",
                         bank->ticket.slotParity, bank->value, completed, (now - bank->since) / ms);
                     recoverySince = now;
                     reset("bank_timeout");
@@ -847,7 +855,7 @@ void frames(Feed& f)
         }
         if (stalled && now - recoverySince >= 240 * ms) drain_failure();
         if (!stalled) {
-            if (recoverySince) { trace(f, "event=bank_wait_recovered\n"); recoverySince = 0; }
+            if (recoverySince) { trace_event(f, "event=bank_wait_recovered\n"); recoverySince = 0; }
             // One private IPC lookahead can detect a boundary while both pairs
             // are live. It does not compare or enter the backend until Step B.
             if (!incoming) ingest();
@@ -1115,7 +1123,12 @@ int wmain(int argc, wchar_t** argv)
     const auto hudScale = hud::scale_for(view->width, view->height,
         static_cast<uint32_t>(bounds.right - bounds.left), static_cast<uint32_t>(bounds.bottom - bounds.top),
         GetDpiForWindow(window));
+    const auto traceConfig = trace_config_from_env();
     Feed feed{*view, parent.h, window, file, argv[3], cliMult, hudScale, split};
+    feed.trace.file = logHandle;
+    feed.trace.stream = file;
+    feed.trace.enabled = traceConfig.enabled;
+    feed.trace.limitBytes = traceConfig.limitBytes;
     Handle workerDone;
     workerDone.h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!workerDone.h) {

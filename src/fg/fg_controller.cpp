@@ -165,9 +165,8 @@ std::wstring resolve_presenter_exe()
     }
     throw ipc::Error(ipc::Status::ProtocolError, ERROR_FILE_NOT_FOUND, "obs-nr-fg-presenter.exe not found");
 }
-std::wstring resolve_log_path()
+std::wstring default_log_path_candidate()
 {
-    if (auto p = env_path(L"OBS_NR_VFG_LOG"); !p.empty()) return p;
     wchar_t tmp[4096]{};
     const auto n = GetTempPathW(ARRAYSIZE(tmp), tmp);
     if (!n || n >= ARRAYSIZE(tmp)) throw ipc::Error(ipc::Status::ProtocolError, E_FAIL, "temp dir");
@@ -403,7 +402,7 @@ VOID CALLBACK write_work_callback(PTP_CALLBACK_INSTANCE instance, PVOID ctx, PTP
 void write_event(const char* event) noexcept
 {
     try {
-        detail::write_event_bounded(resolve_log_path(), event ? event : "");
+        detail::write_event_bounded(detail::resolve_log_path(), event ? event : "");
     } catch (...) {
     }
 }
@@ -538,6 +537,18 @@ WriteEventStatus write_event_bounded(const std::wstring& path, const std::string
     }
     return status;
 }
+std::wstring resolve_log_path()
+{
+    if (auto p = env_path(L"OBS_NR_VFG_LOG"); !p.empty()) return p;
+    const auto path = fs::path(default_log_path_candidate());
+    static std::once_flag resetOnce;
+    std::call_once(resetOnce, [&path] {
+        // A previous real-usage run may have left the unbounded %TEMP% log behind.
+        std::error_code ec;
+        fs::resize_file(path, 0, ec);
+    });
+    return path.wstring();
+}
 void set_marker_mutex_create_fn_for_test(MarkerMutexCreateFn fn) noexcept
 {
     g_markerMutexCreateForTest.store(fn, std::memory_order_release);
@@ -663,7 +674,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         }
     }
     const auto exe = resolve_presenter_exe();
-    const auto log = resolve_log_path();
+    const auto log = detail::resolve_log_path();
     const auto exeDir = fs::path(exe).parent_path().wstring();
     const bool nativeFg = options.backend == Backend::NativeVfg && options.multiplier > 1;
     const auto runtime = nativeFg ? find_runtime_dir() : exeDir;
