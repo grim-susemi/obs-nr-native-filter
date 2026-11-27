@@ -4,7 +4,9 @@
 #include "obs_native_output.h"
 #include <obs.h>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -66,6 +68,8 @@ struct Faults final : model::ObservationSink {
     }
 };
 struct Pipeline {
+    static uint64_t next_instance() { static uint64_t next=51; return next++; }
+    const uint64_t instance;
     const FrameDescriptor desc{{w,h},{0,0,w,h},PixelFormat::Bgra8,ColorSpace::Rec709Srgb,AlphaMode::Opaque,80};
     const Settings settings;
     obs_adapter::NativeOutput output;
@@ -74,9 +78,11 @@ struct Pipeline {
     std::shared_ptr<Faults> faults=std::make_shared<Faults>();
     uint64_t tick=100,seq=0;
     std::vector<std::shared_ptr<model::Job>> jobs;
-    Pipeline(const model::Config& config,const fs::path& assets,bool reuse)
-        :settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),1,100,{}, {},false,reuse},
-         output(51,config,shader(assets/"nr_interop_vertex.cso"),shader(assets/"nr_interop_pixel.cso"),shader(assets/"nr_obs_analysis.cso")) {
+    Pipeline(const model::Config& config,const fs::path& assets,bool reuse,bool stabilize=false)
+        :instance(next_instance()),
+         settings{{1},true,config.runtime.canonicalPath.generic_string(),{1},core_default_tuning(),1,100,{},
+            stabilize?StabilizeSettings{0.25f,0.10f,0.02f,0}:StabilizeSettings{},false,reuse},
+         output(instance,config,shader(assets/"nr_interop_vertex.cso"),shader(assets/"nr_interop_pixel.cso"),shader(assets/"nr_obs_analysis.cso")) {
         check(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&graphics));
         ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;DXGI_ADAPTER_DESC d{};
@@ -101,7 +107,7 @@ struct Pipeline {
         const auto decision=output.prepare({tick,2,3,SourceValidity::Valid,desc,settings},device.Get());
         expect(!decision.placeholder,"unexpected capture bypass");
         const auto& e=decision.epochs;
-        auto selection=output.tick({{51,e.contentEpoch,++seq},tick,tick-1,2,3,e.resourceGeneration,SourceValidity::Valid,desc,settings},
+        auto selection=output.tick({{instance,e.contentEpoch,++seq},tick,tick-1,2,3,e.resourceGeneration,SourceValidity::Valid,desc,settings},
             source.Get(),target.Get());
         if(auto now=output.current_job();now && now->contract.key.frame.ingressSequence==seq)jobs.push_back(now);
         return selection;
@@ -274,11 +280,98 @@ void jitter(Pipeline& p,const JitterTiming& timing) {
     late.reset();p.close();
 }
 void jitter(Pipeline& p) { jitter(p,jitter60); }
+void stabilization_proof(Pipeline& p) {
+    prime(p);
+    p.pattern(301);p.arrive();p.ready();
+    p.pattern(313);p.arrive();p.ready();
+    const auto& job=*p.current();
+    expect(job.eligible && job.evaluated && job.gpuTiming.stabilizeMs>=0.0,
+        "stabilize GPU stage not measured for its own JobKey");
+    std::printf("stabilize_gpu_ms=%.3f\n",job.gpuTiming.stabilizeMs);
+    p.close();
+}
+void timing_proof() {
+    const auto window=model::take_job_timing();
+    const auto entries=model::take_job_telemetry();
+    const model::JobTelemetry* full=nullptr;
+    for(const auto& entry:entries)
+        if(std::strcmp(entry.kind,"evaluation")==0 && entry.gpu.ofaBootstrapMs>=0 &&
+           entry.gpu.ofaRefineMs>=0 && entry.gpu.guidesShaderMs>=0 && entry.gpu.colorPrepMs>=0 &&
+           entry.gpu.ngxPassMs>=0 && entry.gpu.stabilizeMs>=0 && entry.gpu.colorRestoreMs>=0) {
+            full=&entry;break;
+        }
+    expect(full!=nullptr,"no single evaluation JobKey measured every GPU stage");
+    const auto& job=*full;
+    expect(std::fabs(job.admitToDoneMs-(job.preSubmitMs+job.submitToDoneMs))<=0.2,
+        "per-job admit->done identity");
+    expect(std::fabs(job.identityDeltaMs)<=0.2,"stored per-job identity delta");
+    expect(job.gpu.gpuMs>=0,"per-job GPU total");
+    expect(window.telemetryJobs>0 && window.settleWaitMs>=0 && window.dedupWaitMs>=0 &&
+        window.dedupGpuMs>=0 && window.ofaBootstrapMs>=0 && window.ofaRefineMs>=0 &&
+        window.guidesShaderMs>=0 && window.colorPrepMs>=0 && window.ngxPassMs>=0 &&
+        window.stabilizeMs>=0 && window.colorRestoreMs>=0 && window.gpuMs>=0,
+        "window stage means missing");
+    expect(window.preSubmitMs>=0 && window.submitToDoneMs>=0 && window.admitToDoneMs>=0 &&
+        window.identityDeltaMaxMs>=0 && window.identityDeltaMaxMs<=0.2,"window identity");
+    const auto trace=model::take_job_trace();
+    for(const char* field:{"\"settleWaitMs\"","\"dedupWaitMs\"","\"ofaBootstrapMs\"","\"ofaRefineMs\"",
+        "\"guidesShaderMs\"","\"colorPrepMs\"","\"ngxPassMs\"","\"stabilizeMs\"","\"colorRestoreMs\"",
+        "\"gpuMs\"","\"preSubmitMs\"","\"submitToDoneMs\"","\"admitToDoneMs\"","\"identityDeltaMs\""})
+        expect(trace.find(field)!=std::string::npos,"telemetry log field missing");
+    std::printf("NR_MODEL_TIMING {\"telemetryJobs\":%u,\"settleWaitMs\":%.3f,\"dedupWaitMs\":%.3f,"
+        "\"dedupGpuMs\":%.3f,\"ofaBootstrapMs\":%.3f,\"ofaRefineMs\":%.3f,\"guidesShaderMs\":%.3f,"
+        "\"colorPrepMs\":%.3f,\"ngxPassMs\":%.3f,\"stabilizeMs\":%.3f,\"colorRestoreMs\":%.3f,"
+        "\"gpuMs\":%.3f,\"preSubmitMs\":%.3f,\"submitToDoneMs\":%.3f,\"admitToDoneMs\":%.3f,"
+        "\"identityDeltaMaxMs\":%.4f}\n",
+        window.telemetryJobs,window.settleWaitMs,window.dedupWaitMs,window.dedupGpuMs,window.ofaBootstrapMs,
+        window.ofaRefineMs,window.guidesShaderMs,window.colorPrepMs,window.ngxPassMs,window.stabilizeMs,
+        window.colorRestoreMs,window.gpuMs,window.preSubmitMs,window.submitToDoneMs,window.admitToDoneMs,
+        window.identityDeltaMaxMs);
+    std::printf("NR_MODEL_TIMING_JOB {\"instance\":%llu,\"gen\":%llu,\"serial\":%llu,\"ingress\":%llu,"
+        "\"admitToDoneMs\":%.3f,\"preSubmitMs\":%.3f,\"submitToDoneMs\":%.3f,\"identityDeltaMs\":%.4f,"
+        "\"gpuMs\":%.3f,\"ofaBootstrapMs\":%.3f,\"ofaRefineMs\":%.3f,\"guidesShaderMs\":%.3f,"
+        "\"colorPrepMs\":%.3f,\"ngxPassMs\":%.3f,\"stabilizeMs\":%.3f,\"colorRestoreMs\":%.3f}\n",
+        static_cast<unsigned long long>(job.instance),static_cast<unsigned long long>(job.generation),
+        static_cast<unsigned long long>(job.serial),static_cast<unsigned long long>(job.ingress),
+        job.admitToDoneMs,job.preSubmitMs,job.submitToDoneMs,job.identityDeltaMs,job.gpu.gpuMs,
+        job.gpu.ofaBootstrapMs,job.gpu.ofaRefineMs,job.gpu.guidesShaderMs,job.gpu.colorPrepMs,
+        job.gpu.ngxPassMs,job.gpu.stabilizeMs,job.gpu.colorRestoreMs);
+}
+void gpu_timer_fallback(Pipeline& p) {
+    prime(p);
+    p.pattern(421);p.arrive();p.ready();
+    const auto& job=*p.current();
+    expect(job.eligible && job.evaluated && job.code<=1,"fallback evaluation did not complete cleanly");
+    expect(job.gpuTiming.gpuMs==-1.0 && job.gpuTiming.dedupGpuMs==-1.0 &&
+        job.gpuTiming.ofaBootstrapMs==-1.0 && job.gpuTiming.ofaRefineMs==-1.0 &&
+        job.gpuTiming.guidesShaderMs==-1.0 && job.gpuTiming.colorPrepMs==-1.0 &&
+        job.gpuTiming.ngxPassMs==-1.0 && job.gpuTiming.stabilizeMs==-1.0 &&
+        job.gpuTiming.colorRestoreMs==-1.0,"injected timer failure did not yield the -1.0 sentinel");
+    const auto entries=model::take_job_telemetry();
+    const model::JobTelemetry* found=nullptr;
+    for(auto it=entries.rbegin();it!=entries.rend();++it)
+        if(it->serial==job.contract.key.submissionSerial) { found=&*it; break; }
+    expect(found && found->gpu.gpuMs==-1.0,"telemetry did not preserve the exact-job sentinel");
+    std::printf("NR_MODEL_TIMING_FALLBACK {\"instance\":%llu,\"serial\":%llu,\"gpuMs\":%.1f,\"crashes\":0}\n",
+        static_cast<unsigned long long>(job.contract.key.frame.instanceId),
+        static_cast<unsigned long long>(job.contract.key.submissionSerial),job.gpuTiming.gpuMs);
+    p.close();
+}
 }
 model::Config config(const Host& host,const fs::path& assets,uint64_t intervalNs) {
-    model::Config c;c.runtime={fs::canonical(install/"nvngx_dlssnr.dll"),std::string(runtime::allowed_runtimes()[0].sha256)};
+    model::Config c;
+    // The installed allowlisted variant may be either pinned NR build (310.8.0.0 or
+    // 310.9.16.0); select by the actual bytes instead of assuming the oldest entry.
+    // Module::open still verifies that exact hash and the NVIDIA signature.
+    const auto runtimePath=fs::canonical(install/"nvngx_dlssnr.dll");
+    const runtime::RuntimeVariant* installed=nullptr;
+    for(const auto& variant:runtime::allowed_runtimes())
+        if(runtime::inspect({runtimePath,std::string(variant.sha256)}).accepted){installed=&variant;break;}
+    expect(installed!=nullptr,"installed NR runtime is an allowlisted variant");
+    c.runtime={runtimePath,std::string(installed->sha256)};
     c.driver=runtime::resolve_driver().identity.canonicalPath;c.data=fs::canonical(host.data);
     c.codec=shader(assets/"nr_codec.dxil");c.color=shader(assets/"nr_color.dxil");c.guides=shader(assets/"nr_guides.cso");
+    c.stabilize=shader(assets/"nr_stabilize.dxil");
     c.frameIntervalNs=intervalNs;return c;
 }
 int main(int argc,char** argv) try {
@@ -301,6 +394,11 @@ int main(int argc,char** argv) try {
         Host host;const auto c=config(host,assets,frame60Ns);
         {Pipeline p(c,assets,false);jitter(p);}
         {Pipeline p(c,assets,true);reuse_and_refusal(p);}
+        {Pipeline p(c,assets,false,true);stabilization_proof(p);}
+        timing_proof();
+        expect(_putenv_s("OBS_NR_TEST_GPU_TIMER_FAIL","1")==0,"timer fault environment");
+        {Pipeline p(c,assets,false);gpu_timer_fallback(p);}
+        expect(_putenv_s("OBS_NR_TEST_GPU_TIMER_FAIL","")==0,"timer fault environment restore");
     }
     std::puts("PASS nr_model_pipeline");
     return 0;
