@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "fg_controller.h"
-#include <d3d11.h>
+#include <d3d11_4.h>
+#include <d3d12.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -1839,6 +1840,192 @@ void run_anr_ab(const std::wstring& presenter, const fs::path& logDir, const std
             count_tokens(c, "shot_cut=1"), count_tokens(c, "event=present_vfg_subframe "));
     }
 }
+
+// Drive the public IPC/controller boundary. Source PTS and RGB values define
+// the oracle; never infer a repeat or the expected shot cut from the log.
+void run_pair_probe(const std::wstring& presenter, const fs::path& log, const std::wstring& mon)
+{
+    const auto name = log.stem().string();
+    const bool exact = name == "dedup-exact";
+    const bool noisy = name == "dedup-noisy", adaptive = name == "dedup-60to30-adaptive", fixed = name == "dedup-60to30-fixed";
+    const bool live = name == "live-anchor", shot = name == "2-deep-repeat-shot-change";
+    const bool blocked = name == "bank-wait-timeout", resize = name == "2-deep-resize", discontinuity = name == "2-deep-discontinuity";
+    const bool cutover = discontinuity || resize || blocked;
+    const auto mode = adaptive ? DedupMode::Adaptive60To30 : fixed ? DedupMode::Fixed60To30 :
+        noisy || shot ? DedupMode::Auto : DedupMode::OffExact;
+
+    fs::remove(log);
+    SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenter.c_str());
+    SetEnvironmentVariableW(L"OBS_NR_VFG_LOG", log.c_str());
+    GpuFixture gpu(1280, 720);
+    LaunchOptions opts{};
+    opts.lowLatency = 0;
+    opts.monitorId = mon;
+    opts.dedupMode = static_cast<uint32_t>(mode);
+    opts.transportIntervalNs = 16'666'667;
+    opts.gpuShotChange = shot;
+    opts.liveAnchor = live;
+    ipc::Producer producer(gpu.dev.Get(), unique_mapping(L"pair"), gpu.shape);
+    Controller ctl(opts);
+    expect(ctl.offer(producer.connect(ctl.peer()), gpu.shape, gpu.luid) &&
+        WaitForSingleObject(producer.control_event(), 10000) == WAIT_OBJECT_0, "pair probe bind");
+    wait_log_token(log, "event=initialized", ctl);
+    const auto send = [&](unsigned rgb, uint64_t pts) {
+        const auto pixel = 0xff000000u | rgb * 0x010101u;
+        gpu.fill_frame(pixel, pixel, 0);
+        expect(producer.publish(gpu.tex.Get(), pts, clock_ns()) == ipc::Status::Ok, "pair probe publish");
+    };
+    const auto wait_line = [&](std::string_view key, unsigned timeout) {
+        const auto end = clock_ns() + uint64_t{timeout} * 1'000'000;
+        do { if (read_text(log).find(key) != std::string::npos) return; pace_to(clock_ns() + 250'000); } while (clock_ns() < end);
+        throw std::runtime_error(std::string("timed out waiting for ") + std::string(key));
+    };
+    const auto event = [&](std::string_view kind, unsigned serial) {
+        return "event=" + std::string(kind) + " generation=" + std::to_string(producer.generation()) + " b=" + std::to_string(serial) + " ";
+    };
+    ComPtr<ID3D12Fence> release;
+    ComPtr<ID3D11DeviceContext4> gatedContext;
+    ComPtr<ID3D11Fence> gate;
+    if (blocked) {
+        // Create the shared fence before streaming; insert the wait while two pairs are live.
+        ComPtr<ID3D11Device5> d11;
+        ComPtr<ID3D12Device> d12;
+        ComPtr<IDXGIDevice> dxgi;
+        ComPtr<IDXGIAdapter> adapter;
+        Handle shared;
+        expect(SUCCEEDED(gpu.dev.As(&d11)) && SUCCEEDED(gpu.ctx.As(&gatedContext)) && SUCCEEDED(gpu.dev.As(&dxgi)) &&
+            SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(d11->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&gate))) &&
+            SUCCEEDED(gate->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &shared.value)) &&
+            SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d12))) &&
+            SUCCEEDED(d12->OpenSharedHandle(shared.value, IID_PPV_ARGS(&release))), "install shared GPU gate");
+    }
+    unsigned count = 0;
+    if (cutover || shot) {
+        const auto basePts = clock_ns();
+        send(32, basePts);
+        wait_line(event("present_original", 1), 3000);
+        send(224, basePts + 16'666'667);
+        wait_line("event=pair_admitted b=2 ", 1000);
+        if (shot) send(226, basePts + 25'000'000);
+        send(215, basePts + 33'333'333);
+        const unsigned last = shot ? 4 : 3;
+        wait_line("event=pair_admitted b=" + std::to_string(last) + " ", 1000);
+        if (shot) wait_line(event("present_original", last), 1000);
+        if (resize) {
+            expect(ctl.request_resize(), "request resize");
+            const auto end = clock_ns() + 2'000'000'000;
+            while (!ctl.resize_drained() && clock_ns() < end) Sleep(1);
+            expect(ctl.resize_drained(), "resize drain acknowledgement");
+            GpuFixture resizedGpu(960, 540);
+            ipc::Producer resized(resizedGpu.dev.Get(), unique_mapping(L"resized"), resizedGpu.shape);
+            expect(ctl.offer(resized.connect(ctl.peer()), resizedGpu.shape, resizedGpu.luid) &&
+                WaitForSingleObject(resized.control_event(), 10000) == WAIT_OBJECT_0, "resize offer");
+            const auto readyEnd = clock_ns() + 3'000'000'000;
+            while (count_tokens(read_text(log), "event=initialized") < 2 && clock_ns() < readyEnd) Sleep(1);
+            expect(count_tokens(read_text(log), "event=initialized") == 2, "resized backend ready");
+            resizedGpu.fill_frame(0xff303030, 0xff303030, 0);
+            expect(resized.publish(resizedGpu.tex.Get(), basePts + 50'000'000, clock_ns()) == ipc::Status::Ok, "resized anchor");
+            wait_line("event=present_original generation=" + std::to_string(resized.generation()) + " b=1 ", 3000);
+        } else if (discontinuity || blocked) {
+            if (blocked) expect(SUCCEEDED(gatedContext->Wait(gate.Get(), 1)), "delay consumer queue");
+            send(96, basePts + 1); // backwards PTS; read by IPC before the image is ready
+            if (blocked) {
+                try { wait_line("reason=bank_wait_timeout", 1950); }
+                catch (...) { (void)release->Signal(1); throw; }
+                expect(SUCCEEDED(release->Signal(1)), "release GPU gate");
+                wait_line("event=bank_wait_recovered", 500);
+            }
+            const unsigned anchor = blocked ? 5 : 4;
+            if (blocked) send(80, basePts + 16'666'668);
+            wait_line(event("present_original", anchor), 1200);
+            send(120, basePts + (blocked ? 33'333'335 : 16'666'668));
+            wait_line(event("present_original", anchor + 1), 1200);
+        }
+    } else {
+        count = live ? 120u : 48u;
+        const auto basePts = clock_ns() + 2'000'000;
+        const auto phase = fixed || adaptive;
+        for (unsigned i = 0; i < count; ++i) {
+            const auto ts = basePts + uint64_t{i} * 1'000'000'000 / 60;
+            const unsigned id = phase ? i < 16 ? i / 2 : i < 32 ? 8 + (i - 16) / 4 : 12 + i - 32 : noisy || exact ? i / 3 : i;
+            const unsigned rgb = (id % 2 ? 200u : 32u) + (noisy || exact ? i % 3 : 0);
+            pace_to(live ? basePts + (ts - basePts) * 1002 / 1000 : ts);
+            send(rgb, ts);
+        }
+        wait_line(event("input", count), 2000);
+        wait_line(event("present_original", noisy ? count - 2 : fixed ? count - 1 : count), 2000);
+    }
+    wait_controller_exit(ctl);
+    const auto report = read_text(log);
+    expect(count_tokens(report, "event=error") == unsigned(blocked), "unexpected error count in pair probe");
+    std::vector<bool> repeats(count + 1), originals(count + 1), skipped(count + 1);
+    uint64_t lastFence = 0, timeoutMs = 0, recover = 0;
+    unsigned retired = 0, reuse = 0;
+    bool boundary = false, overlap = false, locked = false, cut = false, afterCut = false, repeatSlot = false;
+    unsigned cutSlot = 2;
+    double phaseMs = 0, ppm = 0;
+    std::istringstream lines(report);
+    const auto field_u64 = [](const std::string& line, const char* key) {
+        return std::stoull(field_value(line, " " + std::string(key) + "="));
+    };
+    for (std::string line; std::getline(lines, line);) {
+        const auto serial = field_value(line, " b=");
+        const auto b = serial.empty() ? 0ULL : std::stoull(serial);
+        if (line.starts_with("event=pair_admitted")) {
+            const auto prior = field_u64(line, "prior_fence");
+            expect(field_u64(line, "completed") >= prior, "bank reused before consumer completion");
+            reuse += prior > 0;
+            if (b == (shot ? 4u : 3u) && field_u64(line, "depth") == 2) overlap = true;
+            if (shot && b == 2) cutSlot = static_cast<unsigned>(field_u64(line, "shot_slot"));
+        } else if (line.starts_with("event=pair_retired")) {
+            const auto fence = field_u64(line, "fence");
+            if (resize && boundary && fence == 1) lastFence = 0;
+            expect(fence > lastFence, "retire sequence must increase");
+            lastFence = fence;
+            if (line.find(resize ? "reason=resize" : "reason=discontinuity") != std::string::npos) {
+                if (!boundary) expect(field_u64(line, "depth") == 2, "discontinuity did not drain two pairs");
+                boundary = true;
+                ++retired;
+            }
+        } else if (line.starts_with("event=present_vfg_subframe")) {
+            expect(!boundary || (b != 2 && b != 3), "stale synthetic after drain");
+            if (shot && b == 2) cut = field_u64(line, "shot_cut") == 1 && field_u64(line, "shot_slot") == cutSlot;
+            if (shot && b == 4) afterCut = field_u64(line, "shot_cut") == 0 && field_u64(line, "a") == 2;
+        } else if (line.starts_with("event=repeat_input")) {
+            if (b <= count) repeats[static_cast<size_t>(b)] = true;
+            if (shot && b == 3) repeatSlot = field_u64(line, "shot_slot") != cutSlot;
+        } else if (b && b <= count && line.starts_with("event=present_original")) originals[static_cast<size_t>(b)] = true;
+        else if (b && b <= count && line.starts_with("event=decimate_input")) skipped[static_cast<size_t>(b)] = true;
+        else if (line.starts_with("event=error reason=bank_wait_timeout")) {
+            timeoutMs = field_u64(line, "waited_ms");
+            expect(field_u64(line, "completed") < field_u64(line, "fence"), "test did not delay a consumer fence");
+        } else if (line.starts_with("event=bank_wait_recovered")) ++recover;
+        else if (line.starts_with("[live-anchor]") && field_u64(line, "locked")) {
+            locked = true;
+            phaseMs = std::stod(line.substr(line.find("phaseMs=") + 8));
+            ppm = std::stod(line.substr(line.find("clockDriftPpm=") + 14));
+        }
+    }
+    if (cutover) {
+        expect(overlap && retired == 2 && (resize || reuse), "must retire both banks and resume cleanly");
+        expect(!blocked || (timeoutMs > 0 && timeoutMs <= 2000 && recover == 1), "bounded timeout and recovery required");
+        std::printf("PASS %s depth=2 retired=%u stale_subframes=0 reused_early=0 wait_ms=%llu recovered=%llu errors=%u\n", name.c_str(), retired, timeoutMs, recover, unsigned(blocked));
+    } else if (shot) {
+        expect(overlap && cut && afterCut && repeatSlot, "overlapped repeat clobbered a cut or its predecessor");
+        std::printf("PASS %s gpu_shot_change=1 depth=2 repeat_b=3 cut_b=2 shot_cut=1 next_b=4 next_shot_cut=0 errors=0\n", name.c_str());
+    } else if (live) {
+        expect(locked && phaseMs > 10 && phaseMs < 25 && ppm > 300 && ppm < 4200, "live phase and implanted +2000ppm source drift");
+        std::printf("PASS live-anchor locked=1 phaseMs=%.3f clockDriftPpm=%.2f errors=0\n", phaseMs, ppm);
+    } else {
+        for (unsigned i = 0; i < count; ++i) {
+            const bool unique = exact || (noisy ? i % 3 == 0 : fixed || i < 16 ? i % 2 == 0 : i >= 32 || i % 4 == 0);
+            expect(originals[i + 1] == unique && ((repeats[i + 1] || skipped[i + 1]) != unique), "dedup decision differs from source sequence");
+        }
+        expect(!count_tokens(report, "[live-anchor]") && count_tokens(report, "[content-dedup]") > 0, "dedup telemetry with live anchor disabled");
+        std::printf("PASS %s mode=%u samples=%u originals=%zu repeats=%zu decimated=%zu errors=0\n", name.c_str(), static_cast<unsigned>(mode), count,
+            size_t(std::count(originals.begin(), originals.end(), true)), size_t(std::count(repeats.begin(), repeats.end(), true)), size_t(std::count(skipped.begin(), skipped.end(), true)));
+    }
+}
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -1867,7 +2054,11 @@ int wmain(int argc, wchar_t** argv)
             return (n && n < ARRAYSIZE(buf)) ? std::wstring(buf, n) : std::wstring{};
         };
 
-        if (mode == L"shot-change") run_shot_change(presenter, logDir, monId);
+        if (mode == L"dedup-noisy" || mode == L"dedup-60to30-adaptive" || mode == L"dedup-60to30-fixed" || mode == L"live-anchor" ||
+            mode == L"2-deep-repeat-shot-change" || mode == L"2-deep-discontinuity" || mode == L"2-deep-resize" || mode == L"bank-wait-timeout") {
+            if (mode == L"dedup-noisy") run_pair_probe(presenter, logDir / L"dedup-exact.log", monId);
+            run_pair_probe(presenter, logDir / (std::wstring(mode) + L".log"), monId);
+        } else if (mode == L"shot-change") run_shot_change(presenter, logDir, monId);
         else if (mode == L"hud-lock") run_hud_lock(presenter, logDir, monId);
         else if (mode == L"pacing-repair") run_pacing_repair(presenter, logDir, monId);
         else if (mode == L"adaptive") run_adaptive(presenter, logDir, monId);

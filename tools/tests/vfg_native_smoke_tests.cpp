@@ -47,7 +47,7 @@ std::wstring secondary_monitor_id()
     return found;
 }
 
-enum class Fixture { Standard, Hotfix, PacingAdaptive, SplitTelemetry, Parity };
+enum class Fixture { Standard, Hotfix, PacingAdaptive, SplitTelemetry, Parity, Batch, Hz120 };
 
 void wait_initialized(const std::wstring& logPath, Controller& controller)
 {
@@ -68,7 +68,9 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     const std::wstring& monitorId, uint32_t cadence = 0, Quality quality = Quality::Medium, Fixture fixture = Fixture::Standard)
 {
     const bool hotfix = fixture == Fixture::Hotfix, wiring = fixture == Fixture::PacingAdaptive;
-    const bool split = fixture == Fixture::SplitTelemetry, parity = fixture == Fixture::Parity;
+    const bool scheduler = fixture == Fixture::Batch || fixture == Fixture::Hz120;
+    const bool split = fixture == Fixture::SplitTelemetry, parity = fixture == Fixture::Parity || scheduler;
+    const uint32_t transportHz = fixture == Fixture::Hz120 ? 120u : 60u;
     std::error_code ec;
     std::filesystem::remove(logPath, ec);
     SetEnvironmentVariableW(L"OBS_NR_VFG_PRESENTER", presenterPath.c_str());
@@ -89,7 +91,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     DXGI_ADAPTER_DESC desc{};
     expect(SUCCEEDED(dev.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)), "adapter");
 
-    ipc::Shape shape{hotfix ? 2560u : wiring || split ? 1280u : 1920u, hotfix ? 1440u : wiring || split ? 720u : 1080u,
+    ipc::Shape shape{hotfix ? 2560u : wiring || split || scheduler ? 1280u : 1920u, hotfix ? 1440u : wiring || split || scheduler ? 720u : 1080u,
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
     shape.splitCompare = split;
     D3D11_TEXTURE2D_DESC td{};
@@ -110,6 +112,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     opts.multiplier = mult;
     opts.quality = quality;
     opts.monitorId = monitorId;
+    if (scheduler) { opts.lowLatency = 0; opts.transportIntervalNs = 1'000'000'000 / transportHz; }
     opts.pacingRepair = wiring;
     opts.adaptiveFg = wiring;
     opts.adaptiveTargetFps = wiring ? 60u : 0u;
@@ -144,7 +147,7 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
         : nullptr;
     struct TimerClose { HANDLE h; ~TimerClose() { if (h) CloseHandle(h); } } paceTimerGuard{paceTimer};
     for (uint32_t f = 0; f < count; ++f) {
-        const auto ts = start + uint64_t{f} * 1'000'000'000 / 60;
+        const auto ts = start + uint64_t{f} * 1'000'000'000 / transportHz;
         if (cadence || parity) {
             while (clock_ns() < ts) {
                 const auto rem = ts - (std::min)(ts, clock_ns());
@@ -256,6 +259,47 @@ void run_multiplier(uint32_t mult, const std::wstring& presenterPath, const std:
     }
     if (cadence)
         std::printf("CADENCE hz=%u accepted=%u duplicate_writes=%u\n", cadence, accepted, repeated);
+    if (scheduler) {
+        expect(content.find("batch_capacity=2") != std::string::npos, "native two-bank initialization");
+        const auto value = [](const std::string& line, std::string_view key) {
+            const auto pos = line.find(key);
+            expect(pos != std::string::npos, "missing frame metric");
+            return std::stoull(line.substr(pos + key.size()));
+        };
+        std::map<uint64_t, size_t> staged, presented;
+        std::vector<uint64_t> times;
+        std::istringstream lines(content);
+        size_t order = 0;
+        for (std::string line; std::getline(lines, line); ++order) {
+            const bool stage = line.starts_with("event=stage_queued "), original = line.starts_with("event=present_original ");
+            if (!stage && !original && !line.starts_with("event=present_vfg_subframe ")) continue;
+            const auto serial = value(line, " b=");
+            if (stage) {
+                if (value(line, " a=") + 1 == serial) staged.emplace(serial, order);
+            } else {
+                if (original) presented.emplace(serial, order);
+                if (serial > warmupCount) times.push_back(value(line, " qpc_ns="));
+            }
+        }
+        uint64_t predecessor = 0;
+        for (const auto& [b, stage] : staged) {
+            if (staged.contains(b + 1) && presented.contains(b) && stage < staged.at(b + 1) && staged.at(b + 1) < presented.at(b)) {
+                predecessor = b;
+                break;
+            }
+        }
+        if (fixture == Fixture::Batch) {
+            expect(predecessor != 0, "a chained N+1 must be staged before presenting original N");
+            std::printf("BATCH batch_capacity=2 stage_queued_b=%llu order=%zu before_present_original_b=%llu order=%zu\n",
+                predecessor + 1, staged.at(predecessor + 1), predecessor, presented.at(predecessor));
+        } else {
+            expect(content.find("event=cadence_locked period_ns=8333333") != std::string::npos && times.size() >= 2,
+                "120 Hz content cadence must lock");
+            const double hz = double(times.size() - 1) * 1e9 / double(times.back() - times.front());
+            expect(hz > 216 && hz < 264 && times.size() >= 216, "measured 120 Hz originals plus one synthetic per period");
+            std::printf("120FPS transport_hz=120 eff_mult=2 period_ns=8333333 measured_presents=%zu output_hz=%.2f\n", times.size(), hz);
+        }
+    }
     if (hotfix) {
         const auto mode = static_cast<unsigned>(quality);
         expect(content.find("size=2560x1440 quality=" + std::to_string(mode) + " ") != std::string::npos,
@@ -279,13 +323,15 @@ int wmain(int argc, wchar_t** argv)
         const bool hotfix = argc == 4 && std::wstring_view(argv[3]) == L"--1440p-4x";
         const bool high = argc == 4 && std::wstring_view(argv[3]) == L"--1440p-4x-high";
         const bool parity = argc >= 4 && std::wstring_view(argv[3]) == L"--parity";
+        const bool batch = argc == 4 && std::wstring_view(argv[3]) == L"--batch-capacity-2";
+        const bool hz120 = argc == 4 && std::wstring_view(argv[3]) == L"--120fps-2x";
 #ifdef OBS_NR_VFG_QA_ACTION
         constexpr bool allowPrimary = false;
 #else
         const bool allowPrimary = (argc == 4 && std::wstring_view(argv[3]) == L"--allow-primary") ||
             (parity && argc == 5 && std::wstring_view(argv[4]) == L"--allow-primary");
 #endif
-        expect(argc == 3 || cadence || wiring || split || hotfix || high ||
+        expect(argc == 3 || cadence || wiring || split || hotfix || high || batch || hz120 ||
             (parity && (argc == 4 || allowPrimary)) || (allowPrimary && argc == 4),
             "usage: vfg_native_smoke_tests <presenter.exe> <log_dir> [--cadence|--pacing-adaptive|--split-telemetry|--1440p-4x|--1440p-4x-high|--parity [--allow-primary]|--allow-primary]");
         const std::wstring presenter = argv[1];
@@ -294,6 +340,12 @@ int wmain(int argc, wchar_t** argv)
         expect(allowPrimary || !monId.empty(), "no active secondary display");
         expect(SetEnvironmentVariableW(L"OBS_NR_VFG_QA_MONITOR", monId.empty() ? nullptr : monId.c_str()) != FALSE,
             "set QA monitor override");
+        if (batch || hz120) {
+            std::filesystem::create_directories(logDir);
+            run_multiplier(2, presenter, (logDir / (batch ? L"batch-capacity-2.log" : L"120fps-2x.log")).wstring(),
+                monId, 0, Quality::Medium, batch ? Fixture::Batch : Fixture::Hz120);
+            return 0;
+        }
         if (parity) {
             std::filesystem::create_directories(logDir);
             run_multiplier(2, presenter, (logDir / L"parity-2x.log").wstring(), monId, 0, Quality::Medium, Fixture::Parity);

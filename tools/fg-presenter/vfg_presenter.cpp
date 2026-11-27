@@ -6,6 +6,7 @@
 #include "vfg_cadence.h"
 #include "vfg_generation_scope.h"
 #include "vfg_hud.h"
+#include "vfg_live_anchor.h"
 #include "vfg_pacing_repair.h"
 #include "vfg_reflex.h"
 #include <mmsystem.h>
@@ -14,6 +15,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cwchar>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fcntl.h>
@@ -171,19 +173,14 @@ struct PairTelemetry {
     int64_t shiftNs{};
     bool hudLock{}, shotCut{}, pacingRepair{}, adaptiveFg{};
     LONG adaptiveTargetFps{};
+    unsigned shotSlot{};
 };
 
-void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a, UINT id,
-    const PairTelemetry& telemetry, uint64_t workNs = 0, uint64_t eventNs = 0)
+template<class... Fields>
+void trace(Feed& f, const char* format, Fields... fields)
 {
-    const auto q = [](uint64_t n) { return static_cast<unsigned long long>(n); };
-    char line[512];
-    const int len = snprintf(line, sizeof(line),
-        "event=%s generation=%llu b=%llu b_qpc_ns=%llu b_arrival_ns=%llu b_obs_tick=%llu a=%llu a_qpc_ns=%llu present_id=%u qpc_ns=%llu work_ns=%llu eff_mult=%u pacing_shift_ns=%lld hud_lock=%d shot_cut=%d pacing_repair=%d adaptive_fg=%d adaptive_target_fps=%ld\n",
-        kind, q(b.generation), q(b.serial), q(b.timestampNs), q(b.arrivalNs), q(b.obsTick), q(a ? a->serial : 0),
-        q(a ? a->timestampNs : 0), id, q(eventNs ? eventNs : clock_ns()), q(workNs), telemetry.multiplier,
-        static_cast<long long>(telemetry.shiftNs), telemetry.hudLock, telemetry.shotCut,
-        telemetry.pacingRepair, telemetry.adaptiveFg, telemetry.adaptiveTargetFps);
+    char line[640];
+    const int len = snprintf(line, sizeof(line), format, fields...);
     if (len > 0) {
         const auto bytes = static_cast<DWORD>(std::min<int>(len, static_cast<int>(sizeof(line) - 1)));
         const int fd = _fileno(f.log);
@@ -198,23 +195,66 @@ void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a,
     }
 }
 
-void pace_until(uint64_t targetNs, Feed& f, HANDLE timer)
+void record(Feed& f, const char* kind, const ipc::Frame& b, const ipc::Frame* a, UINT id,
+    const PairTelemetry& telemetry, uint64_t workNs = 0, uint64_t eventNs = 0)
 {
-    for (;;) {
-        if (!f.active()) return;
-        const uint64_t now = clock_ns();
-        if (now >= targetNs) return;
-        const auto remaining = targetNs - now;
-        if (remaining <= 300000) { YieldProcessor(); continue; }
-        LARGE_INTEGER due{};
-        due.QuadPart = -static_cast<LONGLONG>((remaining - 200000) / 100);
-        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-            if (WaitForSingleObject(timer, static_cast<DWORD>(remaining / ms + 2)) != WAIT_FAILED)
-                continue;
-        }
-        if (remaining >= ms) Sleep(1);
-        else SwitchToThread();
+    const auto q = [](uint64_t n) { return static_cast<unsigned long long>(n); };
+    trace(f,
+        "event=%s generation=%llu b=%llu b_qpc_ns=%llu b_arrival_ns=%llu b_obs_tick=%llu a=%llu a_qpc_ns=%llu present_id=%u qpc_ns=%llu work_ns=%llu eff_mult=%u pacing_shift_ns=%lld hud_lock=%d shot_cut=%d pacing_repair=%d adaptive_fg=%d adaptive_target_fps=%ld shot_slot=%u\n",
+        kind, q(b.generation), q(b.serial), q(b.timestampNs), q(b.arrivalNs), q(b.obsTick), q(a ? a->serial : 0),
+        q(a ? a->timestampNs : 0), id, q(eventNs ? eventNs : clock_ns()), q(workNs), telemetry.multiplier,
+        static_cast<long long>(telemetry.shiftNs), telemetry.hudLock, telemetry.shotCut,
+        telemetry.pacingRepair, telemetry.adaptiveFg, telemetry.adaptiveTargetFps, telemetry.shotSlot);
+}
+
+struct PendingPair {
+    ContentFrame prevFrame, currFrame;
+    PairTelemetry telemetry;
+    CadencePlan plan;
+    uint64_t deadlineNs{}, fid{}, hudEpoch{}, extraNs{};
+    std::optional<FgPairTicket> ticket{};
+    unsigned nextSub{1}, shotParity{};
+    bool repeat{}, updateHud{true}, resetHud{};
+    // Split repeats own a presentation slot, never the unique-content anchor.
+    const ContentFrame& anchor() const { return repeat ? prevFrame : currFrame; }
+    uint64_t due() const {
+        return ticket && nextSub <= ticket->lastSubmittedSub ? plan.target(nextSub) : plan.originalNs;
     }
+};
+
+struct HalfRate {
+    std::optional<uint64_t> lastNew, first;
+    bool skip(DedupMode mode, uint64_t serial, bool same) {
+        if (mode != DedupMode::Adaptive60To30 && mode != DedupMode::Fixed60To30) {
+            first.reset();
+            if (!same) lastNew = serial;
+            return same;
+        }
+        if (!first && same && lastNew && serial - *lastNew == 1) first = lastNew;
+        const bool second = first && (serial - *first) % 2 == 1;
+        if (mode == DedupMode::Adaptive60To30 && second && !same) first.reset();
+        if (mode == DedupMode::Fixed60To30 && first) return second;
+        if (!same) lastNew = serial;
+        return same;
+    }
+};
+
+// The HWND runs on another thread. IPC and GPU signals interrupt the nearest
+// presentation deadline; the timed poll also covers missing/coalesced signals.
+void scheduler_wait(uint64_t targetNs, HANDLE timer, const std::array<HANDLE, 3>& sources)
+{
+    const auto now = clock_ns();
+    if (now >= targetNs) return;
+    std::array<HANDLE, 4> handles{};
+    DWORD count = 0;
+    for (const auto h : sources) if (h) handles[count++] = h;
+    const auto remaining = targetNs - now;
+    LARGE_INTEGER due{};
+    due.QuadPart = -static_cast<LONGLONG>(std::max<uint64_t>(1, remaining / 100));
+    if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) handles[count++] = timer;
+    if (MsgWaitForMultipleObjects(count, handles.data(), FALSE,
+            static_cast<DWORD>((remaining + ms - 1) / ms), QS_ALLINPUT) == WAIT_FAILED)
+        check(HRESULT_FROM_WIN32(GetLastError()), "scheduler wait");
 }
 
 struct TimerPeriodGuard {
@@ -338,10 +378,11 @@ void frames(Feed& f)
         }
         }
     }
-    fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld\n",
+    const size_t batchCapacity = vfg ? vfg->max_in_flight_pairs() : 1;
+    fprintf(f.log, "event=initialized backend=%s sdk_version=0x%08X low_latency=%ld gpu_shot_change=%u hud_lock=%ld pacing_repair=%ld adaptive_fg=%ld batch_capacity=%zu\n",
         vfg ? vfg->name() : "original", vfg ? vfg->version_tag() : 0u, lastReflex, f.view.gpuShotChange,
         InterlockedCompareExchange(&f.view.hudLock, 0, 0), InterlockedCompareExchange(&f.view.pacingRepair, 0, 0),
-        InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0));
+        InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0), batchCapacity);
     f.beat();
     f.initializing.store(false);
     if (const auto stall = fixture_ms(f.view, L"OBS_NR_TEST_STALL_WORKER_MS")) {
@@ -378,16 +419,29 @@ void frames(Feed& f)
     int64_t transportNs = TransportIntervalEstimator::kDefaultNs;
     bool staticHold = false, wasRepairing = false, wasAdaptive = false, backendFault = false;
     bool hudEnabled = false, hudReset = true;
+    uint64_t hudEpoch = 0;
     const auto sync_hud_lock = [&] {
         const bool enabled = InterlockedCompareExchange(&f.view.hudLock, 0, 0) != 0;
-        if (enabled != hudEnabled) hudReset = true;
+        if (enabled != hudEnabled) { hudReset = true; ++hudEpoch; }
         hudEnabled = enabled;
         gpu.sync_hud_lock(enabled);
     };
     double contentFps = 0;
     auto displayEpoch = f.split.displayEpoch.load();
     auto monitorHz = window_refresh(f.window);
-    std::optional<FgPairTicket> previousTicket;
+    std::deque<PendingPair> queue;
+    ComPtr<ID3D12Fence> pairRetireFence;
+    if (vfg) check(gpu.d3d_device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pairRetireFence)),
+        "pair retirement fence");
+    struct Retired { FgPairTicket ticket; uint64_t value, since; };
+    std::array<std::optional<Retired>, batch_capacity> retired{};
+    std::array<uint64_t, batch_capacity> lastRetire{};
+    uint64_t retireSeq = 0, recoverySince = 0;
+    LiveAnchorClock liveClock;
+    HalfRate halfRate;
+    DedupMode lastMode = DedupMode::OffExact;
+    bool wasLive = false;
+    uint64_t dedupSamples = 0, repeats = 0, decimated = 0;
     uint64_t hudWindowStart = clock_ns();
     uint64_t hudOrigFrames = 0, hudPresentedFrames = 0;
     uint32_t lastHudPos = UINT32_MAX;
@@ -418,146 +472,214 @@ void frames(Feed& f)
         }
     };
     struct Incoming {
-        ipc::Frame frame;
+        ipc::CopyTicket copy;
         PairTelemetry telemetry;
         uint64_t receivedNs;
         unsigned index;
-        bool continuous;
-        bool interpolate;
+        bool continuous, interpolate;
+        DedupMode mode;
+        bool live;
         uint64_t compareStart{};
     };
     std::optional<Incoming> incoming;
     uint64_t reflexFrameId = 0;
-    while (f.active() && !(pushflowBackend && pushflowBackend->runtime_fault())) {
-        if (faultArm.h && WaitForSingleObject(faultArm.h, 0) == WAIT_OBJECT_0)
-            throw std::runtime_error("test_live_consumer_fault");
-        if (const LONG aff = f.pendingAffinityLog.exchange(-1, std::memory_order_acq_rel); aff >= 0)
-            fprintf(f.log, "event=display_affinity affinity=0x%lX\n", static_cast<DWORD>(aff));
-        sync_reflex();
-        sync_affinity();
-        sync_hud_lock();
-        if (!incoming) {
-            const auto index = history.input_index();
-            gpu.prepare_input(index);
-            const auto next = consumer.copy_next(gpu.input[index].Get(), split ? gpu.before[index].Get() : nullptr);
-            if (!next.current) {
-                if (next.status != ipc::Status::Pending && next.status != ipc::Status::Dropped)
-                    check(E_FAIL, "IPC copy_next");
-                f.beat();
-                WaitForSingleObject(consumer.frame_event(), 4);
-                continue;
-            }
-            if (next.status != ipc::Status::Ok || consumer.order_copy(*next.current, gpu.drawQueue.Get()) != ipc::Status::Ok)
-                check(E_FAIL, "IPC copy dependency");
-            const auto& b = next.current->frame;
-            if (split) f.split.update(b.splitPercent, b.splitSwap);
-            const auto receivedNs = clock_ns();
-            if (vfg && vfg->faulted() && !backendFault) {
-                backendFault = true; // Keep resources alive until their queues drain.
-                fprintf(f.log, "event=backend_fault_fallback_1x backend=%s\n", vfg->name());
-            }
-            const bool interpolate = vfg && !backendFault;
-            const PairTelemetry telemetry{1, 0, hudEnabled,
-                false, InterlockedCompareExchange(&f.view.pacingRepair, 0, 0) != 0,
-                InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0) != 0,
-                InterlockedCompareExchange(&f.view.adaptiveTargetFps, 0, 0)};
-            const auto step = history.observe(index, b, next.previous.has_value());
-            if (step.stale) {
-                record(f, "input", b, nullptr, 0, telemetry, 0, receivedNs);
-                record(f, "drop_original_stale", b, nullptr, 0, telemetry);
-                continue;
-            }
-            if (!step.continuous) {
-                hudReset = true;
-                cadence.reset();
-                lastOriginalTarget = lastPeriod = lastLockedPeriod = 0;
-                sawRepeat = false;
-                repair.reset();
-                rate.reset();
-                staticHold = false;
-                previousRepairedPtsNs = lastChangedNs = 0;
-            }
-            if (b.obsTick > previousObsTick && b.obsTick <= INT64_MAX) {
-                transportNs = transport.observe(static_cast<int64_t>(b.obsTick));
-                previousObsTick = b.obsTick;
-            }
-            incoming = Incoming{b, telemetry, receivedNs, index, step.continuous, interpolate};
+    const auto retire = [&](const char* reason) {
+        const auto& p = queue.front();
+        if (p.ticket) {
+            const auto& ticket = *p.ticket;
+            check(gpu.drawQueue->Signal(pairRetireFence.Get(), ++retireSeq), "pair retirement signal");
+            vfg->retire_pair(ticket, pairRetireFence.Get(), retireSeq);
+            lastRetire[ticket.slotParity] = retireSeq;
+            retired[ticket.slotParity].emplace(Retired{ticket, retireSeq, clock_ns()});
+            trace(f, "event=pair_retired b=%llu bank=%u fence=%llu reason=%s depth=%zu\n",
+                p.currFrame.frame.serial, ticket.slotParity, retireSeq, reason, queue.size());
         }
-        const auto b = incoming->frame;
+    };
+    const auto drain = [&](const char* reason) {
+        while (!queue.empty()) { retire(reason); queue.pop_front(); }
+    };
+    const auto reset = [&](const char* reason) {
+        drain(reason);
+        history.invalidate();
+        gpu.discard_compare();
+        if (incoming) { incoming->continuous = false; incoming->compareStart = 0; }
+        hudReset = true;
+        cadence.reset(); repair.reset(); rate.reset(); liveClock.reset(); halfRate = {};
+        transport.reset(); previousObsTick = 0;
+        lastOriginalTarget = lastPeriod = lastLockedPeriod = previousRepairedPtsNs = lastChangedNs = 0;
+        sawRepeat = staticHold = false;
+    };
+    const auto ingest = [&] {
+        std::array<unsigned, 2 * batch_capacity> pins{};
+        size_t count = 0;
+        for (const auto& p : queue) { pins[count++] = p.prevFrame.index; pins[count++] = p.currFrame.index; }
+        const auto index = history.input_index(std::span(pins).first(count));
+        if (index == content_input_count) return;
+        gpu.prepare_input(index);
+        const auto next = consumer.copy_next(gpu.input[index].Get(), split ? gpu.before[index].Get() : nullptr);
+        if (!next.current) {
+            if (next.status != ipc::Status::Pending && next.status != ipc::Status::Dropped) check(E_FAIL, "IPC copy_next");
+            return;
+        }
+        if (next.status != ipc::Status::Ok || consumer.order_copy(*next.current, gpu.drawQueue.Get()) != ipc::Status::Ok)
+            check(E_FAIL, "IPC copy dependency");
+        const auto& b = next.current->frame;
+        const auto receivedNs = clock_ns();
+        if (split) f.split.update(b.splitPercent, b.splitSwap);
+        if (vfg && vfg->faulted() && !backendFault) {
+            backendFault = true;
+            fprintf(f.log, "event=backend_fault_fallback_1x backend=%s\n", vfg->name());
+        }
+        const PairTelemetry telemetry{1, 0, hudEnabled, false,
+            InterlockedCompareExchange(&f.view.pacingRepair, 0, 0) != 0, InterlockedCompareExchange(&f.view.adaptiveFg, 0, 0) != 0,
+            InterlockedCompareExchange(&f.view.adaptiveTargetFps, 0, 0)};
+        const auto step = history.observe(index, b, next.previous.has_value());
+        if (step.stale) {
+            record(f, "input", b, nullptr, 0, telemetry, 0, receivedNs);
+            record(f, "drop_original_stale", b, nullptr, 0, telemetry);
+            return;
+        }
+        if (!step.continuous) reset("discontinuity");
+        const auto tick = b.obsTick ? b.obsTick : b.timestampNs;
+        if (tick <= INT64_MAX) transportNs = transport.observe(static_cast<int64_t>(tick));
+        const auto mode = static_cast<DedupMode>(InterlockedCompareExchange(&f.view.dedupMode, 0, 0));
+        const bool live = InterlockedCompareExchange(&f.view.liveAnchor, 0, 0) != 0;
+        if (lastMode != mode) { halfRate = {}; rate.reset(); lastMode = mode; }
+        if (wasLive != live) { liveClock.reset(); lastOriginalTarget = 0; wasLive = live; }
+        incoming.emplace(Incoming{*next.current, telemetry, receivedNs, index, step.continuous, vfg && !backendFault, mode, live});
+    };
+    const auto advance = [&](uint64_t& wake) {
+        auto& p = queue.front();
+        const auto now = clock_ns();
+        const auto& b = p.currFrame.frame;
+        const auto& a = p.prevFrame.frame;
+        const auto index = p.currFrame.index;
+        if (now > p.deadlineNs) {
+            record(f, "drop_original_late", b, nullptr, 0, p.telemetry);
+            reset("late");
+            return true;
+        }
+        const auto due = p.due();
+        if (now < due) { wake = std::min(wake, due); return false; }
+        const auto retry = [&] { wake = std::min(wake, clock_ns() + 350'000); return false; };
+        const bool compose = p.telemetry.hudLock && hudEnabled && p.hudEpoch == hudEpoch;
+        if (compose && p.updateHud && !p.repeat) {
+            if (!gpu.commands_ready()) return retry();
+            gpu.update_hud_lock(index, p.prevFrame.index, p.resetHud);
+            p.updateHud = false;
+        }
+        if (p.ticket && p.nextSub <= p.ticket->lastSubmittedSub) {
+            const auto& ticket = *p.ticket;
+            const unsigned sub = p.nextSub;
+            const auto cutoff = std::min(p.plan.target(sub + 1), p.plan.synthetic_cutoff(sub) + p.extraNs);
+            bool ready = false, suppressed = false;
+            if (now < cutoff) {
+                if (anrBackend) {
+                    switch (anrBackend->output(ticket, sub)) {
+                    case AnrFgBackend::Output::Ready: ready = true; break;
+                    case AnrFgBackend::Output::Suppressed: suppressed = true; break;
+                    case AnrFgBackend::Output::Pending: break;
+                    }
+                } else ready = vfg->subframe_ready(ticket, sub);
+                if (!ready && !suppressed) { wake = std::min(wake, cutoff); return retry(); }
+            }
+            if (ready) {
+                refresh_hud(false);
+                reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, p.fid, sub);
+                reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, p.fid, sub);
+                reflex.oob_marker(ReflexMarker::OutOfBandPresentStart, p.fid, sub);
+                auto* texture = gpu.syntheticTex[ticket.slotParity * (max_multiplier - 1) + sub - 1].Get();
+                const Gpu::SyntheticFrame synthetic{texture, [&](ID3D12GraphicsCommandList* cmd) {
+                    vfg->resolve_subframe(cmd, ticket, texture, sub);
+                }, ticket.prevIndex, ticket.currIndex, f.view.gpuShotChange != 0, p.shotParity, compose, sub - 1, ticket.slotParity};
+                const auto id = gpu.try_present_synthetic(synthetic, cutoff, split ? static_cast<int>(index) : -1,
+                    split ? f.split.current() : 50, split && f.split.swapped());
+                reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, p.fid, sub);
+                record(f, id ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a, id.value_or(0), p.telemetry, now - due);
+            } else record(f, suppressed ? "drop_vfg_provider_disabled" : "drop_vfg_subframe_late", b, &a, 0, p.telemetry);
+            ++p.nextSub;
+            return true;
+        }
+        if (!gpu.commands_ready()) return retry();
+        if (!shown) { PostMessageW(f.window, reveal, 0, 0); shown = true; }
+        refresh_hud(true);
+        if (!p.repeat) reflex.marker(ReflexMarker::PresentStart, p.fid);
+        const UINT pid = gpu.present(gpu.input[index].Get(), false, split ? static_cast<int>(index) : -1,
+            split ? f.split.current() : 50, split && f.split.swapped());
+        if (!p.repeat) reflex.marker(ReflexMarker::PresentEnd, p.fid);
+        record(f, p.repeat ? split ? "present_repeat_split" : "present_repeat_original" : "present_original", b, nullptr, pid, p.telemetry);
+        if (!p.repeat) { history.retain(index, b); gpu.enter_steady_state(); }
+        retire("present");
+        if (!p.repeat) lastOriginalTarget = p.plan.originalNs;
+        queue.pop_front();
+        if (faultExitDelay && !faultArm.h) throw std::runtime_error("test_live_consumer_fault");
+        return true;
+    };
+    const auto log_dedup = [&] {
+        trace(f, "[content-dedup] mode=%u samples=%llu repeat=%llu decimated=%llu content_fps=%.3f half_locked=%d\n",
+            static_cast<unsigned>(lastMode), dedupSamples, repeats, decimated, contentFps, int(halfRate.first.has_value()));
+    };
+    const auto admit = [&] {
+        const auto b = incoming->copy.frame;
         const auto index = incoming->index;
         const auto continuous = incoming->continuous;
-        const auto anchor = history.anchor();
+        const auto anchor = queue.empty() ? history.anchor() : std::optional{queue.back().anchor()};
         auto telemetry = incoming->telemetry;
         telemetry.hudLock &= hudEnabled;
         const bool adaptive = telemetry.adaptiveFg, repairing = telemetry.pacingRepair;
-        const bool interpolate = incoming->interpolate;
+        const bool interpolate = incoming->interpolate, live = incoming->live;
+        const auto mode = incoming->mode;
         uint64_t comparedNs{}, compareWorkNs{};
-        bool shotCompared = false;
         uint32_t shotParity = 0;
         const auto record_input = [&](const char* comparison = "content_changed") {
-            // Publish the ingress timestamp with the decision completed for this
-            // frame. A comparison retry must not re-read mutable settings.
             record(f, "input", b, nullptr, 0, telemetry, 0, incoming->receivedNs);
             if (comparedNs) record(f, comparison, b, &anchor->frame, 0, telemetry, compareWorkNs, comparedNs);
             incoming.reset();
         };
-        const bool timely = clock_ns() - b.arrivalNs <= 50 * ms;
-        if ((interpolate || telemetry.hudLock) && anchor && timely) {
+        if (clock_ns() > b.arrivalNs + 50 * ms) {
+            record_input();
+            record(f, "drop_original_late", b, nullptr, 0, telemetry);
+            reset("late");
+            return true;
+        }
+        // Avoid ever entering a blocking Present behind an uncompleted IPC dependency.
+        const auto status = consumer.copy_status(incoming->copy);
+        if (status == ipc::Status::Pending) return false;
+        if (status != ipc::Status::Ok) check(E_FAIL, "IPC copy completion");
+        bool same = false;
+        if ((interpolate || telemetry.hudLock) && anchor) {
             if (!incoming->compareStart) {
-                if (!gpu.begin_compare(anchor->index, index, compareReady.h)) {
-                    pace_until(clock_ns() + 350000, f, paceTimer.h);
-                    continue;
-                }
+                while (std::any_of(queue.begin(), queue.end(), [&](const auto& p) {
+                    return p.ticket && p.shotParity == shotParity;
+                })) ++shotParity;
+                if (!gpu.begin_compare(anchor->index, index, compareReady.h, static_cast<uint32_t>(mode), shotParity)) return false;
                 incoming->compareStart = clock_ns();
             }
             const auto compared = gpu.compare_result();
-            if (!compared) {
-                // The completion event wakes the presentation loop. This branch
-                // does not map the comparison buffer or block a submit call.
-                const HANDLE wake[]{f.parent, compareReady.h};
-                WaitForMultipleObjects(ARRAYSIZE(wake), wake, FALSE, 2);
-                continue;
+            if (!compared) return false;
+            comparedNs = clock_ns(); compareWorkNs = comparedNs - incoming->compareStart;
+            telemetry.shotSlot = shotParity = compared->parity; telemetry.shotCut = compared->cut; same = compared->same;
+        } else if (incoming->compareStart) gpu.discard_compare();
+        const auto tick = b.obsTick ? b.obsTick : b.timestampNs;
+        const auto interval = f.view.transportIntervalNs ? f.view.transportIntervalNs :
+            previousObsTick && tick > previousObsTick ? tick - previousObsTick : 0;
+        previousObsTick = tick;
+        const bool transport60 = interval >= 16'393'443 && interval <= 16'949'152;
+        const bool skip = halfRate.skip(transport60 ? mode : DedupMode::OffExact, b.serial, same);
+        ++dedupSamples;
+        if (skip && same) ++repeats;
+        if (skip && !same) ++decimated;
+        if (skip && anchor) {
+            if (lastChangedNs && b.timestampNs >= lastChangedNs && b.timestampNs - lastChangedNs >= 500 * ms) staticHold = true;
+            contentFps = rate.observe(b.timestampNs, uniqueOrdinal, staticHold);
+            sawRepeat = true;
+            record_input(same ? "repeat_input" : "decimate_input");
+            if (!interpolate || split) {
+                auto& p = queue.emplace_back(PendingPair{*anchor, {b, index}, telemetry, {}, b.arrivalNs + 50 * ms});
+                p.repeat = true;
             }
-            comparedNs = clock_ns();
-            compareWorkNs = comparedNs - incoming->compareStart;
-            shotCompared = f.view.gpuShotChange != 0;
-            shotParity = compared->parity;
-            telemetry.shotCut = compared->cut;
-            if (compared->same) {
-                // A single transport repeat is not a static hold. Once stillness
-                // reaches 500 ms, retain the classification through repeats.
-                if (lastChangedNs && b.timestampNs >= lastChangedNs && b.timestampNs - lastChangedNs >= 500 * ms)
-                    staticHold = true;
-                contentFps = rate.observe(b.timestampNs, uniqueOrdinal, staticHold);
-                sawRepeat = true;
-                record_input("repeat_input");
-                present_content_repeat(interpolate, split, [&] {
-                    if (!shown) {
-                        PostMessageW(f.window, reveal, 0, 0);
-                        shown = true;
-                    }
-                    refresh_hud(true);
-                    const UINT pid = gpu.present(gpu.input[index].Get(), false,
-                        split ? static_cast<int>(index) : -1, split ? f.split.current() : 50, split && f.split.swapped());
-                    record(f, split ? "present_repeat_split" : "present_repeat_original", b, nullptr, pid, telemetry);
-                });
-                f.beat();
-                continue;
-            }
-        } else if (incoming->compareStart) {
-            // OFF may no longer need a HUD-only result; an expired frame never does.
-            gpu.discard_compare();
-        }
-        if (clock_ns() - b.arrivalNs > 50 * ms) {
-            record_input();
-            record(f, "drop_original_late", b, nullptr, 0, telemetry);
-            history.invalidate();
-            hudReset = true;
-            cadence.reset();
-            lastOriginalTarget = lastPeriod = 0;
-            sawRepeat = false;
-            previousRepairedPtsNs = 0;
-            continue;
+            if (dedupSamples % 30 == 0) log_dedup();
+            return true;
         }
         staticHold = false;
         lastChangedNs = b.timestampNs;
@@ -567,15 +689,16 @@ void frames(Feed& f)
             previousRepairedPtsNs = lastOriginalTarget = lastPeriod = lastLockedPeriod = 0;
             wasRepairing = repairing;
         }
-        auto timestamp = b.obsTick ? b.obsTick : b.timestampNs;
+        const bool useObsTick = mode == DedupMode::OffExact && b.obsTick != 0;
+        auto timestamp = useObsTick ? b.obsTick : b.timestampNs;
         auto phaseArrivalNs = b.arrivalNs;
         if (repairing) {
-            if (timestamp > INT64_MAX || phaseArrivalNs > INT64_MAX) { record_input(); continue; }
+            if (timestamp > INT64_MAX || phaseArrivalNs > INT64_MAX) { record_input(); return true; }
             const auto raw = static_cast<int64_t>(timestamp);
             const auto result = repair.apply(raw / 100, raw / 100, transportNs / 100, !continuous);
-            if (result.disposition == PushPacingRepair::Disposition::noRepresentableProgress) { record_input(); continue; }
+            if (result.disposition == PushPacingRepair::Disposition::noRepresentableProgress) { record_input(); return true; }
             const auto repaired = repaired_times(raw, static_cast<int64_t>(phaseArrivalNs), result);
-            if (!repaired || repaired->repairedContentPtsNs < 0 || repaired->phaseArrivalNs < 0) { record_input(); continue; }
+            if (!repaired || repaired->repairedContentPtsNs < 0 || repaired->phaseArrivalNs < 0) { record_input(); return true; }
             timestamp = static_cast<uint64_t>(repaired->repairedContentPtsNs);
             telemetry.shiftNs = result.shift * 100;
             phaseArrivalNs = static_cast<uint64_t>(repaired->phaseArrivalNs);
@@ -590,10 +713,18 @@ void frames(Feed& f)
         lastLockedPeriod = lockedPeriod;
         auto period = lockedPeriod;
         const auto previous = repairing ? previousRepairedPtsNs :
-            anchor ? (anchor->frame.obsTick ? anchor->frame.obsTick : anchor->frame.timestampNs) : 0;
-        if (!period && interpolate && anchor && (repairing || (b.obsTick != 0) == (anchor->frame.obsTick != 0)) &&
-            previous && provisional_60hz(previous, timestamp, sawRepeat))
-            period = period_60hz;
+            anchor ? (useObsTick ? anchor->frame.obsTick : anchor->frame.timestampNs) : 0;
+        if (!period && interpolate && anchor && (repairing || mode != DedupMode::OffExact ||
+                (b.obsTick != 0) == (anchor->frame.obsTick != 0)) && previous) {
+            if (provisional_120hz(previous, timestamp, sawRepeat)) period = period_120hz;
+            else if (provisional_60hz(previous, timestamp, sawRepeat)) period = period_60hz;
+        }
+        bool variable = false;
+        if (interpolate && halfRate.first) period = period_30hz;
+        else if (!period && interpolate && mode != DedupMode::OffExact && previous && timestamp > previous) {
+            period = timestamp - previous;
+            variable = true;
+        }
         previousRepairedPtsNs = repairing ? timestamp : 0;
         if (adaptive != wasAdaptive) {
             multiplierGate.reset();
@@ -608,133 +739,116 @@ void frames(Feed& f)
             const auto selected = adaptive_multiplier(static_cast<AdaptiveBackend>(f.view.backend), mult,
                 contentFps, requested > 1 ? static_cast<double>(requested) : monitorHz);
             telemetry.multiplier = multiplierGate.update(selected, static_cast<int64_t>(b.timestampNs / 100));
-            if (contentFps > 0)
-                period = static_cast<uint64_t>(std::clamp(1e9 / contentFps, 8'333'333.0, 50'000'000.0) + 0.5);
+            if (contentFps > 0 && !halfRate.first)
+                period = static_cast<uint64_t>(std::clamp(1e9 / contentFps, 7'500'000.0, 50'000'000.0) + 0.5);
         }
-        if (!adaptive && period != lastPeriod) lastOriginalTarget = 0;
-        lastPeriod = period;
         const auto activeMult = telemetry.multiplier;
-        const auto plan = !anchor || !period ? CadencePlan{} : adaptive ?
-            plan_cadence_adaptive(phaseArrivalNs, lastOriginalTarget, period, activeMult) :
-            plan_cadence(phaseArrivalNs, lastOriginalTarget, period, activeMult);
-        record_input();
-        if (telemetry.hudLock) {
-            const bool reset = hudReset || telemetry.shotCut || !anchor;
-            gpu.update_hud_lock(index, anchor ? anchor->index : index, reset);
-            hudReset = false;
+        // Consult the last *scheduled* target, not just the last original already displayed.
+        const auto predecessor = queue.empty() ? lastOriginalTarget : queue.back().plan.originalNs;
+        const auto previousTarget = !live && (adaptive || period == lastPeriod) ? predecessor : 0;
+        lastPeriod = period;
+        auto plan = !anchor || !period ? CadencePlan{} : adaptive || variable ?
+            plan_cadence_adaptive(phaseArrivalNs, previousTarget, period, activeMult) :
+            plan_cadence(phaseArrivalNs, previousTarget, period, activeMult);
+        LiveAnchorClock::Timing timing{};
+        if (live) {
+            const auto phase = plan.originalNs ? plan.originalNs - phaseArrivalNs : 0;
+            timing = liveClock.observe({b.timestampNs, b.arrivalNs}, phase);
+            // Even while FG is held, probe a future synthetic slot. A successful
+            // admission restores phase; a refusal uses the immediate real target.
+            if (plan.originalNs) plan.originalNs = std::max(b.arrivalNs, timing.anchorNs + phase);
         }
-        const auto originalDeadline = plan.originalNs ? plan.originalNs + 5 * ms : b.arrivalNs + 50 * ms;
-        const uint64_t fid = ++reflexFrameId;
+        // A bunched callback can reseed the cadence estimator before the front
+        // original. Never schedule its successor's first slot in that old pair.
+        if (!queue.empty() && plan.originalNs && plan.target(1) <= predecessor)
+            plan.originalNs = predecessor + plan.periodNs;
+        record_input();
+        if (dedupSamples % 30 == 0) log_dedup();
+        const auto fid = ++reflexFrameId;
+        const ContentFrame current{b, index};
+        auto& pending = queue.emplace_back(PendingPair{anchor.value_or(current), current, telemetry, plan, 0, fid, hudEpoch});
+        pending.shotParity = shotParity;
+        pending.resetHud = hudReset || telemetry.shotCut || !anchor;
+        if (telemetry.hudLock) hudReset = false;
         reflex.sleep(clock_ns(), clock_ns);
         reflex.marker(ReflexMarker::SimulationStart, fid);
         reflex.marker(ReflexMarker::SimulationEnd, fid);
         reflex.marker(ReflexMarker::RenderSubmitStart, fid);
         if (interpolate && anchor && plan.originalNs) {
             const auto& a = anchor->frame;
-            const bool backendBusy = previousTicket && (anrBackend ? !anrBackend->pair_complete(*previousTicket) :
-                !vfg->subframe_ready(*previousTicket, previousTicket->lastSubmittedSub));
             const auto stageStart = clock_ns();
             const bool pairLate = stageStart >= plan.synthetic_cutoff(activeMult - 1);
             const FgPairDesc pair{gpu.input[anchor->index].Get(), gpu.input[index].Get(), a.serial, b.serial, activeMult,
                 !continuous, telemetry.shotCut,
                 [&] { record(f, "stage_queued", b, &a, 0, telemetry, clock_ns() - stageStart); },
-                [&](uint64_t workNs) { record(f, pushflowBackend ? "pushflow_enqueued" : "cuda_enqueued",
-                    b, &a, 0, telemetry, workNs); }};
-            const auto ticket = !backendBusy && !pairLate ?
-                vfg->try_submit_pair(pair, anchor->index, index) : std::nullopt;
-            if (ticket) {
-                previousTicket.emplace(*ticket);
-                reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
-                bool composeHud = telemetry.hudLock;
-                for (uint32_t sub = 1; sub <= ticket->lastSubmittedSub; ++sub) {
-                    if (!f.active()) break;
-                    const uint64_t targetNs = plan.target(sub);
-                    if (clock_ns() < targetNs) pace_until(targetNs, f, paceTimer.h);
-                    if (!f.active()) break;
-                    const uint64_t waitStart = clock_ns();
-                    const auto cutoff = plan.synthetic_cutoff(sub);
-                    bool generatedReady = false;
-                    bool providerSuppressed = false;
-                    while (f.active() && clock_ns() < cutoff) {
-                        if (anrBackend) {
-                            switch (anrBackend->output(*ticket, sub)) {
-                            case AnrFgBackend::Output::Ready: generatedReady = true; break;
-                            case AnrFgBackend::Output::Suppressed: providerSuppressed = true; break;
-                            case AnrFgBackend::Output::Pending: break;
-                            }
-                            if (generatedReady || providerSuppressed) break;
-                        } else if (vfg->subframe_ready(*ticket, sub)) {
-                            generatedReady = true;
-                            break;
-                        }
-                        pace_until(std::min<uint64_t>(clock_ns() + 350000, cutoff), f, paceTimer.h);
-                    }
-                    const auto readyCheck = clock_ns();
-                    const uint64_t genElapsed = readyCheck - waitStart;
-                    if (!f.active()) break;
-                    if (generatedReady && readyCheck < cutoff) {
-                        sync_hud_lock();
-                        composeHud &= hudEnabled;
-                        refresh_hud(false);
-                        reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitStart, fid, sub);
-                        reflex.oob_marker(ReflexMarker::OutOfBandRenderSubmitEnd, fid, sub);
-                        reflex.oob_marker(ReflexMarker::OutOfBandPresentStart, fid, sub);
-                        auto* const displayTex = gpu.syntheticTex[sub - 1].Get();
-                        const Gpu::SyntheticFrame synthetic{displayTex, [&](ID3D12GraphicsCommandList* cmd) {
-                            vfg->resolve_subframe(cmd, *ticket, displayTex, sub);
-                        }, ticket->prevIndex, ticket->currIndex, shotCompared, shotParity, composeHud, sub - 1};
-                        const auto pid = gpu.try_present_synthetic(synthetic, cutoff,
-                            split ? static_cast<int>(index) : -1, split ? f.split.current() : 50, split && f.split.swapped());
-                        reflex.oob_marker(ReflexMarker::OutOfBandPresentEnd, fid, sub);
-                        record(f, pid ? "present_vfg_subframe" : "drop_vfg_present_busy", b, &a,
-                            pid.value_or(0), telemetry, genElapsed);
-                    } else {
-                        record(f, providerSuppressed ? "drop_vfg_provider_disabled" : "drop_vfg_subframe_late",
-                            b, &a, 0, telemetry,
-                            readyCheck > cutoff ? readyCheck - cutoff : 0);
-                    }
-                }
+                [&](uint64_t workNs) { record(f, pushflowBackend ? "pushflow_enqueued" : "cuda_enqueued", b, &a, 0, telemetry, workNs); }};
+            if (const auto ticket = pairLate ? std::nullopt : vfg->try_submit_pair(pair, anchor->index, index)) {
+                pending.ticket.emplace(*ticket);
+                retired[ticket->slotParity].reset(); // The backend proved both GPU timelines complete.
+                trace(f, "event=pair_admitted b=%llu bank=%u shot_slot=%u depth=%zu prior_fence=%llu completed=%llu\n",
+                    b.serial, ticket->slotParity, shotParity, queue.size(), lastRetire[ticket->slotParity], pairRetireFence->GetCompletedValue());
             } else {
-                reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
-                if (anrBackend && anrBackend->faulted()) telemetry.multiplier = 1;
-                record(f, backendBusy ? "drop_vfg_gpu_busy" :
-                    pairLate ? "drop_vfg_pair_late" : "drop_vfg_stage_busy", b, &a, 0, telemetry);
+                if (anrBackend && anrBackend->faulted()) pending.telemetry.multiplier = 1;
+                const bool waiting = std::any_of(retired.begin(), retired.end(), [](const auto& bank) { return bank.has_value(); });
+                record(f, pairLate ? "drop_vfg_pair_late" : waiting ? "drop_vfg_gpu_busy" : "drop_vfg_stage_busy", b, &a, 0, pending.telemetry);
             }
-        } else {
-            reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
-            if (vfg && !continuous)
-                record(f, "drop_vfg_discontinuity", b, nullptr, 0, telemetry);
+        } else if (vfg && !continuous) record(f, "drop_vfg_discontinuity", b, nullptr, 0, telemetry);
+        reflex.marker(ReflexMarker::RenderSubmitEnd, fid);
+        if (live) {
+            timing = liveClock.resolve_fg(pending.ticket.has_value());
+            if (plan.originalNs) pending.plan.originalNs = timing.fgHeld ? timing.realTargetNs : plan.originalNs;
+            pending.extraNs = timing.deadline_extra_ns();
+            if (uniqueOrdinal % 15 == 0) trace(f,
+                "[live-anchor] b=%llu locked=%d clockDriftPpm=%.2f callbackMinusAnchorMs=%.3f callbackJitterMs=%.3f phaseMs=%.3f deadlineExtraMs=%.3f snaps=%llu fgHeld=%d real_target_ns=%llu\n",
+                b.serial, timing.locked, timing.clockDriftPpm, timing.callbackMinusAnchorMs, timing.callbackJitterMs,
+                timing.phaseMs, timing.deadlineExtraMs, timing.snaps, timing.fgHeld, pending.plan.originalNs ? pending.plan.originalNs : b.arrivalNs);
         }
-        if (plan.originalNs) pace_until(plan.originalNs, f, paceTimer.h);
-        if (!f.active()) break;
-        if (clock_ns() <= originalDeadline) {
-            if (!shown) {
-                PostMessageW(f.window, reveal, 0, 0);
-                shown = true;
+        pending.deadlineNs = pending.plan.originalNs ? pending.plan.originalNs + 5 * ms + pending.extraNs : b.arrivalNs + 50 * ms;
+        return true;
+    };
+    while (f.active() && !(pushflowBackend && pushflowBackend->runtime_fault())) {
+        if (faultArm.h && WaitForSingleObject(faultArm.h, 0) == WAIT_OBJECT_0) throw std::runtime_error("test_live_consumer_fault");
+        if (const LONG aff = f.pendingAffinityLog.exchange(-1, std::memory_order_acq_rel); aff >= 0)
+            fprintf(f.log, "event=display_affinity affinity=0x%lX\n", static_cast<DWORD>(aff));
+        sync_reflex(); sync_affinity(); sync_hud_lock();
+        const auto now = clock_ns();
+        auto wake = now + 4 * ms;
+        bool stalled = false;
+        for (auto& bank : retired) if (bank) {
+            const auto completed = pairRetireFence->GetCompletedValue();
+            if (completed == UINT64_MAX) check(DXGI_ERROR_DEVICE_REMOVED, "pair retirement device lost");
+            if (completed >= bank->value && (backendFault || (anrBackend ? anrBackend->pair_complete(bank->ticket) :
+                    vfg->subframe_ready(bank->ticket, bank->ticket.lastSubmittedSub)))) {
+                bank.reset();
+            } else if (now - bank->since >= 1500 * ms) {
+                if (!recoverySince) {
+                    trace(f, "event=error reason=bank_wait_timeout bank=%u fence=%llu completed=%llu waited_ms=%llu\n",
+                        bank->ticket.slotParity, bank->value, completed, (now - bank->since) / ms);
+                    recoverySince = now;
+                    reset("bank_timeout");
+                }
+                stalled = true;
+                break;
             }
-            refresh_hud(true);
-            reflex.marker(ReflexMarker::PresentStart, fid);
-            const UINT pid = gpu.present(gpu.input[index].Get(), false,
-                split ? static_cast<int>(index) : -1, split ? f.split.current() : 50, split && f.split.swapped());
-            reflex.marker(ReflexMarker::PresentEnd, fid);
-            record(f, "present_original", b, nullptr, pid, telemetry);
-            history.retain(index, b);
-            gpu.enter_steady_state();
-            lastOriginalTarget = plan.originalNs;
-            f.beat();
-            if (faultExitDelay && !faultArm.h)
-                throw std::runtime_error("test_live_consumer_fault");
-        } else {
-            record(f, "drop_original_late", b, nullptr, 0, telemetry);
-            history.invalidate();
-            hudReset = true;
-            cadence.reset();
-            lastOriginalTarget = lastPeriod = lastLockedPeriod = 0;
-            sawRepeat = false;
-            previousRepairedPtsNs = 0;
         }
+        if (stalled && now - recoverySince >= 240 * ms) drain_failure();
+        if (!stalled) {
+            if (recoverySince) { trace(f, "event=bank_wait_recovered\n"); recoverySince = 0; }
+            // One private IPC lookahead can detect a boundary while both pairs
+            // are live. It does not compare or enter the backend until Step B.
+            if (!incoming) ingest();
+            if (!f.active()) break;
+            const bool advanced = !queue.empty() && advance(wake);
+            const bool admitted = incoming && queue.size() < batchCapacity && admit();
+            if (advanced || admitted) { f.beat(); continue; }
+            if (incoming && queue.size() < batchCapacity) wake = std::min(wake, clock_ns() + 350'000);
+        }
+        f.beat();
+        scheduler_wait(wake, paceTimer.h, {f.parent, consumer.frame_event(), compareReady.h});
     }
-    if (incoming) record(f, "input", incoming->frame, nullptr, 0, incoming->telemetry, 0, incoming->receivedNs);
+    drain(state(f.view) == 2 ? "resize" : "stop");
+    if (incoming) record(f, "input", incoming->copy.frame, nullptr, 0, incoming->telemetry, 0, incoming->receivedNs);
+    if (dedupSamples) log_dedup();
     };
     const auto shutdown = [&](bool threw) {
     gpu.discard_compare();
