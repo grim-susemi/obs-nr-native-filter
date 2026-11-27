@@ -207,6 +207,9 @@ struct D3D12Guides::Impl {
     bool pending=false,uncertain=false,disableHints=true,closed=false;
     std::optional<JobKey> last;
     std::optional<Rect> lastActive;
+    ComPtr<ID3D12Resource> lastAnalysis;
+    ComPtr<ID3D12Fence> lastProducer;
+    uint64_t lastProducerValue=0;
     std::optional<FlowResult> output;
     explicit Impl(ID3D12Device* d,ID3D12CommandQueue* q,Extent s,uint64_t interval):device(d),queue(q),size(s),policy(flow_policy(s,interval)) {}
     std::vector<DXGI_FORMAT> formats(NV_OF_BUFFER_USAGE usage) {
@@ -382,6 +385,7 @@ bool D3D12Guides::Impl::close() {
     if(pending || uncertain) return false;
     if(!unregister_all()) return false;
     // ALL registered allocations release before EITHER session (Programming Guide6.2 / observed A/B).
+    lastAnalysis.Reset();lastProducer.Reset();
     hardware.Reset(); cost.Reset(); bootstrap.Reset(); bootstrapCost.Reset(); global.Reset(); hints.Reset();
     bootstrapCurrent.Reset(); bootstrapPrevious.Reset();
     for(auto* owner:{&refinement,&session}) if(*owner) {
@@ -392,8 +396,17 @@ bool D3D12Guides::Impl::close() {
 }
 FlowProblem D3D12Guides::Impl::submit(const FlowInput& in) {
     if(closed || pending || uncertain) return FlowProblem::Busy;
+    // A worker reuse advances the logical predecessor without executing OFA.
+    // Only an alias of our exact immutable last allocation AND producer point
+    // can bridge that gap; the incoming pair still has to be contiguous.
+    const auto* p=in.previous;
+    const bool alias=!in.reset && p && last && p->analysis==lastAnalysis.Get() &&
+        p->ready.fence==lastProducer.Get() && p->ready.value==lastProducerValue &&
+        p->key.frame.instanceId==last->frame.instanceId && p->key.frame.contentEpoch==last->frame.contentEpoch &&
+        p->key.historyEpoch==last->historyEpoch && p->key.resourceGeneration==last->resourceGeneration &&
+        p->key.frame.ingressSequence>last->frame.ingressSequence && p->key.submissionSerial>last->submissionSerial;
     const auto problem=flow_chronology_problem(in.current.key,in.previous?&in.previous->key:nullptr,
-        last?&*last:nullptr,in.active,lastActive?&*lastActive:nullptr,in.reset);
+        alias?&p->key:last?&*last:nullptr,in.active,lastActive?&*lastActive:nullptr,in.reset);
     if(problem!=FlowProblem::None) return problem;
     if(in.working!=size || !flow_geometry_valid(size,in.active) || !image_valid(in.current) ||
        (in.previous && (!image_valid(*in.previous) || in.current.analysis==in.previous->analysis)))
@@ -507,6 +520,7 @@ FlowProblem D3D12Guides::Impl::submit(const FlowInput& in) {
                                  admitted,bootstrapped,predicted,finished,in.current.ready,in.previous?in.previous->ready:NV_OF_FENCE_POINT{},
                                  in.reset?nullptr:bootstrapCurrent.Get(),in.reset?nullptr:bootstrapPrevious.Get(),registeredIds});
         last.emplace(in.current.key); lastActive.emplace(in.active); disableHints=in.reset;
+        lastAnalysis=in.current.analysis;lastProducer=in.current.ready.fence;lastProducerValue=in.current.ready.value;
         return FlowProblem::None;
     } catch(const std::exception& error) {
         OutputDebugStringA(error.what()); uncertain=true; return FlowProblem::ApiFailure;

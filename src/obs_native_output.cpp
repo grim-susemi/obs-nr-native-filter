@@ -17,6 +17,7 @@ struct Record {
     std::shared_ptr<interop::Bridge> bridge;
     bool timelineLogged=false;
     bool warmupObserved=false;
+    bool reuseLogged=false;
 };
 unsigned long long u64(uint64_t x) { return static_cast<unsigned long long>(x); }
 long long qpc(int64_t x) { return static_cast<long long>(x); }
@@ -228,6 +229,7 @@ struct NativeOutput::Impl {
     std::optional<FrameKey> previousKey;
     ID3D11Texture2D* nrTarget=nullptr; // output texture whose content is an NR frame (deadline-miss hold)
     uint64_t nrTargetTick=0;unsigned nrHeld=0;uint64_t heldFrames=0;
+    int64_t lastArrival=0,lastNr=0;
     uint32_t requestedPasses=1;
     bool workBlocked=false;
     uint64_t diagAdmit=0,diagRefused=0,diagNoAdmit=0;unsigned diagLogged=0;uint64_t diagReason[32]{}; // N22 wedge diagnostics
@@ -330,11 +332,16 @@ struct NativeOutput::Impl {
             }
             const auto physical=r.bridge->ownership(r.ticket.slot);
             if(!physical.key || *physical.key!=r.ticket.key) continue;
+            if(r.job->reused && r.job->eligible && !r.reuseLogged) {
+                r.reuseLogged=true;
+                blog(LOG_INFO,"[obs-nr-filter] nr_reused instance=%llu serial=%llu ingress=%llu history=%llu",
+                    u64(instance),u64(r.ticket.key.submissionSerial),u64(r.ticket.key.frame.ingressSequence),u64(r.ticket.key.historyEpoch));
+            }
             if(model::trace_job_timeline() && r.job->timeline && !r.timelineLogged) {
                 r.timelineLogged=true;
                 log_job_timeline(*r.job,physical);
             }
-            if(r.job->composed && r.job->submitted && !r.job->eligible) {
+            if((r.job->composed || r.job->reused) && r.job->submitted && !r.job->eligible) {
                 require(pipeline->cancel(r.ticket.key) && r.bridge->cancel(r.ticket),"native invalid completion cancellation");
             }
             require(model::observe_publication(*pipeline,r.ticket,r.bridge->ownership(r.ticket.slot),
@@ -524,6 +531,11 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     const bool trace=model::trace_job_timeline() && g.timelineTicks<360;
     if(trace)++g.timelineTicks;
     const auto begin=model::qpc_now();
+    const auto arrival=renderTiming.tick?renderTiming.tick:begin;
+    const auto intervalMs=static_cast<double>(p.config.frameIntervalNs)/1e6;
+    const bool shortTick=arrival>p.lastArrival && p.lastNr && model::qpc_ms(arrival-p.lastArrival)<0.75*intervalMs &&
+        model::qpc_ms(arrival-p.lastNr)<intervalMs;
+    p.lastArrival=arrival;
     for(auto& r:p.records) {
         if(r.job->contract.deadlineTick==input.canonicalTick && r.ticket.key.resourceGeneration==g.id)
             r.job->deadlineQpc.store(begin,std::memory_order_relaxed);
@@ -578,7 +590,8 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
             (unsigned long long)o.producer,(unsigned long long)o.producerDone,(unsigned long long)o.worker,(unsigned long long)o.workerDone,
             (unsigned long long)o.consumer,(unsigned long long)o.consumerDone,(int)o.consumerOpen,(int)o.cancelled,(int)o.failed);}}
     p.end_pins();
-    const bool holdNr=!p.deterministicQa && hold_previous_nr(selected,p.nrTarget==target,p.nrTargetTick,p.nrHeld);
+    const bool holdNr=(!p.deterministicQa || shortTick) &&
+        hold_previous_nr(selected,p.nrTarget==target,p.nrTargetTick,shortTick?0:p.nrHeld);
     // The readiness cutoff is latched by begin, not by completion during capture.
     if(selected.kind==OutputKind::DelayedNr) {
         const auto old=std::find_if(p.records.begin(),p.records.end(),[&](const Record& r) {
@@ -591,6 +604,7 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
         if(g.model) require(g.model->publish(old->job,selected,old->bridge->ownership(old->ticket.slot)),"native exact applied publication");
         else old->job->published.store(true,std::memory_order_release);
         p.selectedJob=old->job;
+        p.lastNr=arrival;
     } else if(selected.kind==OutputKind::DelayedRaw) {
         require(p.previousRaw && p.previousKey==selected.frame,"native independent delayed raw owner");
         if(!holdNr)
@@ -598,7 +612,9 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     } else {
         g.graphics->CopyResource(target,immutable->original11.Get());
     }
-    p.nrHeld=holdNr?p.nrHeld+1:0;p.heldFrames+=holdNr?1:0;
+    // A sub-interval repeat does not use the one ordinary miss allowance. The
+    // unchanged target, contiguous tick and lastNr bound still prevent a freeze.
+    p.nrHeld=holdNr?p.nrHeld+(shortTick?0u:1u):0;p.heldFrames+=holdNr?1:0;
     p.nrTarget=selected.kind==OutputKind::DelayedNr||holdNr?target:nullptr;p.nrTargetTick=input.canonicalTick;
     auto raw=std::make_shared<const pipeline::RawFrame>(pipeline::RawFrame{input,immutable});
     if(ticket) {

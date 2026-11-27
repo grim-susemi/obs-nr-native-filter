@@ -3,6 +3,8 @@
 #include "nr_model.h"
 #include "nr_model_layout.h"
 #include "nr_stabilize.h"
+#include "nr_dedup_compare.h"
+#include <wrl/wrappers/corewrappers.h>
 #include <string>
 #include <cstring>
 #include <algorithm>
@@ -154,6 +156,76 @@ ComPtr<ID3D12DescriptorHeap> heap(ID3D12Device* device,UINT count) {
     return result;
 }
 struct Driver;
+// Worker-only; neither the allocator nor an immutable analysis lease can retire
+// before the compare's own exact fence, even if the readback budget expires.
+struct DedupCompare {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commands;
+    ComPtr<ID3D12DescriptorHeap> descriptors;
+    ComPtr<ID3D12Resource> zero,count,readback;
+    ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::Wrappers::Event event;
+    uint64_t serial=0;
+    std::array<std::shared_ptr<const Frame>,2> leases;
+    explicit DedupCompare(ID3D12Device* device)
+        :descriptors(heap(device,2)),zero(buffer(device,D3D12_HEAP_TYPE_UPLOAD)),
+         count(buffer(device,D3D12_HEAP_TYPE_DEFAULT)),readback(buffer(device,D3D12_HEAP_TYPE_READBACK)),
+         event(CreateEventW(nullptr,FALSE,FALSE,nullptr)) {
+        require(event.IsValid(),"NR compare event");
+        checked(device->CreateRootSignature(0,nr_dedup_compare,sizeof nr_dedup_compare,IID_PPV_ARGS(&root)),"NR compare root");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature=root.Get();desc.CS={nr_dedup_compare,sizeof nr_dedup_compare};
+        checked(device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&pipeline)),"NR compare pipeline");
+        checked(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"NR compare allocator");
+        checked(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&commands)),"NR compare list");
+        checked(commands->Close(),"NR compare initial close");
+        checked(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"NR compare fence");
+        void* mapped=nullptr;const D3D12_RANGE empty{};
+        checked(zero->Map(0,&empty,&mapped),"NR compare zero");std::memset(mapped,0,4);zero->Unmap(0,nullptr);
+    }
+    bool retired() const { const auto done=fence->GetCompletedValue();return done!=UINT64_MAX && done>=serial; }
+    bool same(const interop::Context& context,std::array<std::shared_ptr<const Frame>,2> images) {
+        if(!retired())return false;
+        leases=std::move(images);
+        auto* device=context.device();
+        checked(allocator->Reset(),"NR compare allocator reset");
+        checked(commands->Reset(allocator.Get(),pipeline.Get()),"NR compare reset");
+        auto cpu=descriptors->GetCPUDescriptorHandleForHeapStart();
+        for(const auto& frame:leases) {
+            auto* image=frame->analysis.Get();
+            device->CreateShaderResourceView(image,nullptr,cpu);
+            cpu.ptr+=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            barrier(commands.Get(),image,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        commands->CopyBufferRegion(count.Get(),0,zero.Get(),0,4);
+        barrier(commands.Get(),count.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        commands->SetComputeRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[]{descriptors.Get()};commands->SetDescriptorHeaps(1,heaps);
+        commands->SetComputeRootDescriptorTable(0,descriptors->GetGPUDescriptorHandleForHeapStart());
+        commands->SetComputeRootUnorderedAccessView(1,count->GetGPUVirtualAddress());
+        const auto d=leases[0]->analysis->GetDesc();
+        commands->Dispatch((static_cast<UINT>(d.Width)+15)/16,(d.Height+15)/16,1);
+        barrier(commands.Get(),count.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commands->CopyBufferRegion(readback.Get(),0,count.Get(),0,4);
+        barrier(commands.Get(),count.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+        for(const auto& frame:leases)
+            barrier(commands.Get(),frame->analysis.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        checked(commands->Close(),"NR compare close");
+        ID3D12CommandList* lists[]{commands.Get()};
+        context.queue()->ExecuteCommandLists(1,lists);
+        checked(context.queue()->Signal(fence.Get(),++serial),"NR compare signal");
+        ResetEvent(event.Get()); // A previous timed-out comparison may have signaled since.
+        checked(fence->SetEventOnCompletion(serial,event.Get()),"NR compare subscription");
+        if(WaitForSingleObject(event.Get(),16)!=WAIT_OBJECT_0 || !retired())return false;
+        leases={};
+        void* mapped=nullptr;const D3D12_RANGE range{0,4},empty{};
+        checked(readback->Map(0,&range,&mapped),"NR compare readback");
+        uint32_t over=0;std::memcpy(&over,mapped,4);readback->Unmap(0,&empty);
+        return over<=std::max<uint64_t>(1,d.Width*d.Height*3*5/1'000'000);
+    }
+};
 struct CreateReceipt { uint32_t code=0;bool handle=false; };
 struct CreateContext { Driver* driver;CreateReceipt& receipt; };
 thread_local CreateContext* currentCreate=nullptr;
@@ -338,6 +410,19 @@ Job::Job(std::shared_ptr<const Frame> input,const JobContract& sample,ColorExpos
     require(frame && observed && gpu,"model job and exact completion events");
 }
 Job::~Job() { if(observed) CloseHandle(observed); if(gpu) CloseHandle(gpu); }
+bool Job::ready_for_arrival(std::stop_token stop,uint64_t frameIntervalNs) const {
+    if(stop.stop_requested())return false;
+    if(ready.load(std::memory_order_acquire))return true;
+    if(fault!=Fault::None)return false;
+    const auto ms=frameIntervalNs?std::min<uint64_t>(16,frameIntervalNs/1'000'000):16;
+    if(!ms)return false;
+    Microsoft::WRL::Wrappers::Event wake(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+    require(wake.IsValid(),"model settle cancellation event");
+    const std::stop_callback cancel(stop,[&wake]{SetEvent(wake.Get());});
+    const HANDLE events[]{wake.Get(),observed};
+    const auto result=WaitForMultipleObjects(2,events,FALSE,static_cast<DWORD>(ms));
+    return (result==WAIT_OBJECT_0+1 || result==WAIT_TIMEOUT) && !stop.stop_requested() && ready.load(std::memory_order_acquire);
+}
 // Per-job model scratch (five FP16 colors, status buffers, three descriptor heaps) took ~6 ms of CPU per job at
 // 1440p, enough on its own to push 60 fps jobs past their one-tick deadline. A slab returns here only when its
 // job's Resources dies (where it used to be released) and only if its own command list executed, so every
@@ -448,7 +533,7 @@ void finish_completed(Job& job) {
         else { memcpy(&job.invalid,bytes,4); const D3D12_RANGE empty{0,0}; r.statusRead->Unmap(0,&empty); }
     }
     job.eligible=qa_publication_allowed(job.qaFailure.load(std::memory_order_acquire)) &&
-        job.evaluated && job.composed && job.submitted && !job.invalid &&
+        ((job.evaluated && job.composed) || job.reused) && job.submitted && !job.invalid &&
         r.submission->state()==runtime::Completion::Complete;
     { // diagnostic: why a completed job is or is not publishable
         const bool hist=job.flow.has_value() && !job.flow->reset;
@@ -559,6 +644,8 @@ struct Processor::Impl {
     std::optional<Extent> extent;
     std::optional<JobKey> previousKey;
     std::shared_ptr<const Frame> previousFrame;
+    std::unique_ptr<DedupCompare> dedup;
+    ComPtr<ID3D12Resource> previousNrColor;
     std::shared_ptr<Job> pending;
     std::shared_ptr<ColorSlabPool> pool;
     // Immutable device-bound pipelines are shared; each job retains its own lease
@@ -619,17 +706,19 @@ struct Processor::Impl {
     void prepare_inactive();
     bool discard_prewarm();
     bool adopt_prewarm(const JobContract&);
-    bool settle() {
+    bool settle(std::optional<std::stop_token> arrival={}) {
         if(!pending) return true;
-        if(!pending->ready.load(std::memory_order_acquire)) {diagSettle.store(1);return false;}
+        if(!(arrival?pending->ready_for_arrival(*arrival,config.frameIntervalNs):pending->ready.load(std::memory_order_acquire)))
+            {diagSettle.store(1);return false;}
         if(pendingGuide && !guides->collect(*pendingGuide,{pending->resources->complete.Get(),1})) {diagSettle.store(2);return false;}
         const auto completion=pending->resources->submission->state();
         const bool historyRecorded=pending->creationPass || pending->completedPasses || pending->failedPass;
-        if(!chain.settle({pending->completedPasses,pending->failedPass,
+        if(!pending->reused && !chain.settle({pending->completedPasses,pending->failedPass,
             pending->passError?pending->passError:pending->code,
             !historyRecorded || completion==runtime::Completion::Complete || completion==runtime::Completion::Discarded,
             pending->eligible})) {diagSettle.store(3);return false;}
         if(pending->failedPass) {reset=true;lastResetSetter="pass-failed";}
+        if(!pending->eligible)previousNrColor.Reset();
         passStatus.store(pack_pass_status(chain.status()),std::memory_order_release);
         pendingGuide.reset(); pending->resources->unsubscribe(); pending.reset(); return true;
     }
@@ -914,7 +1003,7 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     try {
     p.realWork=true;
     const bool stopped=stop.stop_requested();
-    const bool settled=!stopped && p.settle();
+    const bool settled=!stopped && p.settle(stop);
     if(t) { t->stop=stopped;t->settleEnd=stamp(); }
     if(!settled) return fail(0xe002);
     const auto& d=work.job.input.descriptor;
@@ -931,6 +1020,10 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const auto done=producer.fence->GetCompletedValue();
     if(t)t->producerAtWait=done;
     const auto producerCode=producer_return(job->fault,producer.value,done,[&] {
+        if(job->fault==Fault::None) {
+            checked(p.context->queue()->Wait(producer.fence,producer.value),"model GPU producer dependency");
+            return true;
+        }
         HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr); require(event!=nullptr,"producer event");
         const auto result=producer.fence->SetEventOnCompletion(producer.value,event);
         const auto wait=SUCCEEDED(result)?WaitForSingleObject(event,15000):WAIT_FAILED;
@@ -1062,6 +1155,26 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     const bool reset=p.reset || !p.previousKey || p.previousKey->historyEpoch!=work.job.key.historyEpoch ||
         p.previousKey->frame.contentEpoch!=work.job.key.frame.contentEpoch ||
         p.previousKey->frame.ingressSequence+1!=work.job.key.frame.ingressSequence;
+    if(work.job.input.settings.dedupReuse && job->fault==Fault::None && !reset &&
+       p.previousFrame && p.previousNrColor && p.previousKey->submissionSerial<work.job.key.submissionSerial) {
+        if(!p.dedup)p.dedup=std::make_unique<DedupCompare>(device);
+        if(p.dedup->same(*p.context,{job->frame,p.previousFrame})) {
+            const auto view=work.binding.transport->begin_worker(work.binding.ticket);
+            require(view.has_value(),"NR reuse Bridge admission");
+            job->output=view->output;job->reused=true;job->referenceValid=true;
+            p.subscribe(job);
+            barrier(view->commands,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            barrier(view->commands,view->output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+            view->commands->CopyResource(view->output,p.previousNrColor.Get());
+            barrier(view->commands,view->output,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+            barrier(view->commands,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+            job->submitted=work.binding.transport->submit_worker(work.binding.ticket) && r.submission->submitted(p.context->queue());
+            if(job->submitted)p.previousKey.emplace(work.job.key);
+            else {p.reset=true;p.lastResetSetter="reuse-submit-failed";}
+            p.signal(job);
+            return {work.job,job->submitted,job};
+        }
+    }
     if(!p.guides) {
         if(t)t->guideInit=stamp();
         if(p.guidePreparation.valid()) {
@@ -1231,7 +1344,26 @@ pipeline::Processed Processor::process(const pipeline::Work& work,std::stop_toke
     barrier(list,job->frame->original.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     barrier(list,guide->depth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     barrier(list,guide->motion,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
-    barrier(list,view->output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+    if(work.job.input.settings.dedupReuse && job->fault==Fault::None) {
+        // Bridge output slots recycle independently of model history. Keep one
+        // private restored-color allocation, never pin a reusable Bridge slot.
+        const auto desc=view->output->GetDesc();
+        if(!p.previousNrColor || reset) {
+            p.previousNrColor.Reset();
+            D3D12_HEAP_PROPERTIES allocation{};allocation.Type=D3D12_HEAP_TYPE_DEFAULT;
+            auto cache=desc;cache.Flags=D3D12_RESOURCE_FLAG_NONE;
+            checked(device->CreateCommittedResource(&allocation,D3D12_HEAP_FLAG_NONE,&cache,D3D12_RESOURCE_STATE_COMMON,
+                nullptr,IID_PPV_ARGS(&p.previousNrColor)),"NR duplicate color cache");
+        }
+        barrier(list,view->output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(list,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(p.previousNrColor.Get(),view->output);
+        barrier(list,p.previousNrColor.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+        barrier(list,view->output,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    } else {
+        p.previousNrColor.Reset();
+        barrier(list,view->output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+    }
     const auto states=final_color_states(result.passes);
     for(size_t i=0;i<r.colors.size();++i) if(r.colors[i])
         barrier(list,r.colors[i].Get(),states[i],D3D12_RESOURCE_STATE_COMMON);
@@ -1309,7 +1441,9 @@ void Processor::worker_stopping() noexcept {
                 proof.callbackRetained=proof.guidePending=false;
                 return true;
             case 1:
+                if(p.dedup && !p.dedup->retired())return false;
                 if(!release_passes(p.prewarmed) || !release_passes(p.passes))return false;
+                p.dedup.reset();p.previousNrColor.Reset();
                 p.previousFrame.reset();p.previousKey.reset();p.pool.reset();
                 p.stabilizeOrig={};p.stabilizeTemporal={};p.stabilizeHold={};p.stabilizer.reset();
                 p.stabilizeValid=false;p.stabilizeExtent.reset();

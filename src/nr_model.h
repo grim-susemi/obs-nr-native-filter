@@ -111,6 +111,7 @@ struct Job {
     std::atomic<bool> published{false};
     std::atomic<uint32_t> qaFailure{0}; // Exact-job diagnostic, never completion.
     bool created=false, evaluated=false, composed=false, submitted=false, eligible=false,referenceValid=false;
+    bool reused=false; // Completed transport copy, not a pass evaluation or flow submission.
     uint32_t code=0, invalid=0;
     uint32_t creationPass=0,completedPasses=0,failedPass=0,passError=0;
     uint64_t epoch=0;
@@ -166,6 +167,7 @@ struct Job {
     ~Job();
     Job(const Job&)=delete;
     Job& operator=(const Job&)=delete;
+    bool ready_for_arrival(std::stop_token,uint64_t frameIntervalNs) const;
 };
 bool entry_interposed(HMODULE owner,const void* entry);
 class Processor final : public pipeline::Processor {
