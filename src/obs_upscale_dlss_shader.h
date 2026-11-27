@@ -86,3 +86,28 @@ void compose(uint3 p : SV_DispatchThreadID) {
     dest[p.xy] = float4(rgb * a, a);
 }
 )hlsl";
+
+// Shared NVOF import. The broker already sanitized vectors outside the active
+// rectangle and stores current->previous displacements in guide pixels. Nearest
+// texel sampling avoids blending unrelated objects at guide/input boundaries;
+// guideToOutput applies the guide -> output pixel conversion exactly once.
+constexpr char motionImportShader[] = R"hlsl(
+Texture2D<float2> sharedMotion : register(t0);
+RWTexture2D<float2> destMotion : register(u0);
+cbuffer MotionImport : register(b0) { float2 guideSize; float2 guideToOutput; };
+
+[numthreads(8, 8, 1)]
+void import_shared(uint3 p : SV_DispatchThreadID) {
+    uint w, h;
+    destMotion.GetDimensions(w, h);
+    if (any(p.xy >= uint2(w, h))) return;
+    const float2 uv = (float2(p.xy) + 0.5) / float2(w, h);
+    const int2 source = clamp(int2(uv * guideSize), int2(0, 0), int2(guideSize) - 1);
+    float2 v = sharedMotion.Load(int3(source, 0));
+    // NaN/Inf sanitation without isnan(): fxc proves Load values finite and
+    // rejects the call under warnings-as-errors, so test the exponent bits.
+    const uint2 exponent = asuint(v) & 0x7f800000u;
+    if (exponent.x == 0x7f800000u || exponent.y == 0x7f800000u) v = float2(0.0, 0.0);
+    destMotion[p.xy] = v * guideToOutput;
+}
+)hlsl";

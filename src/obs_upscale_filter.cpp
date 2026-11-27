@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
+// allow: SIZE_OK - OBS filter registration, the spatial CAS draw and the DLSS
+// capture share one source instance; the capture must reuse this exact draw.
 #include "obs_upscale_filter.h"
+#include "obs_filter.h"
 #include "obs_upscale_dlss.h"
 #include "obs_split_compare.h"
 #include "obs_quality_trace.h"
@@ -9,6 +12,7 @@
 #include <graphics/vec4.h>
 #include <util/bmem.h>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <new>
 
@@ -112,6 +116,7 @@ struct Filter {
     std::shared_ptr<const Settings> lastSettings;
     bool dlssAttempted = false;
     bool publishedDlss = false;
+    ObsUpscaleFlowRequest capturedFlow; // Displayed Shared-NVOF provenance of capture[f.current].
     std::atomic<bool> reset{false};
     std::atomic<std::shared_ptr<const Settings>> settings;
 };
@@ -216,6 +221,85 @@ void destroy(Filter* f)
 
 // The libobs filter helper owns its render target privately. Capture explicitly
 // for DLSS so the fallback can reuse this exact frame without a second source draw.
+namespace {
+struct NrProbe {
+    bool present = false, enabled = false, ready = false;
+    uint64_t instance = 0, generation = 0;
+};
+
+struct NrFilterSearch {
+    obs_source_t* found = nullptr;
+};
+
+void find_nr_filter(obs_source_t*, obs_source_t* child, void* param)
+{
+    auto& search = *static_cast<NrFilterSearch*>(param);
+    if (search.found || !child)
+        return;
+    const char* id = obs_source_get_id(child);
+    if (id && !std::strcmp(id, "susemi_nr_filter"))
+        search.found = child;
+}
+
+// Same public, read-only seam the OBS properties use: the NR filter publishes its
+// instance and resource generation on the graphics owner thread.
+NrProbe probe_nr(obs_source_t* parent)
+{
+    NrProbe probe;
+    if (!parent)
+        return probe;
+    NrFilterSearch search;
+    obs_source_enum_filters(parent, find_nr_filter, &search);
+    if (!search.found)
+        return probe;
+    probe.present = true;
+    probe.enabled = obs_source_enabled(search.found);
+    calldata_t data;
+    calldata_init(&data);
+    if (proc_handler_call(obs_source_get_proc_handler(search.found), "nr_sampler_snapshot", &data)) {
+        probe.instance = static_cast<uint64_t>(calldata_int(&data, "instance"));
+        probe.generation = static_cast<uint64_t>(calldata_int(&data, "resource_generation"));
+        probe.ready = calldata_int(&data, "admission") == static_cast<long long>(nr::sampler::Admission::Ready);
+    }
+    calldata_free(&data);
+    return probe;
+}
+
+// The displayed frame for the captured tick; a missing record while NR owns the
+// chain is a late frame, never permission for speculative local OFA.
+ObsUpscaleFlowRequest flow_request(obs_source_t* parent, uint64_t tick)
+{
+    ObsUpscaleFlowRequest request;
+    request.displayedTick = tick;
+    request.previousDisplayedTick = tick > 1 ? tick - 1 : 0;
+    const auto probe = probe_nr(parent);
+    SrFlowInput decision{probe.present, probe.enabled, probe.ready};
+    if (probe.present && probe.enabled && probe.ready && probe.instance) {
+        request.sourceInstanceId = probe.instance;
+        request.resourceGeneration = probe.generation;
+        request.broker = nr::find_flow_broker(probe.instance, probe.generation);
+        if (request.broker) {
+            const auto displayed = request.broker->displayed(probe.generation, tick);
+            if (displayed) {
+                decision.displayFound = true;
+                decision.owner = displayed->owner;
+                decision.provenance = displayed->provenance;
+                decision.pairAvailable =
+                    displayed->provenance == nr::FlowProvenance::Valid && displayed->pair.has_value();
+                if (decision.pairAvailable) {
+                    request.pair = displayed->pair;
+                    request.sharedMvToken = displayed->pair->currColorKey.submissionSerial;
+                }
+                request.reset = displayed->provenance == nr::FlowProvenance::Reset ||
+                                displayed->provenance == nr::FlowProvenance::Discontinuity;
+            }
+        }
+    }
+    request.mode = sr_flow_mode(decision);
+    return request;
+}
+}
+
 static bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Extent out, gs_color_space space)
 {
     if (!f.dlssAttempted) {
@@ -263,6 +347,7 @@ static bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Ex
         gs_texrender_end(capture);
         f.current = next;
         f.ticks[next] = now;
+        f.capturedFlow = flow_request(obs_filter_get_parent(f.source), nr::sampler::canonical_tick(now, interval));
     }
     const auto previous = f.current ^ 1u;
     const auto prior = f.ticks[previous];
@@ -276,7 +361,8 @@ static bool draw_dlss(Filter& f, const Settings& settings, nr::Extent in, nr::Ex
         spatial = input;
 #endif
     auto* output = obs_upscale_dlss_render(f.dlss, input, adjacent ? prior : 0,
-                                          out.width, out.height, settings.model, settings.runtime.c_str());
+                                          out.width, out.height, settings.model, settings.runtime.c_str(),
+                                          &f.capturedFlow);
     if (nr::quality::trace_frames() && f.lastTraceTick != now) {
         f.lastTraceTick = now;
         const auto* parent = obs_filter_get_parent(f.source);
@@ -359,6 +445,26 @@ void defaults(obs_data_t* settings)
     obs_data_set_default_string(settings, runtimeKey, "");
 }
 
+// Public read-only seam for the FG tap: whether SR upscaled and which tick its
+// presented frame belongs to (the temporal output trails the capture by one).
+static void sr_snapshot(void* data, calldata_t* params)
+{
+    const auto* filter = static_cast<const Filter*>(data);
+    ObsUpscaleDlssStats stats;
+    if (!filter || !obs_upscale_dlss_stats(filter->dlss, &stats))
+        return;
+    calldata_set_int(params, "ofa_exec", static_cast<int64_t>(stats.ofaExec));
+    calldata_set_int(params, "shared_hits", static_cast<int64_t>(stats.sharedMvHits));
+    calldata_set_int(params, "shared_fallbacks", static_cast<int64_t>(stats.sharedMvFallbacks));
+    calldata_set_int(params, "shared_misses", static_cast<int64_t>(stats.sharedMvMisses));
+    calldata_set_int(params, "local_fallback", static_cast<int64_t>(stats.localFallback));
+    calldata_set_int(params, "present_tick", static_cast<int64_t>(stats.presentTick));
+    calldata_set_int(params, "captured_tick", static_cast<int64_t>(stats.capturedTick));
+    calldata_set_bool(params, "upscaled", stats.upscaled);
+    calldata_set_bool(params, "temporal", stats.temporal);
+    calldata_set_bool(params, "ngx_active", stats.ngxActive);
+}
+
 static bool sync_controls(obs_properties_t* props, obs_property_t*, obs_data_t* settings)
 {
     const bool enabled = obs_data_get_int(settings, modeKey) != 0;
@@ -405,8 +511,14 @@ extern "C" void nr_register_upscale_filter(void)
     info.get_name = [](void*) { return obs_module_text("Upscale.Name"); };
     info.create = [](obs_data_t* settings, obs_source_t* source) -> void* {
         auto* filter = create(settings, source);
-        if (filter)
+        if (filter) {
             filter->splitSetting.update(settings);
+            proc_handler_add(obs_source_get_proc_handler(source),
+                "void sr_flow_snapshot(out int ofa_exec, out int shared_hits, out int shared_fallbacks, "
+                "out int shared_misses, out int local_fallback, out int present_tick, out int captured_tick, "
+                "out bool upscaled, out bool temporal, out bool ngx_active)",
+                sr_snapshot, filter);
+        }
         return filter;
     };
     info.destroy = [](void* data) { destroy(static_cast<Filter*>(data)); };

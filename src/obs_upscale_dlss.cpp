@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
+// allow: SIZE_OK - one SR backend owns the OBS graphics capture and the NGX
+// worker session; the ngxMutex/fence handoff is a single reviewable contract.
 #include "obs_upscale_dlss.h"
 
 #ifdef _WIN32
@@ -149,6 +151,7 @@ struct Config {
 struct Capture {
     UINT64 epoch = 0, fence = 0;
     UINT64 time = 0, interval = 0;
+    ObsUpscaleFlowRequest flow{};
 };
 
 struct Image {
@@ -185,11 +188,11 @@ Image make_image(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT form
     return image;
 }
 
-ComPtr<ID3DBlob> shader_code(const char* entry, const char* target)
+ComPtr<ID3DBlob> shader_code_from(const char* source, size_t bytes, const char* entry, const char* target)
 {
     ComPtr<ID3DBlob> code, error;
     const D3D_SHADER_MACRO compute[]{{"COMPUTE", "1"}, {nullptr, nullptr}};
-    const auto hr = D3DCompile(shader, sizeof(shader) - 1, "obs_upscale_dlss",
+    const auto hr = D3DCompile(source, bytes, "obs_upscale_dlss",
                                target[0] == 'c' ? compute : nullptr, nullptr, entry,
                                target, D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_WARNINGS_ARE_ERRORS,
                                0, &code, &error);
@@ -199,13 +202,23 @@ ComPtr<ID3DBlob> shader_code(const char* entry, const char* target)
     return code;
 }
 
-ComPtr<ID3D11ComputeShader> program(ID3D11Device* device, const char* entry)
+ComPtr<ID3DBlob> shader_code(const char* entry, const char* target)
 {
-    const auto code = shader_code(entry, "cs_5_0");
+    return shader_code_from(shader, sizeof(shader) - 1, entry, target);
+}
+
+ComPtr<ID3D11ComputeShader> program(ID3D11Device* device, const char* source, size_t bytes, const char* entry)
+{
+    const auto code = shader_code_from(source, bytes, entry, "cs_5_0");
     ComPtr<ID3D11ComputeShader> result;
     check(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &result),
           "SR compute shader");
     return result;
+}
+
+ComPtr<ID3D11ComputeShader> program(ID3D11Device* device, const char* entry)
+{
+    return program(device, shader, sizeof(shader) - 1, entry);
 }
 
 // One admitted D3D11 CORE/device per process. Per-filter resources and
@@ -406,9 +419,25 @@ struct Session {
     OpticalFlow flow;
     std::array<Image, 2> colors;
     ComPtr<ID3D11ComputeShader> prepare, densify, detectCut, compose;
+    ComPtr<ID3D11ComputeShader> importMotion;
     ComPtr<ID3D11Texture2D> cutReadback;
     ComPtr<ID3D11Buffer> motionUnits;
+    ComPtr<ID3D11Buffer> sharedUnits;
     ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11Fence> cutFence;
+    UINT64 cutValue = 0;
+    // One lazily opened view per broker ring slot. Handles stay broker-owned;
+    // only the opened D3D11 objects are released here.
+    struct SharedSlot {
+        HANDLE motion = nullptr, ready = nullptr, back = nullptr;
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> view;
+        ComPtr<ID3D11Fence> readyFence, backFence;
+    };
+    std::array<SharedSlot, nr::flow_ring_slots> sharedSlots{};
+    uint64_t sharedInstance = 0, sharedGeneration = 0;
+    bool flowOpened = false;
+    SrFlowCounters counters;
     float inputPerOutputX = 1.0f, inputPerOutputY = 1.0f;
     NVSDK_NGX_Parameter* caps = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
@@ -499,6 +528,8 @@ struct Session {
         densify = program(device.Get(), "densify");
         detectCut = program(device.Get(), "detect_cut");
         compose = program(device.Get(), "compose");
+        importMotion = program(device.Get(), motionImportShader, sizeof(motionImportShader) - 1, "import_shared");
+        check(device->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&cutFence)), "SR cut fence");
         D3D11_TEXTURE2D_DESC cutDesc{};
         cutFlag.texture->GetDesc(&cutDesc);
         cutDesc.BindFlags = 0;
@@ -515,6 +546,11 @@ struct Session {
         constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         const D3D11_SUBRESOURCE_DATA data{scale, 0, 0};
         check(device->CreateBuffer(&constants, &data, &motionUnits), "SR motion units");
+        D3D11_BUFFER_DESC sharedConstants{};
+        sharedConstants.ByteWidth = sizeof(float) * 4;
+        sharedConstants.Usage = D3D11_USAGE_DEFAULT;
+        sharedConstants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        check(device->CreateBuffer(&sharedConstants, nullptr, &sharedUnits), "SR shared motion units");
         D3D11_SAMPLER_DESC sd{};
         sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -525,16 +561,12 @@ struct Session {
 
         // Admission failures select spatial for the entire configuration.
         // Do not alternate hardware and software vectors inside NGX history.
-        unresolved = true;
-        try {
-            flow.open(device.Get(), commands.Get(), w, h);
-        } catch (...) {
-            unresolved = !finish_worker() || flow.uncertain;
-            throw;
-        }
+        // NVOF is opened lazily on the first consumer-owned frame, so an
+        // NR-owned chain never admits a second optical-flow session.
         {
+            unresolved = true;
             if (!finish_worker())
-                throw std::runtime_error("SR NVOF initialization did not complete");
+                throw std::runtime_error("SR initialization did not complete");
             unresolved = false;
             const auto getCaps = ngx_call(core->ngx.capabilities, &caps);
             unresolved = getCaps == NVSDK_NGX_Result_FAIL_PlatformError;
@@ -638,13 +670,20 @@ struct Session {
         commands->CSSetUnorderedAccessViews(0, 2, noUAVs, nullptr);
     }
 
-    bool read_cut(const Image& color, const Image& prior, bool& reset)
+    // Cut detection readback is split so the bounded GPU wait never runs under
+    // ngxMutex. The cut depends only on this pair (current, prior), so it still
+    // applies to the same frame the local NVOF evaluates.
+    void read_cut_begin(const Image& color, const Image& prior)
     {
         dispatch(detectCut.Get(), color, &prior, cutFlag, 1, 1, false, true);
         commands->CopyResource(cutReadback.Get(), cutFlag.texture.Get());
-        // The NGX reset flag lives on the CPU. Only the worker waits for
-        // these four bytes, using the same bounded completion fence.
-        if (!finish_worker())
+        commands->Signal(cutFence.Get(), ++cutValue);
+        commands->Flush();
+    }
+
+    bool read_cut_end(bool& reset)
+    {
+        if (!wait(cutFence.Get(), cutValue))
             return false;
         D3D11_MAPPED_SUBRESOURCE map{};
         const auto hr = commands->Map(cutReadback.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
@@ -665,13 +704,96 @@ struct Session {
         return true;
     }
 
+    void ensure_flow()
+    {
+        if (flowOpened)
+            return;
+        flow.open(device.Get(), commands.Get(), config.width, config.height);
+        flowOpened = true;
+        resetFlowHints = true; // a fresh NVOF session has no temporal hints yet
+    }
+
+    void dispatch_shared(ID3D11ShaderResourceView* shared, Image& out, UINT w, UINT h)
+    {
+        ID3D11ShaderResourceView* srvs[]{shared};
+        ID3D11UnorderedAccessView* uavs[]{out.uav.Get()};
+        ID3D11Buffer* cb = sharedUnits.Get();
+        commands->CSSetShader(importMotion.Get(), nullptr, 0);
+        commands->CSSetShaderResources(0, 1, srvs);
+        commands->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        commands->CSSetConstantBuffers(0, 1, &cb);
+        commands->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        ID3D11ShaderResourceView* noSrv[1]{};
+        ID3D11UnorderedAccessView* noUav[1]{};
+        commands->CSSetShaderResources(0, 1, noSrv);
+        commands->CSSetUnorderedAccessViews(0, 1, noUav, nullptr);
+    }
+
+    // NrOwned + Valid: import the Shared NVOF pair instead of running NVOF.
+    // The GPU Wait on the shared ready fence and the SR return signal are both
+    // queued commands, so the worker never blocks the graphics thread here.
+    bool import_shared(const nr::ExportedFlow& exported, bool& reset)
+    {
+        if (!exported.motion || !exported.readyFence || !exported.returnFence ||
+            !exported.guide.valid({exported.guide.guideWidth, exported.guide.guideHeight}))
+            return false;
+        if (sharedInstance != exported.pair.currColorKey.sourceInstanceId ||
+            sharedGeneration != exported.pair.currColorKey.resourceGeneration) {
+            sharedSlots = {};
+            sharedInstance = exported.pair.currColorKey.sourceInstanceId;
+            sharedGeneration = exported.pair.currColorKey.resourceGeneration;
+        }
+        auto& slot = sharedSlots[exported.slot % sharedSlots.size()];
+        if (slot.motion != exported.motion || slot.ready != exported.readyFence || slot.back != exported.returnFence) {
+            slot = {};
+            slot.motion = exported.motion;
+            slot.ready = exported.readyFence;
+            slot.back = exported.returnFence;
+            try {
+                check(device->OpenSharedResource1(exported.motion, IID_PPV_ARGS(&slot.texture)), "shared SR motion open");
+                D3D11_TEXTURE2D_DESC description{};
+                slot.texture->GetDesc(&description);
+                if (description.Format != DXGI_FORMAT_R16G16_FLOAT ||
+                    description.Width != exported.guide.guideWidth ||
+                    description.Height != exported.guide.guideHeight || description.MipLevels != 1 ||
+                    description.ArraySize != 1 || description.SampleDesc.Count != 1) {
+                    slot = {};
+                    return false;
+                }
+                check(device->CreateShaderResourceView(slot.texture.Get(), nullptr, &slot.view), "shared SR motion view");
+                check(device->OpenSharedFence(exported.readyFence, IID_PPV_ARGS(&slot.readyFence)),
+                      "shared SR ready fence");
+                check(device->OpenSharedFence(exported.returnFence, IID_PPV_ARGS(&slot.backFence)),
+                      "shared SR return fence");
+            } catch (const std::exception& error) {
+                blog(LOG_WARNING, "obs-nr-upscale: shared SR motion unavailable: %s", error.what());
+                slot = {};
+                return false;
+            }
+        }
+        if (!slot.view || !slot.readyFence || !slot.backFence)
+            return false;
+        commands->Wait(slot.readyFence.Get(), exported.readyValue);
+        const auto scale = sr_motion_scale(exported.guide.guideWidth, exported.guide.guideHeight,
+            exported.guide.mvScaleX, exported.guide.mvScaleY, config.width, config.height, config.outWidth,
+            config.outHeight);
+        const float constants[]{static_cast<float>(exported.guide.guideWidth),
+            static_cast<float>(exported.guide.guideHeight), scale.x, scale.y};
+        commands->UpdateSubresource(sharedUnits.Get(), 0, nullptr, constants, 0, 0);
+        dispatch_shared(slot.view.Get(), motion, config.width, config.height);
+        if (FAILED(commands->Signal(slot.backFence.Get(), exported.returnValue)))
+            return false;
+        reset = reset || exported.guide.shotCut || exported.guide.reset;
+        return true;
+    }
+
     bool run(const Capture& frame)
     {
         if (!wait(transfer.Get(), frame.fence)) {
             unresolved = true;
             return false;
         }
-        const std::lock_guard lock(ngxMutex);
+        std::unique_lock lock(ngxMutex);
         if (core->unsafe) {
             unresolved = true;
             return false;
@@ -679,32 +801,85 @@ struct Session {
         const auto w = config.width, h = config.height;
         const UINT64 cadenceLimit = std::min(maxHistoryGapNs, frame.interval + frame.interval / 2);
         bool reset = frame.epoch != previous.epoch || frame.time <= previous.time ||
-                     frame.interval != previous.interval || frame.time - previous.time > cadenceLimit;
+                     frame.interval != previous.interval || frame.time - previous.time > cadenceLimit ||
+                     frame.flow.reset;
         auto& color = colors[nextColor];
         auto& prior = colors[nextColor ^ 1u];
         unresolved = true;
         dispatch(prepare.Get(), input, nullptr, color, w, h);
-        flow.prepare(commands.Get(), nextColor, color, w, h);
-        if (!reset && !read_cut(color, prior, reset))
-            return false;
+
+        SrFlowMode mode = frame.flow.mode;
+        if (mode == SrFlowMode::UseShared && (!frame.flow.broker || !frame.flow.pair ||
+                frame.flow.broker->source_instance_id() != frame.flow.sourceInstanceId ||
+                frame.flow.pair->currColorKey.sourceInstanceId != frame.flow.sourceInstanceId ||
+                frame.flow.pair->currColorKey.resourceGeneration != frame.flow.resourceGeneration ||
+                frame.flow.previousDisplayedTick + 1 != frame.flow.displayedTick ||
+                !nr::FlowBroker::display_tick_for(*frame.flow.pair, frame.flow.displayedTick)))
+            mode = SrFlowMode::ForbidLocal;
+        if (mode == SrFlowMode::UseShared) {
+            const auto lease = frame.flow.broker->find_pair(*frame.flow.pair, nr::FlowConsumer::Sr);
+            if (lease && frame.flow.sharedMvToken &&
+                lease->pair.currColorKey.submissionSerial == frame.flow.sharedMvToken &&
+                import_shared(*lease, reset)) {
+                resetFlowHints = true; // NVOF was not used; its temporal hints are stale
+            } else {
+                // The displayed pair was Valid but its ring slot is already gone:
+                // never fall back to speculative local OFA while NR owns analysis.
+                ++counters.sharedMisses;
+                mode = SrFlowMode::ForbidLocal;
+            }
+        }
+        bool executedOfa = false;
+        switch (mode) {
+        case SrFlowMode::UseShared:
+            break;
+        case SrFlowMode::ForbidLocal:
+            reset = true;
+            resetFlowHints = true;
+            break;
+        case SrFlowMode::LocalFallback:
+            // NVOF is opened only when the consumer actually owns motion
+            // analysis, so an NR-owned chain never admits a second OFA session.
+            ensure_flow();
+            flow.prepare(commands.Get(), nextColor, color, w, h);
+            if (reset) {
+                resetFlowHints = true;
+            } else {
+                read_cut_begin(color, prior);
+                // A bounded GPU wait must never run under ngxMutex: it would stall
+                // every other SR worker behind this frame's cut readback.
+                lock.unlock();
+                const bool cut = read_cut_end(reset);
+                lock.lock();
+                if (!cut)
+                    return false;
+            }
+            break;
+        }
         if (reset) {
             constexpr float zero[]{0, 0, 0, 0};
             commands->ClearUnorderedAccessViewFloat(motion.uav.Get(), zero);
             resetFlowHints = true;
-        } else {
+        } else if (mode == SrFlowMode::LocalFallback) {
             try {
                 flow.execute(nextColor, resetFlowHints);
             } catch (...) {
-                unresolved = !finish_worker() || flow.uncertain;
+                lock.unlock();
+                const bool complete = finish_worker();
+                unresolved = !complete || flow.uncertain;
                 throw;
             }
             dispatch(densify.Get(), color, &prior, motion, w, h, true);
             resetFlowHints = false;
+            executedOfa = true;
         }
         const auto result = ngx_call(&Session::evaluate_feature, this, static_cast<ID3D11Resource*>(color.texture.Get()),
                                      reset);
         if (NVSDK_NGX_SUCCEED(result))
             dispatch(compose.Get(), evaluated, &color, output, config.outWidth, config.outHeight);
+        // Release the shared NGX/NVOF context before the bounded CPU wait. The
+        // issued commands stay ordered on this session's own completion fence.
+        lock.unlock();
         const bool complete = finish_worker();
         unresolved = !complete || result == NVSDK_NGX_Result_FAIL_PlatformError;
         check_ngx(result, "NGX SR evaluation");
@@ -712,8 +887,9 @@ struct Session {
             return false;
         if (!previous.epoch)
             blog(LOG_INFO, "obs-nr-upscale: first NGX SR evaluation completed on GPU");
-        previous = frame;
+        previous = {frame.epoch, frame.fence, frame.time, frame.interval};
         nextColor ^= 1u;
+        counters.observe(mode, executedOfa);
         return true;
     }
 
@@ -811,6 +987,9 @@ struct ObsUpscaleDlss {
     std::optional<Config> graphicsConfig;
     UINT64 renderTick = 0, renderInterval = 0, acceptedTick = 0;
     bool renderTemporal = false;
+    std::atomic<uint64_t> statFrames{0}, statOfaExec{0}, statSharedHits{0}, statSharedFallbacks{0},
+        statSharedMisses{0}, statLocalFallback{0}, statPresentTick{0}, statCapturedTick{0};
+    std::atomic<bool> statUpscaled{false}, statTemporal{false}, statNgxActive{false};
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -933,6 +1112,13 @@ struct ObsUpscaleDlss {
 #endif
                 lock.lock();
                 if (done) {
+                    const auto stats = session->counters;
+                    statFrames.store(stats.frames, std::memory_order_relaxed);
+                    statOfaExec.store(stats.ofaExec, std::memory_order_relaxed);
+                    statSharedHits.store(stats.sharedHits, std::memory_order_relaxed);
+                    statSharedFallbacks.store(stats.sharedFallbacks, std::memory_order_relaxed);
+                    statSharedMisses.store(stats.sharedMisses, std::memory_order_relaxed);
+                    statLocalFallback.store(stats.localFallback, std::memory_order_relaxed);
                     phase = Phase::Complete;
                 } else {
                     // A failed evaluation with a known fence can be retired
@@ -1011,7 +1197,8 @@ void obs_upscale_dlss_reset(ObsUpscaleDlss* backend) noexcept
 gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr_source,
                                     uint64_t present_tick,
                                     uint32_t output_width, uint32_t output_height,
-                                    uint32_t model, const char* runtime_path) noexcept
+                                    uint32_t model, const char* runtime_path,
+                                    const ObsUpscaleFlowRequest* flow) noexcept
 {
     if (!backend)
         return nullptr;
@@ -1146,6 +1333,7 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
             b.graphics->Flush();
             b.acceptedTick = now;
             b.job = {b.epoch.load(std::memory_order_relaxed), b.access, now, interval};
+            b.job.flow = flow ? *flow : ObsUpscaleFlowRequest{};
             b.phase = Phase::Captured;
             b.wake.notify_one();
         }
@@ -1154,6 +1342,15 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
         if (obs_upscale_dlss_qa_legacy_pacing())
             b.renderTemporal = b.qa_fresh(b.displayed, now);
 #endif
+        b.statTemporal.store(b.renderTemporal, std::memory_order_relaxed);
+        b.statNgxActive.store(b.active && b.phase != Phase::Poisoned, std::memory_order_relaxed);
+        if (b.renderTemporal) {
+            b.statPresentTick.store(present_tick, std::memory_order_relaxed);
+            b.statCapturedTick.store(b.job.time, std::memory_order_relaxed);
+            b.statUpscaled.store(b.active && (b.active->config.outWidth != b.active->config.width ||
+                                              b.active->config.outHeight != b.active->config.height),
+                                 std::memory_order_relaxed);
+        }
         return b.renderTemporal ? b.presentation : nullptr;
     } catch (...) {
         b.invalidate();
@@ -1161,10 +1358,28 @@ gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss* backend, gs_texture_t* sdr
     }
 }
 
+bool obs_upscale_dlss_stats(const ObsUpscaleDlss* backend, ObsUpscaleDlssStats* out) noexcept
+{
+    if (!backend || !out)
+        return false;
+    out->frames = backend->statFrames.load(std::memory_order_relaxed);
+    out->ofaExec = backend->statOfaExec.load(std::memory_order_relaxed);
+    out->sharedMvHits = backend->statSharedHits.load(std::memory_order_relaxed);
+    out->sharedMvFallbacks = backend->statSharedFallbacks.load(std::memory_order_relaxed);
+    out->sharedMvMisses = backend->statSharedMisses.load(std::memory_order_relaxed);
+    out->localFallback = backend->statLocalFallback.load(std::memory_order_relaxed);
+    out->presentTick = backend->statPresentTick.load(std::memory_order_relaxed);
+    out->capturedTick = backend->statCapturedTick.load(std::memory_order_relaxed);
+    out->upscaled = backend->statUpscaled.load(std::memory_order_relaxed);
+    out->temporal = backend->statTemporal.load(std::memory_order_relaxed);
+    out->ngxActive = backend->statNgxActive.load(std::memory_order_relaxed);
+    return true;
+}
+
 #else
 ObsUpscaleDlss* obs_upscale_dlss_create() noexcept { return nullptr; }
 void obs_upscale_dlss_destroy(ObsUpscaleDlss*) noexcept {}
 void obs_upscale_dlss_reset(ObsUpscaleDlss*) noexcept {}
 gs_texture_t* obs_upscale_dlss_render(ObsUpscaleDlss*, gs_texture_t*, uint64_t, uint32_t, uint32_t,
-                                    uint32_t, const char*) noexcept { return nullptr; }
+                                    uint32_t, const char*, const void*) noexcept { return nullptr; }
 #endif

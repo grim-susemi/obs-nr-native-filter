@@ -171,7 +171,13 @@ void FlowBroker::Impl::create_slot(Slot& slot, uint32_t index)
     description.MipLevels = 1;
     description.Format = DXGI_FORMAT_R16G16_FLOAT;
     description.SampleDesc.Count = 1;
-    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // D3D11 consumers import this ring through OpenSharedResource1. D3D12 only
+    // exposes a shared texture to D3D11 when the resource is created with
+    // ALLOW_SIMULTANEOUS_ACCESS plus a render-target-capable description; UOA
+    // stays for the sanitize copy. Probe evidence: UOA-only slots were refused
+    // by D3D11 with E_INVALIDARG (upscale_shared_flow_tests).
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
     checked(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_SHARED, &description,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&slot.motion)), "flow ring shared texture");
     checked(device->CreateSharedHandle(slot.motion.Get(), nullptr, GENERIC_ALL, nullptr, &slot.motionHandle),
