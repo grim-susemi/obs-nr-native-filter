@@ -3,6 +3,11 @@
 // Mode 0: Fast Veyra-style NvofDensify cost-gated 5-cell cross photometric upsample
 //         with static-pixel zero-motion protection (stops 4x4 block wobble at minimal GPU cost).
 // Mode 1: reset, Mode 2: predictor broadcast, Mode 3: bilinear upsample, Mode 4: zero motion.
+//
+// `sanitize` is the Shared NVOF export path, compiled separately into
+// nr_flow_export.h. The private `main` above keeps Feature 18's NaN marker
+// outside activeRect; the exported shared ring never exposes that marker, so a
+// consumer on another device/process can sample the texture without filtering.
 cbuffer Parameters : register(b0) {
     uint width, height, grid, resetFrame;
     uint activeX, activeY, activeWidth, activeHeight;
@@ -90,4 +95,28 @@ void main(uint3 tid : SV_DispatchThreadID) {
         bestMv *= saturate(1.0 - (bestSad - 0.16) / 0.14);
     }
     motion[p] = bestMv;
+}
+
+cbuffer ExportParameters : register(b0) {
+    uint exportWidth, exportHeight, exportActiveX, exportActiveY;
+    uint exportActiveWidth, exportActiveHeight, exportGrid, exportReserved;
+};
+Texture2D<float2> privateMotion : register(t0);
+RWTexture2D<float2> exportedMotion : register(u0);
+
+// Copy the private guide texture into the broker's shared slot. Pixels outside
+// activeRect and any non-finite vector become (0,0); this is the only place a
+// consumer's motion is allowed to come from.
+[numthreads(8, 8, 1)]
+void sanitize(uint3 tid : SV_DispatchThreadID) {
+    uint2 p = tid.xy;
+    if (p.x >= exportWidth || p.y >= exportHeight) return;
+    float2 mv = privateMotion.Load(int3(p, 0));
+    const bool inside = p.x >= exportActiveX && p.y >= exportActiveY &&
+        p.x < exportActiveX + exportActiveWidth && p.y < exportActiveY + exportActiveHeight;
+    if (!inside || !all(isfinite(mv))) {
+        exportedMotion[p] = float2(0, 0);
+        return;
+    }
+    exportedMotion[p] = mv;
 }

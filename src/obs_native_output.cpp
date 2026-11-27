@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "obs_native_output.h"
+#include "nr_flow_broker.h"
 #include <obs.h>
 #include <algorithm>
 #include <list>
@@ -318,6 +319,19 @@ struct NativeOutput::Impl {
         }
         return value;
     }
+    // The displayed frame is what consumers may reuse; never the ingress tick the
+    // job was admitted for. Only a DelayedNr with an exact exported pair is Valid.
+    void record_displayed(const IngressSample& input,const Selection& selected,bool heldPrevious,bool dedupReused)
+    {
+        const auto broker=find_flow_broker(instance,input.resourceGeneration);
+        if(!broker) return;
+        std::optional<FramePairKey> pair;
+        if(selected.kind==OutputKind::DelayedNr && selected.job && !dedupReused)
+            pair=broker->pair_for_job(input.resourceGeneration,input.canonicalTick,selected.job->submissionSerial);
+        const auto displayed=classify_display(DisplayInput{selected.kind,selected.status,input.settings.enabled,
+            selected.resetTemporal,heldPrevious,dedupReused,pair});
+        broker->record_display(input.resourceGeneration,input.canonicalTick,displayed);
+    }
     void observe()
     {
         for(auto& r:records) {
@@ -567,7 +581,9 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
         p.clear_views();p.end_pins();p.nrTarget=nullptr;
         require(p.pipeline->finish({}),"native capture-free scheduler placeholder");
         p.collect();p.tickWitness->counters=p.pipeline->counters();
-        return p.pipeline->view(input.canonicalTick)->selection;
+        const auto selection=p.pipeline->view(input.canonicalTick)->selection;
+        p.record_displayed(input,selection,false,false);
+        return selection;
     }
     const bool timeJob=trace || (plan.warmup && plan.admission);
     const auto snapshotStart=timeJob?model::qpc_now():0;
@@ -595,11 +611,13 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     const bool holdNr=(!p.deterministicQa || shortTick) &&
         hold_previous_nr(selected,p.nrTarget==target,p.nrTargetTick,shortTick?0:p.nrHeld);
     // The readiness cutoff is latched by begin, not by completion during capture.
+    bool dedupReused=false;
     if(selected.kind==OutputKind::DelayedNr) {
         const auto old=std::find_if(p.records.begin(),p.records.end(),[&](const Record& r) {
             return selected.job && r.ticket.key==*selected.job;
         });
         require(old!=p.records.end(),"native exact selected NR resource owner");
+        dedupReused=old->job->reused;
         const auto consumer=old->bridge->acquire_output(old->ticket);
         require(consumer && old->bridge->copy_to(*consumer,target),"native selected output consumer copy");
         require(static_cast<bool>(old->bridge->end_consumer(*consumer)),"native selected output consumer end");
@@ -614,6 +632,7 @@ Selection NativeOutput::tick(const IngressSample& input,ID3D11Texture2D* borrowe
     } else {
         g.graphics->CopyResource(target,immutable->original11.Get());
     }
+    p.record_displayed(input,selected,holdNr,dedupReused);
     // A sub-interval repeat does not use the one ordinary miss allowance. The
     // unchanged target, contiguous tick and lastNr bound still prevent a freeze.
     p.nrHeld=holdNr?p.nrHeld+(shortTick?0u:1u):0;p.heldFrames+=holdNr?1:0;
