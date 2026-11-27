@@ -705,7 +705,11 @@ void frames(Feed& f)
         }
         telemetry.multiplier = interpolate ? mult : 1u;
         contentFps = rate.observe(b.timestampNs, ++uniqueOrdinal, staticHold);
-        const auto lockedPeriod = interpolate ? cadence.observe(timestamp) : 0;
+        // A live-anchor session accepts the 24 Hz band's alternating 33/50 ms
+        // transport ticks; liveAnchor=0 keeps the pre-v5 gate so a 17/50 ms
+        // dedup burst is a discontinuity, not a 30 Hz cadence lock.
+        const auto lockedPeriod = interpolate ? cadence.observe(timestamp,
+            live ? cadence_max_interval_live_ns : cadence_max_interval_legacy_ns) : 0;
         if (lockedPeriod && lockedPeriod != lastLockedPeriod) {
             fprintf(f.log, "event=cadence_locked period_ns=%llu repairing=%d\n",
                 static_cast<unsigned long long>(lockedPeriod), repairing ? 1 : 0);
@@ -754,9 +758,12 @@ void frames(Feed& f)
         if (live) {
             const auto phase = plan.originalNs ? plan.originalNs - phaseArrivalNs : 0;
             timing = liveClock.observe({b.timestampNs, b.arrivalNs}, phase);
-            // Even while FG is held, probe a future synthetic slot. A successful
-            // admission restores phase; a refusal uses the immediate real target.
-            if (plan.originalNs) plan.originalNs = std::max(b.arrivalNs, timing.anchorNs + phase);
+            // Pacing repair owns the content clock. Re-applying the raw callback
+            // phase on top would reintroduce the source cadence the repair
+            // removes, so the repaired cadence plan keeps the target. The clock
+            // still observes every original, and a held frame probes admission.
+            if (plan.originalNs && !repairing)
+                plan.originalNs = std::max(b.arrivalNs, timing.anchorNs + phase);
         }
         // A bunched callback can reseed the cadence estimator before the front
         // original. Never schedule its successor's first slot in that old pair.

@@ -10,6 +10,12 @@ namespace nr::fg::vfg {
 inline constexpr uint64_t period_120hz = 8'333'333, period_60hz = 16'666'667, period_50hz = 20'000'000,
     period_40hz = 25'000'000, period_30hz = 33'333'333, period_24hz = 41'666'667;
 inline constexpr int64_t clock_stall_ns = 500'000'000;
+// A live-anchor session accepts the 24 Hz band's alternating 33/50 ms transport
+// ticks. A liveAnchor=0 session keeps the pre-v5 gate: any gap longer than
+// 42 ms is a transport discontinuity, not a cadence sample, so the 17/50 ms
+// burst of a 30 Hz source on 60 Hz transport cannot lock 30 Hz.
+inline constexpr uint64_t cadence_max_interval_live_ns = 50'000'000;
+inline constexpr uint64_t cadence_max_interval_legacy_ns = 42'000'000;
 namespace detail {
 struct CadenceBand { uint64_t periodNs, toleranceNs; };
 inline constexpr std::array<CadenceBand, 6> cadence_bands{{
@@ -31,7 +37,12 @@ public:
     // alternating ~17/33 ms intervals, so use the mean rather than the median.
     [[nodiscard]] uint64_t observe(uint64_t timestampNs) noexcept
     {
-        if (!last_ || timestampNs <= *last_ || timestampNs - *last_ > 50'000'000 ||
+        return observe(timestampNs, cadence_max_interval_live_ns);
+    }
+
+    [[nodiscard]] uint64_t observe(uint64_t timestampNs, uint64_t maxIntervalNs) noexcept
+    {
+        if (!last_ || timestampNs <= *last_ || timestampNs - *last_ > maxIntervalNs ||
             timestampNs - *last_ < 6'000'000) {
             reset();
             last_ = timestampNs;
