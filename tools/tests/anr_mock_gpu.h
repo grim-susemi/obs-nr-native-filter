@@ -31,7 +31,7 @@ struct Graphics {
     std::unique_ptr<Gpu> gpu;
     ComPtr<ID3D12InfoQueue> diagnostics;
     std::unique_ptr<AnrCommands> commands;
-    explicit Graphics(bool warp)
+    explicit Graphics(bool warp, bool swapchain = true)
     {
         require(window.handle != nullptr, "create test window");
         ComPtr<IDXGIFactory4> factory;
@@ -56,7 +56,7 @@ struct Graphics {
         session.height = extent.height;
         session.gpuShotChange = 1;
         session.adapter = desc.AdapterLuid;
-        gpu = std::make_unique<Gpu>(session, window.handle, 4);
+        gpu = std::make_unique<Gpu>(session, window.handle, 4, swapchain);
         if (!smokeWithoutDebugLayer)
             check(gpu->d3d_device()->QueryInterface(IID_PPV_ARGS(&diagnostics)), "fixture D3D12 debug layer");
         commands = std::make_unique<AnrCommands>(gpu->d3d_device(), gpu->drawQueue.Get());

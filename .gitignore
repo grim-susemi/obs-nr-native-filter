@@ -76,3 +76,8 @@
 # NVIDIA runtime binaries are bundled by make-release.ps1, never committed
 nvngx_dlssnr.dll
 /packaging/**/*.dll
+
+# MFG-Unlocker: the MIT ABI declaration only. No community or Intel binaries.
+!/deps/mfg-xemfg/
+/deps/mfg-xemfg/*
+!/deps/mfg-xemfg/mfg_xemfg_provider.h

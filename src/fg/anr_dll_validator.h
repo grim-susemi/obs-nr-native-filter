@@ -39,6 +39,12 @@ struct FileSource {
     virtual OpenResult open(const std::wstring& path, EntryKind kind) const = 0;
 };
 
+// Production file boundary: fixed, removable or RAM disks only; every handle is
+// opened with FILE_FLAG_OPEN_REPARSE_POINT and must resolve to its own path.
+struct DiskSource final : FileSource {
+    OpenResult open(const std::wstring& path, EntryKind kind) const override;
+};
+
 struct PinnedAddon {
     std::wstring canonicalPath;
     std::string sha256;
@@ -53,6 +59,9 @@ struct Validation {
 };
 
 const char* status_name(ValidationStatus status) noexcept;
+// Generic x64 PE/DLL export inspection, shared with the XeMFG provider gate.
+ValidationStatus inspect_exports(std::span<const unsigned char> bytes,
+    std::span<const std::string_view> names);
 ValidationStatus inspect_exports(std::span<const unsigned char> bytes);
 Validation validate_addon(std::wstring_view path, bool experimentalOptIn, const FileSource& files);
 Validation validate_addon(std::wstring_view path, bool experimentalOptIn);

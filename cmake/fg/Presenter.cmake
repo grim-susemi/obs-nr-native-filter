@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-add_library(fg_control STATIC src/fg/fg_controller.cpp src/fg/anr_dll_validator.cpp)
+add_library(fg_control STATIC src/fg/fg_controller.cpp src/fg/anr_dll_validator.cpp src/fg/xemfg_dll_validator.cpp)
 target_link_libraries(fg_control PUBLIC fg_ipc PRIVATE bcrypt)
 target_compile_options(fg_control PRIVATE /W4 /WX /permissive-)
 target_sources(obs-nr-filter PRIVATE src/fg/fg_tap.cpp)
@@ -25,7 +25,12 @@ set(VFG_PRESENTER_SOURCES
   tools/fg-presenter/pushflow_shader_bytecode.cpp
   tools/fg-presenter/xefg_runtime.cpp
   tools/fg-presenter/xefg_presenter.cpp
-  src/fg/anr_dll_validator.cpp)
+  tools/fg-presenter/xemfg_runtime.cpp
+  tools/fg-presenter/xemfg_companion.cpp
+  tools/fg-presenter/xemfg_backend.cpp
+  tools/fg-presenter/xemfg_evaluate.cpp
+  src/fg/anr_dll_validator.cpp
+  src/fg/xemfg_dll_validator.cpp)
 # One definition for the shipping presenter and the test-fixture presenter. The
 # fixture additionally compiles the NR_FG_TEST_MOCK_XESS admission branch, which
 # only accepts pinned hashes supplied by the test and never exists in shipping.
@@ -35,7 +40,7 @@ function(nr_fg_presenter name)
     "${PUSHFLOW_PACK_HEADER}" "${PUSHFLOW_UNPACK_HEADER}" "${PUSHFLOW_RECONSTRUCT_HEADER}")
   target_sources(${name} PRIVATE ${ANR_BACKEND_SOURCES})
   add_dependencies(${name} vfg_presenter_shaders nr_guides_shaders)
-  target_include_directories(${name} PRIVATE deps/ngx deps/xess-3.0.2/inc)
+  target_include_directories(${name} PRIVATE deps/ngx deps/xess-3.0.2/inc deps/mfg-xemfg)
   target_link_libraries(${name} PRIVATE nr_guides fg_ipc d3d12 dxgi user32 winmm bcrypt wintrust crypt32)
   target_compile_features(${name} PRIVATE cxx_std_20)
   target_compile_definitions(${name} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -157,6 +162,58 @@ add_test(NAME xefg_presenter COMMAND xefg_presenter_tests
   "$<TARGET_FILE_DIR:xefg_presenter_tests>/xess-fg"
   "$<TARGET_FILE:obs-nr-fg-presenter-xefg-mock>")
 set_tests_properties(xefg_presenter PROPERTIES TIMEOUT 240 RUN_SERIAL TRUE LABELS gpu)
+
+add_library(xemfg_mock_dll MODULE tools/tests/xemfg_mock_dll.cpp)
+set_target_properties(xemfg_mock_dll PROPERTIES PREFIX "" OUTPUT_NAME "MFGUnlocker")
+target_compile_features(xemfg_mock_dll PRIVATE cxx_std_20)
+target_compile_definitions(xemfg_mock_dll PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(xemfg_mock_dll PRIVATE /W4 /WX /permissive-)
+target_include_directories(xemfg_mock_dll PRIVATE deps/ngx deps/mfg-xemfg)
+target_link_libraries(xemfg_mock_dll PRIVATE d3d12 dxgi)
+
+# Opt-in XeMFG admission: unsigned-but-valid provider accepted, every
+# path/PE/export/companion failure rejected before LoadLibrary.
+add_executable(xemfg_validator_tests tools/tests/xemfg_validator_tests.cpp)
+target_compile_features(xemfg_validator_tests PRIVATE cxx_std_20)
+target_compile_definitions(xemfg_validator_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(xemfg_validator_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(xemfg_validator_tests PRIVATE src src/fg)
+target_link_libraries(xemfg_validator_tests PRIVATE fg_control)
+add_dependencies(xemfg_validator_tests xemfg_mock_dll)
+add_test(NAME xemfg_validator COMMAND xemfg_validator_tests "$<TARGET_FILE:xemfg_mock_dll>")
+set_tests_properties(xemfg_validator PROPERTIES TIMEOUT 30)
+
+# 3x/4x transport contract: real provider ABI, SEH quarantine, syntheticTex,
+# HUD-lock compose and teardown, all against the mock provider above.
+add_executable(xemfg_backend_tests tools/tests/xemfg_backend_tests.cpp
+  tools/fg-presenter/xemfg_backend.cpp tools/fg-presenter/xemfg_evaluate.cpp
+  tools/fg-presenter/xemfg_runtime.cpp tools/fg-presenter/xemfg_companion.cpp
+  tools/fg-presenter/xefg_runtime.cpp
+  tools/fg-presenter/anr_guides.cpp tools/fg-presenter/shared_guides.cpp
+  tools/fg-presenter/anr_commands.cpp tools/fg-presenter/anr_runtime.cpp
+  tools/fg-presenter/vfg_gpu.cpp tools/fg-presenter/vfg_hud_lock.cpp
+  tools/fg-presenter/vfg_shot_change.cpp tools/fg-presenter/pushflow_shader_bytecode.cpp)
+target_compile_features(xemfg_backend_tests PRIVATE cxx_std_20)
+target_compile_definitions(xemfg_backend_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+  NR_FG_TEST_MOCK_XESS=1)
+target_compile_options(xemfg_backend_tests PRIVATE /W4 /WX /permissive-)
+target_include_directories(xemfg_backend_tests PRIVATE src src/fg tools/fg-presenter
+  deps/xess-3.0.2/inc deps/ngx deps/mfg-xemfg "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(xemfg_backend_tests PRIVATE fg_control fg_ipc nr_guides d3d12 dxgi
+  user32 winmm bcrypt wintrust crypt32)
+add_dependencies(xemfg_backend_tests vfg_presenter_shaders nr_guides_shaders xefg_mock_fg xefg_mock_xell
+  xemfg_mock_dll)
+add_custom_command(TARGET xemfg_backend_tests POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:xemfg_backend_tests>/xess-fg"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:xefg_mock_fg>"
+    "$<TARGET_FILE_DIR:xemfg_backend_tests>/xess-fg/libxess_fg.dll"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:xefg_mock_xell>"
+    "$<TARGET_FILE_DIR:xemfg_backend_tests>/xess-fg/libxell.dll"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:xemfg_mock_dll>"
+    "$<TARGET_FILE_DIR:xemfg_backend_tests>/MFGUnlocker.dll"
+  VERBATIM)
+add_test(NAME xemfg_backend COMMAND xemfg_backend_tests "$<TARGET_FILE:xemfg_mock_dll>")
+set_tests_properties(xemfg_backend PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE LABELS gpu)
 
 add_library(anr_mock_dll MODULE tools/tests/anr_mock_dll.cpp)
 target_compile_features(anr_mock_dll PRIVATE cxx_std_20)

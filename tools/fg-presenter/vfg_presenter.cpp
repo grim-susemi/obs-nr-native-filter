@@ -12,6 +12,7 @@
 #include "vfg_trace.h"
 #include "xefg_presenter.h"
 #include "xefg_runtime.h"
+#include "xemfg_backend.h"
 #include <mmsystem.h>
 #include <windowsx.h>
 #include <algorithm>
@@ -356,6 +357,7 @@ void frames(Feed& f)
     std::unique_ptr<IFgBackend> backend;
     PushFlowBackend* pushflowBackend{};
     AnrFgBackend* anrBackend{};
+    XeMfgBackend* xeMfgBackend{};
     IFgBackend* vfg{};
     const auto userClosing = [&f] { return read_exit_reason(f.view) == ExitReason::UserClosed; };
     const auto drain_failure = [&] {
@@ -456,10 +458,21 @@ void frames(Feed& f)
             vfg = backend.get();
             break;
         }
-        case Backend::XeMfg:
-            // Todo 7 installs the opt-in XeMFG backend; same safe 1x contract.
-            fprintf(f.log, "event=xemfg_backend_unavailable_fallback_1x\n");
+        case Backend::XeMfg: {
+            auto owner = std::make_unique<XeMfgBackend>();
+            xeMfgBackend = owner.get();
+            backend = std::move(owner);
+            if (xeMfgBackend->open({gpu.d3d_device(), gpu.drawQueue.Get(), {f.view.width, f.view.height},
+                    f.view.generation, std::wstring(f.view.xemfgDllPath), std::wstring(f.view.xessRuntimeDir),
+                    f.view.experimentalXeMfgOptIn == 1, mult, f.log, &gpu, nullptr,
+                    f.view.transportIntervalNs})) {
+                vfg = xeMfgBackend;
+                mult = std::min(mult, xeMfgBackend->multiplier_limit());
+            } else {
+                fprintf(f.log, "event=xemfg_unavailable_fallback_1x\n");
+            }
             break;
+        }
         }
     }
     // A 4x pair's three subframes share one 60 Hz period, leaving ~4.2 ms per
@@ -1056,8 +1069,8 @@ void frames(Feed& f)
     }
     const bool pushflowFault = pushflowBackend && pushflowBackend->runtime_fault();
     try {
-        if (anrBackend) {
-            const auto shared = anrBackend->guide_stats();
+        if (anrBackend || xeMfgBackend) {
+            const auto shared = anrBackend ? anrBackend->guide_stats() : xeMfgBackend->guide_stats();
             const auto unavailable = shared.sharedUnavailable + flowUnavailable;
             const auto pairs = shared.sharedHits + unavailable;
             fprintf(f.log, "event=shared_flow_summary fg_ofa_exec_count=%llu shared_mv_hits=%llu "

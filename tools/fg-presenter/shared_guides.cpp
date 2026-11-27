@@ -26,7 +26,7 @@ class SharedGuides final : public IAnrGuideProvider {
 
     ComPtr<ID3D12RootSignature> root_;
     ComPtr<ID3D12PipelineState> pipeline_;
-    ComPtr<ID3D12DescriptorHeap> heap_;
+    ComPtr<ID3D12DescriptorHeap> heap_, cpuHeap_;
     UINT step_{};
     ComPtr<ID3D12Resource> scaled_, neutralDepth_;
     ComPtr<ID3D12Fence> immediate_;
@@ -68,6 +68,12 @@ class SharedGuides final : public IAnrGuideProvider {
             const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
                 D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
             check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&heap_)), "shared flow scale descriptors");
+            // ClearUnorderedAccessView* takes its CPU handle from a CPU-only heap
+            // and its GPU handle from the shader-visible one; a single
+            // shader-visible heap is rejected by the debug layer.
+            auto cpuHeap = heap;
+            cpuHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            check(device_->CreateDescriptorHeap(&cpuHeap, IID_PPV_ARGS(&cpuHeap_)), "shared flow CPU descriptors");
             step_ = device_->GetDescriptorHandleIncrementSize(heap.Type);
             D3D12_HEAP_PROPERTIES heapProperties{};
             heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -94,6 +100,8 @@ class SharedGuides final : public IAnrGuideProvider {
             pipelineFailed_ = true;
             root_.Reset();
             pipeline_.Reset();
+            heap_.Reset();
+            cpuHeap_.Reset();
             scaled_.Reset();
             neutralDepth_.Reset();
         }
@@ -102,11 +110,16 @@ class SharedGuides final : public IAnrGuideProvider {
     void clear(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, UINT slot, const float value[4])
     {
         transition(list, resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        auto cpu = heap_->GetCPUDescriptorHandleForHeapStart();
+        auto cpu = cpuHeap_->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += step_ * slot;
         device_->CreateUnorderedAccessView(resource, nullptr, nullptr, cpu);
+        auto gpuCpu = heap_->GetCPUDescriptorHandleForHeapStart();
+        gpuCpu.ptr += step_ * slot;
+        device_->CopyDescriptorsSimple(1, gpuCpu, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto uav = heap_->GetGPUDescriptorHandleForHeapStart();
         uav.ptr += step_ * slot;
+        ID3D12DescriptorHeap* heaps[]{heap_.Get()};
+        list->SetDescriptorHeaps(1, heaps);
         list->ClearUnorderedAccessViewFloat(uav, cpu, resource, value, 0, nullptr);
         transition(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     }
