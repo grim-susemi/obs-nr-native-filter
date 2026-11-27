@@ -14,8 +14,9 @@ using Microsoft::WRL::ComPtr;
 class Guides final : public IAnrGuideProvider {
     D3D12Guides inner_;
 public:
-    Guides(ID3D12Device* device, ID3D12CommandQueue* queue, Extent size, std::span<const std::byte> shader)
-        : inner_(device, queue, size, shader) {}
+    Guides(ID3D12Device* device, ID3D12CommandQueue* queue, Extent size, std::span<const std::byte> shader,
+        uint64_t frameIntervalNs)
+        : inner_(device, queue, size, shader, frameIntervalNs) {}
     FlowProblem submit(const FlowInput& input) override { return inner_.submit(input); }
     const FlowResult* result() const override { return inner_.result(); }
     bool collect(const JobKey& key, NV_OF_FENCE_POINT fence) override { return inner_.collect(key, fence); }
@@ -23,7 +24,7 @@ public:
 };
 } // namespace
 
-std::unique_ptr<IAnrGuideProvider> make_anr_guides(ID3D12Device* device, Extent size)
+std::unique_ptr<IAnrGuideProvider> make_anr_guides(ID3D12Device* device, Extent size, uint64_t frameIntervalNs)
 {
     std::wstring path(32768, L'\0');
     DWORD count = GetEnvironmentVariableW(L"OBS_NR_GUIDES_SHADER", path.data(), static_cast<DWORD>(path.size()));
@@ -45,8 +46,9 @@ std::unique_ptr<IAnrGuideProvider> make_anr_guides(ID3D12Device* device, Extent 
     ComPtr<ID3D12CommandQueue> queue;
     const D3D12_COMMAND_QUEUE_DESC desc{};
     check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "ANR guide queue");
-    return std::make_unique<Guides>(device, queue.Get(), size, shader);
+    return std::make_unique<Guides>(device, queue.Get(), size, shader, guide_interval_ns(frameIntervalNs));
 }
+
 
 AnrBgra::AnrBgra(ID3D12Device* device, Extent size) : size_(size), stager_(device)
 {

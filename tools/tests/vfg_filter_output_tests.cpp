@@ -194,6 +194,7 @@ Pixels probe(obs_source_t* src, const Pixels& background, bool sourceOver)
 
 void canvas_contract(const std::filesystem::path& log)
 {
+    TapLogCapture shared;
     auto input = source("vfg_test_color");
     auto data = settings();
     obs_data_set_bool(data.get(), "vfg_hide_source_canvas", true);
@@ -216,6 +217,9 @@ void canvas_contract(const std::filesystem::path& log)
         }
     }
     expect(publishing, "preview must receive originals while the canvas is hidden");
+    const auto fallback = shared.wait_last("[vfg-shared]", std::chrono::seconds(3));
+    expect(fallback.find("owner=consumer_fallback") != std::string::npos,
+        "a chain without an upstream NR filter grants the presenter local analysis");
     const auto activeProps = properties(filter.get());
     auto* active = obs_properties_get(activeProps.get(), "vfg_active_status");
     expect(active && std::string_view(obs_property_description(active)).find("next open") != std::string_view::npos,

@@ -347,16 +347,22 @@ void PushFlowBackend::synchronize()
     }
 }
 
-bool PushFlowBackend::close()
+bool PushFlowBackend::close() noexcept
 {
     if (!impl_) return true;
     auto& p = *impl_;
     if (p.releaseFailed) return false;
-    const bool clean = p.stop() && p.ort.release();
-    const bool markers = p.marker.finish_teardown(p.callbacks.userClosing(), clean && !runtimeFault_);
-    if (clean && markers) impl_.reset();
-    else p.releaseFailed = true;
-    if (!clean || !markers) faulted_ = runtimeFault_ = true;
-    return clean && markers;
+    try {
+        const bool clean = p.stop() && p.ort.release();
+        const bool markers = p.marker.finish_teardown(p.callbacks.userClosing(), clean && !runtimeFault_);
+        if (clean && markers) impl_.reset();
+        else p.releaseFailed = true;
+        if (!clean || !markers) faulted_ = runtimeFault_ = true;
+        return clean && markers;
+    } catch (...) {
+        p.releaseFailed = true;
+        faulted_ = runtimeFault_ = true;
+        return false;
+    }
 }
 } // namespace nr::fg::vfg

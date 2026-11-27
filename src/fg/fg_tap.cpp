@@ -2,16 +2,21 @@
 #include "fg_controller.h"
 #include "anr_dll_validator.h"
 #include "fg_monitor_text.h"
+#include "../nr_flow_broker.h"
+#include "../obs_filter.h"
 #include "../obs_upscale_filter.h"
 #include "../obs_split_compare.h"
 #include "../obs_quality_trace.h"
 #include <obs-module.h>
 #include <graphics/vec4.h>
+#include <d3d11_4.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 #ifdef OBS_NR_VFG_QA_ACTION
@@ -82,12 +87,90 @@ struct Tap {
     bool breakPair{};
     bool resizing{};
     bool stopping{true};
+    // Upstream Shared NVOF discovery. The NR filter publishes its instance and
+    // resource generation through nr_sampler_snapshot; the broker is keyed by
+    // exactly that pair.
+    bool nrPresent{};
+    bool nrEnabled{};
+    uint64_t nrInstance{}, nrGeneration{};
+    uint32_t nrWidth{}, nrHeight{};
+    uint32_t activeGuidesWidth{}, activeGuidesHeight{};
+    uint64_t flowFrames{}, flowHits{};
+    uint32_t flowLoggedOwner{0xffffffffu};
+    const nr::FlowBroker* flowCacheBroker{};
+    uint64_t flowCacheGeneration{};
+    std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 4> flowMotion;
+    std::array<Microsoft::WRL::ComPtr<ID3D11Fence>, 4> flowReady, flowReturn;
+    std::array<HANDLE, 4> flowMotionHandle{}, flowReadyHandle{}, flowReturnHandle{};
     std::atomic_bool testCheckpointUsed{};
     std::atomic_bool hideSourceCanvas{false};
     std::atomic_bool vfgActive{false};
     std::atomic_bool detached{false};
 };
 std::atomic_uint64_t nextTap{0};
+
+struct UpstreamNr {
+    obs_source_t* filter{};
+    uint64_t instance{}, generation{};
+    uint32_t width{}, height{};
+    int64_t admission{};
+};
+
+// Calls the NR filter's read-only sampler observation. The contract is the one
+// nr-qa-host uses; an unrelated source answers false and is skipped.
+bool sample_nr(obs_source_t* filter, UpstreamNr& out)
+{
+    if (!filter) return false;
+    calldata_t data;
+    calldata_init(&data);
+    struct Free { calldata_t* value; ~Free() { calldata_free(value); } } free{&data};
+    if (!proc_handler_call(obs_source_get_proc_handler(filter), "nr_sampler_snapshot", &data)) return false;
+    out.filter = filter;
+    out.instance = static_cast<uint64_t>(calldata_int(&data, "instance"));
+    out.generation = static_cast<uint64_t>(calldata_int(&data, "resource_generation"));
+    out.width = static_cast<uint32_t>(std::max<int64_t>(0, calldata_int(&data, "width")));
+    out.height = static_cast<uint32_t>(std::max<int64_t>(0, calldata_int(&data, "height")));
+    out.admission = calldata_int(&data, "admission");
+    return out.instance != 0;
+}
+
+std::optional<UpstreamNr> upstream_nr(obs_source_t* parent, obs_source_t* self)
+{
+    if (!parent) return std::nullopt;
+    struct Probe { obs_source_t* self; std::optional<UpstreamNr> found; } probe{self, std::nullopt};
+    obs_source_enum_filters(parent, [](obs_source_t*, obs_source_t* child, void* opaque) {
+        auto& p = *static_cast<Probe*>(opaque);
+        if (p.found || child == p.self) return;
+        UpstreamNr nr;
+        if (sample_nr(child, nr)) p.found = nr;
+    }, &probe);
+    return probe.found;
+}
+
+const char* flow_owner_name(nr::FlowOwnerPolicy owner)
+{
+    switch (owner) {
+    case nr::FlowOwnerPolicy::NrOwned: return "nr_owned";
+    case nr::FlowOwnerPolicy::ConsumerFallback: return "consumer_fallback";
+    case nr::FlowOwnerPolicy::Unavailable: return "unavailable";
+    }
+    return "invalid";
+}
+
+const char* flow_provenance_name(nr::FlowProvenance value)
+{
+    switch (value) {
+    case nr::FlowProvenance::Valid: return "valid";
+    case nr::FlowProvenance::DedupReused: return "dedup_reused";
+    case nr::FlowProvenance::HeldPrevious: return "held_previous";
+    case nr::FlowProvenance::Reset: return "reset";
+    case nr::FlowProvenance::Discontinuity: return "discontinuity";
+    case nr::FlowProvenance::Unknown: return "unknown";
+    }
+    return "invalid";
+}
+
+void clear_flow_cache(Tap& tap) noexcept;
 
 std::vector<MonitorItem> list_monitors()
 {
@@ -127,6 +210,14 @@ std::vector<MonitorItem> list_monitors()
 
 void disconnect(Tap& tap, const char* cause, bool userStop = false) noexcept
 {
+    if (tap.flowFrames)
+        blog(LOG_INFO, "[vfg-shared] summary frames=%llu shared=%llu hit_rate=%.4f cause=%s",
+            static_cast<unsigned long long>(tap.flowFrames), static_cast<unsigned long long>(tap.flowHits),
+            static_cast<double>(tap.flowHits) / static_cast<double>(tap.flowFrames), cause);
+    tap.flowFrames = tap.flowHits = 0;
+    clear_flow_cache(tap);
+    tap.flowCacheBroker = nullptr;
+    tap.flowCacheGeneration = 0;
     if (tap.controller) tap.controller->request_stop(userStop);
     if (tap.producer) {
         tap.retiredGeneration = tap.producer->generation();
@@ -206,6 +297,168 @@ bool test_checkpoint(Tap& tap, const wchar_t* stage)
     return resumed != nullptr;
 }
 
+struct FlowPublish {
+    ipc::FlowBundle bundle;
+    Microsoft::WRL::ComPtr<ID3D11Fence> returnFence;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context;
+    uint64_t returnValue{};
+};
+
+// One publish's output extent and whether it starts a new pair.
+struct FlowRequest {
+    Extent output;
+    bool reset;
+};
+
+void clear_flow_cache(Tap& tap) noexcept
+{
+    for (size_t i = 0; i < tap.flowMotion.size(); ++i) {
+        tap.flowMotion[i].Reset();
+        tap.flowReady[i].Reset();
+        tap.flowReturn[i].Reset();
+        tap.flowMotionHandle[i] = nullptr;
+        tap.flowReadyHandle[i] = nullptr;
+        tap.flowReturnHandle[i] = nullptr;
+    }
+}
+
+// Shared NT handles are valid for one broker generation. Reopen only when the
+// publisher replaced the handle; a failed open leaves the cache empty so the
+// frame degrades to the original instead of reusing stale motion.
+ID3D11Fence* open_fence(ID3D11Device5* device, HANDLE handle, ComPtr<ID3D11Fence>& cache, HANDLE& cached)
+{
+    if (cache && cached == handle) return cache.Get();
+    cache.Reset();
+    cached = nullptr;
+    if (!handle || FAILED(device->OpenSharedFence(handle, IID_PPV_ARGS(&cache)))) return nullptr;
+    cached = handle;
+    return cache.Get();
+}
+
+ID3D11Texture2D* open_motion(ID3D11Device5* device, size_t slot, HANDLE handle,
+    std::array<ComPtr<ID3D11Texture2D>, 4>& cache, std::array<HANDLE, 4>& cached)
+{
+    if (cache[slot] && cached[slot] == handle) return cache[slot].Get();
+    cache[slot].Reset();
+    cached[slot] = nullptr;
+    if (!handle || FAILED(device->OpenSharedResource1(handle, IID_PPV_ARGS(&cache[slot])))) return nullptr;
+    cached[slot] = handle;
+    return cache[slot].Get();
+}
+
+ipc::FrameKey ipc_key(const nr::FlowColorKey& key)
+{
+    return {static_cast<uint32_t>(key.sourceInstanceId), static_cast<uint32_t>(key.resourceGeneration),
+        key.submissionSerial, key.canonicalTick, key.historyEpoch, key.contentEpoch};
+}
+
+// Bridges the leased shared pair into the IPC slot. The D3D11 context waits on
+// NR's ready fence before the producer's copy, so the copy never observes a
+// half-written analysis texture; the caller signals the return fence afterwards.
+std::optional<FlowPublish> bridge_flow(Tap& tap, const nr::ExportedFlow& lease, const FlowRequest& request)
+{
+    FlowPublish out;
+    auto* device = static_cast<ID3D11Device*>(gs_get_device_obj());
+    if (!device) return std::nullopt;
+    ComPtr<ID3D11Device5> device5;
+    ComPtr<ID3D11DeviceContext> immediate;
+    ComPtr<ID3D11DeviceContext4> context;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device5)))) return std::nullopt;
+    device->GetImmediateContext(&immediate);
+    if (!immediate || FAILED(immediate.As(&context))) return std::nullopt;
+    auto* returned = open_fence(device5.Get(), lease.returnFence, tap.flowReturn[lease.slot],
+        tap.flowReturnHandle[lease.slot]);
+    if (!returned) return std::nullopt;
+    // Every acquired lease must be returned even when the bridge cannot use it.
+    const auto release = [&] {
+        (void)context->Signal(returned, lease.returnValue);
+        context->Flush();
+    };
+    if (!lease.motion || !tap.activeGuidesWidth || !tap.activeGuidesHeight ||
+        lease.guide.guideWidth != tap.activeGuidesWidth || lease.guide.guideHeight != tap.activeGuidesHeight) {
+        release();
+        return std::nullopt;
+    }
+    auto* motion = open_motion(device5.Get(), lease.slot, lease.motion, tap.flowMotion, tap.flowMotionHandle);
+    auto* ready = open_fence(device5.Get(), lease.readyFence, tap.flowReady[lease.slot], tap.flowReadyHandle[lease.slot]);
+    if (!motion || !ready || FAILED(context->Wait(ready, lease.readyValue))) {
+        release();
+        return std::nullopt;
+    }
+    const auto& pair = lease.pair;
+    out.bundle.motion = motion;
+    out.bundle.color = ipc_key(pair.currColorKey);
+    out.bundle.pair.owner = ipc::FlowOwner::NrOwned;
+    out.bundle.pair.provenance = ipc::FlowProvenance::Valid;
+    out.bundle.pair.mvScaleX = static_cast<float>(request.output.width) / static_cast<float>(lease.guide.guideWidth);
+    out.bundle.pair.mvScaleY = static_cast<float>(request.output.height) / static_cast<float>(lease.guide.guideHeight);
+    out.bundle.pair.pairPrevTick = pair.prevColorKey.canonicalTick;
+    out.bundle.pair.pairCurrTick = pair.currColorKey.canonicalTick;
+    out.bundle.pair.shotCut = lease.guide.shotCut;
+    out.bundle.pair.reset = request.reset || lease.guide.reset;
+    out.bundle.pair.hasSharedMv = true;
+    out.bundle.pair.prevColor = ipc_key(pair.prevColorKey);
+    out.bundle.pair.currColor = ipc_key(pair.currColorKey);
+    out.returnFence = tap.flowReturn[lease.slot];
+    out.returnValue = lease.returnValue;
+    out.context = context;
+    return out;
+}
+
+// Single-owner producer policy. NR-owned frames never fall back to presenter
+// analysis: a held/dropped/unmatched pair publishes original-only with reset.
+// Consumer fallback is granted only when the upstream filter itself says NR is
+// disabled; a missing broker record on an active NR chain is still NR-owned.
+FlowPublish resolve_flow(Tap& tap, uint64_t displayTick, const FlowRequest& request)
+{
+    FlowPublish out;
+    if (!tap.nrPresent || !tap.nrEnabled) {
+        out.bundle.pair.owner = ipc::FlowOwner::ConsumerFallback;
+        out.bundle.pair.provenance = ipc::FlowProvenance::Unknown;
+        out.bundle.pair.reset = request.reset;
+        return out;
+    }
+    auto broker = nr::find_flow_broker(tap.nrInstance, tap.nrGeneration);
+    if (!broker) {
+        out.bundle.pair.owner = ipc::FlowOwner::NrOwned;
+        out.bundle.pair.provenance = ipc::FlowProvenance::Reset;
+        out.bundle.pair.reset = true;
+        return out;
+    }
+    if (tap.flowCacheBroker != broker.get() || tap.flowCacheGeneration != tap.nrGeneration) {
+        clear_flow_cache(tap);
+        tap.flowCacheBroker = broker.get();
+        tap.flowCacheGeneration = tap.nrGeneration;
+    }
+    const auto displayed = broker->displayed(tap.nrGeneration, displayTick);
+    if (!displayed) {
+        out.bundle.pair.owner = ipc::FlowOwner::NrOwned;
+        out.bundle.pair.provenance = ipc::FlowProvenance::Reset;
+        out.bundle.pair.reset = true;
+        return out;
+    }
+    if (displayed->owner == nr::FlowOwnerPolicy::ConsumerFallback) {
+        out.bundle.pair.owner = ipc::FlowOwner::ConsumerFallback;
+        out.bundle.pair.provenance = ipc::FlowProvenance::Unknown;
+        out.bundle.pair.reset = request.reset;
+        return out;
+    }
+    if (displayed->owner == nr::FlowOwnerPolicy::NrOwned && displayed->provenance == nr::FlowProvenance::Valid &&
+        displayed->pair) {
+        if (const auto lease = broker->find_displayed(tap.nrGeneration, displayTick, nr::FlowConsumer::Fg); lease) {
+            if (auto bridged = bridge_flow(tap, *lease, request)) return *bridged;
+        }
+        out.bundle.pair.owner = ipc::FlowOwner::NrOwned;
+        out.bundle.pair.provenance = ipc::FlowProvenance::HeldPrevious;
+        out.bundle.pair.reset = true;
+        return out;
+    }
+    out.bundle.pair.owner = static_cast<ipc::FlowOwner>(static_cast<uint32_t>(displayed->owner));
+    out.bundle.pair.provenance = static_cast<ipc::FlowProvenance>(static_cast<uint32_t>(displayed->provenance));
+    out.bundle.pair.reset = true;
+    return out;
+}
+
 void draw_sdr(gs_texture_t* texture, Extent size, gs_blend_type destBlend)
 {
     auto* effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
@@ -269,6 +522,29 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
     const auto tick = obs_get_video_frame_time();
     if (tick == tap.lastTick) return nullptr;
     tap.lastTick = tick;
+    const auto nr = upstream_nr(parent, tap.source);
+    tap.nrPresent = nr.has_value();
+    tap.nrEnabled = nr && nr->admission == static_cast<int64_t>(nr::sampler::Admission::Ready) &&
+        obs_source_enabled(nr->filter);
+    if (nr) {
+        tap.nrInstance = nr->instance;
+        tap.nrGeneration = nr->generation;
+        tap.nrWidth = nr->width;
+        tap.nrHeight = nr->height;
+    } else {
+        tap.nrInstance = tap.nrGeneration = 0;
+        tap.nrWidth = tap.nrHeight = 0;
+    }
+    const uint32_t guideWidth = tap.nrPresent ? tap.nrWidth : 0;
+    const uint32_t guideHeight = tap.nrPresent ? tap.nrHeight : 0;
+    // The tap's integrated SR displays the previous OBS tick on both the
+    // temporal and spatial branches when adjacent, so its colour identity is
+    // one tick behind the publish tick. NR's own 1-tick delay is already part of
+    // the broker's displayed provenance.
+    const Extent inputExtent{obs_source_get_base_width(target), obs_source_get_base_height(target)};
+    const bool srDelayed = tap.upscale &&
+        (output.width != inputExtent.width || output.height != inputExtent.height);
+    const uint64_t displayTick = srDelayed && tick > 1 ? tick - 1 : tick;
     auto* kind = obs_source_get_unversioned_id(parent);
     const gs_color_space wanted[]{GS_CS_SRGB};
     const uint32_t w = output.width, h = output.height;
@@ -281,7 +557,8 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
     }
     try {
         if (tap.producer && !tap.resizing &&
-            (tap.activeWidth != w || tap.activeHeight != h || tap.activeSplit != bool(compare))) {
+            (tap.activeWidth != w || tap.activeHeight != h || tap.activeSplit != bool(compare) ||
+                tap.activeGuidesWidth != guideWidth || tap.activeGuidesHeight != guideHeight)) {
             if (!tap.controller->request_resize()) {
                 if (!tap.controller->alive() || tap.controller->is_fault_or_watchdog_exit())
                     try_recover_peer_exit(tap, "resize_request_peer_fault");
@@ -312,6 +589,7 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
         }
         ipc::Shape shape{w, h, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709};
         shape.splitCompare = bool(compare);
+        shape.guides = {guideWidth, guideHeight};
         if (!tap.producer) {
             auto* device = static_cast<ID3D11Device*>(gs_get_device_obj());
             ComPtr<IDXGIDevice> dxgi;
@@ -339,6 +617,8 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             tap.activeWidth = w;
             tap.activeHeight = h;
             tap.activeSplit = shape.splitCompare;
+            tap.activeGuidesWidth = shape.guides.width;
+            tap.activeGuidesHeight = shape.guides.height;
             if (!tap.controller->offer(offer, shape, desc.AdapterLuid)) {
                 if (!tap.controller->alive() || tap.controller->is_fault_or_watchdog_exit())
                     try_recover_peer_exit(tap, "offer_peer_fault");
@@ -402,9 +682,35 @@ gs_texture_t* publish(Tap& tap, obs_source_t* target, obs_source_t* parent, Exte
             return texture;
         }
         const auto arrival = clock_ns();
+        auto flow = resolve_flow(tap, displayTick, {output, tap.breakPair});
+        if (tap.nrPresent && tap.nrEnabled) {
+            ++tap.flowFrames;
+            if (flow.bundle.pair.hasSharedMv) ++tap.flowHits;
+            const auto owner = static_cast<uint32_t>(flow.bundle.pair.owner);
+            if (owner != tap.flowLoggedOwner) {
+                tap.flowLoggedOwner = owner;
+                blog(LOG_INFO, "[vfg-shared] generation=%llu owner=%s provenance=%s guides=%ux%u output=%ux%u display_tick=%llu shared=%d",
+                    static_cast<unsigned long long>(tap.nrGeneration), flow_owner_name(static_cast<nr::FlowOwnerPolicy>(owner)),
+                    flow_provenance_name(static_cast<nr::FlowProvenance>(static_cast<uint32_t>(flow.bundle.pair.provenance))),
+                    guideWidth, guideHeight, w, h, static_cast<unsigned long long>(displayTick),
+                    flow.bundle.pair.hasSharedMv ? 1 : 0);
+            }
+        } else if (tap.flowLoggedOwner != static_cast<uint32_t>(ipc::FlowOwner::ConsumerFallback)) {
+            tap.flowLoggedOwner = static_cast<uint32_t>(ipc::FlowOwner::ConsumerFallback);
+            blog(LOG_INFO, "[vfg-shared] owner=consumer_fallback provenance=unknown reason=no_upstream_nr output=%ux%u display_tick=%llu",
+                w, h, static_cast<unsigned long long>(displayTick));
+        }
         const auto result = tap.producer->publish(texture ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(texture)) : nullptr,
             captureQpc, arrival, tap.breakPair, tick,
-            before ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(before)) : nullptr, compare.percent, compare.swap);
+            before ? static_cast<ID3D11Texture2D*>(gs_texture_get_obj(before)) : nullptr, compare.percent, compare.swap,
+            flow.bundle);
+        if (flow.returnFence && flow.context) {
+            // The producer copy is ordered on the immediate context before this
+            // signal, so the broker can reuse the ring slot after GPU completion.
+            if (FAILED(flow.context->Signal(flow.returnFence.Get(), flow.returnValue)))
+                blog(LOG_WARNING, "[vfg-shared] return fence signal failed");
+            flow.context->Flush();
+        }
         if (nr::quality::trace_frames())
             blog(LOG_INFO, "[quality] stage=vfg_tap obs_tick_ns=%llu source=%s generation=%llu capture_qpc_ns=%llu arrival_qpc_ns=%llu status=%d",
                 nr::quality::id(tick), obs_source_get_uuid(parent), nr::quality::id(tap.producer->generation()),
