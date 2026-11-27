@@ -25,8 +25,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $Version = '0.2.12'
-$RuntimeSha = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
 $RuntimeRel = 'bin\64bit\nvngx_dlssnr.dll'
+function Get-AllowedRuntimeShas {
+    return @{
+        'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a' = '310.8.0.0'
+        'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed' = '310.9.16.0 (Model B)'
+    }
+}
 $SrRel = 'bin\64bit\dlss\nvngx_dlss.dll'
 $SrUrl = 'https://raw.githubusercontent.com/NVIDIA/DLSS/374959484e79a640feaba44c93ac8cfb0a03f5b5/lib/Windows_x86_64/rel/nvngx_dlss.dll'
 $SrSha = '3975567b8943c53acce397f2b72380092f84f162d00b0d2c7d08a1025c563983'
@@ -65,14 +70,15 @@ $Text = @{
         admin      = '관리자 권한이 필요합니다. 권한 확인 창에서 [예]를 눌러 주세요.'
         adminFail  = '관리자 권한을 받지 못해 중단했습니다.'
         adminDone  = '관리자 창에서 진행했습니다. 결과는 그 창에 표시됐습니다 (종료 코드 {0}).'
-        rtOk       = '확인됨: {0}'
+        rtOk       = '확인됨 ({1}): {0}'
+        rtLocal    = '로컬 Veyra NR 모델({0})을 재사용합니다: {1}'
         rtMissing  = 'OBS에 NR 모델 파일(nvngx_dlssnr.dll)이 없습니다.'
         rtWrong    = 'OBS에 있는 nvngx_dlssnr.dll은 이 필터가 받는 판이 아닙니다 (SHA-256 {0}…). 이대로는 NR이 동작하지 않습니다.'
-         rtNeed     = 'Native NR용 모델: nvngx_dlssnr.dll 310.8.0.0 호환판, SHA-256 e67dee20…c989a (이 패키지에는 없음). 독립 CAS에는 필요하지 않습니다.'
+        rtNeed     = 'Native NR용 모델: nvngx_dlssnr.dll 310.8.0.0 (SHA-256 e67dee20…c989a) 또는 310.9.16.0 Model B (SHA-256 cdfa6c1e…bf3ed) (이 패키지에는 없음). 독립 CAS에는 필요하지 않습니다.'
         rtAsk      = 'nvngx_dlssnr.dll을 끌어놓고 Enter (건너뛰기: 그냥 Enter)'
         rtNotFound = '파일이 없습니다: {0}'
-        rtBadHash  = '이 파일은 다른 판입니다 (SHA-256 {0}…).'
-        rtWillCopy = '이 파일을 OBS 폴더에 넣습니다: {0}'
+        rtBadHash  = '이 파일은 허용된 판이 아닙니다 (SHA-256 {0}…). 310.8.0.0 또는 310.9.16.0 Model B만 사용할 수 있습니다.'
+        rtWillCopy = '이 파일을 OBS 폴더에 넣습니다 ({1}): {0}'
         rtCopied   = 'NR 모델 파일을 넣었습니다: {0}'
         rtSkipped  = 'NR 모델 파일 없이 계속합니다. 나중에 여기에 넣어 주세요: {0}'
         srOk       = 'DLSS 4.5 SR 런타임 확인됨: {0}'
@@ -132,14 +138,15 @@ $Text = @{
         admin      = 'Admin rights are needed. Choose Yes in the Windows prompt.'
         adminFail  = 'Did not get admin rights, stopped.'
         adminDone  = 'Finished in the admin window, which showed the result (exit code {0}).'
-        rtOk       = 'OK: {0}'
+        rtOk       = 'OK ({1}): {0}'
+        rtLocal    = 'Reusing local Veyra NR model ({0}): {1}'
         rtMissing  = 'The NR model file (nvngx_dlssnr.dll) is not in this OBS.'
         rtWrong    = 'The nvngx_dlssnr.dll in this OBS is a different build (SHA-256 {0}...). NR will not run with it.'
-         rtNeed     = 'Native NR model: nvngx_dlssnr.dll 310.8.0.0 compatibility build, SHA-256 e67dee20...c989a (not bundled). Standalone CAS does not need it.'
+        rtNeed     = 'Native NR model: nvngx_dlssnr.dll 310.8.0.0 (SHA-256 e67dee20...c989a) or 310.9.16.0 Model B (SHA-256 cdfa6c1e...bf3ed) (not bundled). Standalone CAS does not need it.'
         rtAsk      = 'Drag your nvngx_dlssnr.dll into this window and press Enter (Enter alone skips)'
         rtNotFound = 'File not found: {0}'
-        rtBadHash  = 'That file is a different build (SHA-256 {0}...).'
-        rtWillCopy = 'Will copy this file into OBS: {0}'
+        rtBadHash  = 'That file is not an allowed build (SHA-256 {0}...). Expected 310.8.0.0 or 310.9.16.0 Model B.'
+        rtWillCopy = 'Will copy this file into OBS ({1}): {0}'
         rtCopied   = 'NR model file copied: {0}'
         rtSkipped  = 'Continuing without the NR model file. Put it here later: {0}'
         srOk       = 'DLSS 4.5 SR runtime OK: {0}'
@@ -178,6 +185,10 @@ $Text = @{
 }
 
 function T([string]$Key, [object[]]$Arg = @()) {
+    if (-not $Text -or -not $script:L -or -not $Text.ContainsKey($script:L)) {
+        if ($Arg.Count) { return "$Key ($($Arg -join ', '))" }
+        return $Key
+    }
     $s = $Text[$script:L][$Key]
     if ($Arg.Count) { $s = $s -f $Arg }
     return $s
@@ -211,7 +222,7 @@ function Say([string]$Key, [object[]]$Arg = @(), [string]$Color = 'Gray') {
     $message = T $Key $Arg
     if ($Key -in 'copy','backup','error','srFail','vfgFail' -or $script:SingleScreen) { $script:LogDetails.Add($message) }
     $status = switch ($Key) {
-        {$_ -in 'done','uDone','payloadOk','rtOk','srOk','vfgOk','srSigOk','uRestored'} { 'OK' }
+        {$_ -in 'done','uDone','payloadOk','rtOk','rtLocal','srOk','vfgOk','vfgLocal','srSigOk','uRestored'} { 'OK' }
         {$_ -in 'rtSkipped','srFail','vfgFail','uChanged','cancelled','uNoState'} { '-' }
         {$_ -in 'error','adminFail','obsInvalid','obsOld','obsRunning','rtWrong','rtNotFound','rtBadHash','rolledBack'} { '!' }
         {$_ -in 'admin','srDown','vfgDown','vfgVerify','rtWillCopy'} { '>' }
@@ -220,7 +231,7 @@ function Say([string]$Key, [object[]]$Arg = @(), [string]$Color = 'Gray') {
     $ko = $script:L -eq 'ko'
     switch ($Key) {
         'rtSkipped' { $message = if ($ko) {'NR 모델 건너뜀'} else {'NR model skipped'} }
-        'rtNeed' { $message = if ($ko) {'Native NR 모델: 310.8.0.0 호환판 (ZIP 미포함)'} else {'Native NR model: compatible 310.8.0.0 (not in ZIP)'} }
+        'rtNeed' { $message = if ($ko) {'Native NR 모델: 310.8.0.0 또는 310.9.16.0 Model B (ZIP 미포함)'} else {'Native NR model: 310.8.0.0 or 310.9.16.0 Model B (not in ZIP)'} }
         'srFail' { $message = if ($ko) {'DLSS 설치 건너뜀. 이중선형과 CAS는 사용 가능.'} else {'DLSS skipped. Bilinear and CAS still work.'} }
         'vfgFail' { $message = if ($ko) {'VFG 설치 건너뜀. NR과 업스케일은 사용 가능.'} else {'VFG skipped. NR and upscale still work.'} }
         'error' {
@@ -485,22 +496,57 @@ function Invoke-Elevated([string]$Dir, [string]$RuntimeSource, $Optional, [strin
     return $p.ExitCode
 }
 
+function Find-LocalVeyraNrRuntime {
+    if (-not $env:LOCALAPPDATA) { return '' }
+    $versionsDir = Join-Path $env:LOCALAPPDATA 'Programs\Veyra (NVIDIA)\versions'
+    if (-not (Test-Path -LiteralPath $versionsDir -PathType Container)) { return '' }
+    $targetSha = 'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed'
+    $candidates = Get-ChildItem -LiteralPath $versionsDir -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $parts = $_.Name.Split('.')
+            if ($parts.Count -ge 1 -and $parts.Count -le 4 -and @($parts | Where-Object { $_ -notmatch '^\d+$' }).Count -eq 0) {
+                $padded = [uint64[]]@(0, 0, 0, 0)
+                for ($i = 0; $i -lt $parts.Count; $i++) { $padded[$i] = [uint64]$parts[$i] }
+                [pscustomobject]@{
+                    SortKey = '{0:D20}.{1:D20}.{2:D20}.{3:D20}' -f $padded[0], $padded[1], $padded[2], $padded[3]
+                    Path    = Join-Path $_.FullName 'runtime\experimental\nr-ampere\nvngx_dlssnr.dll'
+                }
+            }
+        } |
+        Sort-Object SortKey -Descending
+    foreach ($cand in $candidates) {
+        if ((Test-Path -LiteralPath $cand.Path -PathType Leaf) -and (Get-Sha $cand.Path) -eq $targetSha) {
+            return $cand.Path
+        }
+    }
+    return ''
+}
+
 function Resolve-Runtime([string]$Dir) {
+    $allowed = Get-AllowedRuntimeShas
     $target = Join-Path $Dir $RuntimeRel
     if ($Runtime) {
         $p = Get-FullPath $Runtime
         if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw (T 'rtNotFound' @($p)) }
         $h = Get-Sha $p
-        if ($h -ne $RuntimeSha) { throw ((T 'rtBadHash' @($h.Substring(0, 16))) + ' ' + (T 'rtNeed')) }
-        if (Test-SamePath $p $target) { Say 'rtOk' @($target) 'Green'; return '' }
-        Say 'rtWillCopy' @($p) 'Green'
+        if (-not $allowed.ContainsKey($h)) { throw ((T 'rtBadHash' @($h.Substring(0, 16))) + ' ' + (T 'rtNeed')) }
+        if (Test-SamePath $p $target) { Say 'rtOk' @($target, $allowed[$h]) 'Green'; return '' }
+        Say 'rtWillCopy' @($p, $allowed[$h]) 'Green'
         return $p
     }
     if (Test-Path -LiteralPath $target -PathType Leaf) {
         $h = Get-Sha $target
-        if ($h -eq $RuntimeSha) { Say 'rtOk' @($target) 'Green'; return '' }
+        if ($allowed.ContainsKey($h)) { Say 'rtOk' @($target, $allowed[$h]) 'Green'; return '' }
         Say 'rtWrong' @($h.Substring(0, 16)) 'Yellow'
     } else {
+        if (-not $RuntimeDecided) {
+            $localVeyra = Find-LocalVeyraNrRuntime
+            if ($localVeyra) {
+                $localLabel = $allowed['cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed']
+                Say 'rtLocal' @($localLabel, $localVeyra) 'Green'
+                return $localVeyra
+            }
+        }
         Say 'rtMissing' @() 'Yellow'
     }
     Say 'rtNeed' @() 'Gray'
@@ -517,12 +563,12 @@ function Resolve-Runtime([string]$Dir) {
             continue
         }
         $h = Get-Sha $p
-        if ($h -ne $RuntimeSha) {
+        if (-not $allowed.ContainsKey($h)) {
             Show-Screen ('[3/5] ' + (T 'sRuntime'))
             Say 'rtBadHash' @($h.Substring(0, 16)) 'Red'
             continue
         }
-        Say 'rtWillCopy' @($p) 'Green'
+        Say 'rtWillCopy' @($p, $allowed[$h]) 'Green'
         return $p
     }
     Say 'rtSkipped' @($target) 'Yellow'
@@ -814,7 +860,13 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
             $backup = ''
             if ($previous.runtimeBackedUp) { $backup = Join-Path $previous.backupDir $RuntimeRel }
             Assert-ReceiptFile $RuntimeRel $backup
-            $owned[$RuntimeRel] = @{ relative = $RuntimeRel; hash = $RuntimeSha; backup = $backup }
+            $legacyRuntimeHash = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
+            $rtPath = Join-Path $Dir $RuntimeRel
+            if (Test-Path -LiteralPath $rtPath -PathType Leaf) {
+                $diskSha = Get-Sha $rtPath
+                if ((Get-AllowedRuntimeShas).ContainsKey($diskSha)) { $legacyRuntimeHash = $diskSha }
+            }
+            $owned[$RuntimeRel] = @{ relative = $RuntimeRel; hash = $legacyRuntimeHash; backup = $backup }
         }
     }
     $sources = [ordered]@{}
@@ -851,7 +903,13 @@ function Install-Files([string]$Dir, [string]$RuntimeSource, [string]$SrSource, 
         foreach ($rel in @($sources.Keys)) {
             $dst = Join-Path $Dir $rel
             $sourceHash = if ($Manifest.Contains($rel)) { $Manifest[$rel] }
-                elseif ($rel -eq $RuntimeRel) { $RuntimeSha } else { Get-Sha $sources[$rel] }
+                elseif ($rel -eq $RuntimeRel) {
+                    $rtHash = Get-Sha $sources[$rel]
+                    if (-not (Get-AllowedRuntimeShas).ContainsKey($rtHash)) {
+                        throw ((T 'rtBadHash' @($rtHash.Substring(0, 16))) + ' ' + (T 'rtNeed'))
+                    }
+                    $rtHash
+                } else { Get-Sha $sources[$rel] }
             $backup = ''
             if ($owned.ContainsKey($rel)) { $backup = [string]$owned[$rel].backup }
             elseif ($legacyFiles.ContainsKey($rel)) { $backup = [string]$legacyFiles[$rel] }
@@ -991,7 +1049,7 @@ function Remove-Files([string]$Dir, $Manifest, $State) {
         }
         if ($State.runtimeCopied) {
             $rt = Join-Path $Dir $RuntimeRel
-            if ((Test-Path -LiteralPath $rt -PathType Leaf) -and (Get-Sha $rt) -eq $RuntimeSha) {
+            if ((Test-Path -LiteralPath $rt -PathType Leaf) -and (Get-AllowedRuntimeShas).ContainsKey((Get-Sha $rt))) {
                 Remove-Item -LiteralPath $rt -Force
                 Say 'uRemoved' @($RuntimeRel) 'Gray'
             }

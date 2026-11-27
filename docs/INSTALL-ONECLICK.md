@@ -1,13 +1,13 @@
 # OBS 원클릭 설치 — 0.2.12
 
 1. `SHA256SUMS.txt`로 ZIP을 확인하고 **모두 압축 해제**합니다. OBS를 종료한 뒤 `install.bat`을 더블클릭합니다. 포터블 OBS가 목록에 없으면 `bin\64bit\obs64.exe`가 들어 있는 OBS 최상위 폴더를 지정합니다.
-2. 설치기는 현재 질문만 표시합니다. DLSS와 VFG는 각각 **Y 또는 Enter**로 설치하고 **N**으로 건너뜁니다. Native NR용 `nvngx_dlssnr.dll`이 있으면 모델 질문에서 지정합니다. 그냥 Enter를 누르면 모델만 건너뜁니다. 자세한 준비 사항은 [설치 안내](INSTALL.md)를 참고하세요.
+2. 설치기는 현재 질문만 표시합니다. DLSS와 VFG는 각각 **Y 또는 Enter**로 설치하고 **N**으로 건너뜁니다. Native NR용 `nvngx_dlssnr.dll`은 **310.8.0.0** (`e67dee20…c989a`)과 **310.9.16.0 Model B** (`cdfa6c1e…bf3ed`) 두 판을 지원합니다. OBS에 파일이 없고 로컬 Veyra(`%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`)에 검증된 `310.9.16.0` 파일이 있으면 자동으로 재사용합니다. 직접 지정하려면 모델 질문에서 끌어다 놓거나 `-Runtime <경로>`를 전달하세요. 그냥 Enter를 누르면 모델만 건너뜁니다. 자세한 준비 사항은 [설치 안내](INSTALL.md)를 참고하세요.
 
 ![격리 환경의 실제 DLSS 설치 질문](oneclick/dlss-prompt.png)
 
 ![격리 환경의 실제 설치 완료 콘솔](oneclick/installer.png)
 
-3. OBS에서 **소스 우클릭 → 필터 → 효과 필터의 + → 영상 업스케일 및 프레임 생성**을 선택합니다. 업스케일만 쓰려면 오른쪽 속성에서 아래로 스크롤해 **업스케일 및 선명화**를 켭니다. VFG 창은 **미리보기 창 제어 · 상태**에서 엽니다. 노이즈 제거용 **Native NR**은 같은 `+` 메뉴에서 별도로 추가합니다.
+3. OBS에서 **소스 우클릭 → 필터 → 효과 필터의 + → 영상 업스케일 및 프레임 생성**을 선택합니다. 업스케일만 쓰려면 오른쪽 속성에서 아래로 스크롤해 **업스케일 및 선명화**를 켭니다. VFG 창은 **미리보기 창 제어 · 상태**에서 엽니다(VFG는 저지연 쌍 프레임 생성을 위해 **`batchCapacity=2`**로 동작하며, 120fps 구성 시 OBS 설정 > 비디오 > FPS를 **`120/1`**로 맞춥니다). 노이즈 제거용 **Native NR**은 같은 `+` 메뉴에서 별도로 추가한 뒤 **빠른 프리셋**에서 **`Veyra 추천`**을 선택할 수 있으며, `310.9.16.0` 사용 시 **Model B** 성능 모델을 켤 수 있습니다.
 
 ![격리 OBS의 통합 업스케일 속성: DLSS 모델과 선명화 설정](oneclick/obs-filters.png)
 

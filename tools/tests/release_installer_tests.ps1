@@ -214,7 +214,137 @@ function Test-PushFlowElevation {
     Assert-Equal (Invoke-Elevated $dir '' $optional (Join-Path $root 'staging root')) 42 'mocked elevated child must receive both staged directories'
     Write-Host 'PASS PushFlow UAC argument forwarding (mocked Start-Process)'
 }
+function Test-NrRuntimeAdmission {
+    $sha3108 = 'e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a'
+    $sha3109 = 'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed'
+    $shaThird = '1111111111111111111111111111111111111111111111111111111111111111'
+    $allowed = Get-AllowedRuntimeShas
+    Assert-Equal $allowed.Count 2 'allowed runtime table must pin both 310.8 and 310.9'
+    Assert-Equal $allowed[$sha3108] '310.8.0.0' '310.8 label'
+    Assert-Equal $allowed[$sha3109] '310.9.16.0 (Model B)' '310.9 label'
+    Assert-Equal $allowed.ContainsKey($shaThird) $false 'third hash must not be allowed'
+
+    $nrRoot = Join-Path $root 'nr-admission'
+    $obs = Join-Path $nrRoot 'obs'
+    $StateDir = Join-Path $nrRoot 'state'
+    $Payload = Join-Path $nrRoot 'payload'
+    $sources = Join-Path $nrRoot 'sources'
+    $rt3108 = Join-Path $sources 'nr-310.8.dll'
+    $rt3109 = Join-Path $sources 'nr-310.9.dll'
+    $rtThird = Join-Path $sources 'nr-third.dll'
+    $rt221 = Join-Path $nrRoot 'localappdata\Programs\Veyra (NVIDIA)\versions\2.2.1\runtime\experimental\nr-ampere\nvngx_dlssnr.dll'
+    $rt210 = Join-Path $nrRoot 'localappdata\Programs\Veyra (NVIDIA)\versions\2.10.0\runtime\experimental\nr-ampere\nvngx_dlssnr.dll'
+    $rt211Bad = Join-Path $nrRoot 'localappdata\Programs\Veyra (NVIDIA)\versions\2.11.0\runtime\experimental\nr-ampere\nvngx_dlssnr.dll'
+
+    Put (Join-Path $obs 'bin\64bit\obs64.exe') 'mock-obs'
+    Put (Join-Path $Payload $rel) 'plugin-bytes'
+    $manifest = [ordered]@{}
+    $manifest[$rel] = (Get-Sha (Join-Path $Payload $rel))
+    Put $rt3108 'fixture-310.8.0.0'
+    Put $rt3109 'fixture-310.9.16.0'
+    Put $rtThird 'fixture-third-build'
+    Put $rt221 'veyra-2.2.1'
+    Put $rt210 'veyra-2.10.0'
+    Put $rt211Bad 'veyra-2.11.0-bad'
+
+    $realSha = ${function:Get-Sha}
+    $hashOverrides = @{
+        $rt3108   = $sha3108
+        $rt3109   = $sha3109
+        $rtThird  = $shaThird
+        $rt221    = $sha3109
+        $rt210    = $sha3109
+        $rt211Bad = $shaThird
+    }
+    function Get-Sha([string]$Path) {
+        $full = Get-FullPath $Path
+        if ($hashOverrides.ContainsKey($full)) { return $hashOverrides[$full] }
+        $bytes = [IO.File]::ReadAllText($full)
+        switch ($bytes) {
+            'fixture-310.8.0.0'  { return $sha3108 }
+            'fixture-310.9.16.0' { return $sha3109 }
+            'veyra-2.10.0'       { return $sha3109 }
+            'fixture-third-build'{ return $shaThird }
+            default { return (& $realSha $Path) }
+        }
+    }
+
+    $obsRt = Join-Path $obs $RuntimeRel
+    $Runtime = ''; $Yes = $true; $RuntimeDecided = $false
+
+    $prevLocalApp = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = Join-Path $nrRoot 'localappdata'
+        $pickedLocal = Find-LocalVeyraNrRuntime
+        Assert-Equal (Get-FullPath $pickedLocal) (Get-FullPath $rt210) 'numeric version sort must pick 2.10.0 over 2.2.1 and skip unverified 2.11.0'
+        Assert-Equal (Get-FullPath (Resolve-Runtime $obs)) (Get-FullPath $rt210) 'Resolve-Runtime must reuse verified local Veyra 310.9 when OBS lacks nvngx_dlssnr.dll'
+        Write-Host 'PASS NR local Veyra runtime numeric version sort (2.10.0 > 2.2.1) and SHA-256 verification'
+    } finally {
+        $env:LOCALAPPDATA = $prevLocalApp
+    }
+
+    foreach ($case in @(
+        @{ label = '310.8.0.0'; src = $rt3108; sha = $sha3108; expectedText = 'fixture-310.8.0.0' },
+        @{ label = '310.9.16.0'; src = $rt3109; sha = $sha3109; expectedText = 'fixture-310.9.16.0' }
+    )) {
+        Put $obsRt 'foreign-nr-dll'
+        $Runtime = $case.src
+        $resolved = Resolve-Runtime $obs
+        Assert-Equal (Get-FullPath $resolved) (Get-FullPath $case.src) "$($case.label) must pass Resolve-Runtime"
+        Install-Files $obs $resolved '' '' $manifest @{}
+        Assert-Equal ([IO.File]::ReadAllText($obsRt)) $case.expectedText "$($case.label) bytes must be installed"
+        Assert-Equal (Get-Sha $obsRt) $case.sha "$($case.label) installed hash must match pinned hash"
+        $receiptRt = @((Read-State).ownedFiles | Where-Object { $_.relative -eq $RuntimeRel })[0]
+        Assert-Equal $receiptRt.hash $case.sha "$($case.label) receipt must record pinned hash"
+        $Runtime = ''
+        Assert-Equal (Resolve-Runtime $obs) '' "$($case.label) installed in OBS must validate in-place"
+        Remove-Files $obs $manifest (Read-State)
+        Assert-Equal ([IO.File]::ReadAllText($obsRt)) 'foreign-nr-dll' "$($case.label) uninstall must restore original foreign NR DLL"
+        Write-Host "PASS NR runtime $($case.label) accepted and uninstall rollback verified"
+    }
+
+    Put $obsRt 'foreign-nr-dll'
+    $Runtime = $rtThird
+    $threwThird = $false
+    try { [void](Resolve-Runtime $obs) } catch { $threwThird = $_.Exception.Message -match 'rtBadHash' }
+    Assert-Equal $threwThird $true 'Resolve-Runtime must reject third SHA-256'
+    $threwInstallThird = $false
+    try { Install-Files $obs $rtThird '' '' $manifest @{} } catch { $threwInstallThird = $_.Exception.Message -match 'rtBadHash' }
+    Assert-Equal $threwInstallThird $true 'Install-Files must reject third SHA-256'
+    Assert-Equal ([IO.File]::ReadAllText($obsRt)) 'foreign-nr-dll' 'rejected third hash must leave mock OBS untouched'
+
+    $Runtime = Join-Path $sources 'missing-truncated.dll'
+    $threwMissing = $false
+    try { [void](Resolve-Runtime $obs) } catch { $threwMissing = $_.Exception.Message -match 'rtNotFound' }
+    Assert-Equal $threwMissing $true 'Resolve-Runtime must reject missing/invalid DLL path'
+    Assert-Equal ([IO.File]::ReadAllText($obsRt)) 'foreign-nr-dll' 'invalid DLL path must leave mock OBS untouched'
+    Write-Host 'PASS NR third hash and invalid path rejected with mock OBS untouched'
+
+    $Runtime = $rt3109
+    $realCopy = ${function:Copy-WithDir}
+    function Copy-WithDir([string]$From, [string]$To) {
+        if ($From -eq $rt3109) {
+            & $realCopy $From $To
+            throw 'injected failure after NR copy'
+        }
+        & $realCopy $From $To
+    }
+    Assert-Rejected { Install-Files $obs $rt3109 '' '' $manifest @{} } 'injected failure after NR copy'
+    function Copy-WithDir([string]$From, [string]$To) { & $realCopy $From $To }
+    Assert-Equal ([IO.File]::ReadAllText($obsRt)) 'foreign-nr-dll' 'mid-install rollback must restore foreign NR DLL'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $obs $rel)) $false 'mid-install rollback must remove newly copied plugin'
+    Assert-Equal @(Get-ChildItem -LiteralPath $StateDir -Filter 'rollback-*').Count 0 'rollback must clean staging'
+
+    # Stale state rerun after rollback must succeed cleanly and preserve rollback target.
+    Install-Files $obs $rt3109 '' '' $manifest @{}
+    Assert-Equal (Get-Sha $obsRt) $sha3109 'rerun after rollback must install 310.9'
+    Remove-Files $obs $manifest (Read-State)
+    Assert-Equal ([IO.File]::ReadAllText($obsRt)) 'foreign-nr-dll' 'uninstall after post-rollback rerun must restore foreign NR DLL'
+    Write-Host 'PASS NR rollback and stale-state rerun verified'
+}
+
 try {
+    Test-NrRuntimeAdmission
     Test-PushFlowOwnership
     Test-PushFlowStaging
     Test-PushFlowElevation
@@ -360,6 +490,24 @@ try {
     if ($partialResult -notmatch 'nr_cas\.dxil') { throw "installer must identify the missing shader: $partialResult" }
     Assert-Equal ([IO.File]::ReadAllText((Join-Path $realObs $rel))) 'entry-foreign' 'incomplete manifest must not write the OBS plugin'
     [IO.File]::WriteAllLines($manifestFile, $complete)
+    $badRuntimeFile = Join-Path $root 'bad-runtime.dll'
+    Put $badRuntimeFile 'truncated-or-arbitrary-runtime'
+    $realRuntimeTarget = Join-Path $realObs $RuntimeRel
+    Put $realRuntimeTarget 'entry-foreign-nr'
+    $badHashResult = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $packageScript -ObsDir $realObs -StateDir $realState -Lang en -Yes -NoPause -SkipOptional -SkipPushFlow -Runtime $badRuntimeFile | Out-String
+    Assert-Equal $LASTEXITCODE 1 'real installer CLI must reject arbitrary third SHA-256 non-zero'
+    if ($badHashResult -notmatch '310\.8\.0\.0' -or $badHashResult -notmatch '310\.9\.16\.0') {
+        throw "real installer error must describe both allowed builds: $badHashResult"
+    }
+    Assert-Equal ([IO.File]::ReadAllText((Join-Path $realObs $rel))) 'entry-foreign' 'third-hash rejection must leave mock OBS plugin untouched'
+    Assert-Equal ([IO.File]::ReadAllText($realRuntimeTarget)) 'entry-foreign-nr' 'third-hash rejection must leave mock OBS runtime untouched'
+
+    $missingRuntimePath = Join-Path $root 'nonexistent\nvngx_dlssnr.dll'
+    $missingPathResult = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $packageScript -ObsDir $realObs -StateDir $realState -Lang en -Yes -NoPause -SkipOptional -SkipPushFlow -Runtime $missingRuntimePath | Out-String
+    Assert-Equal $LASTEXITCODE 1 'real installer CLI must reject missing runtime path non-zero'
+    Assert-Equal ([IO.File]::ReadAllText($realRuntimeTarget)) 'entry-foreign-nr' 'missing runtime path must leave mock OBS runtime untouched'
+    Write-Host 'PASS real installer CLI rejected third hash and missing path non-zero with mock OBS untouched'
+
     Run-Installer $false
     Put (Join-Path $packagePayload $rel) 'entry-v2'
     Write-Manifest; Run-Installer $false

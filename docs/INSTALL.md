@@ -8,7 +8,10 @@ How to install OBS Native NR 0.2.12 into OBS Studio on Windows. Start with the [
 
 - **OBS Studio 32.x, 64-bit** (built and tested with 32.2.2) with the **Direct3D 11 renderer**.
 - **NVIDIA RTX 20, 30, 40 or 50 series** with a current driver (NVIDIA VFG preview requires RTX 40 or 50).
-- **For Native NR only:** `nvngx_dlssnr.dll` (310.8.0.0 compatibility build, 165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`). It is not included in the zip; get it from the RenoDX Discord:
+- **For Native NR only:** `nvngx_dlssnr.dll` — either:
+  - **310.8.0.0** compatibility build (165,840,496 bytes, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`, Model A), or
+  - **310.9.16.0** build (SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`, enables **Model B** small-FP8 performance mode). If OBS does not have `nvngx_dlssnr.dll` yet and a verified 310.9.16.0 copy exists under `%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`, `install.bat` automatically reuses it.
+  It is not included in the zip; you can also get it from the RenoDX Discord or pass `-Runtime <path>`:
   1. Join: https://discord.gg/F6AUTeWJHM
   2. Channel: https://discord.com/channels/1408098019194310818/1543975158937821315
 - **Optional DLSS 4.5 SR & NVIDIA VFG runtimes**: `install.bat` automatically offers to download and verify them directly from NVIDIA's official repositories (`github.com/NVIDIA/DLSS` and `pypi.nvidia.com/nvidia-vfx/`).
@@ -20,11 +23,15 @@ How to install OBS Native NR 0.2.12 into OBS Studio on Windows. Start with the [
 3. Extract the whole zip into a folder and double-click `install.bat`. The console replaces each question with the next one.
    - **Language**: Enter for Korean, `2` for English.
    - **OBS folder**: press Enter to confirm the detected OBS path.
-   - **NR model file**: drag `nvngx_dlssnr.dll` into the window and press Enter (or Enter alone to skip).
+   - **NR model file**: if OBS lacks `nvngx_dlssnr.dll`, a verified local Veyra `310.9.16.0` copy is reused automatically; otherwise drag `nvngx_dlssnr.dll` (`310.8.0.0` or `310.9.16.0`) into the window and press Enter (or Enter alone to skip).
    - **DLSS 4.5 SR (~56 MB)**: press Enter (Y) to download & signature-verify official `nvngx_dlss.dll` into `bin\64bit\dlss\nvngx_dlss.dll`.
    - **NVIDIA VFG (~415 MB wheel -> 5 DLLs)**: press Enter (Y) to download, verify SHA-256, and extract the 5 signed NVIDIA VFG DLLs into `bin\64bit\nvidia-vfg\` (reused locally if Veyra is already installed).
    - **Admin prompt**: choose **Yes**.
 4. Start OBS > right-click a source > **Filters** > **Effect Filters [+]**. Choose **Video Upscale & Frame Generation**, then turn on **Upscale & Sharpen**, or choose **Native NR** for denoising. Bilinear scaling and CAS need no NVIDIA runtime; the optional DLSS method uses `nvngx_dlss.dll`. For older scene settings, see the [filter guide](standalone-upscale.md).
+   - **Recommended Veyra parity settings**:
+     - **Quick preset**: select **Veyra Standard + Anti-flicker (Recommended)** (`Veyra 추천`) in **Native NR**.
+     - **310.9.16.0 Model B**: when `310.9.16.0` is installed, toggle **Use performance model (Model B, 310.9.16.0)** for lower GPU cost; `310.8.0.0` keeps Model A.
+     - **120fps OBS Video & VFG pacing**: set OBS Settings > Video > Fractional/Common FPS to **`120/1`** (120 fps) for 120 fps output/capture; the VFG runtime configures **`batchCapacity=2`** for low-latency paired frame generation.
 
 Logs are saved under `%LOCALAPPDATA%\obs-nr-native-filter`.
 
@@ -60,7 +67,10 @@ OBS Native NR 0.2.12를 Windows OBS Studio에 설치하는 방법입니다. [화
 
 - **OBS Studio 32.x 64비트** (32.2.2에서 시험), 렌더러는 **Direct3D 11** (기본값).
 - **NVIDIA RTX 20~50 시리즈** (NVIDIA VFG 2x~4x 미리보기는 RTX 40/50 전용).
-- **Native NR에만 필요한 모델 파일** `nvngx_dlssnr.dll` 310.8.0.0 호환판 (165,840,496바이트, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`). 릴리즈에 들어 있지 않으며, RenoDX 디스코드(https://discord.gg/F6AUTeWJHM)에서 받을 수 있습니다.
+- **Native NR에만 필요한 모델 파일** `nvngx_dlssnr.dll` — 아래 두 판 중 하나를 사용합니다:
+  - **310.8.0.0** 호환판 (165,840,496바이트, SHA-256 `e67dee209320cdafe0e93e45675d7aa34323a53acc57a72b2e40a181581c989a`, Model A)
+  - **310.9.16.0** 판 (SHA-256 `cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed`, **Model B** 지원). OBS에 `nvngx_dlssnr.dll`이 없고 로컬 Veyra(`%LOCALAPPDATA%\Programs\Veyra (NVIDIA)\versions\*\runtime\experimental\nr-ampere\nvngx_dlssnr.dll`)에 검증된 `310.9.16.0` 파일이 있으면 `install.bat`이 자동으로 재사용합니다.
+  릴리즈에 들어 있지 않으며, RenoDX 디스코드(https://discord.gg/F6AUTeWJHM)에서 받거나 `-Runtime <경로>`로 직접 지정할 수 있습니다.
 - **DLSS 4.5 SR · NVIDIA VFG 런타임**: 별도로 찾아 받을 필요 없이 `install.bat`이 NVIDIA 공식 서버에서 직접 내려받아 서명·SHA-256을 검증한 뒤 자동 설치해 줍니다.
 
 ### 원클릭 설치 순서
@@ -70,10 +80,14 @@ OBS Native NR 0.2.12를 Windows OBS Studio에 설치하는 방법입니다. [화
 3. 압축 푼 폴더의 `install.bat`을 더블클릭합니다.
    - **언어**: 그냥 Enter를 누르면 한국어입니다.
    - **OBS 폴더**: 찾은 경로가 맞으면 Enter.
-   - **NR 모델 파일**: `bin\64bit\nvngx_dlssnr.dll`이 없으면 파일을 창에 끌어다 놓고 Enter (Enter만 누르면 건너뜀).
+   - **NR 모델 파일**: `bin\64bit\nvngx_dlssnr.dll`이 없으면 로컬 Veyra의 `310.9.16.0` 파일을 자동 재사용하거나, 직접 파일을 창에 끌어다 놓고 Enter (`310.8.0.0` 또는 `310.9.16.0` 허용, Enter만 누르면 건너뜀).
    - **DLSS 4.5 SR / NVIDIA VFG**: 자동 설치 여부를 묻는 곳에서 그냥 Enter(Y)를 누르면 공식 NVIDIA 파일이 자동 설치됩니다.
    - **관리자 권한 창**: **예**를 누릅니다.
 4. OBS를 실행해 소스 우클릭 > **필터** > **효과 필터 [+]**에서 필요한 효과를 선택합니다.
+   - **Native NR 추천 설정 (Veyra 호환)**:
+     - **빠른 프리셋**: **Veyra 추천** (`Veyra 추천 · 표준 선명 + 안티플리커`)을 선택하면 표준 선명도 + 안티플리커가 한 번에 적용됩니다.
+     - **310.9.16.0 Model B**: `310.9.16.0` 런타임을 설치한 경우 **성능 모델 사용 (Model B, 310.9.16.0)** 토글로 가벼운 Model B(small-FP8)를 켤 수 있습니다(`310.8.0.0`은 Model A 유지).
+     - **120fps OBS 비디오 설정 (`120/1`) 및 VFG `batchCapacity=2`**: 120fps 출력·캡처 시 OBS 설정 > 비디오 > FPS를 **`120/1`** (120fps)로 맞추세요. VFG 런타임은 저지연 쌍 프레임 생성을 위해 **`batchCapacity=2`**로 동작합니다.
    - **영상 업스케일 및 프레임 생성**의 **업스케일 및 선명화**는 SDR 전용입니다. 이중선형 확대와 CAS는 NVIDIA 런타임 없이 작동하고, 선택 기능인 DLSS는 `nvngx_dlss.dll`을 사용합니다.
    - 이전에 **Native NR**에서 사용한 확대·선명화는 **영상 업스케일 및 프레임 생성**에서 다시 설정하세요. 저장된 독립 효과는 계속 작동합니다. [전환 안내](standalone-upscale.md)를 참고하세요.
    - **Native NR**은 노이즈 제거만 합니다. 두 효과를 함께 쓸 때는 [필터 순서 안내](standalone-upscale.md)를 확인하세요.
