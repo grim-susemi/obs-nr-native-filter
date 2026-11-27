@@ -65,6 +65,84 @@ void require(bool ok, const char* op)
 {
     if (!ok) throw ipc::Error(ipc::Status::ProtocolError, HRESULT_FROM_WIN32(GetLastError()), op);
 }
+// Exhaustive backend policy helpers: a new Backend enumerator is a compile error
+// here instead of silently inheriting a negated check somewhere else.
+constexpr bool backend_is_pushflow(Backend backend) noexcept
+{
+    switch (backend) {
+    case Backend::NativeVfg:
+    case Backend::AnrExperimental:
+    case Backend::XeFg:
+    case Backend::XeMfg:
+        return false;
+    case Backend::PushFlow:
+        return true;
+    }
+    return false;
+}
+constexpr bool backend_is_anr(Backend backend) noexcept
+{
+    switch (backend) {
+    case Backend::NativeVfg:
+    case Backend::PushFlow:
+    case Backend::XeFg:
+    case Backend::XeMfg:
+        return false;
+    case Backend::AnrExperimental:
+        return true;
+    }
+    return false;
+}
+constexpr bool backend_uses_native_vfg(Backend backend) noexcept
+{
+    switch (backend) {
+    case Backend::NativeVfg:
+        return true;
+    case Backend::PushFlow:
+    case Backend::AnrExperimental:
+    case Backend::XeFg:
+    case Backend::XeMfg:
+        return false;
+    }
+    return false;
+}
+constexpr bool backend_supports_auto_fallback(Backend backend) noexcept
+{
+    switch (backend) {
+    case Backend::NativeVfg:
+        return false;
+    case Backend::PushFlow:
+    case Backend::AnrExperimental:
+    case Backend::XeFg:
+    case Backend::XeMfg:
+        return true;
+    }
+    return false;
+}
+// A degraded 1x session must not carry the failed backend's runtime selection
+// into the recovery child: multiplier 1 is accepted with those fields cleared.
+void clear_backend_fields(LaunchOptions& options) noexcept
+{
+    switch (options.backend) {
+    case Backend::NativeVfg:
+        break;
+    case Backend::PushFlow:
+        options.pushflowRuntimeDir.clear();
+        break;
+    case Backend::AnrExperimental:
+        options.anrDllPath.clear();
+        options.experimentalAnrOptIn = 0;
+        break;
+    case Backend::XeFg:
+        options.xessRuntimeDir.clear();
+        break;
+    case Backend::XeMfg:
+        options.xessRuntimeDir.clear();
+        options.xemfgDllPath.clear();
+        options.experimentalXeMfgOptIn = 0;
+        break;
+    }
+}
 std::wstring env_path(const wchar_t* key)
 {
     wchar_t value[4096]{};
@@ -636,12 +714,22 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     header.liveAnchor = static_cast<LONG>(options.liveAnchor);
     header.transportIntervalNs = options.transportIntervalNs;
     header.launchEpoch = fallback ? 2 : 1;
+    header.experimentalXeMfgOptIn = options.experimentalXeMfgOptIn;
+    header.xefgStabilityMask = options.xefgStabilityMask;
+    header.sharedNvofEnabled = options.sharedNvofEnabled;
     require(options.pushflowRuntimeDir.size() < ARRAYSIZE(header.pushflowRuntimeDir) &&
-        options.anrDllPath.size() < ARRAYSIZE(header.anrDllPath), "VFG runtime path too long");
+        options.anrDllPath.size() < ARRAYSIZE(header.anrDllPath) &&
+        options.xessRuntimeDir.size() < ARRAYSIZE(header.xessRuntimeDir) &&
+        options.xemfgDllPath.size() < ARRAYSIZE(header.xemfgDllPath), "VFG runtime path too long");
     std::copy(options.anrDllPath.begin(), options.anrDllPath.end(), header.anrDllPath);
+    std::copy(options.xessRuntimeDir.begin(), options.xessRuntimeDir.end(), header.xessRuntimeDir);
+    std::copy(options.xemfgDllPath.begin(), options.xemfgDllPath.end(), header.xemfgDllPath);
+    // Stamp the requested multiplier before admission so a 1x recovery header is
+    // validated under its real mode rather than the zero-initialised default.
+    header.multiplier = std::clamp<uint32_t>(options.multiplier, 1, max_multiplier);
     require(validate_session_header(header), "VFG invalid session header");
     std::unique_ptr<anr::PinnedAddon> anrPin;
-    if (options.backend == Backend::AnrExperimental && !fallback) {
+    if (backend_is_anr(options.backend) && !fallback) {
         auto result = anr::validate_addon(options.anrDllPath, options.experimentalAnrOptIn == 1);
         std::string reason = anr::status_name(result.status);
         switch (result.status) {
@@ -676,11 +764,11 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     const auto exe = resolve_presenter_exe();
     const auto log = detail::resolve_log_path();
     const auto exeDir = fs::path(exe).parent_path().wstring();
-    const bool nativeFg = options.backend == Backend::NativeVfg && options.multiplier > 1;
+    const bool nativeFg = backend_uses_native_vfg(options.backend) && options.multiplier > 1;
     const auto runtime = nativeFg ? find_runtime_dir() : exeDir;
     if (nativeFg && runtime.empty())
         throw ipc::Error(ipc::Status::ProtocolError, ERROR_FILE_NOT_FOUND, "NVIDIA VFG runtime DLLs not found");
-    if (options.backend == Backend::PushFlow && options.multiplier > 1 && !fallback) {
+    if (backend_is_pushflow(options.backend) && options.multiplier > 1 && !fallback) {
         const auto marks = marker_dir();
         const auto legacyStarting = marks / L"pushflow-starting.txt";
         const auto quarantine = marks / L"pushflow-crash-quarantine.txt";
@@ -763,7 +851,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         }
     }
     Handle markerLock;
-    if (options_.backend == Backend::PushFlow && options_.multiplier > 1) {
+    if (backend_is_pushflow(options_.backend) && options_.multiplier > 1) {
         header.markerOwnerToken = allocate_marker_token(markerLock);
         if (header.markerOwnerToken == 0) {
             write_event("event=pushflow_marker_lock_failed_fallback_1x\n");
@@ -853,7 +941,7 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
         const uint64_t ownerTok = s->markerOwnerToken;
         const bool needsUserCloseCleanup =
             s->markerCleanupStatus.load(std::memory_order_acquire) == MarkerCleanupStatus::Pending && ownerTok != 0;
-        if (reason == ExitReason::UserClosed && backend == Backend::PushFlow && needsUserCloseCleanup) {
+        if (reason == ExitReason::UserClosed && backend_is_pushflow(backend) && needsUserCloseCleanup) {
             std::error_code ec;
             if (clear_starting_marker(marks, ownerTok, ec)) {
                 s->markerCleanupStatus.store(MarkerCleanupStatus::Succeeded, std::memory_order_release);
@@ -901,10 +989,10 @@ Controller::Controller(const LaunchOptions& options, bool fallback) : options_(o
     Handle relaunchSettled{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     require(relaunchSettled.value != nullptr, "VFG relaunch settled event");
     // Start relaunchWorker_ last, after session_ is committed, so constructor errors never deadlock unwind.
-    if (!fallback && options.backend != Backend::NativeVfg) {
+    if (!fallback && backend_supports_auto_fallback(options.backend)) {
         auto recovery = options_;
         recovery.multiplier = 1;
-        recovery.pushflowRuntimeDir.clear();
+        clear_backend_fields(recovery);
         relaunchWorker_ = std::jthread([this, recovery = std::move(recovery)] { run_fallback(recovery); });
     }
     relaunchSettledEvent_ = relaunchSettled.release();
@@ -965,7 +1053,7 @@ void Controller::stop(bool userStop) noexcept
     replacement_.reset();
     relaunchState_.store(RelaunchState::Idle);
     if (relaunchSettledEvent_) SetEvent(relaunchSettledEvent_);
-    if (userStop && session_ && options_.backend == Backend::PushFlow) {
+    if (userStop && session_ && backend_is_pushflow(options_.backend)) {
         if (session_->child && WaitForSingleObject(session_->child, 0) == WAIT_OBJECT_0)
             await_exit_cleanup(250);
     }
@@ -979,7 +1067,7 @@ bool Controller::is_fault_or_watchdog_exit() const noexcept
 
 bool Controller::can_recover() const noexcept
 {
-    return options_.backend != Backend::NativeVfg && !fallbackRestarted_ && !stopRequested_.load() &&
+    return backend_supports_auto_fallback(options_.backend) && !fallbackRestarted_ && !stopRequested_.load() &&
         exit_reason() != ExitReason::UserClosed;
 }
 
@@ -1005,7 +1093,7 @@ void Controller::run_fallback(LaunchOptions recovery)
         require(WaitForSingleObject(session_->child, 1000) == WAIT_OBJECT_0, "VFG faulted child reap");
         await_exit_cleanup(200);
         if (stopRequested_.load() || exit_reason() == ExitReason::UserClosed) return;
-        if (recovery.backend == Backend::PushFlow) {
+        if (backend_is_pushflow(recovery.backend)) {
             const auto marks = marker_dir();
             if (!marks.empty()) {
                 std::error_code ec;
@@ -1034,6 +1122,7 @@ RelaunchState Controller::poll_async_fallback_relaunch() noexcept
     if (result == RelaunchState::Ready && !stopRequested_.load()) {
         std::swap(session_, replacement_->session_);
         options_.multiplier = 1;
+        clear_backend_fields(options_);
         ++launchEpoch_;
         sync_live_settings();
         relaunchState_.store(RelaunchState::Idle);
@@ -1099,9 +1188,26 @@ void Controller::set_live_anchor(uint32_t on) noexcept
 }
 LiveSettings Controller::live_settings() const noexcept
 {
-    if (!session_ || !session_->view) return LiveSettings{options_.dedupMode, options_.liveAnchor};
-    return LiveSettings{static_cast<uint32_t>(InterlockedCompareExchange(&session_->view->dedupMode, 0, 0)),
-        static_cast<uint32_t>(InterlockedCompareExchange(&session_->view->liveAnchor, 0, 0))};
+    LiveSettings result{};
+    auto* view = session_ && session_->view ? session_->view : nullptr;
+    if (view) {
+        result.dedupMode = static_cast<uint32_t>(InterlockedCompareExchange(&view->dedupMode, 0, 0));
+        result.liveAnchor = static_cast<uint32_t>(InterlockedCompareExchange(&view->liveAnchor, 0, 0));
+        result.experimentalXeMfgOptIn = static_cast<uint32_t>(InterlockedCompareExchange(&view->experimentalXeMfgOptIn, 0, 0));
+        result.xefgStabilityMask = static_cast<uint32_t>(InterlockedCompareExchange(&view->xefgStabilityMask, 0, 0));
+        result.sharedNvofEnabled = static_cast<uint32_t>(InterlockedCompareExchange(&view->sharedNvofEnabled, 0, 0));
+        std::copy_n(std::begin(view->xessRuntimeDir), ARRAYSIZE(result.xessRuntimeDir), result.xessRuntimeDir);
+        std::copy_n(std::begin(view->xemfgDllPath), ARRAYSIZE(result.xemfgDllPath), result.xemfgDllPath);
+    } else {
+        result.dedupMode = options_.dedupMode;
+        result.liveAnchor = options_.liveAnchor;
+        result.experimentalXeMfgOptIn = options_.experimentalXeMfgOptIn;
+        result.xefgStabilityMask = options_.xefgStabilityMask;
+        result.sharedNvofEnabled = options_.sharedNvofEnabled;
+        std::copy(options_.xessRuntimeDir.begin(), options_.xessRuntimeDir.end(), result.xessRuntimeDir);
+        std::copy(options_.xemfgDllPath.begin(), options_.xemfgDllPath.end(), result.xemfgDllPath);
+    }
+    return result;
 }
 
 void Controller::sync_live_settings() noexcept
@@ -1143,6 +1249,9 @@ bool Controller::offer(const ipc::Offer& offer, const ipc::Shape& shape, LUID ad
     InterlockedExchange(&view->hideFromCapture, static_cast<LONG>(options_.hideFromCapture ? 1u : 0u));
     InterlockedExchange(&view->dedupMode, static_cast<LONG>(options_.dedupMode));
     InterlockedExchange(&view->liveAnchor, static_cast<LONG>(options_.liveAnchor));
+    InterlockedExchange(&view->experimentalXeMfgOptIn, static_cast<LONG>(options_.experimentalXeMfgOptIn));
+    InterlockedExchange(&view->xefgStabilityMask, static_cast<LONG>(options_.xefgStabilityMask));
+    InterlockedExchange(&view->sharedNvofEnabled, static_cast<LONG>(options_.sharedNvofEnabled));
     wcscpy_s(view->mapping, offer.mapping.c_str());
     if (!options_.monitorId.empty() && options_.monitorId.size() < ARRAYSIZE(view->monitorId)) {
         wcscpy_s(view->monitorId, options_.monitorId.c_str());

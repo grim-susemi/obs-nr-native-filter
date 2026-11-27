@@ -7,6 +7,8 @@
 #include "fg_ipc_sequence.h"
 #include <wrl/client.h>
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -51,6 +53,27 @@ bool format(DXGI_FORMAT f){
  switch(f){case DXGI_FORMAT_R8G8B8A8_UNORM:case DXGI_FORMAT_B8G8R8A8_UNORM:
  case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R10G10B10A2_UNORM:return true;default:return false;}
 }
+bool guides_valid(const GuideShape& g){
+ return (!g.width&&!g.height)||(g.width&&g.height&&g.width<=16384&&g.height<=16384);
+}
+bool flow_enums_valid(FlowOwner owner,FlowProvenance provenance){
+ return static_cast<uint32_t>(owner)<=2&&static_cast<uint32_t>(provenance)<=5;
+}
+// A key is usable as a displayed-frame identity only when every distinguishing
+// field is present; history/content epochs may legitimately start at zero.
+bool key_set(const FrameKey& key){
+ return key.sourceInstanceId&&key.resourceGeneration&&key.submissionSerial&&key.canonicalTick;
+}
+void key_store(std::array<uint64_t,wire_word_count>& words,size_t at,const FrameKey& key){
+ words[at]=(uint64_t{key.resourceGeneration}<<32)|key.sourceInstanceId;
+ words[at+1]=key.submissionSerial;words[at+2]=key.canonicalTick;words[at+3]=key.historyEpoch;words[at+4]=key.contentEpoch;
+}
+FrameKey key_load(const std::array<uint64_t,wire_word_count>& words,size_t at){
+ FrameKey key;
+ key.sourceInstanceId=static_cast<uint32_t>(words[at]);key.resourceGeneration=static_cast<uint32_t>(words[at]>>32);
+ key.submissionSerial=words[at+1];key.canonicalTick=words[at+2];key.historyEpoch=words[at+3];key.contentEpoch=words[at+4];
+ return key;
+}
 bool compatible(DXGI_FORMAT actual,DXGI_FORMAT wanted){
  if(actual==wanted)return true;
  switch(wanted){
@@ -77,23 +100,47 @@ Status validate(const Header& h,LUID expected){
 }
 std::optional<Frame> snapshot(const WireFrame& wire){
  const auto before=load(wire.sequence);if(before<=0||(before&1))return {};
- std::array<uint64_t,16> words{};for(size_t i=0;i<words.size();++i)words[i]=static_cast<uint64_t>(load(wire.words[i]));
+ std::array<uint64_t,wire_word_count> words{};for(size_t i=0;i<words.size();++i)words[i]=static_cast<uint64_t>(load(wire.words[i]));
  if(load(wire.sequence)!=before||words[1]!=static_cast<uint64_t>(before)/2)return {};
  const bool split=(words[6]&2)!=0;const bool swap=(words[6]&4)!=0;const auto percent=static_cast<uint32_t>((words[6]>>8)&0xff);
- Frame result{words[0],words[1],words[2],words[3],{static_cast<uint32_t>(words[4]),static_cast<uint32_t>(words[4]>>32),
-  static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5])),static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32),{},(words[6]&1)!=0,split},words[15],split?percent:50,split&&swap};
+ Frame result{};
+ result.generation=words[0];result.serial=words[1];result.timestampNs=words[2];result.arrivalNs=words[3];
+ result.shape.width=static_cast<uint32_t>(words[4]);result.shape.height=static_cast<uint32_t>(words[4]>>32);
+ result.shape.format=static_cast<DXGI_FORMAT>(static_cast<uint32_t>(words[5]));
+ result.shape.colorSpace=static_cast<DXGI_COLOR_SPACE_TYPE>(words[5]>>32);
+ result.shape.displayCapture=(words[6]&1)!=0;result.shape.splitCompare=split;
+ result.shape.guides={static_cast<uint32_t>(words[18]),static_cast<uint32_t>(words[18]>>32)};
+ result.obsTick=words[15];result.splitPercent=split?percent:50;result.splitSwap=split&&swap;
+ result.flow.owner=static_cast<FlowOwner>(static_cast<uint32_t>(words[16]));
+ result.flow.provenance=static_cast<FlowProvenance>(static_cast<uint32_t>(words[17]));
+ result.flow.mvScaleX=std::bit_cast<float>(static_cast<uint32_t>(words[19]));
+ result.flow.mvScaleY=std::bit_cast<float>(static_cast<uint32_t>(words[19]>>32));
+ result.flow.pairPrevTick=words[20];result.flow.pairCurrTick=words[21];
+ result.flow.shotCut=(words[22]&1)!=0;result.flow.reset=(words[22]&2)!=0;
+ result.flow.hasSharedMv=(words[22]&4)!=0;
+ result.key=key_load(words,key_word);
+ result.flow.prevColor=key_load(words,prev_key_word);
+ result.flow.currColor=key_load(words,curr_key_word);
  if(!result.generation||!result.shape.width||!result.shape.height||!format(result.shape.format)||
-  (words[6]&~uint64_t{0xff07})||(split?percent>100:(percent!=0||swap)))return {};
+  (words[6]&~uint64_t{0xff07})||(split?percent>100:(percent!=0||swap))||words[23]||(words[22]&~uint64_t{7})||
+  !flow_enums_valid(result.flow.owner,result.flow.provenance))return {};
+ if(result.flow.hasSharedMv&&(!result.shape.guides.width||!result.shape.guides.height||
+  result.shape.guides.width>16384||result.shape.guides.height>16384||result.flow.owner==FlowOwner::Unavailable||
+  result.flow.provenance!=FlowProvenance::Valid||!result.flow.pairCurrTick||
+  !std::isfinite(result.flow.mvScaleX)||!std::isfinite(result.flow.mvScaleY)||
+  result.flow.mvScaleX==0||result.flow.mvScaleY==0||!key_set(result.key)||
+  !key_set(result.flow.prevColor)||result.flow.currColor!=result.key||
+  result.flow.prevColor==result.flow.currColor))return {};
  std::memcpy(result.shape.sourceMonitor.data(),words.data()+7,sizeof(result.shape.sourceMonitor));return result;
 }
 struct Producer::Config {
  Ptr<ID3D11Device5> device;Ptr<ID3D11DeviceContext4> graphics;std::wstring name;Shape shape;LUID adapter;DWORD thread;
 };
 struct Producer::Impl {
- struct Slot {Ptr<ID3D11Texture2D> texture;Ptr<ID3D11Fence> write,returned;uint64_t target=0;};
+ struct Slot {Ptr<ID3D11Texture2D> texture,mv;Ptr<ID3D11Fence> write,returned;uint64_t target=0;};
  Mapping mapping;Handle peer,frameEvent,controlEvent;
  Ptr<ID3D11Device5> device;Ptr<ID3D11DeviceContext4> graphics;
- std::array<Slot,4> slots;std::array<HANDLE,14> remote{};Offer offer;
+ std::array<Slot,4> slots;std::array<HANDLE,handle_count> remote{};Offer offer;
  uint64_t serial=0;bool retired=false,uncertain=false;
  DWORD revokeError=ERROR_SUCCESS;
 #ifdef NR_FG_IPC_TEST_PROBE
@@ -144,7 +191,7 @@ struct Producer::Impl {
  ~Impl(){if(mapping.header)revoke();}
 };
 #ifdef NR_FG_IPC_TEST_PROBE
-Producer::RevokeProbeResult Producer::test_revoke(std::array<HANDLE,14>& remote,decltype(&DuplicateHandle) duplicate){
+Producer::RevokeProbeResult Producer::test_revoke(std::array<HANDLE,handle_count>& remote,decltype(&DuplicateHandle) duplicate){
  Impl fixture;fixture.peer=verified(identity(GetCurrentProcess()));fixture.duplicateCloseSource=duplicate;
  fixture.mapping.handle=Handle(CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,static_cast<DWORD>(sizeof(Header)),nullptr));
  win(fixture.mapping.handle.value!=nullptr,"revocation probe mapping");fixture.mapping.map();
@@ -154,7 +201,8 @@ Producer::RevokeProbeResult Producer::test_revoke(std::array<HANDLE,14>& remote,
 }
 #endif
 Producer::Producer(ID3D11Device* device,std::wstring name,const Shape& shape):config_(std::make_unique<Config>()){
- if(!device||name.empty()||!shape.width||!shape.height||shape.width>16384||shape.height>(shape.splitCompare?8192u:16384u)||!format(shape.format))
+ if(!device||name.empty()||!shape.width||!shape.height||shape.width>16384||shape.height>(shape.splitCompare?8192u:16384u)||!format(shape.format)||
+  !guides_valid(shape.guides))
   throw Error(Status::InvalidFrame,E_INVALIDARG,"producer shape/device/name");
  check(device->QueryInterface(IID_PPV_ARGS(&config_->device)),"ID3D11Device5");Ptr<ID3D11DeviceContext> immediate;
  device->GetImmediateContext(&immediate);check(immediate.As(&config_->graphics),"ID3D11DeviceContext4");
@@ -202,6 +250,19 @@ Offer Producer::connect(const Peer& consumer){
  p->frameEvent=Handle(CreateEventW(nullptr,FALSE,FALSE,nullptr));win(p->frameEvent.value!=nullptr,"frame event");
  p->controlEvent=Handle(CreateEventW(nullptr,FALSE,FALSE,nullptr));win(p->controlEvent.value!=nullptr,"control event");
  duplicate(p->frameEvent.value,12);duplicate(p->controlEvent.value,13);
+ // The optional motion ring is allocated here so its shared handles exist before
+ // the consumer imports the bundle; a null-flow generation publishes zeros.
+ if(!config_->shape.guides.width){
+  for(size_t i=0;i<p->slots.size();++i)h.handles[mv_handle_first+i]=0;
+ }else for(size_t i=0;i<p->slots.size();++i){
+  auto& slot=p->slots[i];D3D11_TEXTURE2D_DESC md{};md.Width=config_->shape.guides.width;md.Height=config_->shape.guides.height;
+  md.MipLevels=md.ArraySize=md.SampleDesc.Count=1;md.Format=DXGI_FORMAT_R16G16_FLOAT;md.Usage=D3D11_USAGE_DEFAULT;
+  md.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;md.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+  check(p->device->CreateTexture2D(&md,nullptr,&slot.mv),"shared motion texture");Ptr<IDXGIResource1> motionDxgi;
+  check(slot.mv.As(&motionDxgi),"shared motion DXGI texture");Handle motion;
+  check(motionDxgi->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,nullptr,&motion.value),"motion NT handle");
+  duplicate(motion.value,mv_handle_first+i);
+ }
  store(h.transfer,static_cast<uint64_t>(Transfer::Offered));*available=p;current_=p;return p->offer;
 }
 Status Producer::status()const{
@@ -216,12 +277,25 @@ Status Producer::status()const{
  return Status::ProtocolError;
 }
 Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arrival,bool discontinuity,uint64_t obsTick,
- ID3D11Texture2D* before,uint32_t splitPercent,bool splitSwap){
+ ID3D11Texture2D* before,uint32_t splitPercent,bool splitSwap,const FlowBundle& shared){
  if(GetCurrentThreadId()!=config_->thread)return Status::ProtocolError;
  const auto state=status();if(state!=Status::Ok)return state;if(!source)return Status::InvalidFrame;
+ const auto& flow=shared.pair;
+ if(!flow_enums_valid(flow.owner,flow.provenance))return Status::InvalidFrame;
+ if(flow.hasSharedMv!=static_cast<bool>(shared.motion))return Status::InvalidFrame;
  D3D11_TEXTURE2D_DESC d{};source->GetDesc(&d);Ptr<ID3D11Device> owner;source->GetDevice(&owner);
  if(owner.Get()!=config_->device.Get()||d.Width!=config_->shape.width||d.Height!=config_->shape.height||
   !compatible(d.Format,config_->shape.format)||d.MipLevels!=1||d.ArraySize!=1||d.SampleDesc.Count!=1)return Status::InvalidFrame;
+ if(flow.hasSharedMv){
+  if(!config_->shape.guides.width)return Status::InvalidFrame;
+  if(!key_set(shared.color)||!key_set(flow.prevColor)||flow.currColor!=shared.color||flow.prevColor==flow.currColor)
+   return Status::InvalidFrame;
+  D3D11_TEXTURE2D_DESC m{};shared.motion->GetDesc(&m);Ptr<ID3D11Device> motionOwner;shared.motion->GetDevice(&motionOwner);
+  if(motionOwner.Get()!=config_->device.Get()||m.Width!=config_->shape.guides.width||m.Height!=config_->shape.guides.height||
+   m.Format!=DXGI_FORMAT_R16G16_FLOAT||m.MipLevels!=1||m.ArraySize!=1||m.SampleDesc.Count!=1)return Status::InvalidFrame;
+  if(!std::isfinite(flow.mvScaleX)||!std::isfinite(flow.mvScaleY)||!flow.mvScaleX||!flow.mvScaleY||!flow.pairCurrTick)
+   return Status::InvalidFrame;
+ }
  if(config_->shape.splitCompare){
   if(!before||splitPercent>100)return Status::InvalidFrame;
   D3D11_TEXTURE2D_DESC original{};before->GetDesc(&original);Ptr<ID3D11Device> originalOwner;before->GetDevice(&originalOwner);
@@ -242,14 +316,26 @@ Status Producer::publish(ID3D11Texture2D* source,uint64_t timestamp,uint64_t arr
   p.graphics->CopySubresourceRegion(slot.texture.Get(),0,0,0,0,source,0,nullptr);
   p.graphics->CopySubresourceRegion(slot.texture.Get(),0,0,config_->shape.height,0,before,0,nullptr);
  }else p.graphics->CopyResource(slot.texture.Get(),source);
+ if(flow.hasSharedMv)p.graphics->CopyResource(slot.mv.Get(),shared.motion);
  if(FAILED(p.graphics->Signal(slot.write.Get(),slot.target)))return Status::ProtocolError;
  p.graphics->Flush();p.uncertain=false;
  auto& wire=p.mapping.header->frames[index];const auto& shape=config_->shape;
- std::array<uint64_t,16> words{generation(),slot.target,timestamp,arrival,(uint64_t{shape.height}<<32)|shape.width,
-  (uint64_t{static_cast<uint32_t>(shape.colorSpace)}<<32)|static_cast<uint32_t>(shape.format),
-  (shape.displayCapture?uint64_t{1}:uint64_t{0})|(shape.splitCompare?(uint64_t{2}|(splitSwap?uint64_t{4}:uint64_t{0})|(uint64_t{splitPercent}<<8)):uint64_t{0})};
+ std::array<uint64_t,wire_word_count> words{};
+ words[0]=generation();words[1]=slot.target;words[2]=timestamp;words[3]=arrival;
+ words[4]=(uint64_t{shape.height}<<32)|shape.width;
+ words[5]=(uint64_t{static_cast<uint32_t>(shape.colorSpace)}<<32)|static_cast<uint32_t>(shape.format);
+ words[6]=(shape.displayCapture?uint64_t{1}:uint64_t{0})|(shape.splitCompare?(uint64_t{2}|(splitSwap?uint64_t{4}:uint64_t{0})|(uint64_t{splitPercent}<<8)):uint64_t{0});
  std::memcpy(words.data()+7,shape.sourceMonitor.data(),sizeof(shape.sourceMonitor));
  words[15]=obsTick;
+ words[16]=static_cast<uint64_t>(flow.owner);words[17]=static_cast<uint64_t>(flow.provenance);
+ words[18]=(uint64_t{shape.guides.height}<<32)|shape.guides.width;
+ words[19]=flow.hasSharedMv?((uint64_t{std::bit_cast<uint32_t>(flow.mvScaleY)}<<32)|std::bit_cast<uint32_t>(flow.mvScaleX)):uint64_t{0};
+ words[20]=flow.pairPrevTick;words[21]=flow.pairCurrTick;
+ words[22]=(flow.shotCut?uint64_t{1}:uint64_t{0})|(flow.reset?uint64_t{2}:uint64_t{0})|(flow.hasSharedMv?uint64_t{4}:uint64_t{0});
+ words[23]=0;
+ key_store(words,key_word,shared.color);
+ key_store(words,prev_key_word,flow.prevColor);
+ key_store(words,curr_key_word,flow.currColor);
  store(wire.sequence,slot.target*2-1);
  for(size_t i=0;i<words.size();++i)store(wire.words[i],words[i]);
  store(wire.sequence,slot.target*2);
@@ -281,8 +367,9 @@ bool Producer::generation_retained(uint64_t generation){
 
 struct Consumer::Impl {
  struct Slot {
-  Ptr<ID3D12Resource> texture,destination,before;Ptr<ID3D12Fence> write,returned;
+  Ptr<ID3D12Resource> texture,mv,destination,before;Ptr<ID3D12Fence> write,returned;
   Ptr<ID3D12CommandAllocator> allocator;Ptr<ID3D12GraphicsCommandList> list;
+  Ptr<ID3D12Resource> mvDestination;
   uint64_t submitted=0;
  };
  Mapping mapping;Handle peer,frameEvent,controlEvent;Ptr<ID3D12Device> device;Ptr<ID3D12CommandQueue> queue;
@@ -296,9 +383,12 @@ struct Consumer::Impl {
  static auto& mutex(){static std::mutex m;return m;}
  bool drain(){
   if(closed)return true;if(uncertain)return false;
-  for(const auto& slot:slots)if(slot.submitted&&!complete(slot.returned->GetCompletedValue(),slot.submitted))return false;
-  for(auto& slot:slots){slot.list.Reset();slot.allocator.Reset();slot.destination.Reset();slot.before.Reset();slot.texture.Reset();slot.write.Reset();slot.returned.Reset();}
-  store(mapping.header->transfer,static_cast<uint64_t>(Transfer::Closed));SetEvent(controlEvent.value);closed=true;return true;
+  for(const auto& slot:slots)if(slot.submitted&&(!slot.returned||!complete(slot.returned->GetCompletedValue(),slot.submitted)))return false;
+  for(auto& slot:slots){slot.list.Reset();slot.allocator.Reset();slot.destination.Reset();slot.before.Reset();slot.mvDestination.Reset();
+   slot.texture.Reset();slot.mv.Reset();slot.write.Reset();slot.returned.Reset();}
+  if(mapping.header)store(mapping.header->transfer,static_cast<uint64_t>(Transfer::Closed));
+  if(controlEvent.value)SetEvent(controlEvent.value);
+  closed=true;return true;
  }
  static void collect(){for(auto& p:vault())if(p&&p->retired&&p->drain())p.reset();}
 };
@@ -316,17 +406,22 @@ Consumer::Consumer(ID3D12CommandQueue* queue,const Offer& offer,const Peer& prod
  if(h.generation!=offer.generation||h.producerPid!=producer.pid||h.producerCreation!=producer.creation||
   h.consumerPid!=self.pid||h.consumerCreation!=self.creation)throw Error(Status::WrongPeer,E_INVALIDARG,"IPC offer identity");
  if(!exchange(h,Transfer::Offered,Transfer::Importing))throw Error(Status::PeerBusy,E_PENDING,"offer already claimed/revoked");
- std::array<Handle,14> incoming;
+ std::array<Handle,handle_count> incoming;
  for(size_t i=0;i<incoming.size();++i)incoming[i]=Handle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(h.handles[i])));
  p->frameEvent=std::move(incoming[12]);p->controlEvent=std::move(incoming[13]);p->generation=h.generation;
+ const auto motionFirst=incoming.begin()+static_cast<std::ptrdiff_t>(mv_handle_first);
+ const bool anyMotion=std::any_of(motionFirst,incoming.end(),[](const Handle& x){return x.value!=nullptr;});
+ const bool allMotion=std::all_of(motionFirst,incoming.end(),[](const Handle& x){return x.value!=nullptr;});
  wchar_t inject[2]{};
  const bool reject=GetEnvironmentVariableW(L"OBS_NR_TEST_REJECT_FIRST_IMPORT",inject,ARRAYSIZE(inject))==1&&inject[0]==L'1';
  try{
   if(reject)throw Error(Status::Rejected,E_FAIL,"test_first_import_rejected");
+  if(anyMotion&&!allMotion)throw Error(Status::ProtocolError,E_INVALIDARG,"partial motion handle bundle");
   for(size_t i=0;i<p->slots.size();++i){
    auto& slot=p->slots[i];check(p->device->OpenSharedHandle(incoming[i*3].value,IID_PPV_ARGS(&slot.texture)),"import texture");
    check(p->device->OpenSharedHandle(incoming[i*3+1].value,IID_PPV_ARGS(&slot.write)),"import write fence");
    check(p->device->OpenSharedHandle(incoming[i*3+2].value,IID_PPV_ARGS(&slot.returned)),"import return fence");
+   if(anyMotion)check(p->device->OpenSharedHandle(incoming[mv_handle_first+i].value,IID_PPV_ARGS(&slot.mv)),"import motion texture");
    check(p->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&slot.allocator)),"copy allocator");
    check(p->device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,slot.allocator.Get(),nullptr,IID_PPV_ARGS(&slot.list)),"copy list");
    check(slot.list->Close(),"initial copy close");
@@ -376,9 +471,9 @@ Status Consumer::copy(size_t index,ID3D12Resource* destination){
  impl_->sequence.break_pair();
  const auto f=frame(index);if(!f)return Status::Pending;
  if(f->shape.splitCompare)return Status::InvalidFrame;
- return copy_frame({index,*f},destination,nullptr,false);
+ return copy_frame({index,*f},{destination});
 }
-CopyStep Consumer::copy_next(ID3D12Resource* destination,ID3D12Resource* before){
+CopyStep Consumer::copy_next(ID3D12Resource* destination,ID3D12Resource* before,ID3D12Resource* mv){
  if(!impl_)return {Status::Closed};
  if(GetCurrentThreadId()!=impl_->thread)return {Status::ProtocolError};
  const auto state=status();auto& sequence=impl_->sequence;
@@ -388,16 +483,16 @@ CopyStep Consumer::copy_next(ID3D12Resource* destination,ID3D12Resource* before)
  const auto ticket=detail::CopySequence::oldest(visible);
  if(!ticket)return {Status::Pending};
  const auto& previous=sequence.previous();
+ const auto aliases=[&](const auto& slot){return slot.destination.Get()==destination||slot.before.Get()==destination||
+  slot.mvDestination.Get()==destination||(before&&(slot.destination.Get()==before||slot.before.Get()==before||
+   slot.mvDestination.Get()==before))||(mv&&(slot.destination.Get()==mv||slot.before.Get()==mv||slot.mvDestination.Get()==mv));};
  if(!destination||destination->GetDesc().Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
-    (ticket->frame.shape.splitCompare&&(!before||before==destination))||
-    (previous&&(impl_->slots[previous->slot].destination.Get()==destination||
-     impl_->slots[previous->slot].before.Get()==destination||
-     (ticket->frame.shape.splitCompare&&(impl_->slots[previous->slot].destination.Get()==before||
-      impl_->slots[previous->slot].before.Get()==before))))){
+    (ticket->frame.shape.splitCompare&&(!before||before==destination))||mv==destination||mv==before||
+    (previous&&aliases(impl_->slots[previous->slot]))){
   return sequence.record(*ticket,Status::InvalidFrame);
  }
  // This exact serial still owns the source slot until its return fence signals.
- return sequence.record(*ticket,copy_frame(*ticket,destination,ticket->frame.shape.splitCompare?before:nullptr,true));
+ return sequence.record(*ticket,copy_frame(*ticket,{destination,ticket->frame.shape.splitCompare?before:nullptr,mv,true}));
 }
 Status Consumer::copy_status(const CopyTicket& ticket)const{
  if(!impl_)return Status::Closed;
@@ -415,15 +510,20 @@ Status Consumer::order_copy(const CopyTicket& ticket,ID3D12CommandQueue* reader)
  const auto& slot=impl_->slots[ticket.slot];
  return SUCCEEDED(reader->Wait(slot.returned.Get(),ticket.frame.serial))?Status::Ok:Status::ProtocolError;
 }
-Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination,ID3D12Resource* before,bool guardCrossSlotDestination){
+Status Consumer::copy_frame(const CopyTicket& ticket,const CopyTargets& targets){
+ auto* destination=targets.destination;auto* before=targets.before;auto* mv=targets.mv;
  if(!destination)return Status::InvalidFrame;
  const auto state=status();if(state!=Status::Ok)return state;
  const auto* f=&ticket.frame;
  auto& p=*impl_;auto& slot=p.slots[ticket.slot];
  for(const auto& other:p.slots){
-  if(other.submitted&&(&other==&slot||(guardCrossSlotDestination&&
-   (other.destination.Get()==destination||other.before.Get()==destination||
-    (before&&(other.destination.Get()==before||other.before.Get()==before)))))){
+  if(!other.submitted)continue;
+  const bool same=&other==&slot;
+  const bool aliased=targets.guardCrossSlotDestination&&
+   (other.destination.Get()==destination||other.before.Get()==destination||other.mvDestination.Get()==destination||
+    (before&&(other.destination.Get()==before||other.before.Get()==before||other.mvDestination.Get()==before))||
+    (mv&&(other.destination.Get()==mv||other.before.Get()==mv||other.mvDestination.Get()==mv)));
+  if(same||aliased){
    const auto ready=detail::copy_completion(other.returned->GetCompletedValue(),other.submitted);
    if(ready!=Status::Ok)return ready;
   }
@@ -440,11 +540,30 @@ Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination
  }else if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.Width!=f->shape.width||target.Height!=f->shape.height||
   target.Format!=source.Format||target.MipLevels!=1||target.DepthOrArraySize!=1||target.SampleDesc.Count!=1)return Status::InvalidFrame;
  if(f->shape.splitCompare){
-  if(readback||!before||before==destination)return Status::InvalidFrame;
+  if(readback||!before||before==destination||mv==before)return Status::InvalidFrame;
   Ptr<ID3D12Device> beforeOwner;const auto original=before->GetDesc();
   if(FAILED(before->GetDevice(IID_PPV_ARGS(&beforeOwner)))||beforeOwner.Get()!=p.device.Get()||
    original.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||original.Width!=target.Width||original.Height!=target.Height||
    original.Format!=target.Format||original.MipLevels!=1||original.DepthOrArraySize!=1||original.SampleDesc.Count!=1)return Status::InvalidFrame;
+ }
+ D3D12_PLACED_SUBRESOURCE_FOOTPRINT mvLayout{};UINT64 mvBytes=0;bool mvReadback=false;
+ if(mv){
+  if(!slot.mv||!f->flow.hasSharedMv)return Status::InvalidFrame;
+  const auto motion=slot.mv->GetDesc();
+  if(motion.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||motion.Width!=f->shape.guides.width||
+   motion.Height!=f->shape.guides.height||motion.Format!=DXGI_FORMAT_R16G16_FLOAT||motion.MipLevels!=1||
+   motion.DepthOrArraySize!=1||motion.SampleDesc.Count!=1)return Status::InvalidFrame;
+  Ptr<ID3D12Device> motionOwner;
+  if(FAILED(mv->GetDevice(IID_PPV_ARGS(&motionOwner)))||motionOwner.Get()!=p.device.Get())return Status::InvalidFrame;
+  p.device->GetCopyableFootprints(&motion,0,1,0,&mvLayout,nullptr,nullptr,&mvBytes);
+  const auto motionTarget=mv->GetDesc();
+  mvReadback=motionTarget.Dimension==D3D12_RESOURCE_DIMENSION_BUFFER;
+  if(mvReadback){D3D12_HEAP_PROPERTIES heap{};D3D12_HEAP_FLAGS flags{};
+   if(FAILED(mv->GetHeapProperties(&heap,&flags))||heap.Type!=D3D12_HEAP_TYPE_READBACK||motionTarget.Width<mvBytes)return Status::InvalidFrame;
+  }else if(motionTarget.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
+   motionTarget.Width!=f->shape.guides.width||motionTarget.Height!=f->shape.guides.height||
+   motionTarget.Format!=DXGI_FORMAT_R16G16_FLOAT||motionTarget.MipLevels!=1||motionTarget.DepthOrArraySize!=1||
+   motionTarget.SampleDesc.Count!=1)return Status::InvalidFrame;
  }
  if(FAILED(slot.allocator->Reset())||FAILED(slot.list->Reset(slot.allocator.Get(),nullptr)))return Status::ProtocolError;
  transition(slot.list.Get(),slot.texture.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -467,12 +586,25 @@ Status Consumer::copy_frame(const CopyTicket& ticket,ID3D12Resource* destination
   transition(slot.list.Get(),destination,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
   slot.list->CopyResource(destination,slot.texture.Get());transition(slot.list.Get(),destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
  }
+ if(mv){
+  transition(slot.list.Get(),slot.mv.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+  if(mvReadback){
+   D3D12_TEXTURE_COPY_LOCATION from{};from.pResource=slot.mv.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+   D3D12_TEXTURE_COPY_LOCATION to{};to.pResource=mv;to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=mvLayout;
+   slot.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+  }else{
+   transition(slot.list.Get(),mv,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+   slot.list->CopyResource(mv,slot.mv.Get());
+   transition(slot.list.Get(),mv,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+  }
+  transition(slot.list.Get(),slot.mv.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+ }
  transition(slot.list.Get(),slot.texture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
  if(FAILED(slot.list->Close()))return Status::ProtocolError;
  if(FAILED(p.queue->Wait(slot.write.Get(),f->serial)))return Status::ProtocolError;
  // Reserve before Execute: a crash or Signal failure must leave a known pending
  // target in both processes. No CPU receipt after submission can prove safety.
- slot.destination=destination;slot.before=before;slot.submitted=f->serial;p.uncertain=true;
+ slot.destination=destination;slot.before=before;slot.mvDestination=mv;slot.submitted=f->serial;p.uncertain=true;
  ID3D12CommandList* lists[]{slot.list.Get()};p.queue->ExecuteCommandLists(1,lists);
 #ifdef NR_FG_IPC_TEST_PROBE
  if(p.reached){

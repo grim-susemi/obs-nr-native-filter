@@ -18,7 +18,8 @@ struct LaunchOptions {
     Backend backend{};
     PushFlowTier pushflowTier{};
     uint32_t gpuShotChange{}, experimentalAnrOptIn{};
-    std::wstring pushflowRuntimeDir, anrDllPath;
+    std::wstring pushflowRuntimeDir, anrDllPath, xessRuntimeDir, xemfgDllPath;
+    uint32_t experimentalXeMfgOptIn{}, xefgStabilityMask{}, sharedNvofEnabled{};
     uint32_t hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{};
     uint32_t dedupMode = 0; // DedupMode: 0 = off/exact, 1 = auto, 5 = 60->30 adaptive, 6 = 60->30 fixed
     uint32_t liveAnchor = 0; // 0 = off, 1 = live clock phase-lock
@@ -27,6 +28,8 @@ struct LaunchOptions {
 struct LiveSettings {
     uint32_t dedupMode{};
     uint32_t liveAnchor{};
+    uint32_t experimentalXeMfgOptIn{}, xefgStabilityMask{}, sharedNvofEnabled{};
+    wchar_t xessRuntimeDir[520]{}, xemfgDllPath[520]{};
 };
 enum class RelaunchState { Idle, InFlight, Ready, Failed };
 class Controller final {

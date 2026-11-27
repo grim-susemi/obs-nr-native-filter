@@ -249,6 +249,86 @@ void cadence_schedule(){
 }
 }
 
+FrameKey color_key(uint64_t serial,uint32_t instance=0x51u){
+ return FrameKey{instance,7u,serial,serial*16666667u,1,2};
+}
+void shared_mv_pairs(){
+ // Given two adjacent colour identities, When their flow records are paired,
+ // Then shared MV is exposed only when the guide pair is keyed to exactly those
+ // displayed colour slots, never merely internally consistent.
+ const auto frame=[](uint64_t serial,uint64_t prevTick,uint64_t currTick,FlowProvenance provenance=FlowProvenance::Valid,
+  bool shared=true,uint32_t guideWidth=1344,uint32_t keyInstance=0x51u){
+  auto f=original(serial,serial*1000);
+  f.shape.splitCompare=true;f.shape.guides={guideWidth,756};
+  f.key=color_key(serial,keyInstance);
+  f.flow={FlowOwner::NrOwned,provenance,1.5f,1.0f,prevTick,currTick,false,false,shared};
+  f.flow.prevColor=color_key(serial>1?serial-1:40,keyInstance);
+  f.flow.currColor=f.key;
+  return f;
+ };
+ {
+  // Given the first flow frame is not itself proof of a pair, When the adjacent
+  // second frame arrives, Then the pair exposes shared MV.
+  CopySequence sequence;
+  expect(!sequence.record({0,frame(1,40,41)},Status::Ok).hasValidSharedMv,"one frame cannot prove a pair");
+  const auto first=frame(1,40,41);
+  const auto second=frame(2,41,42);
+  expect(second.flow.prevColor==first.key&&second.flow.currColor==second.key,
+   "positive control binds the guide endpoints to the adjacent colour slots");
+  CopySequence bound;
+  (void)bound.record({0,first},Status::Ok);
+  expect(bound.record({1,second},Status::Ok).hasValidSharedMv,"adjacent keyed NrOwned+Valid ticks expose shared MV");
+ }
+ {
+  // Given a self-consistent guide pair whose current endpoint is bound to a
+  // different displayed colour slot, When the adjacent frame is recorded, Then
+  // the pair is withheld even though ticks and guide extent all agree.
+  CopySequence sequence;
+  const auto first=frame(1,40,41);
+  auto stale=frame(2,41,42);
+  stale.key=color_key(9);
+  (void)sequence.record({0,first},Status::Ok);
+  const auto step=sequence.record({1,stale},Status::Ok);
+  expect(step.previous&&!step.hasValidSharedMv,"guide current endpoint keyed to another colour slot is withheld");
+ }
+ {
+  // Given the guide previous endpoint belongs to a different displayed colour
+  // slot, When the pair is recorded, Then shared MV is withheld.
+  CopySequence sequence;
+  auto first=frame(1,40,41);
+  first.key=color_key(9);
+  first.flow.currColor=color_key(9);
+  const auto second=frame(2,41,42);
+  (void)sequence.record({0,first},Status::Ok);
+  const auto step=sequence.record({1,second},Status::Ok);
+  expect(step.previous&&!step.hasValidSharedMv,"guide previous endpoint keyed to another colour slot is withheld");
+ }
+ struct Case { const char* why; Frame second; };
+ const std::array<Case,5> rejected{{
+  {"a pair tick gap never exposes shared MV",frame(2,99,42)},
+  {"a held second frame never exposes shared MV",frame(2,41,42,FlowProvenance::HeldPrevious)},
+  {"a second frame without motion never exposes shared MV",frame(2,41,42,FlowProvenance::Valid,false)},
+  {"a guide extents change breaks the pair",frame(2,41,42,FlowProvenance::Valid,true,1345)},
+  {"a transport gap breaks the pair",frame(3,41,42)},
+ }};
+ for(const auto& item:rejected){
+  CopySequence sequence;
+  (void)sequence.record({0,frame(1,40,41)},Status::Ok);
+  const auto step=sequence.record({1,item.second},Status::Ok);
+  expect(!step.hasValidSharedMv,item.why);
+ }
+ {
+  // Given the previous frame belongs to another owner policy, When the pair is
+  // recorded, Then colour pairing still works but shared MV is not exposed.
+  CopySequence sequence;
+  auto first=frame(1,40,41,FlowProvenance::Reset);
+  (void)sequence.record({0,first},Status::Ok);
+  const auto step=sequence.record({1,frame(2,41,42)},Status::Ok);
+  expect(step.previous&&!step.hasValidSharedMv,"a reset original cannot license shared MV");
+ }
+ std::puts("PASS shared_mv_pairs adjacent=exposed stale_colour_key/prev_key/tick_gap/held/no_mv/guide_gap/serial_gap/reset=withheld");
+}
+
 int main(){
  try{
   ordered_adjacent();std::puts("PASS ordered_adjacent metadata=preserved");
@@ -259,6 +339,7 @@ int main(){
   content_boundaries();std::puts("PASS content_boundaries cuts generations clocks shape and invalidation");
   cadence_rates();std::puts("PASS cadence_rates 24/30/40/50/60/120 acquisition, stall and unsupported rate");
   cadence_schedule();std::puts("PASS cadence_schedule 2x/3x/4x intervals and both 40 Hz phases");
+  shared_mv_pairs();
   return 0;
  }catch(const std::exception& error){std::fprintf(stderr,"FAIL fg_ipc_sequence: %s\n",error.what());return 1;}
 }

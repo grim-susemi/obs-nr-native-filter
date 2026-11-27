@@ -28,11 +28,14 @@ void check_header()
     LaunchOptions opts{};
     expect(opts.backend == Backend::NativeVfg && opts.pushflowTier == PushFlowTier::Fast && opts.multiplier == 2 &&
         !opts.gpuShotChange && !opts.experimentalAnrOptIn && !opts.hudLock && !opts.pacingRepair &&
-        !opts.adaptiveFg && !opts.adaptiveTargetFps && !opts.dedupMode && !opts.liveAnchor && !opts.transportIntervalNs,
+        !opts.adaptiveFg && !opts.adaptiveTargetFps && !opts.dedupMode && !opts.liveAnchor && !opts.transportIntervalNs &&
+        !opts.experimentalXeMfgOptIn && !opts.xefgStabilityMask && !opts.sharedNvofEnabled &&
+        opts.xessRuntimeDir.empty() && opts.xemfgDllPath.empty(),
         "v0.2.12 launch defaults");
     Session s{};
-    expect(s.sessionVersion == 3 && s.sessionBytes == sizeof(Session) && !s.dedupMode && !s.liveAnchor &&
-        !s.transportIntervalNs && validate_session_header(s), "default v3 session");
+    expect(s.sessionVersion == 4 && s.sessionBytes == sizeof(Session) && !s.dedupMode && !s.liveAnchor &&
+        !s.transportIntervalNs && !s.experimentalXeMfgOptIn && !s.xefgStabilityMask && !s.sharedNvofEnabled &&
+        validate_session_header(s), "default v4 session");
     for (const LONG mode : {0L, 1L, 5L, 6L}) {
         s.dedupMode = mode;
         expect(validate_session_header(s), "accept DedupMode v3 header");
@@ -49,9 +52,11 @@ void check_header()
     s.liveAnchor = 0;
     s.sessionVersion = 99;
     expect(!validate_session_header(s), "reject bad ABI version");
-    s.sessionVersion = 2;
-    expect(!validate_session_header(s), "reject v2 ABI version");
-    s.sessionVersion = 3;
+    for (const uint32_t legacy : {2u, 3u}) {
+        s.sessionVersion = legacy;
+        expect(!validate_session_header(s), "reject pre-v4 ABI version");
+    }
+    s.sessionVersion = 4;
     ++s.sessionBytes;
     expect(!validate_session_header(s), "reject oversized ABI byte count");
     --s.sessionBytes;
@@ -67,11 +72,59 @@ void check_header()
     expect(!validate_session_header(s), "reject ANR without opt-in");
     s.experimentalAnrOptIn = 1;
     expect(validate_session_header(s), "validate opted-in ANR header without loading DLL");
+    s.backend = static_cast<Backend>(5);
+    expect(!validate_session_header(s), "reject unknown backend 5");
+    s.backend = Backend::XeFg;
+    s.multiplier = 2;
+    expect(!validate_session_header(s), "XeFG 2x requires a XeSS runtime dir");
+    std::fill_n(s.xessRuntimeDir, ARRAYSIZE(s.xessRuntimeDir), L'x');
+    s.xessRuntimeDir[519] = L'\0';
+    expect(validate_session_header(s), "XeFG 2x accepts a terminated runtime dir");
+    s.multiplier = 1;
+    s.xessRuntimeDir[0] = L'\0';
+    expect(validate_session_header(s), "XeFG 1x recovery accepts cleared runtime fields");
+    s.backend = Backend::XeMfg;
+    s.multiplier = 2;
+    s.xessRuntimeDir[0] = L'x';
+    expect(!validate_session_header(s), "XeMFG requires explicit opt-in");
+    s.experimentalXeMfgOptIn = 1;
+    expect(!validate_session_header(s), "XeMFG requires a DLL path");
+    s.xemfgDllPath[0] = L'x';
+    expect(validate_session_header(s), "XeMFG 2x accepts opt-in and both paths");
+    s.multiplier = 1;
+    s.experimentalXeMfgOptIn = 0;
+    s.xemfgDllPath[0] = L'\0';
+    s.xessRuntimeDir[0] = L'\0';
+    expect(validate_session_header(s), "XeMFG 1x recovery accepts fully cleared experimental fields");
+    s.backend = Backend::NativeVfg;
+    s.multiplier = 0;
+    s.xefgStabilityMask = static_cast<LONG>(xefg_stability_mask_bits);
+    expect(validate_session_header(s), "accept every defined XeFG stability bit");
+    s.xefgStabilityMask = static_cast<LONG>(xefg_stability_mask_bits) + 1;
+    expect(!validate_session_header(s), "reject an undefined XeFG stability bit");
+    s.xefgStabilityMask = 0;
+    s.sharedNvofEnabled = 2;
+    expect(!validate_session_header(s), "reject sharedNvofEnabled 2");
+    s.sharedNvofEnabled = 1;
+    expect(validate_session_header(s), "accept sharedNvofEnabled 1");
+    s.sharedNvofEnabled = 0;
+    s.experimentalAnrOptIn = 2;
+    expect(!validate_session_header(s), "reject experimentalAnrOptIn 2");
+    s.experimentalAnrOptIn = 0;
+    std::fill_n(s.xemfgDllPath, ARRAYSIZE(s.xemfgDllPath), L'x');
+    expect(!validate_session_header(s), "reject unterminated XeMFG path");
+    s.xemfgDllPath[519] = L'\0';
+    std::fill_n(s.xessRuntimeDir, ARRAYSIZE(s.xessRuntimeDir), L'x');
+    expect(!validate_session_header(s), "reject unterminated XeSS runtime path");
+    s.xessRuntimeDir[519] = L'\0';
+    s.xessRuntimeDir[0] = L'\0';
+    s.xemfgDllPath[0] = L'\0';
     stamp_exit_reason(s, ExitReason::Fault);
     stamp_exit_reason(s, ExitReason::UserClosed);
     expect(read_exit_reason(s) == ExitReason::Fault, "the first exit reason wins");
-    std::printf("PASS vfg_session_controller: session_v3 dedup={0,1,5,6} liveAnchor={0,1} accepted; "
-        "sessionVersion={2,99}, dedupMode=99, liveAnchor=2, and mismatched sessionBytes rejected\n");
+    std::printf("PASS vfg_session_controller: session_v4 dedup={0,1,5,6} liveAnchor={0,1} accepted; "
+        "sessionVersion={2,3,99}, backend=5, dedupMode=99, liveAnchor=2, XeFG/XeMFG admission and 1x recovery, "
+        "stability bits, and mismatched sessionBytes rejected\n");
 }
 
 void reject_parent_options()
@@ -102,6 +155,22 @@ void reject_parent_options()
     LaunchOptions badAnchor{};
     badAnchor.liveAnchor = 2;
     reject(badAnchor, "VFG invalid session header");
+    LaunchOptions xeFgMissing{};
+    xeFgMissing.backend = Backend::XeFg;
+    reject(xeFgMissing, "VFG invalid session header");
+    LaunchOptions xeFgLong{};
+    xeFgLong.backend = Backend::XeFg;
+    xeFgLong.xessRuntimeDir.assign(520, L'x');
+    reject(xeFgLong, "VFG runtime path too long");
+    LaunchOptions xeMfgNoOptIn{};
+    xeMfgNoOptIn.backend = Backend::XeMfg;
+    xeMfgNoOptIn.xessRuntimeDir = L"unused-xess";
+    xeMfgNoOptIn.xemfgDllPath = L"unused.dll";
+    reject(xeMfgNoOptIn, "VFG invalid session header");
+    LaunchOptions xeMfgLong{};
+    xeMfgLong.backend = Backend::XeMfg;
+    xeMfgLong.xemfgDllPath.assign(520, L'x');
+    reject(xeMfgLong, "VFG runtime path too long");
 }
 
 void runtime_contract(const fs::path& scratch)
@@ -157,20 +226,29 @@ void fallback_live_settings_survive(const fs::path& exe, const fs::path& scratch
     LaunchOptions opts{};
     opts.backend = Backend::PushFlow;
     opts.multiplier = 2;
+    opts.experimentalXeMfgOptIn = 1;
+    opts.xefgStabilityMask = 3;
+    opts.sharedNvofEnabled = 1;
+    opts.xessRuntimeDir = L"unused-xess";
+    opts.xemfgDllPath = L"unused.dll";
     Controller ctrl(opts);
     ctrl.set_dedup_mode(5);
     ctrl.set_live_anchor(1);
     ctrl.set_dedup_mode(99); // invalid live input must not perturb the session
     const auto applied = ctrl.live_settings();
-    expect(applied.dedupMode == 5 && applied.liveAnchor == 1,
-        "live setters apply dedupMode and liveAnchor to the running session");
+    expect(applied.dedupMode == 5 && applied.liveAnchor == 1 && applied.experimentalXeMfgOptIn == 1 &&
+        applied.xefgStabilityMask == 3 && applied.sharedNvofEnabled == 1 &&
+        std::wstring(applied.xessRuntimeDir) == L"unused-xess" && std::wstring(applied.xemfgDllPath) == L"unused.dll",
+        "live setters publish the XeFG/XeMFG launch contract to the running session");
     expect(ctrl.begin_async_fallback_relaunch(true), "simulated fallback relaunch begins");
     expect(ctrl.await_async_fallback_relaunch(8000), "simulated fallback relaunch settles");
     expect(ctrl.poll_async_fallback_relaunch() == RelaunchState::Ready, "simulated fallback relaunch reaches Ready");
     const auto recovered = ctrl.live_settings();
-    expect(recovered.dedupMode == 5 && recovered.liveAnchor == 1,
-        "dedupMode and liveAnchor survive the fallback recovery relaunch");
-    std::printf("PASS vfg_session_controller: live_settings_survive_fallback dedup=5 anchor=1 (invalid dedup=99 ignored)\n");
+    expect(recovered.dedupMode == 5 && recovered.liveAnchor == 1 && recovered.experimentalXeMfgOptIn == 1 &&
+        recovered.xefgStabilityMask == 3 && recovered.sharedNvofEnabled == 1 &&
+        std::wstring(recovered.xessRuntimeDir) == L"unused-xess" && std::wstring(recovered.xemfgDllPath) == L"unused.dll",
+        "dedupMode, liveAnchor, and the XeFG/XeMFG launch contract survive the fallback relaunch");
+    std::printf("PASS vfg_session_controller: live_settings_survive_fallback dedup=5 anchor=1 xemfg_optin=1 stability=3 shared_nvof=1 (invalid dedup=99 ignored)\n");
     ctrl.stop(true);
     expect(ctrl.await_exit_cleanup(2000), "fallback live settings cleanup");
     fs::remove_all(localApp);
@@ -657,8 +735,8 @@ int wmain(int argc, wchar_t** argv)
         malformed_child(exe, log);
         cancel_io_ex_and_marker_fallback_contract(exe, scratch);
         fallback_live_settings_survive(exe, scratch);
-        std::puts("PASS vfg_session_controller: v3 defaults, malformed header and paths, parent and child admission, "
-            "numeric runtime order, overlapped cancel & marker fallback, live dedup/anchor across fallback");
+        std::puts("PASS vfg_session_controller: v4 defaults, malformed header and paths, parent and child admission, "
+            "numeric runtime order, overlapped cancel & marker fallback, live dedup/anchor/XeFG/XeMFG across fallback");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL vfg_session_controller: %s\n", e.what());

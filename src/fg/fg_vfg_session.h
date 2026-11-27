@@ -5,7 +5,8 @@
 
 namespace nr::fg::vfg {
 inline constexpr uint32_t max_multiplier = 4;
-inline constexpr uint32_t session_version = 3;
+inline constexpr uint32_t session_version = 4;
+inline constexpr uint32_t xefg_stability_mask_bits = 0x7;
 enum class DedupMode : uint32_t { OffExact = 0, Auto = 1, Adaptive60To30 = 5, Fixed60To30 = 6 };
 inline constexpr bool is_valid_dedup_mode(uint32_t mode) noexcept
 {
@@ -37,15 +38,33 @@ inline std::wstring marker_mutex_name(uint64_t ownerToken)
 {
     return L"Local\\obs-nr-pf-tok-" + format_marker_token_w(ownerToken);
 }
-enum class Backend : uint32_t { NativeVfg = 0, PushFlow = 1, AnrExperimental = 2 };
+enum class Backend : uint32_t { NativeVfg = 0, PushFlow = 1, AnrExperimental = 2, XeFg = 3, XeMfg = 4 };
 enum class PushFlowTier : uint32_t { Fast = 0, Quality = 1 };
 enum class ExitReason : LONG { None = 0, UserClosed = 1, Fault = 2, Watchdog = 3 };
+inline constexpr bool is_valid_backend(Backend backend) noexcept
+{
+    switch (backend) {
+    case Backend::NativeVfg:
+    case Backend::PushFlow:
+    case Backend::AnrExperimental:
+    case Backend::XeFg:
+    case Backend::XeMfg:
+        return true;
+    }
+    return false;
+}
+inline constexpr bool is_valid_switch(uint32_t on) noexcept
+{
+    return on <= 1;
+}
 inline constexpr const char* backend_name(Backend backend) noexcept
 {
     switch (backend) {
     case Backend::NativeVfg: return "nvidia-vfg-native";
     case Backend::PushFlow: return "pushflow";
     case Backend::AnrExperimental: return "anr-experimental";
+    case Backend::XeFg: return "xefg";
+    case Backend::XeMfg: return "xemfg";
     }
     return "invalid";
 }
@@ -63,7 +82,8 @@ struct Session {
     uint32_t gpuShotChange{}, experimentalAnrOptIn{};
     uint64_t launchEpoch = 1; // A recovery child must not replay first-launch fixtures.
     uint64_t markerOwnerToken{}; // Non-zero for PushFlow multiplier > 1 sessions to isolate starting markers.
-    wchar_t pushflowRuntimeDir[520]{}, anrDllPath[520]{};
+    wchar_t pushflowRuntimeDir[520]{}, anrDllPath[520]{}, xessRuntimeDir[520]{}, xemfgDllPath[520]{};
+    alignas(4) volatile LONG experimentalXeMfgOptIn{}, xefgStabilityMask{}, sharedNvofEnabled{};
     alignas(4) volatile LONG hudLock{}, pacingRepair{}, adaptiveFg{}, adaptiveTargetFps{}, exitReason{};
     alignas(4) volatile LONG forceTerminated{}, watchdogInitializing{}, pushflowActive{}, drainFailed{}, logWriteInFlight{};
     alignas(8) volatile LONG64 watchdogElapsedMs{};
@@ -87,13 +107,33 @@ struct Session {
 inline bool validate_session_header(const Session& s) noexcept
 {
     if (s.sessionVersion != session_version || s.sessionBytes != sizeof(Session) ||
-        (s.backend != Backend::NativeVfg && s.backend != Backend::PushFlow && s.backend != Backend::AnrExperimental) ||
+        !is_valid_backend(s.backend) ||
         (s.pushflowTier != PushFlowTier::Fast && s.pushflowTier != PushFlowTier::Quality) ||
         !is_valid_dedup_mode(static_cast<uint32_t>(s.dedupMode)) ||
         !is_valid_live_anchor(static_cast<uint32_t>(s.liveAnchor)) ||
+        !is_valid_switch(static_cast<uint32_t>(s.experimentalAnrOptIn)) ||
+        !is_valid_switch(static_cast<uint32_t>(s.experimentalXeMfgOptIn)) ||
+        !is_valid_switch(static_cast<uint32_t>(s.sharedNvofEnabled)) ||
+        (static_cast<uint32_t>(s.xefgStabilityMask) & ~xefg_stability_mask_bits) ||
         !wmemchr(s.pushflowRuntimeDir, L'\0', ARRAYSIZE(s.pushflowRuntimeDir)) ||
-        !wmemchr(s.anrDllPath, L'\0', ARRAYSIZE(s.anrDllPath))) return false;
-    return s.backend != Backend::AnrExperimental || (s.experimentalAnrOptIn == 1 && s.anrDllPath[0]);
+        !wmemchr(s.anrDllPath, L'\0', ARRAYSIZE(s.anrDllPath)) ||
+        !wmemchr(s.xessRuntimeDir, L'\0', ARRAYSIZE(s.xessRuntimeDir)) ||
+        !wmemchr(s.xemfgDllPath, L'\0', ARRAYSIZE(s.xemfgDllPath))) return false;
+    // A multiplier-1 recovery header is always legal: run_fallback clears the
+    // experimental runtime paths and opt-in when it degrades to the original frame.
+    if (s.multiplier == 1) return true;
+    switch (s.backend) {
+    case Backend::NativeVfg:
+    case Backend::PushFlow:
+        return true;
+    case Backend::AnrExperimental:
+        return s.experimentalAnrOptIn == 1 && s.anrDllPath[0];
+    case Backend::XeFg:
+        return s.xessRuntimeDir[0] != L'\0';
+    case Backend::XeMfg:
+        return s.experimentalXeMfgOptIn == 1 && s.xemfgDllPath[0] && s.xessRuntimeDir[0];
+    }
+    return false;
 }
 inline ExitReason read_exit_reason(Session& s) noexcept
 {
