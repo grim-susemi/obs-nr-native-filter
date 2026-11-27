@@ -16,6 +16,15 @@
 namespace nr {
 namespace {
 using Microsoft::WRL::ComPtr;
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+// Test transport only: counts "pinned for the process lifetime" fallbacks so a
+// QA lane can prove the unreachable path stayed unreachable.
+std::atomic<uint64_t>& teardown_pins()
+{
+    static std::atomic<uint64_t> value{0};
+    return value;
+}
+#endif
 void checked(HRESULT result, const char* what)
 {
     if (FAILED(result)) throw std::runtime_error(what);
@@ -150,6 +159,9 @@ struct FlowBroker::Impl {
     uint32_t recordHead = 0;
     mutable std::mutex lock;
     bool poisoned = false, retired = false, closed = false;
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+    HANDLE probeReached = nullptr, probeResume = nullptr;
+#endif
     Impl(Extent size, uint64_t id) : extent(size), instance(id) {}
     void initialize(ID3D12Device*, ID3D12CommandQueue*);
     void create_slot(Slot&, uint32_t index);
@@ -296,18 +308,38 @@ FlowBroker::~FlowBroker()
         std::lock_guard<std::mutex> guard(impl_->lock);
         impl_->retired = true;
     }
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+    if (impl_->probeReached && impl_->probeResume) {
+        // Test transport only: hold the exact window between close() and
+        // collect_parked() open until the QA host completes the lease it left
+        // unresolved. Bounded so a lost host cannot hang teardown.
+        SetEvent(impl_->probeReached);
+        WaitForSingleObject(impl_->probeResume, 30000);
+    }
+#endif
     std::lock_guard<std::mutex> guard(parked_lock());
     // Admission reserved this owner's vault slot for its whole life, so teardown
     // only hands that reservation back: immediately once the ring is gone, and
     // through collect_parked() when fences still keep the retired ring parked.
     collect_parked();
     if (released) return;
+    {
+        std::lock_guard<std::mutex> stateGuard(impl_->lock);
+        // close() saw an incomplete consumer fence, but that fence may have
+        // completed before collect_parked(): the collector then released this
+        // ring itself. Pin only a ring that is somehow still alive; a closed one
+        // is already torn down, and pinning it would leak the owner outright.
+        if (impl_->closed) return;
+    }
     if (std::any_of(parked_rings().begin(), parked_rings().end(),
             [this](const auto& entry) { return entry.get() == impl_.get(); })) return;
     // Unreachable for a normally admitted broker: the caller already holds the
     // vault slot. Pin this owner for the process lifetime rather than freeing a
     // ring a consumer may still read.
     (void)new std::shared_ptr<Impl>(impl_);
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+    teardown_pins().fetch_add(1, std::memory_order_relaxed);
+#endif
 }
 std::array<std::shared_ptr<FlowBroker::Impl>, flow_ring_generation_limit>& FlowBroker::parked_rings()
 {
@@ -531,6 +563,16 @@ bool FlowBroker::close()
     owner.release();
     return true;
 }
+
+#ifdef NR_FLOW_BROKER_TEST_PROBE
+void FlowBroker::test_teardown_probe(HANDLE reached, HANDLE resume)
+{
+    impl_->probeReached = reached;
+    impl_->probeResume = resume;
+}
+uint64_t FlowBroker::test_pin_count() { return teardown_pins().load(std::memory_order_relaxed); }
+void FlowBroker::test_reset_pin_count() { teardown_pins().store(0, std::memory_order_relaxed); }
+#endif
 
 void register_flow_broker(const std::shared_ptr<FlowBroker>& broker)
 {
