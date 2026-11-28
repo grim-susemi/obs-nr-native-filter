@@ -15,7 +15,7 @@ How to install OBS Native NR 0.3.0 into OBS Studio on Windows. Start with the [i
 
 ## One-click install
 
-1. Download `obs-nr-native-filter-0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0) and verify the checksum.
+1. Download `obs-nr-native-filter-0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/coding-susemi/obs-nr-native-filter/releases/tag/v0.3.0) and verify the checksum.
 2. Close OBS completely, including the tray icon.
 3. Extract the whole zip into a folder and double-click `install.bat`. The console replaces each question with the next one.
    - **Language**: Enter for Korean, `2` for English.
@@ -52,7 +52,7 @@ Close OBS and double-click `uninstall.bat`. It restores any backed-up files and 
 
 - **OBS renderer**: confirm OBS Settings > Advanced > Video > Renderer is **Direct3D 11**.
 - **Logs to attach**: OBS log in `%APPDATA%\obs-studio\logs` and installer log in `%LOCALAPPDATA%\obs-nr-native-filter`.
-- **Open an issue**: [Submit a bug report](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml) with your plugin version, OBS version, GPU, driver version, and the logs above.
+- **Open an issue**: [Submit a bug report](https://github.com/coding-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml) with your plugin version, OBS version, GPU, driver version, and the logs above.
 
 ---
 
@@ -69,7 +69,7 @@ OBS Native NR 0.3.0을 Windows OBS Studio에 설치하는 방법입니다. [화�
 
 ### 원클릭 설치 순서
 
-1. [v0.3.0 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0)에서 `obs-nr-native-filter-0.3.0-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
+1. [v0.3.0 릴리스](https://github.com/coding-susemi/obs-nr-native-filter/releases/tag/v0.3.0)에서 `obs-nr-native-filter-0.3.0-windows-x64.zip`과 `SHA256SUMS.txt`를 받아 체크섬을 확인한 뒤 압축을 전부 풉니다.
 2. OBS를 완전히 끕니다(트레이 아이콘 포함).
 3. 압축 푼 폴더의 `install.bat`을 더블클릭합니다.
    - **언어**: 그냥 Enter를 누르면 한국어입니다.
@@ -94,6 +94,6 @@ OBS를 끄고 같은 폴더의 `uninstall.bat`을 더블클릭합니다. 설치�
 ### 문제 해결 및 오류 제보
 
 - OBS 설정 > 고급 > 비디오 > 렌더러가 **Direct3D 11**인지 확인하세요.
-- 오류가 나면 [GitHub 이슈 제보](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml)에 플러그인 버전, OBS 버전, GPU/드라이버 버전과 함께 아래 로그를 첨부해 주세요.
+- 오류가 나면 [GitHub 이슈 제보](https://github.com/coding-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml)에 플러그인 버전, OBS 버전, GPU/드라이버 버전과 함께 아래 로그를 첨부해 주세요.
   - OBS 로그: `%APPDATA%\obs-studio\logs`
   - 설치기 로그: `%LOCALAPPDATA%\obs-nr-native-filter`

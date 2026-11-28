@@ -9,7 +9,7 @@ Put it on a capture card, game capture, window or media source. No ReShade, no i
 
 <br />
 
-[![Download](https://img.shields.io/github/v/release/grim-susemi/obs-nr-native-filter?style=for-the-badge&label=Download&logo=github&color=2ea043)](https://github.com/grim-susemi/obs-nr-native-filter/releases/latest)
+[![Download](https://img.shields.io/github/v/release/coding-susemi/obs-nr-native-filter?style=for-the-badge&label=Download&logo=github&color=2ea043)](https://github.com/coding-susemi/obs-nr-native-filter/releases/latest)
 [![Install guide](https://img.shields.io/badge/Install-guide-1f6feb?style=for-the-badge&logo=gitbook&logoColor=white)](docs/INSTALL.md)
 [![OBS Studio 32](https://img.shields.io/badge/OBS%20Studio-32.x-302e31?style=for-the-badge&logo=obsstudio&logoColor=white)](https://obsproject.com/)
 [![License GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-6e40c9?style=for-the-badge)](LICENSE)
@@ -98,7 +98,7 @@ If the ZIP does not contain `files\bin\64bit\nvngx_dlssnr.dll`, the installer re
 
 ## Install
 
-1. Download `obs-nr-native-filter-0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0).
+1. Download `obs-nr-native-filter-0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/coding-susemi/obs-nr-native-filter/releases/tag/v0.3.0).
 2. Close OBS completely (including tray icon).
 3. Extract the entire zip and double-click **`install.bat`**.
 4. Pick your language (`1` Korean, `2` English) and confirm the detected OBS folder.
@@ -125,7 +125,7 @@ Close OBS and run **`uninstall.bat`** from the extracted release folder. It remo
 
 - **Installer failed or rolled back**: check the installer log under `%LOCALAPPDATA%\obs-nr-native-filter`.
 - **Filter missing, black frame, or crash in OBS**: make sure OBS uses the **Direct3D 11** renderer (Settings > Advanced > Video), verify `obs-nr-filter.dll` and runtime DLLs are present (see [docs/INSTALL.md](docs/INSTALL.md)), and inspect the latest OBS log under `%APPDATA%\obs-studio\logs`.
-- **Report an issue**: [open a bug report](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml) and attach your OBS log, installer log, GPU model, and NVIDIA driver version.
+- **Report an issue**: [open a bug report](https://github.com/coding-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml) and attach your OBS log, installer log, GPU model, and NVIDIA driver version.
 
 ## Build from source
 
@@ -147,7 +147,7 @@ See [`deps/THIRD-PARTY-NOT-INCLUDED.md`](deps/THIRD-PARTY-NOT-INCLUDED.md) for t
 
 Source code is licensed under [GNU GPL v3](LICENSE) (GPL-3.0-only).
 
-Related: [OptiScaler-Susemi](https://github.com/grim-susemi/OptiScaler-Susemi) · [DLSS5 NR guide](https://github.com/grim-susemi/dlss5-nr-guide)
+Related: [OptiScaler-Susemi](https://github.com/coding-susemi/OptiScaler-Susemi) · [DLSS5 NR guide](https://github.com/coding-susemi/dlss5-nr-guide)
 
 ---
 
@@ -161,7 +161,7 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 
 **설치 방법 (원클릭)**
 
-1. [v0.3.0 릴리스](https://github.com/grim-susemi/obs-nr-native-filter/releases/tag/v0.3.0)에서 `obs-nr-native-filter-0.3.0-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
+1. [v0.3.0 릴리스](https://github.com/coding-susemi/obs-nr-native-filter/releases/tag/v0.3.0)에서 `obs-nr-native-filter-0.3.0-windows-x64.zip`과 `SHA256SUMS.txt`를 내려받아 체크섬을 확인한 뒤 압축을 풉니다.
 2. OBS를 완전히 끕니다.
 3. **`install.bat`** 을 더블클릭하고 Enter(한국어) → OBS 폴더 확인을 누릅니다.
 4. `nvngx_dlssnr.dll`(310.9.16.0 Model B)은 ZIP에 동봉되어 있어 SHA-256 검증 후 자동 설치됩니다. 동봉되지 않은 경량 패키지에서만 창에 끌어다 놓고 Enter를 누릅니다. (RenoDX 디스코드: https://discord.gg/F6AUTeWJHM)
@@ -169,4 +169,4 @@ OBS 소스에 NVIDIA DLSS NR(뉴럴 렌더링), 2패스 조합, Veyra 방식 안
 6. 관리자 권한 창에서 **예**를 누르면 설치가 끝납니다.
 7. OBS를 켜고 소스 우클릭 > **필터** > **효과 필터 [+]**에서 **영상 업스케일 및 프레임 생성** 또는 **Native NR**을 선택합니다. 이중선형 확대와 CAS만 쓰려면 모델과 선택 런타임 설치를 건너뛰어도 됩니다.
 
-자세한 안내와 제거(`uninstall.bat`)·문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)를 참고하세요. 설치·실행 중 오류가 나면 [GitHub 이슈 제보](https://github.com/grim-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml)에 OBS 로그(`%APPDATA%\obs-studio\logs`)와 설치기 로그(`%LOCALAPPDATA%\obs-nr-native-filter`)를 함께 올려주세요.
+자세한 안내와 제거(`uninstall.bat`)·문제 해결은 [설치 안내서](docs/INSTALL.md#한국어-설치-안내)를 참고하세요. 설치·실행 중 오류가 나면 [GitHub 이슈 제보](https://github.com/coding-susemi/obs-nr-native-filter/issues/new?template=bug_report.yml)에 OBS 로그(`%APPDATA%\obs-studio\logs`)와 설치기 로그(`%LOCALAPPDATA%\obs-nr-native-filter`)를 함께 올려주세요.
